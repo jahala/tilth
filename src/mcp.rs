@@ -7,6 +7,26 @@ use serde_json::Value;
 use crate::cache::OutlineCache;
 use crate::session::Session;
 
+// Sent to the LLM via the MCP `instructions` field during initialization.
+// Keeps the strategic guidance from AGENTS.md available to any host.
+const SERVER_INSTRUCTIONS: &str = "\
+tilth — code intelligence MCP server. Five tools: read, search, files, map, session.\n\
+\n\
+Workflow: Start with tilth_map to orient, then tilth_search to find symbols/text, \
+then tilth_read to view files. Always pass `context` (the file you're editing) to \
+tilth_search — it boosts nearby results.\n\
+\n\
+tilth_read: Small files → full content. Large files → structural outline. \
+Start with the outline, then use `section` to drill into specific line ranges.\n\
+\n\
+tilth_search: Symbol search (default) finds definitions first via tree-sitter AST, \
+then usages. Use `kind: \"content\"` for strings/comments. Use `expand` to see full \
+source of top matches.\n\
+\n\
+tilth_files: Glob search with token estimates. Use to find test files, configs, etc.\n\
+\n\
+tilth_session: Check what you've already read/searched to avoid redundant calls.";
+
 /// MCP server over stdio. Three tools:
 /// - `tilth_read`  → smart file view
 /// - `tilth_search` → symbol/content/regex search
@@ -89,7 +109,8 @@ fn handle_request(
                 "serverInfo": {
                     "name": "tilth",
                     "version": env!("CARGO_PKG_VERSION")
-                }
+                },
+                "instructions": SERVER_INSTRUCTIONS
             })),
             error: None,
         },
