@@ -26,7 +26,7 @@
             src = ./.;
             cargoLock.lockFile = ./Cargo.lock;
             meta = {
-              description = "Tree-sitter indexed lookups — smart code reading for AI agents";
+              inherit (cargoToml.package) description;
               homepage = "https://github.com/jahala/tilth";
               license = lib.licenses.mit;
               mainProgram = "tilth";
