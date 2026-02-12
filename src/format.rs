@@ -67,3 +67,43 @@ pub fn number_lines(content: &str, start: u32) -> String {
     }
     out
 }
+
+// ---------------------------------------------------------------------------
+// Hashline support (edit mode)
+// ---------------------------------------------------------------------------
+
+/// FNV-1a hash of a line, truncated to 12 bits (3 hex chars).
+/// Used as a per-line content checksum for edit-mode anchors.
+pub(crate) fn line_hash(bytes: &[u8]) -> u16 {
+    let mut h: u32 = 0x811c_9dc5;
+    for &b in bytes {
+        h ^= u32::from(b);
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    (h & 0xFFF) as u16
+}
+
+/// Format lines with hashline anchors: `{line}:{hash}|{content}`
+/// Used in edit mode so the agent can reference lines by content hash.
+pub fn hashlines(content: &str, start: u32) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut out = String::with_capacity(content.len() + lines.len() * 8);
+    for (i, line) in lines.iter().enumerate() {
+        let num = start as usize + i;
+        let hash = line_hash(line.as_bytes());
+        let _ = writeln!(out, "{num}:{hash:03x}|{line}");
+    }
+    out
+}
+
+/// Parse a hashline anchor `"42:a3f"` into `(line_number, hash)`.
+/// Inverse of the format produced by [`hashlines`].
+pub(crate) fn parse_anchor(s: &str) -> Option<(usize, u16)> {
+    let (line_str, hash_str) = s.split_once(':')?;
+    let line: usize = line_str.trim().parse().ok()?;
+    if line == 0 {
+        return None; // 1-indexed
+    }
+    let hash = u16::from_str_radix(hash_str.trim(), 16).ok()?;
+    Some((line, hash))
+}

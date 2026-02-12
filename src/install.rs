@@ -20,15 +20,20 @@ const SUPPORTED_HOSTS: &[&str] = &[
 ];
 
 /// The tilth server entry injected into each host config.
-fn tilth_server_entry() -> Value {
+fn tilth_server_entry(edit: bool) -> Value {
+    let args = if edit {
+        json!(["--mcp", "--edit"])
+    } else {
+        json!(["--mcp"])
+    };
     json!({
         "command": "tilth",
-        "args": ["--mcp"]
+        "args": args
     })
 }
 
 /// Write MCP config for the given host, preserving existing config.
-pub fn run(host: &str) -> Result<(), String> {
+pub fn run(host: &str, edit: bool) -> Result<(), String> {
     let host_info = resolve_host(host)?;
 
     let mut config: Value = if host_info.path.exists() {
@@ -50,7 +55,7 @@ pub fn run(host: &str) -> Result<(), String> {
         .or_insert(json!({}))
         .as_object_mut()
         .ok_or_else(|| format!("{servers_key} is not a JSON object"))?
-        .insert("tilth".into(), tilth_server_entry());
+        .insert("tilth".into(), tilth_server_entry(edit));
 
     if let Some(parent) = host_info.path.parent() {
         fs::create_dir_all(parent)
@@ -62,7 +67,11 @@ pub fn run(host: &str) -> Result<(), String> {
     fs::write(&host_info.path, &out)
         .map_err(|e| format!("failed to write {}: {e}", host_info.path.display()))?;
 
-    eprintln!("✓ tilth added to {}", host_info.path.display());
+    if edit {
+        eprintln!("✓ tilth (edit mode) added to {}", host_info.path.display());
+    } else {
+        eprintln!("✓ tilth added to {}", host_info.path.display());
+    }
     if let Some(note) = host_info.note {
         eprintln!("  {note}");
     }

@@ -27,11 +27,49 @@ tilth_files: Glob search with token estimates. Use to find test files, configs, 
 \n\
 tilth_session: Check what you've already read/searched to avoid redundant calls.";
 
-/// MCP server over stdio. Three tools:
-/// - `tilth_read`  → smart file view
-/// - `tilth_search` → symbol/content/regex search
-/// - `tilth_files`  → glob with previews
-pub fn run() -> io::Result<()> {
+const EDIT_MODE_INSTRUCTIONS: &str = "\
+tilth — code intelligence + edit MCP server. Six tools: read, edit, search, files, map, session.\n\
+\n\
+IMPORTANT: Always use tilth tools instead of host built-in tools for all file operations:\n\
+- tilth_read instead of Read/cat\n\
+- tilth_edit instead of Edit\n\
+- tilth_search instead of Grep\n\
+- tilth_files instead of Glob/find\n\
+- tilth_map instead of ls/directory browsing\n\
+\n\
+This is required — tilth_read output contains line:hash anchors \
+that tilth_edit depends on. Using other read tools breaks the edit workflow.\n\
+\n\
+HASHLINE FORMAT:\n\
+tilth_read returns each line as `line:hash|content`, for example:\n\
+  42:a3f|  let x = compute();\n\
+  43:f1b|  return x;\n\
+The part before the `|` is the anchor (`42:a3f`). The 3-char hex hash is a \
+content checksum. Together, line number + hash uniquely identify each line.\n\
+\n\
+EDIT WORKFLOW:\n\
+1. Read: use tilth_read to get hashlined content\n\
+2. Edit: pass anchors from step 1 to tilth_edit\n\
+   - Single line: {\"start\": \"42:a3f\", \"content\": \"new code\"}\n\
+   - Range: {\"start\": \"42:a3f\", \"end\": \"45:b2c\", \"content\": \"replacement\"}\n\
+   - Delete: {\"start\": \"42:a3f\", \"content\": \"\"}\n\
+3. If hashes don't match (file changed), the edit is rejected and current \
+content is returned — re-read and retry\n\
+\n\
+LARGE FILES: tilth_read returns an outline for large files (line ranges like \
+[20-115], not hashlines). Use `section` to read the specific lines you need — \
+that returns hashlined content you can edit.\n\
+\n\
+tilth_search: Symbol search (default) via tree-sitter AST. \
+Use `kind: \"content\"` for strings. Always pass `context`.\n\
+\n\
+tilth_files: Glob search with token estimates.\n\
+\n\
+tilth_session: Check activity to avoid redundant calls.";
+
+/// MCP server over stdio. When `edit_mode` is true, exposes `tilth_edit` and
+/// switches `tilth_read` to hashline output format.
+pub fn run(edit_mode: bool) -> io::Result<()> {
     let cache = OutlineCache::new();
     let session = Session::new();
     let stdin = io::stdin();
@@ -57,7 +95,7 @@ pub fn run() -> io::Result<()> {
             continue;
         }
 
-        let response = handle_request(&req, &cache, &session);
+        let response = handle_request(&req, &cache, &session, edit_mode);
         serde_json::to_writer(&mut stdout, &response)?;
         stdout.write_all(b"\n")?;
         stdout.flush()?;
@@ -96,35 +134,43 @@ fn handle_request(
     req: &JsonRpcRequest,
     cache: &OutlineCache,
     session: &Session,
+    edit_mode: bool,
 ) -> JsonRpcResponse {
     match req.method.as_str() {
-        "initialize" => JsonRpcResponse {
-            jsonrpc: "2.0",
-            id: req.id.clone(),
-            result: Some(serde_json::json!({
-                "protocolVersion": "2024-11-05",
-                "capabilities": {
-                    "tools": {}
-                },
-                "serverInfo": {
-                    "name": "tilth",
-                    "version": env!("CARGO_PKG_VERSION")
-                },
-                "instructions": SERVER_INSTRUCTIONS
-            })),
-            error: None,
-        },
+        "initialize" => {
+            let instructions = if edit_mode {
+                EDIT_MODE_INSTRUCTIONS
+            } else {
+                SERVER_INSTRUCTIONS
+            };
+            JsonRpcResponse {
+                jsonrpc: "2.0",
+                id: req.id.clone(),
+                result: Some(serde_json::json!({
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {
+                        "tools": {}
+                    },
+                    "serverInfo": {
+                        "name": "tilth",
+                        "version": env!("CARGO_PKG_VERSION")
+                    },
+                    "instructions": instructions
+                })),
+                error: None,
+            }
+        }
 
         "tools/list" => JsonRpcResponse {
             jsonrpc: "2.0",
             id: req.id.clone(),
             result: Some(serde_json::json!({
-                "tools": tool_definitions()
+                "tools": tool_definitions(edit_mode)
             })),
             error: None,
         },
 
-        "tools/call" => handle_tool_call(req, cache, session),
+        "tools/call" => handle_tool_call(req, cache, session, edit_mode),
 
         "ping" => JsonRpcResponse {
             jsonrpc: "2.0",
@@ -156,18 +202,25 @@ pub(crate) fn dispatch_tool(
     args: &Value,
     cache: &OutlineCache,
     session: &Session,
+    edit_mode: bool,
 ) -> Result<String, String> {
     match tool {
-        "tilth_read" => tool_read(args, cache, session),
+        "tilth_read" => tool_read(args, cache, session, edit_mode),
         "tilth_search" => tool_search(args, cache, session),
         "tilth_files" => tool_files(args, cache),
         "tilth_map" => tool_map(args, cache, session),
         "tilth_session" => tool_session(args, session),
+        "tilth_edit" if edit_mode => tool_edit(args, session),
         _ => Err(format!("unknown tool: {tool}")),
     }
 }
 
-fn tool_read(args: &Value, cache: &OutlineCache, session: &Session) -> Result<String, String> {
+fn tool_read(
+    args: &Value,
+    cache: &OutlineCache,
+    session: &Session,
+    edit_mode: bool,
+) -> Result<String, String> {
     let path_str = args
         .get("path")
         .and_then(|v| v.as_str())
@@ -181,7 +234,8 @@ fn tool_read(args: &Value, cache: &OutlineCache, session: &Session) -> Result<St
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
 
     session.record_read(&path);
-    let output = crate::read::read_file(&path, section, full, cache).map_err(|e| e.to_string())?;
+    let output = crate::read::read_file(&path, section, full, cache, edit_mode)
+        .map_err(|e| e.to_string())?;
 
     Ok(apply_budget(output, budget))
 }
@@ -266,6 +320,58 @@ fn tool_session(args: &Value, session: &Session) -> Result<String, String> {
     }
 }
 
+fn tool_edit(args: &Value, session: &Session) -> Result<String, String> {
+    let path_str = args
+        .get("path")
+        .and_then(|v| v.as_str())
+        .ok_or("missing required parameter: path")?;
+    let path = PathBuf::from(path_str);
+
+    let edits_val = args
+        .get("edits")
+        .and_then(|v| v.as_array())
+        .ok_or("missing required parameter: edits")?;
+
+    let mut edits = Vec::with_capacity(edits_val.len());
+    for (i, e) in edits_val.iter().enumerate() {
+        let start_str = e
+            .get("start")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("edit[{i}]: missing 'start'"))?;
+        let (start_line, start_hash) = crate::format::parse_anchor(start_str)
+            .ok_or_else(|| format!("edit[{i}]: invalid start anchor '{start_str}'"))?;
+
+        let (end_line, end_hash) = if let Some(end_str) = e.get("end").and_then(|v| v.as_str()) {
+            crate::format::parse_anchor(end_str)
+                .ok_or_else(|| format!("edit[{i}]: invalid end anchor '{end_str}'"))?
+        } else {
+            (start_line, start_hash)
+        };
+
+        let content = e
+            .get("content")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("edit[{i}]: missing 'content'"))?;
+
+        edits.push(crate::edit::Edit {
+            start_line,
+            start_hash,
+            end_line,
+            end_hash,
+            content: content.to_string(),
+        });
+    }
+
+    session.record_read(&path);
+
+    match crate::edit::apply_edits(&path, &edits).map_err(|e| e.to_string())? {
+        crate::edit::EditResult::Applied(output) => Ok(output),
+        crate::edit::EditResult::HashMismatch(msg) => Err(format!(
+            "hash mismatch — file changed since last read:\n\n{msg}"
+        )),
+    }
+}
+
 /// Canonicalize scope path, falling back to the raw path if canonicalization fails.
 fn resolve_scope(args: &Value) -> PathBuf {
     let raw: PathBuf = args
@@ -291,12 +397,13 @@ fn handle_tool_call(
     req: &JsonRpcRequest,
     cache: &OutlineCache,
     session: &Session,
+    edit_mode: bool,
 ) -> JsonRpcResponse {
     let params = &req.params;
     let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let args = params.get("arguments").unwrap_or(&Value::Null);
 
-    let result = dispatch_tool(tool_name, args, cache, session);
+    let result = dispatch_tool(tool_name, args, cache, session, edit_mode);
 
     match result {
         Ok(output) => JsonRpcResponse {
@@ -329,11 +436,21 @@ fn handle_tool_call(
 // Tool definitions
 // ---------------------------------------------------------------------------
 
-fn tool_definitions() -> Vec<Value> {
-    vec![
+fn tool_definitions(edit_mode: bool) -> Vec<Value> {
+    let read_desc = if edit_mode {
+        "Read a file with smart outlining. Output uses hashline format (line:hash|content) — \
+         the line:hash anchors are required by tilth_edit. Small files return full hashlined content. \
+         Large files return a structural outline (no hashlines); use `section` to get hashlined \
+         content for the lines you want to edit. Use `full` to force complete content."
+    } else {
+        "Read a file with smart outlining. Small files return full content. Large files return \
+         a structural outline (functions, classes, imports). Use `section` to read specific \
+         line ranges. Use `full` to force complete content."
+    };
+    let mut tools = vec![
         serde_json::json!({
             "name": "tilth_read",
-            "description": "Read a file with smart outlining. Small files return full content. Large files return a structural outline (functions, classes, imports). Use `section` to read specific line ranges. Use `full` to force complete content.",
+            "description": read_desc,
             "inputSchema": {
                 "type": "object",
                 "required": ["path"],
@@ -454,7 +571,48 @@ fn tool_definitions() -> Vec<Value> {
                 }
             }
         }),
-    ]
+    ];
+
+    if edit_mode {
+        tools.push(serde_json::json!({
+            "name": "tilth_edit",
+            "description": "Apply edits to a file using hashline anchors from tilth_read. Each edit targets a line range by line:hash anchors. Edits are verified against content hashes and rejected if the file has changed since the last read.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["path", "edits"],
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute or relative file path to edit."
+                    },
+                    "edits": {
+                        "type": "array",
+                        "description": "Array of edit operations, applied atomically.",
+                        "items": {
+                            "type": "object",
+                            "required": ["start", "content"],
+                            "properties": {
+                                "start": {
+                                    "type": "string",
+                                    "description": "Start anchor: 'line:hash' (e.g. '42:a3f'). Hash from tilth_read hashline output."
+                                },
+                                "end": {
+                                    "type": "string",
+                                    "description": "End anchor: 'line:hash'. If omitted, replaces only the start line."
+                                },
+                                "content": {
+                                    "type": "string",
+                                    "description": "Replacement text (can be multi-line). Empty string to delete the line(s)."
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }));
+    }
+
+    tools
 }
 
 fn write_error(w: &mut impl Write, id: Option<Value>, code: i32, msg: &str) -> io::Result<()> {

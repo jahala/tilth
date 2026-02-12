@@ -108,6 +108,44 @@ tilth install cursor  # or windsurf, claude-code, vscode, claude-desktop
 
 Five tools over JSON-RPC stdio: `tilth_read`, `tilth_search`, `tilth_files`, `tilth_map`, `tilth_session`. One persistent process, grammars loaded once, shared cache. Server instructions are sent to the LLM automatically during initialization.
 
+### Edit mode
+
+Add `--edit` during install to enable hash-anchored file editing:
+
+```bash
+tilth install claude-code --edit
+tilth install cursor --edit
+```
+
+This registers tilth with `["--mcp", "--edit"]` in your MCP config. It adds a sixth tool (`tilth_edit`) and switches `tilth_read` to hashline output — every line tagged with a content hash:
+
+```
+42:a3f|  let x = compute();
+43:f1b|  return x;
+```
+
+The `line:hash` before the `|` is the anchor. `tilth_edit` uses these to apply verified edits — if the file changed since the last read, the hashes won't match and the edit is rejected with current content shown:
+
+```json
+{
+  "path": "src/auth.ts",
+  "edits": [
+    { "start": "42:a3f", "content": "  let x = recompute();" },
+    { "start": "44:b2c", "end": "46:e1d", "content": "" }
+  ]
+}
+```
+
+For large files, `tilth_read` still returns an outline first. Use `section` to get hashlined content for the lines you need to edit.
+
+To install without edit mode (read-only, no `tilth_edit`):
+
+```bash
+tilth install claude-code
+```
+
+Inspired by [The Harness Problem](https://blog.can.ac/2026/02/12/the-harness-problem/) — the insight that LLM coding performance can be bottlenecked by the edit interface, not model capability.
+
 Or call the CLI from bash — every agent framework has a shell tool. Add this to your agent prompt:
 
 ```

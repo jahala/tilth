@@ -40,6 +40,10 @@ struct Cli {
     #[arg(long)]
     mcp: bool,
 
+    /// Enable edit mode: hashline output + tilth_edit tool.
+    #[arg(long)]
+    edit: bool,
+
     /// Generate a structural codebase map.
     #[arg(long)]
     map: bool,
@@ -56,6 +60,10 @@ enum Command {
     Install {
         /// MCP host to configure.
         host: String,
+
+        /// Enable edit mode (hashline output + tilth_edit tool).
+        #[arg(long)]
+        edit: bool,
     },
 }
 
@@ -71,8 +79,8 @@ fn main() {
     // Subcommands
     if let Some(cmd) = cli.command {
         match cmd {
-            Command::Install { ref host } => {
-                if let Err(e) = tilth::install::run(host) {
+            Command::Install { ref host, edit } => {
+                if let Err(e) = tilth::install::run(host, edit) {
                     eprintln!("install error: {e}");
                     process::exit(1);
                 }
@@ -83,7 +91,7 @@ fn main() {
 
     // MCP mode: JSON-RPC server
     if cli.mcp {
-        if let Err(e) = tilth::mcp::run() {
+        if let Err(e) = tilth::mcp::run(cli.edit) {
             eprintln!("mcp error: {e}");
             process::exit(1);
         }

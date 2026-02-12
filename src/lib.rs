@@ -16,6 +16,7 @@
 pub(crate) mod budget;
 pub mod cache;
 pub(crate) mod classify;
+pub(crate) mod edit;
 pub mod error;
 pub(crate) mod format;
 pub mod install;
@@ -67,7 +68,7 @@ fn run_inner(
     let query_type = classify(query, scope);
 
     let output = match query_type {
-        QueryType::FilePath(path) => read::read_file(&path, section, full, cache)?,
+        QueryType::FilePath(path) => read::read_file(&path, section, full, cache, false)?,
 
         QueryType::Glob(pattern) => search::search_glob(&pattern, scope, cache)?,
 

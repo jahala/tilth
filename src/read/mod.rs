@@ -21,6 +21,7 @@ pub fn read_file(
     section: Option<&str>,
     full: bool,
     cache: &OutlineCache,
+    edit_mode: bool,
 ) -> Result<String, TilthError> {
     let meta = match fs::metadata(path) {
         Ok(m) => m,
@@ -52,7 +53,7 @@ pub fn read_file(
 
     // Section param → return those lines verbatim, any size
     if let Some(range) = section {
-        return read_section(path, range);
+        return read_section(path, range, edit_mode);
     }
 
     // Empty check before mmap — mmap on 0-byte file may fail on some platforms
@@ -96,6 +97,10 @@ pub fn read_file(
     // Full mode or small file → return full content (skip smart view)
     if full || tokens <= TOKEN_THRESHOLD {
         let header = format::file_header(path, byte_len, line_count, ViewMode::Full);
+        if edit_mode {
+            let numbered = format::hashlines(&content, 1);
+            return Ok(format!("{header}\n\n{numbered}"));
+        }
         return Ok(format!("{header}\n\n{content}"));
     }
 
@@ -120,7 +125,7 @@ pub fn read_file(
 /// Read a specific line range from a file.
 /// Uses memchr to find the Nth newline offset and slice the mmap buffer directly
 /// instead of collecting all lines into a Vec.
-fn read_section(path: &Path, range: &str) -> Result<String, TilthError> {
+fn read_section(path: &Path, range: &str, edit_mode: bool) -> Result<String, TilthError> {
     let (start, end) = parse_range(range).ok_or_else(|| TilthError::InvalidQuery {
         query: range.to_string(),
         reason: "expected format: \"start-end\" (e.g. \"45-89\")".into(),
@@ -164,8 +169,12 @@ fn read_section(path: &Path, range: &str) -> Result<String, TilthError> {
     let byte_len = selected.len() as u64;
     let line_count = (e - s) as u32;
     let header = format::file_header(path, byte_len, line_count, ViewMode::Section);
-    let numbered = format::number_lines(&selected, start as u32);
-    Ok(format!("{header}\n\n{numbered}"))
+    let formatted = if edit_mode {
+        format::hashlines(&selected, start as u32)
+    } else {
+        format::number_lines(&selected, start as u32)
+    };
+    Ok(format!("{header}\n\n{formatted}"))
 }
 
 /// Parse "45-89" into (45, 89). 1-indexed.
