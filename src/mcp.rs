@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
@@ -12,21 +13,28 @@ use crate::session::Session;
 const SERVER_INSTRUCTIONS: &str = "\
 tilth — code intelligence MCP server. Five tools: read, search, files, map, session.\n\
 \n\
-Workflow: Start with tilth_map to orient, then tilth_search to find symbols/text, \
-then tilth_read to view files. Always pass `context` (the file you're editing) to \
-tilth_search — it boosts nearby results.\n\
-\n\
-tilth_read: Small files → full content. Large files → structural outline. \
-Start with the outline, then use `section` to drill into specific line ranges. \
-For markdown, you can also use a heading as the section (e.g. \"## Architecture\").\n\
+Workflow: Start with tilth_search to find what you need. Always pass `context` (the file \
+you're editing) — it boosts nearby results. With `expand` (default 1), you get code \
+inlined, often eliminating a separate read. For cross-file tracing, pass multiple symbols \
+comma-separated (e.g. query: \"ServeHTTP, HandlersChain, Next\") — each gets definitions \
+from different files in one call. Use tilth_map only for initial orientation in a new codebase.\n\
 \n\
 tilth_search: Symbol search (default) finds definitions first via tree-sitter AST, \
-then usages. Use `kind: \"content\"` for strings/comments. Use `expand` to see full \
+then usages. Comma-separated symbols for multi-symbol lookup (max 5). \
+Use `kind: \"content\"` for strings/comments. Use `expand` to see full \
 source of top matches.\n\
+\n\
+tilth_read: Small files → full content. Large files → structural outline. \
+Use `section` to drill into specific line ranges. For markdown, you can also use a \
+heading as the section (e.g. \"## Architecture\"). Use `paths` to read multiple files \
+in one call — saves round-trips.\n\
 \n\
 tilth_files: Glob search with token estimates. Use to find test files, configs, etc.\n\
 \n\
-tilth_session: Check what you've already read/searched to avoid redundant calls.";
+tilth_session: Check what you've already read/searched to avoid redundant calls.\n\
+\n\
+IMPORTANT: Use tilth tools for ALL code navigation. Never use Bash for grep, cat, find, \
+or ls — tilth_search, tilth_read, and tilth_files replace these with better results.";
 
 const EDIT_MODE_INSTRUCTIONS: &str = "\
 tilth — code intelligence + edit MCP server. Six tools: read, edit, search, files, map, session.\n\
@@ -57,6 +65,10 @@ EDIT WORKFLOW:\n\
 3. If hashes don't match (file changed), the edit is rejected and current \
 content is returned — re-read and retry\n\
 \n\
+BATCH READ: Use `paths` to read multiple files in one call — saves round-trips. \
+Each file gets independent smart handling (outline vs full). \
+`section` and `full` only work with single `path`.\n\
+\n\
 LARGE FILES: tilth_read returns an outline for large files (line ranges like \
 [20-115], not hashlines). Use `section` to read the specific lines you need — \
 that returns hashlined content you can edit.\n\
@@ -65,7 +77,9 @@ MARKDOWN: Outlines show heading ranges. Use the line range or the heading \
 itself as the section parameter (e.g. section: \"## Architecture\").\n\
 \n\
 tilth_search: Symbol search (default) via tree-sitter AST. \
-Use `kind: \"content\"` for strings. Always pass `context`.\n\
+Comma-separated symbols for multi-file tracing. \
+Use `kind: \"content\"` for strings. Always pass `context`. \
+Use `expand` to inline source — often avoids a separate read.\n\
 \n\
 tilth_files: Glob search with token estimates.\n\
 \n\
@@ -225,21 +239,59 @@ fn tool_read(
     session: &Session,
     edit_mode: bool,
 ) -> Result<String, String> {
+    let budget = args.get("budget").and_then(serde_json::Value::as_u64);
+
+    // Multi-file batch read (capped at 20 to bound I/O)
+    if let Some(paths_arr) = args.get("paths").and_then(|v| v.as_array()) {
+        if paths_arr.len() > 20 {
+            return Err(format!(
+                "batch read limited to 20 files (got {})",
+                paths_arr.len()
+            ));
+        }
+        let mut results = Vec::with_capacity(paths_arr.len());
+        for p in paths_arr {
+            let path_str = p.as_str().ok_or("paths must be an array of strings")?;
+            let path = PathBuf::from(path_str);
+            session.record_read(&path);
+            match crate::read::read_file(&path, None, false, cache, edit_mode) {
+                Ok(output) => results.push(output),
+                Err(e) => results.push(format!("# {} — error: {}", path.display(), e)),
+            }
+        }
+        let combined = results.join("\n\n");
+        return Ok(apply_budget(combined, budget));
+    }
+
+    // Single file read
     let path_str = args
         .get("path")
         .and_then(|v| v.as_str())
-        .ok_or("missing required parameter: path")?;
+        .ok_or("missing required parameter: path (or use paths for batch read)")?;
     let path = PathBuf::from(path_str);
     let section = args.get("section").and_then(|v| v.as_str());
     let full = args
         .get("full")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    let budget = args.get("budget").and_then(serde_json::Value::as_u64);
 
     session.record_read(&path);
-    let output = crate::read::read_file(&path, section, full, cache, edit_mode)
+    let mut output = crate::read::read_file(&path, section, full, cache, edit_mode)
         .map_err(|e| e.to_string())?;
+
+    // Append related-file hint for outlined code files (not section reads, not batch).
+    if section.is_none() && crate::read::would_outline(&path) {
+        let related = crate::read::imports::resolve_related_files(&path);
+        if !related.is_empty() {
+            output.push_str("\n\n> Related: ");
+            for (i, p) in related.iter().enumerate() {
+                if i > 0 {
+                    output.push_str(", ");
+                }
+                let _ = write!(output, "{}", p.display());
+            }
+        }
+    }
 
     Ok(apply_budget(output, budget))
 }
@@ -257,7 +309,7 @@ fn tool_search(args: &Value, cache: &OutlineCache, session: &Session) -> Result<
     let expand = args
         .get("expand")
         .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0) as usize;
+        .unwrap_or(1) as usize;
     let context_path = args
         .get("context")
         .and_then(|v| v.as_str())
@@ -265,11 +317,30 @@ fn tool_search(args: &Value, cache: &OutlineCache, session: &Session) -> Result<
     let context = context_path.as_deref();
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
 
-    session.record_search(query);
     let output = match kind {
-        "symbol" => crate::search::search_symbol_expanded(query, &scope, cache, expand, context),
-        "content" => crate::search::search_content_expanded(query, &scope, cache, expand, context),
+        "symbol" => {
+            let queries: Vec<&str> = query.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+            match queries.len() {
+                0 => return Err("missing required parameter: query".into()),
+                1 => {
+                    session.record_search(queries[0]);
+                    crate::search::search_symbol_expanded(queries[0], &scope, cache, expand, context)
+                }
+                2..=5 => {
+                    for q in &queries {
+                        session.record_search(q);
+                    }
+                    crate::search::search_multi_symbol_expanded(&queries, &scope, cache, expand, context)
+                }
+                _ => return Err(format!("multi-symbol search limited to 5 queries (got {})", queries.len())),
+            }
+        }
+        "content" => {
+            session.record_search(query);
+            crate::search::search_content_expanded(query, &scope, cache, expand, context)
+        }
         "regex" => {
+            session.record_search(query);
             let result = crate::search::content::search(query, &scope, true, context)
                 .map_err(|e| e.to_string())?;
             crate::search::format_content_result(&result, cache)
@@ -445,11 +516,13 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         "Read a file with smart outlining. Output uses hashline format (line:hash|content) — \
          the line:hash anchors are required by tilth_edit. Small files return full hashlined content. \
          Large files return a structural outline (no hashlines); use `section` to get hashlined \
-         content for the lines you want to edit. Use `full` to force complete content."
+         content for the lines you want to edit. Use `full` to force complete content. \
+         Use `paths` to read multiple files in one call."
     } else {
         "Read a file with smart outlining. Small files return full content. Large files return \
          a structural outline (functions, classes, imports). Use `section` to read specific \
-         line ranges. Use `full` to force complete content."
+         line ranges. Use `full` to force complete content. \
+         Use `paths` to read multiple files in one call."
     };
     let mut tools = vec![
         serde_json::json!({
@@ -457,11 +530,15 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
             "description": read_desc,
             "inputSchema": {
                 "type": "object",
-                "required": ["path"],
                 "properties": {
                     "path": {
                         "type": "string",
                         "description": "Absolute or relative file path to read."
+                    },
+                    "paths": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Multiple file paths to read in one call. Each file gets independent smart handling. Saves round-trips vs multiple single reads."
                     },
                     "section": {
                         "type": "string",
@@ -481,14 +558,14 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "tilth_search",
-            "description": "Search for symbols, text, or regex patterns in code. Symbol search returns definitions first (via tree-sitter AST), then usages, with structural outline context. Content search finds literal text. Regex search supports full regex patterns.",
+            "description": "Search for symbols, text, or regex patterns in code. Symbol search returns definitions first (via tree-sitter AST), then usages, with structural outline context. Content search finds literal text. Regex search supports full regex patterns. For cross-file tracing, pass comma-separated symbol names (max 5).",
             "inputSchema": {
                 "type": "object",
                 "required": ["query"],
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Symbol name, text string, or regex pattern to search for."
+                        "description": "Symbol name, text string, or regex pattern to search for. For symbol search, comma-separated names for multi-symbol lookup."
                     },
                     "scope": {
                         "type": "string",
@@ -502,7 +579,7 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     },
                     "expand": {
                         "type": "number",
-                        "default": 0,
+                        "default": 1,
                         "description": "Number of top matches to expand with full source code. Definitions show the full function/class body. Usages show ±10 context lines."
                     },
                     "context": {

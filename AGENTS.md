@@ -6,25 +6,26 @@ Code intelligence MCP server. Five tools: read, search, files, map, session. Six
 
 Read a file. Small files → full content. Large files → structural outline (signatures, classes, imports).
 
-- `path` (required): file path
-- `section`: line range e.g. `"45-89"` or markdown heading e.g. `"## Architecture"` — returns only those lines
-- `full`: `true` to force full content on large files
+- `path`: file path (single file)
+- `paths`: array of file paths — read multiple files in one call, saves round-trips
+- `section`: line range e.g. `"45-89"` or markdown heading e.g. `"## Architecture"` — returns only those lines (single `path` only)
+- `full`: `true` to force full content on large files (single `path` only)
 - `budget`: max response tokens
 
-Start with the outline. Use `section` to drill into what you need. For markdown, you can use heading names directly (e.g. `"## Architecture"`).
+Use `path` for single file reads, `paths` for batch. Start with the outline. Use `section` to drill into what you need. For markdown, you can use heading names directly (e.g. `"## Architecture"`).
 
 ## tilth_search
 
 Search code. Returns ranked results with structural context.
 
-- `query` (required): symbol name, text, or `/regex/`
+- `query` (required): symbol name, text, or `/regex/`. For symbol search, comma-separated names search multiple symbols in one call (max 5).
 - `kind`: `"symbol"` (default) | `"content"` | `"regex"`
-- `expand`: number of top results to show with full source body (default 0)
+- `expand`: number of top results to show with full source body (default 1). Shared across multi-symbol queries — each file expanded at most once.
 - `context`: path of the file you're editing — boosts nearby results
 - `scope`: directory to search within
 - `budget`: max response tokens
 
-Symbol search finds definitions first (tree-sitter AST), then usages. Use content search for strings/comments that aren't code symbols. Always pass `context` when editing a file.
+Symbol search finds definitions first (tree-sitter AST), then usages. For cross-file tracing, pass multiple symbols comma-separated to get definitions from different files in one call. Use content search for strings/comments that aren't code symbols. Always pass `context` when editing a file.
 
 ## tilth_map
 
@@ -34,7 +35,7 @@ Structural codebase map. Code files show exported symbols. Non-code files show t
 - `depth`: max directory depth (default: 3)
 - `budget`: max response tokens
 
-Use at task start to orient before searching or reading.
+Use only for initial orientation in a new codebase — prefer tilth_search for all navigation.
 
 ## tilth_files
 

@@ -3,9 +3,10 @@ pub mod glob;
 pub mod rank;
 pub mod symbol;
 
+use std::collections::HashSet;
 use std::fmt::Write;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use ignore::WalkBuilder;
@@ -14,7 +15,7 @@ use crate::cache::OutlineCache;
 use crate::error::TilthError;
 use crate::format;
 use crate::read;
-use crate::types::{FileType, Match, SearchResult};
+use crate::types::{estimate_tokens, FileType, Match, SearchResult};
 
 // Directories that are always skipped — build artifacts, dependencies, VCS internals.
 // We skip these explicitly instead of relying on .gitignore so that locally-relevant
@@ -48,6 +49,8 @@ pub(crate) const SKIP_DIRS: &[&str] = &[
     ".gradle",
     ".idea",
 ];
+
+const EXPAND_FULL_FILE_THRESHOLD: u64 = 1500;
 
 /// Build a parallel directory walker that searches ALL files except known junk directories.
 /// Does NOT respect .gitignore — ensures gitignored but locally-relevant files are found.
@@ -112,6 +115,45 @@ pub fn search_symbol_expanded(
     format_search_result(&result, cache, expand)
 }
 
+pub fn search_multi_symbol_expanded(
+    queries: &[&str],
+    scope: &Path,
+    cache: &OutlineCache,
+    expand: usize,
+    context: Option<&Path>,
+) -> Result<String, TilthError> {
+    // Shared expand budget: at least 1 slot per query, or explicit expand if higher.
+    // expand=0 means no expansion at all.
+    let mut expand_remaining = if expand == 0 { 0 } else { expand.max(queries.len()) };
+    let mut expanded_files = HashSet::new();
+    let mut sections = Vec::with_capacity(queries.len());
+
+    for query in queries {
+        let result = symbol::search(query, scope, context)?;
+        let mut out = format::search_header(
+            &result.query,
+            &result.scope,
+            result.matches.len(),
+            result.definitions,
+            result.usages,
+        );
+        format_matches(
+            &result.matches,
+            cache,
+            &mut expand_remaining,
+            &mut expanded_files,
+            &mut out,
+        );
+        if result.total_found > result.matches.len() {
+            let omitted = result.total_found - result.matches.len();
+            let _ = write!(out, "\n\n... and {omitted} more matches. Narrow with scope.");
+        }
+        sections.push(out);
+    }
+
+    Ok(sections.join("\n\n---\n"))
+}
+
 pub fn search_content(
     query: &str,
     scope: &Path,
@@ -170,6 +212,67 @@ pub fn search_glob(
     format_glob_result(&result, scope)
 }
 
+/// Format match entries with optional expansion and related file hints.
+/// Shared expand state enables cross-query dedup in multi-symbol search.
+fn format_matches(
+    matches: &[Match],
+    cache: &OutlineCache,
+    expand_remaining: &mut usize,
+    expanded_files: &mut HashSet<PathBuf>,
+    out: &mut String,
+) {
+    // Multi-file: one expand per unique file. Single-file: sequential per-match.
+    // expanded_files may contain entries from prior queries (cross-query dedup).
+    let multi_file = matches
+        .first()
+        .is_some_and(|first| matches.iter().any(|m| m.path != first.path));
+
+    for m in matches {
+        let kind = if m.is_definition {
+            "definition"
+        } else {
+            "usage"
+        };
+        let _ = write!(out, "\n\n## {}:{} [{kind}]", m.path.display(), m.line);
+
+        if let Some(context) = outline_context_for_match(&m.path, m.line, cache) {
+            out.push_str(&context);
+        } else {
+            let _ = write!(out, "\n→ [{}]   {}", m.line, m.text);
+        }
+
+        if *expand_remaining > 0 {
+            // Multi-file or cross-query: skip files already expanded.
+            // Single-file within one query: expand sequentially (no per-file dedup).
+            let skip = multi_file && expanded_files.contains(&m.path);
+            if !skip {
+                if let Some((code, content)) = expand_match(m) {
+                    out.push('\n');
+                    out.push_str(&code);
+
+                    // Related file hint — reuses content from expand_match (no extra read).
+                    let related = crate::read::imports::resolve_related_files_with_content(
+                        &m.path, &content,
+                    );
+                    if !related.is_empty() {
+                        out.push_str("\n\n> Related: ");
+                        for (i, p) in related.iter().enumerate() {
+                            if i > 0 {
+                                out.push_str(", ");
+                            }
+                            let _ = write!(out, "{}", p.display());
+                        }
+                    }
+
+                    *expand_remaining -= 1;
+                    // Always insert for cross-query tracking.
+                    expanded_files.insert(m.path.clone());
+                }
+            }
+        }
+    }
+}
+
 /// Format a symbol/content search result.
 /// When an outline cache is available, wraps each match in the file's outline context.
 /// When `expand > 0`, the top N matches inline actual code (def body or ±10 lines).
@@ -185,59 +288,37 @@ fn format_search_result(
         result.definitions,
         result.usages,
     );
-
     let mut out = header;
     let mut expand_remaining = expand;
-
-    for m in &result.matches {
-        let kind = if m.is_definition {
-            "definition"
-        } else {
-            "usage"
-        };
-        let _ = write!(out, "\n\n## {}:{} [{kind}]", m.path.display(), m.line);
-
-        // Try to add outline context around the match
-        if let Some(context) = outline_context_for_match(&m.path, m.line, cache) {
-            out.push_str(&context);
-        } else {
-            let _ = write!(out, "\n→ [{}]   {}", m.line, m.text);
-        }
-
-        // Expand: inline actual code for top N matches
-        if expand_remaining > 0 {
-            if let Some(code) = expand_match(m) {
-                out.push('\n');
-                out.push_str(&code);
-                expand_remaining -= 1;
-            }
-        }
-    }
+    let mut expanded_files = HashSet::new();
+    format_matches(&result.matches, cache, &mut expand_remaining, &mut expanded_files, &mut out);
 
     if result.total_found > result.matches.len() {
         let omitted = result.total_found - result.matches.len();
-        let _ = write!(
-            out,
-            "\n\n... and {omitted} more matches. Narrow with scope."
-        );
+        let _ = write!(out, "\n\n... and {omitted} more matches. Narrow with scope.");
     }
-
     Ok(out)
 }
 
-/// Inline the actual code for a match.
+/// Inline the actual code for a match. Returns `(formatted_block, raw_content)`.
+/// The raw content is returned so the caller can reuse it (e.g. for related-file hints)
+/// without a redundant file read.
+///
 /// For definitions: use tree-sitter node range (`def_range`).
 /// For usages: ±10 lines around the match.
-fn expand_match(m: &Match) -> Option<String> {
-    let (start, end) = m
-        .def_range
-        .unwrap_or((m.line.saturating_sub(10), m.line.saturating_add(10)));
+fn expand_match(m: &Match) -> Option<(String, String)> {
     let content = fs::read_to_string(&m.path).ok()?;
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len() as u32;
 
-    let start = start.max(1);
-    let end = end.min(total);
+    let (start, end) = if estimate_tokens(content.len() as u64) < EXPAND_FULL_FILE_THRESHOLD {
+        (1, total)
+    } else {
+        let (s, e) = m
+            .def_range
+            .unwrap_or((m.line.saturating_sub(10), m.line.saturating_add(10)));
+        (s.max(1), e.min(total))
+    };
 
     let mut out = String::new();
     let _ = write!(out, "\n```{}:{}-{}", m.path.display(), start, end);
@@ -248,7 +329,7 @@ fn expand_match(m: &Match) -> Option<String> {
         }
     }
     out.push_str("\n```");
-    Some(out)
+    Some((out, content))
 }
 
 /// Generate outline context for a search match: show nearby outline entries

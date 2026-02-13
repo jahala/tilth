@@ -82,8 +82,8 @@ Or call it from bash — see [AGENTS.md](./AGENTS.md) for the agent prompt.
 | 0 bytes | `[empty]` |
 | Binary | `[skipped]` with mime type |
 | Generated (lockfiles, .min.js) | `[generated]` |
-| < ~1500 tokens | Full content with line numbers |
-| > ~1500 tokens | Structural outline with line ranges |
+| < ~3500 tokens | Full content with line numbers |
+| > ~3500 tokens | Structural outline with line ranges |
 
 Token-based, not line-based — a 1-line minified bundle gets outlined; a 120-line focused module prints whole.
 
