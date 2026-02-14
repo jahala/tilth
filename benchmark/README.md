@@ -210,7 +210,7 @@ All modes use the same system prompt, $1.00 budget cap, and model. The agent exp
 **Setup:**
 
 ```bash
-# Clone repos at pinned commits (~500MB total)
+# Clone repos at pinned commits (~100MB total)
 python benchmark/fixtures/setup_repos.py
 ```
 
