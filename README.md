@@ -135,7 +135,7 @@ Smaller models (e.g. Haiku) may ignore tilth tools in favor of built-in Bash/Gre
 claude --disallowedTools "Bash,Grep,Glob"
 ```
 
-Benchmarks show this improves Haiku accuracy from 69% to 100% and reduces cost by 73% on code navigation tasks.
+Benchmarks show this improves Haiku accuracy from 69% to 100% and reduces cost per correct answer by 82% on code navigation tasks.
 
 ## How it decides what to show
 
