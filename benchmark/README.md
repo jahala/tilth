@@ -119,7 +119,7 @@ TOTAL                                                           15  14
 
 Opus uses tilth tools aggressively (4.1 tilth_search + 6.2 tilth_read per run). Notable: `rg_walker_parallel` goes from 0/3 → 2/3 — opus + tilth is the only combination that solves this task. One regression: `fastapi_dependency_resolution` drops from 3/3 → 0/3 with tilth.
 
-## Haiku 4.5 (117 runs)
+## Haiku 4.5 (71 runs)
 
 Haiku was tested in three configurations: baseline (no tilth), hybrid (tilth available alongside built-in tools), and forced (built-in search tools removed).
 
@@ -131,7 +131,7 @@ Haiku was tested in three configurations: baseline (no tilth), hybrid (tilth ava
 
 In hybrid mode, Haiku used tilth tools in only 3 of 35 valid runs. It defaults to Bash/Grep/Read regardless of MCP instructions. Instruction tuning (moving directives to the top, using CRITICAL/MUST language) had no measurable effect on adoption.
 
-In forced mode (`--disallowedTools "Bash,Grep,Glob"`), Haiku achieves 7/7 correct at $0.04 average — the cheapest correct answers in the entire benchmark. The same 7 tasks score 74% accuracy at $0.15 average in baseline.
+In forced mode (`--disallowedTools "Bash,Grep,Glob"`), Haiku achieves 7/7 correct at $0.04 average — the cheapest correct answers in the entire benchmark. The same 7 tasks score 74% accuracy at $0.11 average in baseline.
 
 ## Cross-model analysis
 

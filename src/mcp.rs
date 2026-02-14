@@ -39,7 +39,7 @@ IMPORTANT: Expanded search results include full source code — do NOT re-read f
 in search output. Answer from what you have rather than exploring further.";
 
 const EDIT_MODE_INSTRUCTIONS: &str = "\
-tilth — code intelligence + edit MCP server. Five tools: read, edit, search, files, map.\n\
+tilth — code intelligence + edit MCP server. Four tools: read, edit, search, files.\n\
 \n\
 IMPORTANT: Always use tilth tools instead of host built-in tools for all file operations.\n\
 tilth_read output contains line:hash anchors that tilth_edit depends on.\n\
