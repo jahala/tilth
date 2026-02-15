@@ -5,8 +5,10 @@ pub mod facets;
 pub mod glob;
 pub mod rank;
 pub mod siblings;
+pub mod strip;
 pub mod symbol;
 pub mod treesitter;
+pub mod truncate;
 
 use std::collections::HashSet;
 use std::fmt::Write;
@@ -271,7 +273,10 @@ fn format_matches(
             let _ = write!(out, "\n\n## {}:{} [{kind}]", m.path.display(), m.line);
         }
 
-        if let Some(context) = outline_context_for_match(&m.path, m.line, cache) {
+        // Skip outline for small files — the expanded code speaks for itself
+        if m.file_lines < 50 {
+            let _ = write!(out, "\n→ [{}]   {}", m.line, m.text);
+        } else if let Some(context) = outline_context_for_match(&m.path, m.line, cache) {
             out.push_str(&context);
         } else {
             let _ = write!(out, "\n→ [{}]   {}", m.line, m.text);
@@ -308,8 +313,35 @@ fn format_matches(
                             }
                         }
 
+                        // Strip cognitive noise (debug logs, plain comments)
+                        let mut skip_lines = strip::strip_noise(&content, &m.path, m.def_range);
+
+                        // Smart truncation: for long definitions, select diverse
+                        // lines instead of showing everything
+                        if let Some((def_start, def_end)) = m.def_range {
+                            let file_type = crate::read::detect_file_type(&m.path);
+                            if let crate::types::FileType::Code(lang) = file_type {
+                                if let Some(keep) = truncate::select_diverse_lines(
+                                    &content, def_start, def_end, lang,
+                                ) {
+                                    let keep_set: HashSet<u32> = keep.into_iter().collect();
+                                    for ln in def_start..=def_end {
+                                        if !keep_set.contains(&ln) {
+                                            skip_lines.insert(ln);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        let stripped_code = if skip_lines.is_empty() {
+                            code
+                        } else {
+                            filter_code_lines(&code, &skip_lines)
+                        };
+
                         out.push('\n');
-                        out.push_str(&code);
+                        out.push_str(&stripped_code);
 
                         if m.is_definition && m.def_range.is_some() {
                             // Definition expansion: transitive callee resolution footer
@@ -569,7 +601,7 @@ fn expand_match(m: &Match) -> Option<(String, String)> {
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len() as u32;
 
-    let (start, end) = if estimate_tokens(content.len() as u64) < EXPAND_FULL_FILE_THRESHOLD {
+    let (mut start, end) = if estimate_tokens(content.len() as u64) < EXPAND_FULL_FILE_THRESHOLD {
         (1, total)
     } else {
         let (s, e) = m
@@ -578,16 +610,101 @@ fn expand_match(m: &Match) -> Option<(String, String)> {
         (s.max(1), e.min(total))
     };
 
+    // Skip leading import blocks in expanded definitions near top of file
+    if m.is_definition && start <= 5 {
+        let mut first_non_import = start;
+        for i in start..=end {
+            let idx = (i - 1) as usize;
+            if idx >= lines.len() {
+                break;
+            }
+            let trimmed = lines[idx].trim();
+            let is_import = trimmed.starts_with("use ")
+                || trimmed.starts_with("import ")
+                || trimmed.starts_with("from ")
+                || trimmed.starts_with("#include")
+                || trimmed.starts_with("require(")
+                || trimmed.starts_with("require ")
+                || (trimmed.starts_with("const ") && trimmed.contains("= require("));
+
+            if !is_import && !trimmed.is_empty() {
+                first_non_import = i;
+                break;
+            }
+        }
+        // Guard: only skip if we found at least one non-import line
+        if first_non_import > start && first_non_import <= end {
+            start = first_non_import;
+        }
+    }
+
     let mut out = String::new();
     let _ = write!(out, "\n```{}:{}-{}", m.path.display(), start, end);
+
+    // Track consecutive blank lines for collapsing
+    let mut prev_blank = false;
     for i in start..=end {
         let idx = (i - 1) as usize;
         if idx < lines.len() {
-            let _ = write!(out, "\n{:>4} │ {}", i, lines[idx]);
+            let line = lines[idx];
+            let is_blank = line.trim().is_empty();
+
+            // Skip consecutive blank lines (keep first, drop rest)
+            if is_blank && prev_blank {
+                continue;
+            }
+
+            let _ = write!(out, "\n{i:>4} │ {line}");
+            prev_blank = is_blank;
         }
     }
     out.push_str("\n```");
     Some((out, content))
+}
+
+/// Filter formatted code lines using a set of line numbers to skip.
+/// Input is the fenced code block from `expand_match` (opening/closing fence lines
+/// plus numbered content lines). Inserts gap markers for runs of >3 skipped lines.
+fn filter_code_lines(code: &str, skip_lines: &HashSet<u32>) -> String {
+    let mut kept: Vec<String> = Vec::new();
+    let mut consecutive_skipped: u32 = 0;
+
+    for segment in code.split('\n') {
+        // Fence lines and the leading empty segment pass through unchanged
+        if segment.starts_with("```") || segment.is_empty() {
+            flush_gap_marker(&mut kept, &mut consecutive_skipped);
+            kept.push(segment.to_owned());
+            continue;
+        }
+
+        // Extract line number from formatted line: "  42 │ content"
+        let line_num = segment
+            .find('│')
+            .and_then(|pos| segment[..pos].trim().parse::<u32>().ok());
+
+        if let Some(num) = line_num {
+            if skip_lines.contains(&num) {
+                consecutive_skipped += 1;
+                continue;
+            }
+        }
+
+        flush_gap_marker(&mut kept, &mut consecutive_skipped);
+        kept.push(segment.to_owned());
+    }
+
+    kept.join("\n")
+}
+
+/// If >3 lines were skipped consecutively, push a gap marker and reset counter.
+fn flush_gap_marker(kept: &mut Vec<String>, consecutive_skipped: &mut u32) {
+    if *consecutive_skipped > 3 {
+        kept.push(format!(
+            "       ... ({} lines omitted)",
+            *consecutive_skipped
+        ));
+    }
+    *consecutive_skipped = 0;
 }
 
 /// Generate outline context for a search match: show nearby outline entries
