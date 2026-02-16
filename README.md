@@ -86,10 +86,10 @@ Code navigation tasks across 4 real-world repos (Express, FastAPI, Gin, ripgrep)
 | Model | Tasks | Baseline $/correct | tilth $/correct | Change | Baseline acc | tilth acc |
 |---|---|---|---|---|---|---|
 | Sonnet 4.5 | 26 (52 runs) | $0.26 | $0.19 | **-29%** | 96% | 92% |
-| Opus 4.6 | 5 hard tasks | — | $0.23 | — | — | 100% |
-| Haiku 4.5 | 26 (tilth only) | — | $0.19 | — | — | 69% |
+| Opus 4.6 | 5 hard (10 runs) | $0.29 | $0.23 | **-22%** | 100% | 100% |
+| Haiku 4.5 | 26 (52 runs) | $0.17 | $0.19 | +12% | 58% | 69% |
 
-Sonnet achieves 98% tilth tool adoption and wins 19 of 26 tasks on cost. Opus solves 5/5 hard tasks with 100% tilth adoption. Haiku is cost-competitive ($0.19/correct) despite lower accuracy — it solves tasks Sonnet fails (`express_app_render`, `gin_radix_tree`).
+Sonnet achieves 98% tilth tool adoption and wins 19 of 26 tasks on cost. Opus solves all 5 hard tasks with 100% adoption and -22% $/correct. Haiku gains +12pp accuracy with tilth (5 new tasks solved) but costs more per attempt — net +12% $/correct. Forced mode (`--disallowedTools`) is recommended for Haiku.
 
 See [benchmark/](benchmark/) for per-task results, by-language breakdowns, and model comparison.
 

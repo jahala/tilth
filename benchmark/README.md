@@ -7,8 +7,8 @@ Automated evaluation of tilth's impact on AI agent code navigation.
 | Model | Tasks | Runs | Baseline $/correct | tilth $/correct | Change | Baseline acc | tilth acc |
 |---|---|---|---|---|---|---|---|
 | Sonnet 4.5 | 26 | 52 | $0.26 | $0.19 | **-29%** | 96% | 92% |
-| Opus 4.6 | 5 (tilth only) | 5 | — | $0.23 | — | — | 100% |
-| Haiku 4.5 | 26 (tilth only) | 26 | — | $0.19 | — | — | 69% |
+| Opus 4.6 | 5 hard | 10 | $0.29 | $0.23 | **-22%** | 100% | 100% |
+| Haiku 4.5 | 26 | 52 | $0.17 | $0.19 | +12% | 58% | 69% |
 
 ### Why "cost per correct answer"?
 
@@ -88,43 +88,45 @@ Costs are $/correct (avg_cost / accuracy). Winner: accuracy difference > 15pp fi
 
 Python sees the largest improvement: cost per correct answer drops 56% with perfect accuracy. All languages improve. Only 2 failures: `express_app_render` (both modes fail — requires deep render chain tracing) and `rg_search_dispatch` (tilth only — intermittent on this complex Rust dispatch task).
 
-## Opus 4.6 (31 shared runs)
+## Opus 4.6 (10 runs)
 
-6 tasks with both baseline and tilth data (18 baseline + 13 tilth). Opus was also tested on all 26 tasks (59 tilth runs total, 90% accuracy).
+5 hard tasks selected for Opus — tasks where Sonnet struggles or loses. 5 baseline + 5 tilth runs.
+
+| | Baseline | tilth | Change |
+|---|---|---|---|
+| **Cost per correct answer** | **$0.29** | **$0.23** | **-22%** |
+| Accuracy | 5/5 (100%) | 5/5 (100%) | 0pp |
+| Avg cost per task | $0.29 | $0.23 | -22% |
 
 ```
 Task                                     Base    Tilth   Delta  B✓  T✓
 ─────────────────────────────────────────────────────────────────────────
-fastapi_depends_processing              $0.41   $0.22   -47%   3/3 2/2  TILTH ($)
-gin_middleware_chain                    $0.46   $0.28   -40%   3/3 2/2  TILTH ($)
-rg_walker_parallel                        inf   $0.25    ↓∞    0/3 2/3  TILTH (acc)
-gin_servehttp_flow                      $0.24   $0.31   +26%   3/3 2/2  BASE ($)
-rg_search_dispatch                      $0.69   $1.00   +46%   3/3 1/2  BASE
-fastapi_dependency_resolution           $0.41   $0.79   +91%   3/3 1/2  BASE (acc)
+fastapi_depends_processing              $0.45   $0.21   -54%  1/1 1/1  TILTH ($)
+rg_search_dispatch                      $0.67   $0.56   -18%  1/1 1/1  TILTH ($)
+gin_context_next                        $0.06   $0.06   +10%  1/1 1/1  ~tie
+express_app_render                      $0.13   $0.15   +12%  1/1 1/1  ~tie
+gin_radix_tree                          $0.14   $0.16   +12%  1/1 1/1  ~tie
 ─────────────────────────────────────────────────────────────────────────
-TOTAL                                                          15  10
 ```
+
+Opus achieves 100% accuracy in both modes and 100% tilth adoption. Notable: `express_app_render` and `rg_search_dispatch` — tasks Sonnet fails — are solved by Opus in both baseline and tilth modes.
+
+## Haiku 4.5 (52 runs)
+
+26 baseline + 26 tilth runs across all tasks.
 
 | | Baseline | tilth | Change |
 |---|---|---|---|
-| **Cost per correct answer** | $0.49 | $0.39 | **-20%** |
-| Accuracy | 83% (15/18) | 77% (10/13) | -6pp |
-| Avg cost per task | $0.41 | $0.30 | -27% |
+| **Cost per correct answer** | **$0.17** | **$0.19** | **+12%** |
+| Accuracy | 15/26 (58%) | 18/26 (69%) | +12pp |
+| Avg cost per task | $0.098 | $0.131 | +35% |
+| Tilth adoption | — | 42% (96/228) | — |
 
-Opus uses tilth tools aggressively (1.8 tilth_search + 3.1 tilth_read per run). Across all 26 tasks (59 tilth runs), Opus achieves 90% accuracy (53/59 correct). The 6 failures are: `read_large_file` (0/4 — always misses `def rate_limit`), `rg_search_dispatch` (1/2), `fastapi_dependency_resolution` (1/2), `rg_walker_parallel` (2/3). Notable: `rg_walker_parallel` goes from 0/3 → 2/3, `rg_trait_implementors` is 6/6 (vs Sonnet's 3/7).
+tilth improves Haiku accuracy by 12pp (5 new tasks solved) but costs more per attempt (+35%). The net effect: +12% $/correct — the accuracy gain doesn't fully offset the cost increase.
 
-## Haiku 4.5 (26 tilth runs)
+W11 T11 L4. tilth wins include `rg_trait_implementors`, `rg_lineiter_usage`, `fastapi_depends_internals`, `gin_radix_tree`, and `gin_middleware_chain` — 5 tasks that baseline Haiku can't solve at all. Losses are mostly tasks where both modes fail but tilth spends more trying.
 
-| | Haiku tilth |
-|---|---|
-| Accuracy | 18/26 (69%) |
-| Avg cost | $0.131 |
-| $/correct | $0.190 |
-| Avg turns | 9.5 |
-| Avg tool calls | 8.8 |
-| Tilth adoption | 42% (96/228) |
-
-Haiku is cheap enough ($0.19/correct) to be competitive despite lower accuracy (69%). It solves tasks that Sonnet fails — notably `express_app_render` ($0.04) and `gin_radix_tree` ($0.03). However, tilth adoption is only 42% — Haiku defaults to Bash (102 calls) over tilth tools despite instruction tuning. Use `--disallowedTools "Bash,Grep,Glob"` to force adoption.
+Haiku tilth adoption is only 42% — it defaults to Bash (102 calls) over tilth tools despite instruction tuning. Use `--disallowedTools "Bash,Grep,Glob"` to force adoption.
 
 ## Cross-model analysis
 
@@ -254,6 +256,6 @@ Good tasks have unambiguous correct answers that can be verified by string match
 | v0.3.1 | Go same-package callees, map demotion | +12% (regression) |
 | v0.3.2 | Map disabled, instruction tuning, multi-model benchmarks | **-26%** |
 | v0.4.0 | def_weight ranking, basename boost, impl collector, sibling surfacing, transitive callees, faceted results, cognitive load stripping, smart truncation, symbol index, bloom filters | **-17%** (Sonnet), **-20%** (Opus) |
-| v0.4.1 | Instruction tuning: "Replaces X" tool descriptions, explicit host tool naming in SERVER_INSTRUCTIONS | **-29%** (Sonnet) |
+| v0.4.1 | Instruction tuning: "Replaces X" tool descriptions, explicit host tool naming in SERVER_INSTRUCTIONS | **-29%** (Sonnet), **-22%** (Opus) |
 
 v0.4.1 focus: MCP instruction tuning. Tool descriptions now explicitly state which host tools they replace (e.g., "Replaces grep/rg and the host Grep tool"). SERVER_INSTRUCTIONS explicitly name host tools (Read, Grep, Glob) to replace. Result: tilth adoption jumped from 89% to 98%, and cost per correct answer improved from -17% to -29%.
