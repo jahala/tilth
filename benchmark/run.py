@@ -23,22 +23,24 @@ from config import (
     MODELS,
     MODES,
     REPOS,
+    RUNNERS,
     SYSTEM_PROMPT,
     DEFAULT_MAX_BUDGET_USD,
     SYNTHETIC_REPO,
     RESULTS_DIR,
     DEFAULT_REPS,
+    TILTH_MCP_CODEX_ARGS,
 )
-from parse import parse_stream_json, tool_call_counts
+from parse import parse_stream_json, parse_codex_json, tool_call_counts
 from tasks import TASKS
-from fixtures.reset import reset_repo
+from fixtures.reset import reset_repo, ensure_repo_clean
 
 
 def _tilth_version() -> Optional[str]:
     """Get installed tilth version via `tilth --version`."""
     try:
         result = subprocess.run(
-            ["tilth", "--version"],
+            ["/Users/flysikring/.cargo/bin/tilth", "--version"],
             capture_output=True, text=True, timeout=5,
         )
         # Output: "tilth 0.2.1"
@@ -100,27 +102,46 @@ def run_single(
     repo_path = get_repo_path(task.repo)
     mode = MODES[mode_name]
     model_id = MODELS[model_name]
+    runner = RUNNERS[model_name]
 
-    # Build command
-    cmd = [
-        "claude", "-p",
-        "--output-format", "stream-json",
-        "--verbose",
-        "--model", model_id,
-        "--max-budget-usd", str(DEFAULT_MAX_BUDGET_USD),
-        "--no-session-persistence",
-        "--dangerously-skip-permissions",
-        "--strict-mcp-config",
-        "--system-prompt", SYSTEM_PROMPT,
-    ]
+    # Build command based on runner
+    if runner == "codex":
+        cmd = [
+            "codex", "exec",
+            "--json",
+            "--full-auto",
+            "--ephemeral",
+            "-m", model_id,
+        ]
 
-    if mode.tools:
-        cmd += ["--tools", ",".join(mode.tools)]
+        # Add MCP config for tilth modes
+        if mode.mcp_config_path:
+            cmd += TILTH_MCP_CODEX_ARGS
 
-    if mode.mcp_config_path:
-        cmd += ["--mcp-config", mode.mcp_config_path]
+        # Codex has no --system-prompt, prepend to prompt
+        full_prompt = f"{SYSTEM_PROMPT}\n\n{task.prompt}"
+        cmd += ["--", full_prompt]
 
-    cmd += ["--", task.prompt]
+    else:  # claude
+        cmd = [
+            "claude", "-p",
+            "--output-format", "stream-json",
+            "--verbose",
+            "--model", model_id,
+            "--max-budget-usd", str(DEFAULT_MAX_BUDGET_USD),
+            "--no-session-persistence",
+            "--dangerously-skip-permissions",
+            "--strict-mcp-config",
+            "--system-prompt", SYSTEM_PROMPT,
+        ]
+
+        if mode.tools:
+            cmd += ["--tools", ",".join(mode.tools)]
+
+        if mode.mcp_config_path:
+            cmd += ["--mcp-config", mode.mcp_config_path]
+
+        cmd += ["--", task.prompt]
 
     if verbose:
         print(f"    Running: {' '.join(cmd)}")
@@ -139,14 +160,18 @@ def run_single(
     elapsed_ms = int((time.time() - start_time) * 1000)
 
     if result.returncode != 0:
+        runner_name = "codex exec" if runner == "codex" else "claude -p"
         raise RuntimeError(
-            f"claude -p failed with code {result.returncode}\n"
+            f"{runner_name} failed with code {result.returncode}\n"
             f"stderr: {result.stderr}\n"
             f"stdout: {result.stdout[:500]}"
         )
 
-    # Parse stream-json output
-    run_result = parse_stream_json(result.stdout)
+    # Parse output based on runner
+    if runner == "codex":
+        run_result = parse_codex_json(result.stdout, model_id)
+    else:
+        run_result = parse_stream_json(result.stdout)
     run_result.task_name = task_name
     run_result.mode_name = mode_name
     run_result.model_name = model_name
@@ -295,6 +320,13 @@ Examples:
             print("  python benchmark/fixtures/setup_repos.py")
             sys.exit(1)
 
+    # Clean real-world repos before starting (removes junk files from previous runs)
+    for repo_name in selected_repos:
+        repo_path = REPOS[repo_name].path
+        ensure_repo_clean(repo_path)
+        if args.verbose:
+            print(f"Cleaned repo: {repo_name}")
+
     # Create results directory
     RESULTS_DIR.mkdir(exist_ok=True)
 
@@ -415,6 +447,11 @@ Examples:
                             }
                             f.write(json.dumps(error_result) + "\n")
                             f.flush()
+
+    # Clean real-world repos after run (remove junk files written by Claude sessions)
+    for repo_name in selected_repos:
+        repo_path = REPOS[repo_name].path
+        ensure_repo_clean(repo_path)
 
     # Print summary
     print()

@@ -25,6 +25,14 @@ use crate::read;
 use crate::session::Session;
 use crate::types::{estimate_tokens, FileType, Match, SearchResult};
 
+/// Path relative to scope for cleaner output. Falls back to full path.
+fn rel(path: &Path, scope: &Path) -> String {
+    path.strip_prefix(scope)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
 // Directories that are always skipped — build artifacts, dependencies, VCS internals.
 // We skip these explicitly instead of relying on .gitignore so that locally-relevant
 // gitignored files (docs/, configs, generated code) are still searchable.
@@ -187,6 +195,7 @@ pub fn search_multi_symbol_expanded(
         );
         format_matches(
             &result.matches,
+            &result.scope,
             cache,
             Some(session),
             bloom,
@@ -274,6 +283,7 @@ pub fn search_glob(
 /// Shared expand state enables cross-query dedup in multi-symbol search.
 fn format_matches(
     matches: &[Match],
+    scope: &Path,
     cache: &OutlineCache,
     session: Option<&Session>,
     bloom: &crate::index::bloom::BloomFilterCache,
@@ -302,15 +312,15 @@ fn format_matches(
                 let _ = write!(
                     out,
                     "\n\n## {}:{}-{} [{kind}]",
-                    m.path.display(),
+                    rel(&m.path, scope),
                     start,
                     end
                 );
             } else {
-                let _ = write!(out, "\n\n## {}:{} [{kind}]", m.path.display(), m.line);
+                let _ = write!(out, "\n\n## {}:{} [{kind}]", rel(&m.path, scope), m.line);
             }
         } else {
-            let _ = write!(out, "\n\n## {}:{} [{kind}]", m.path.display(), m.line);
+            let _ = write!(out, "\n\n## {}:{} [{kind}]", rel(&m.path, scope), m.line);
         }
 
         // Skip outline for small files — the expanded code speaks for itself
@@ -334,7 +344,7 @@ fn format_matches(
                     let _ = write!(
                         out,
                         "\n\n[shown earlier] {}:{}-{} {}",
-                        m.path.display(),
+                        rel(&m.path, scope),
                         start,
                         end,
                         m.text
@@ -345,7 +355,7 @@ fn format_matches(
                 // Single-file within one query: expand sequentially (no per-file dedup).
                 let skip = multi_file && expanded_files.contains(&m.path);
                 if !skip {
-                    if let Some((code, content)) = expand_match(m) {
+                    if let Some((code, content)) = expand_match(m, scope) {
                         // Record expansion for future dedup
                         if m.is_definition && m.def_range.is_some() {
                             if let Some(s) = session {
@@ -420,7 +430,7 @@ fn format_matches(
                                                 out,
                                                 "\n  {}  {}:{}-{}",
                                                 c.name,
-                                                c.file.display(),
+                                                rel(&c.file, scope),
                                                 c.start_line,
                                                 c.end_line
                                             );
@@ -432,7 +442,7 @@ fn format_matches(
                                                     out,
                                                     "\n    \u{2192} {}  {}:{}-{}",
                                                     child.name,
-                                                    child.file.display(),
+                                                    rel(&child.file, scope),
                                                     child.start_line,
                                                     child.end_line
                                                 );
@@ -476,7 +486,7 @@ fn format_matches(
                                                         out,
                                                         "\n  {}  {}:{}-{}  {}",
                                                         s.name,
-                                                        m.path.display(),
+                                                        rel(&m.path, scope),
                                                         s.start_line,
                                                         s.end_line,
                                                         s.signature,
@@ -498,7 +508,7 @@ fn format_matches(
                                     if i > 0 {
                                         out.push_str(", ");
                                     }
-                                    let _ = write!(out, "{}", p.display());
+                                    let _ = write!(out, "{}", rel(p, scope));
                                 }
                             }
                         }
@@ -544,6 +554,7 @@ fn format_search_result(
             let _ = write!(out, "\n\n### Definitions ({})", faceted.definitions.len());
             format_matches(
                 &faceted.definitions,
+                &result.scope,
                 cache,
                 session,
                 bloom,
@@ -561,6 +572,7 @@ fn format_search_result(
             );
             format_matches(
                 &faceted.implementations,
+                &result.scope,
                 cache,
                 session,
                 bloom,
@@ -574,6 +586,7 @@ fn format_search_result(
             let _ = write!(out, "\n\n### Tests ({})", faceted.tests.len());
             format_matches(
                 &faceted.tests,
+                &result.scope,
                 cache,
                 session,
                 bloom,
@@ -591,6 +604,7 @@ fn format_search_result(
             );
             format_matches(
                 &faceted.usages_local,
+                &result.scope,
                 cache,
                 session,
                 bloom,
@@ -608,6 +622,7 @@ fn format_search_result(
             );
             format_matches(
                 &faceted.usages_cross,
+                &result.scope,
                 cache,
                 session,
                 bloom,
@@ -620,6 +635,7 @@ fn format_search_result(
         // Linear display for ≤5 matches
         format_matches(
             &result.matches,
+            &result.scope,
             cache,
             session,
             bloom,
@@ -645,7 +661,7 @@ fn format_search_result(
 ///
 /// For definitions: use tree-sitter node range (`def_range`).
 /// For usages: ±10 lines around the match.
-fn expand_match(m: &Match) -> Option<(String, String)> {
+fn expand_match(m: &Match, scope: &Path) -> Option<(String, String)> {
     let content = fs::read_to_string(&m.path).ok()?;
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len() as u32;
@@ -688,7 +704,7 @@ fn expand_match(m: &Match) -> Option<(String, String)> {
     }
 
     let mut out = String::new();
-    let _ = write!(out, "\n```{}:{}-{}", m.path.display(), start, end);
+    let _ = write!(out, "\n```{}:{}-{}", rel(&m.path, scope), start, end);
 
     // Track consecutive blank lines for collapsing
     let mut prev_blank = false;
@@ -844,7 +860,7 @@ fn format_glob_result(result: &glob::GlobResult, scope: &Path) -> Result<String,
 
     let mut out = header;
     for file in &result.files {
-        let _ = write!(out, "\n  {}", file.path.display());
+        let _ = write!(out, "\n  {}", rel(&file.path, scope));
         if let Some(ref preview) = file.preview {
             let _ = write!(out, "  ({preview})");
         }

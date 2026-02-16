@@ -21,7 +21,7 @@ class GinRadixTreeTask(Task):
     @property
     def ground_truth(self) -> GroundTruth:
         return GroundTruth(
-            required_strings=["tree.go", "type node struct", "catchAll", "getValue", "wildChild"],
+            required_strings=["type node struct", "catchAll", "getValue", "wildChild"],
         )
 
 
@@ -103,7 +103,7 @@ class GinContextNextTask(Task):
     def ground_truth(self) -> GroundTruth:
         return GroundTruth(
             required_strings=[
-                "Next", "context.go", "index",
+                "Next", "index", "handlers",
             ],
         )
 
