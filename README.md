@@ -1,6 +1,6 @@
 # tilth
 
-**Smart code reading for humans and AI agents.**
+**Smart code reading for humans and AI agents.** Reduces cost per correct answer by **29%** on Sonnet and **22%** on Opus across 114 benchmark runs. ([benchmarks](#benchmarks))
 
 tilth is what happens when you give `ripgrep`, `tree-sitter`, and `cat` a shared brain.
 
@@ -136,7 +136,7 @@ Smaller models (e.g. Haiku) may ignore tilth tools in favor of built-in Bash/Gre
 claude --disallowedTools "Bash,Grep,Glob"
 ```
 
-Benchmarks show this improves Haiku accuracy from 69% to 100% and reduces cost per correct answer by 82% on code navigation tasks.
+Benchmarks show Haiku only adopts tilth tools 42% of the time in hybrid mode. Forced mode ensures consistent tool adoption and improves accuracy.
 
 ## How it decides what to show
 
