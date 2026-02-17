@@ -224,6 +224,10 @@ The search output format is informed by wavelet multi-resolution (outline header
 
 **tilth** — the state of soil that's been prepared for planting. Your codebase is the soil; tilth gives it structure so you can find where to dig.
 
+## Support
+
+[!["Buy Me A Coffee"](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://buymeacoffee.com/jahala)
+
 ## License
 
 MIT
