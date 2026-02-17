@@ -79,7 +79,7 @@ impl std::fmt::Display for ViewMode {
 }
 
 /// A single search match, carrying enough context for ranking and display.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Match {
     pub path: PathBuf,
     pub line: u32,
@@ -95,6 +95,11 @@ pub struct Match {
     pub def_range: Option<(u32, u32)>,
     /// The defined symbol name (populated from AST during definition detection).
     pub def_name: Option<String>,
+    /// Semantic weight for definition kinds. 0 for usages.
+    pub def_weight: u16,
+    /// For impl/implements matches: the trait or interface being implemented.
+    /// None for primary definitions and plain usages.
+    pub impl_target: Option<String>,
 }
 
 /// Assembled search results before formatting.

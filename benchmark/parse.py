@@ -118,6 +118,134 @@ def parse_stream_json(raw_output: str) -> RunResult:
     )
 
 
+def parse_codex_json(raw_output: str, model_id: str) -> RunResult:
+    """Parse newline-delimited JSON output from codex exec --json."""
+    lines = [line.strip() for line in raw_output.strip().split("\n") if line.strip()]
+    events = [json.loads(line) for line in lines]
+
+    # Pricing per 1M tokens (approximate)
+    pricing = {
+        "gpt-5-codex": {"input": 2.00, "cached": 0.50, "output": 8.00},
+        "o3": {"input": 2.00, "cached": 0.50, "output": 8.00},
+    }
+    rates = pricing.get(model_id, pricing["gpt-5-codex"])
+
+    session_id = ""
+    result_text = ""
+    turn_items: dict[int, list] = {}  # turn_index -> items in that turn
+    current_turn = -1
+    turn_usages: list[dict] = []
+
+    # Collect events
+    for event in events:
+        event_type = event.get("type")
+
+        if event_type == "thread.started":
+            session_id = event.get("thread_id", "")
+
+        elif event_type == "turn.started":
+            current_turn += 1
+            turn_items[current_turn] = []
+
+        elif event_type == "item.completed":
+            item = event.get("item", {})
+            if current_turn >= 0:
+                turn_items[current_turn].append(item)
+
+            # Extract final message text
+            if item.get("type") == "agent_message":
+                result_text = item.get("text", "")
+
+        elif event_type == "turn.completed":
+            usage = event.get("usage", {})
+            turn_usages.append(usage)
+
+    # Build turns
+    turns: list[Turn] = []
+    for turn_idx in sorted(turn_items.keys()):
+        items = turn_items[turn_idx]
+        usage = turn_usages[turn_idx] if turn_idx < len(turn_usages) else {}
+
+        input_tokens = usage.get("input_tokens", 0)
+        cached_input_tokens = usage.get("cached_input_tokens", 0)
+        output_tokens = usage.get("output_tokens", 0)
+
+        # Build tool calls from items
+        tool_calls: list[ToolCall] = []
+        for item in items:
+            item_type = item.get("type")
+            item_id = item.get("id", "")
+
+            if item_type == "command_execution":
+                tool_calls.append(ToolCall(
+                    name="Bash",
+                    input={"command": item.get("command", "")},
+                    tool_use_id=item_id,
+                    turn_index=turn_idx,
+                ))
+
+            elif item_type == "mcp_tool_call":
+                tool_name = item.get("tool", "unknown")
+                tool_calls.append(ToolCall(
+                    name=tool_name,
+                    input=item.get("arguments", {}),
+                    tool_use_id=item_id,
+                    turn_index=turn_idx,
+                ))
+
+            elif item_type == "file_edit":
+                tool_calls.append(ToolCall(
+                    name="Edit",
+                    input={"file_path": item.get("file_path", "")},
+                    tool_use_id=item_id,
+                    turn_index=turn_idx,
+                ))
+
+            elif item_type == "file_write":
+                tool_calls.append(ToolCall(
+                    name="Write",
+                    input={"file_path": item.get("file_path", "")},
+                    tool_use_id=item_id,
+                    turn_index=turn_idx,
+                ))
+
+        turn = Turn(
+            index=turn_idx,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_creation_tokens=0,  # codex doesn't report this
+            cache_read_tokens=cached_input_tokens,
+            tool_calls=tool_calls,
+        )
+        turns.append(turn)
+
+    # Compute totals
+    total_input = sum(u.get("input_tokens", 0) for u in turn_usages)
+    total_cached = sum(u.get("cached_input_tokens", 0) for u in turn_usages)
+    total_output = sum(u.get("output_tokens", 0) for u in turn_usages)
+
+    # Calculate cost
+    cost_usd = (
+        (total_input * rates["input"] / 1_000_000) +
+        (total_cached * rates["cached"] / 1_000_000) +
+        (total_output * rates["output"] / 1_000_000)
+    )
+
+    return RunResult(
+        session_id=session_id,
+        turns=turns,
+        num_turns=len(turn_usages),
+        total_cost_usd=cost_usd,
+        duration_ms=0,  # set by caller from subprocess timing
+        duration_api_ms=0,
+        total_input_tokens=total_input,
+        total_output_tokens=total_output,
+        total_cache_creation_tokens=0,
+        total_cache_read_tokens=total_cached,
+        result_text=result_text,
+    )
+
+
 def tool_call_counts(result: RunResult) -> dict[str, int]:
     """Count tool calls by name across all turns."""
     counts: dict[str, int] = {}

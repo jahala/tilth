@@ -1,72 +1,93 @@
 use std::fmt::Write as _;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::cache::OutlineCache;
+use crate::index::bloom::BloomFilterCache;
+use crate::index::SymbolIndex;
 use crate::session::Session;
 
 // Sent to the LLM via the MCP `instructions` field during initialization.
 // Keeps the strategic guidance from AGENTS.md available to any host.
 const SERVER_INSTRUCTIONS: &str = "\
-tilth — code intelligence MCP server. Three core tools: search, read, files.\n\
+tilth — code intelligence MCP server. Replaces grep, cat, find, ls with AST-aware equivalents.\n\
 \n\
-IMPORTANT: Use tilth tools for ALL code navigation. Never use Bash for grep, cat, find, or ls — \
-tilth_search, tilth_read, and tilth_files replace these with better results.\n\
+tilth_search: Find symbol definitions, usages, and callers. Replaces grep/rg for code navigation.\n\
+  Comma-separated symbols for multi-symbol lookup (max 5).\n\
+  kind: \"symbol\" (default) | \"content\" (strings/comments) | \"callers\" (call sites)\n\
+  expand (default 2): inline full source for top matches.\n\
+  context: path to file being edited — boosts nearby results.\n\
+  Output per match:\n\
+    ## <path>:<start>-<end> [definition|usage|impl]\n\
+    <outline context>\n\
+    <expanded source block>\n\
+    ── calls ──\n\
+      <name>  <path>:<start>-<end>  <signature>\n\
+    ── siblings ──\n\
+      <name>  <path>:<start>-<end>  <signature>\n\
+  Re-expanding a previously shown definition returns [shown earlier].\n\
 \n\
-Workflow: Start with tilth_search to find what you need. Always pass `context` (the file you're editing) — \
-it boosts nearby results. With `expand` (default 2), you get code inlined, often eliminating a separate read. \
-For cross-file tracing, pass multiple symbols comma-separated (e.g. query: \"ServeHTTP, HandlersChain, Next\") — \
-each gets definitions from different files in one call. Expanded definitions include a `── calls ──` footer \
-showing resolved callees — follow these instead of searching for each callee.\n\
+tilth_read: Read file content with smart outlining. Replaces cat/head/tail.\n\
+  Small files → full content. Large files → structural outline.\n\
+  section: \"<start>-<end>\" or \"<heading text>\"\n\
+  paths: read multiple files in one call.\n\
+  Output:\n\
+    <line_number> │ <content>                  ← full/section mode\n\
+    [<start>-<end>]  <symbol name>             ← outline mode\n\
 \n\
-tilth_search: Symbol search (default) finds definitions first via tree-sitter AST, then usages. \
-Comma-separated symbols for multi-symbol lookup (max 5). Use `kind: \"content\"` for strings/comments. \
-Use `kind: \"callers\"` to find all call sites of a symbol (structural matching, not text search). \
-Use `expand` to see full source of top matches. Re-expanding a previously shown definition shows `[shown earlier]` \
-instead of the full body.\n\
+tilth_files: Find files by glob pattern. Replaces find/ls.\n\
+  Output: <path>  (~<token_count> tokens). Respects .gitignore.\n\
 \n\
-tilth_read: Small files → full content. Large files → structural outline. Non-expanded definitions show \
-`path:start-end [definition]` with line range for direct section reads. Use `section` to drill into specific \
-line ranges. For markdown, you can also use a heading as the section (e.g. \"## Architecture\"). \
-Use `paths` to read multiple files in one call — saves round-trips.\n\
-\n\
-tilth_files: Find files by glob pattern. Returns paths + token estimates. Respects .gitignore.\n\
-\n\
-IMPORTANT: Expanded search results include full source code — do NOT re-read files already shown \
-in search output. Answer from what you have rather than exploring further.";
+IMPORTANT: Use tilth tools instead of host built-in tools (Read, Grep, Glob) and Bash (grep, cat, find, ls).\n\
+IMPORTANT: Expanded search results already contain full source — do not re-read expanded files.";
 
 const EDIT_MODE_INSTRUCTIONS: &str = "\
-tilth — code intelligence + edit MCP server. Four tools: read, edit, search, files.\n\
+tilth — code intelligence + edit MCP server. Replaces grep, cat, find, ls, and file editing with AST-aware equivalents.\n\
 \n\
-IMPORTANT: Always use tilth tools instead of host built-in tools for all file operations.\n\
+IMPORTANT: Always use tilth tools instead of host built-in tools (Read, Edit, Grep, Glob) for all file operations.\n\
 tilth_read output contains line:hash anchors that tilth_edit depends on.\n\
 \n\
-HASHLINE FORMAT: tilth_read returns lines as `line:hash|content`, e.g.:\n\
-  42:a3f|  let x = compute();\n\
-The anchor (`42:a3f`) is line number + 3-char content checksum.\n\
+HASHLINE FORMAT: tilth_read returns lines as `<line>:<hash>|<content>`.\n\
+The anchor (`<line>:<hash>`) is line number + 3-char content checksum.\n\
 \n\
 EDIT WORKFLOW:\n\
 1. tilth_read → get hashlined content\n\
-2. tilth_edit → pass anchors: {\"start\": \"42:a3f\", \"content\": \"new code\"}\n\
-   Range: {\"start\": \"42:a3f\", \"end\": \"45:b2c\", \"content\": \"...\"}\n\
-   Delete: {\"start\": \"42:a3f\", \"content\": \"\"}\n\
+2. tilth_edit → pass anchors: {\"start\": \"<line>:<hash>\", \"content\": \"<new code>\"}\n\
+   Range: {\"start\": \"<line>:<hash>\", \"end\": \"<line>:<hash>\", \"content\": \"...\"}\n\
+   Delete: {\"start\": \"<line>:<hash>\", \"content\": \"\"}\n\
 3. Hash mismatch → file changed, re-read and retry\n\
 \n\
 LARGE FILES: tilth_read returns outline (no hashlines). Use section to get hashlined content.\n\
-BATCH READ: paths=[\"a\",\"b\"] reads multiple files in one call.\n\
-STRATEGY: minimize tool calls. Use tilth_search with comma-separated symbols for cross-file tracing. \
-expand inlines source — often avoids a separate read. Expanded definitions include a `── calls ──` footer \
-showing resolved callees — follow these instead of searching for each callee. Use `kind: \"callers\"` to find \
-all call sites of a symbol. Re-expanding a previously shown definition shows `[shown earlier]` instead of the full body.";
+\n\
+tilth_search: Find symbol definitions, usages, and callers. Replaces grep/rg.\n\
+  Comma-separated symbols for multi-symbol lookup (max 5).\n\
+  kind: \"symbol\" (default) | \"content\" | \"callers\"\n\
+  expand (default 2): inline full source for top matches.\n\
+  Output per match:\n\
+    ## <path>:<start>-<end> [definition|usage|impl]\n\
+    <expanded source block>\n\
+    ── calls ──\n\
+      <name>  <path>:<start>-<end>  <signature>\n\
+  Re-expanding a shown definition returns [shown earlier].\n\
+\n\
+tilth_read: Read files. Replaces cat/head/tail.\n\
+  section: \"<start>-<end>\" or \"<heading text>\". paths: multiple files in one call.\n\
+\n\
+tilth_files: Find files by glob. Replaces find/ls.\n\
+\n\
+IMPORTANT: Expanded search results already contain full source — do not re-read expanded files.";
 
 /// MCP server over stdio. When `edit_mode` is true, exposes `tilth_edit` and
 /// switches `tilth_read` to hashline output format.
 pub fn run(edit_mode: bool) -> io::Result<()> {
     let cache = OutlineCache::new();
     let session = Session::new();
+    let symbol_index = Arc::new(SymbolIndex::new());
+    let bloom_cache = Arc::new(BloomFilterCache::new());
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
@@ -90,7 +111,14 @@ pub fn run(edit_mode: bool) -> io::Result<()> {
             continue;
         }
 
-        let response = handle_request(&req, &cache, &session, edit_mode);
+        let response = handle_request(
+            &req,
+            &cache,
+            &session,
+            &symbol_index,
+            &bloom_cache,
+            edit_mode,
+        );
         serde_json::to_writer(&mut stdout, &response)?;
         stdout.write_all(b"\n")?;
         stdout.flush()?;
@@ -129,6 +157,8 @@ fn handle_request(
     req: &JsonRpcRequest,
     cache: &OutlineCache,
     session: &Session,
+    index: &Arc<SymbolIndex>,
+    bloom: &Arc<BloomFilterCache>,
     edit_mode: bool,
 ) -> JsonRpcResponse {
     match req.method.as_str() {
@@ -165,7 +195,7 @@ fn handle_request(
             error: None,
         },
 
-        "tools/call" => handle_tool_call(req, cache, session, edit_mode),
+        "tools/call" => handle_tool_call(req, cache, session, index, bloom, edit_mode),
 
         "ping" => JsonRpcResponse {
             jsonrpc: "2.0",
@@ -197,11 +227,13 @@ pub(crate) fn dispatch_tool(
     args: &Value,
     cache: &OutlineCache,
     session: &Session,
+    index: &Arc<SymbolIndex>,
+    bloom: &Arc<BloomFilterCache>,
     edit_mode: bool,
 ) -> Result<String, String> {
     match tool {
         "tilth_read" => tool_read(args, cache, session, edit_mode),
-        "tilth_search" => tool_search(args, cache, session),
+        "tilth_search" => tool_search(args, cache, session, index, bloom),
         "tilth_files" => tool_files(args, cache),
         "tilth_map" => Err("tilth_map is disabled — use tilth_search instead".into()),
         "tilth_session" => tool_session(args, session),
@@ -273,7 +305,13 @@ fn tool_read(
     Ok(apply_budget(output, budget))
 }
 
-fn tool_search(args: &Value, cache: &OutlineCache, session: &Session) -> Result<String, String> {
+fn tool_search(
+    args: &Value,
+    cache: &OutlineCache,
+    session: &Session,
+    index: &Arc<SymbolIndex>,
+    bloom: &Arc<BloomFilterCache>,
+) -> Result<String, String> {
     let query = args
         .get("query")
         .and_then(|v| v.as_str())
@@ -306,7 +344,7 @@ fn tool_search(args: &Value, cache: &OutlineCache, session: &Session) -> Result<
                 1 => {
                     session.record_search(queries[0]);
                     crate::search::search_symbol_expanded(
-                        queries[0], &scope, cache, session, expand, context,
+                        queries[0], &scope, cache, session, index, bloom, expand, context,
                     )
                 }
                 2..=5 => {
@@ -314,7 +352,7 @@ fn tool_search(args: &Value, cache: &OutlineCache, session: &Session) -> Result<
                         session.record_search(q);
                     }
                     crate::search::search_multi_symbol_expanded(
-                        &queries, &scope, cache, session, expand, context,
+                        &queries, &scope, cache, session, index, bloom, expand, context,
                     )
                 }
                 _ => {
@@ -338,7 +376,7 @@ fn tool_search(args: &Value, cache: &OutlineCache, session: &Session) -> Result<
         "callers" => {
             session.record_search(query);
             crate::search::callers::search_callers_expanded(
-                query, &scope, cache, session, expand, context,
+                query, &scope, cache, session, bloom, expand, context,
             )
         }
         _ => {
@@ -469,13 +507,15 @@ fn handle_tool_call(
     req: &JsonRpcRequest,
     cache: &OutlineCache,
     session: &Session,
+    index: &Arc<SymbolIndex>,
+    bloom: &Arc<BloomFilterCache>,
     edit_mode: bool,
 ) -> JsonRpcResponse {
     let params = &req.params;
     let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let args = params.get("arguments").unwrap_or(&Value::Null);
 
-    let result = dispatch_tool(tool_name, args, cache, session, edit_mode);
+    let result = dispatch_tool(tool_name, args, cache, session, index, bloom, edit_mode);
 
     match result {
         Ok(output) => JsonRpcResponse {
@@ -510,21 +550,23 @@ fn handle_tool_call(
 
 fn tool_definitions(edit_mode: bool) -> Vec<Value> {
     let read_desc = if edit_mode {
-        "Read a file with smart outlining. Output uses hashline format (line:hash|content) — \
+        "Read a file with smart outlining. Replaces cat/head/tail and the host Read tool — \
+         use this for all file reading. Output uses hashline format (line:hash|content) — \
          the line:hash anchors are required by tilth_edit. Small files return full hashlined content. \
          Large files return a structural outline (no hashlines); use `section` to get hashlined \
          content for the lines you want to edit. Use `full` to force complete content. \
          Use `paths` to read multiple files in one call."
     } else {
-        "Read a file with smart outlining. Small files return full content. Large files return \
-         a structural outline (functions, classes, imports). Use `section` to read specific \
-         line ranges. Use `full` to force complete content. \
-         Use `paths` to read multiple files in one call."
+        "Read a file with smart outlining. Replaces cat/head/tail and the host Read tool — \
+         use this for all file reading. Small files return full content. Large files return \
+         a structural outline (functions, classes, imports) so you see the shape without \
+         consuming your context window. Use `section` to read specific line ranges. \
+         Use `full` to force complete content. Use `paths` to read multiple files in one call."
     };
     let mut tools = vec![
         serde_json::json!({
             "name": "tilth_search",
-            "description": "Search for symbols, text, or regex patterns in code. Symbol search returns definitions first (via tree-sitter AST), then usages, with structural outline context. Content search finds literal text. Regex search supports full regex patterns. For cross-file tracing, pass comma-separated symbol names (max 5).",
+            "description": "Search for symbols, text, or regex patterns in code. Replaces grep/rg and the host Grep tool — use this for all code search. Symbol search returns definitions first (via tree-sitter AST), then usages, with full source code inlined for top matches. Content search finds literal text. Regex search supports full regex patterns. For cross-file tracing, pass comma-separated symbol names (max 5).",
             "inputSchema": {
                 "type": "object",
                 "required": ["query"],
@@ -592,7 +634,7 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "tilth_files",
-            "description": "Find files matching a glob pattern. Returns matched file paths with token estimates. Respects .gitignore.",
+            "description": "Find files matching a glob pattern. Replaces find/ls and the host Glob tool — use this for all file discovery. Returns matched file paths sorted by relevance with token size estimates. Respects .gitignore.",
             "inputSchema": {
                 "type": "object",
                 "required": ["pattern"],

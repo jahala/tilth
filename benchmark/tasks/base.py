@@ -41,7 +41,8 @@ class Task(ABC):
     def check_correctness(self, result_text: str, repo_path: str) -> tuple[bool, str]:
         """Validate result against ground truth."""
         gt = self.ground_truth
-        text_lower = result_text.lower()
+        # Strip markdown backticks so "trait Matcher" matches "`Matcher` trait" etc.
+        text_lower = result_text.replace("`", "").lower()
 
         for required in gt.required_strings:
             if required.lower() not in text_lower:

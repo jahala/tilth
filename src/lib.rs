@@ -19,6 +19,7 @@ pub(crate) mod classify;
 pub(crate) mod edit;
 pub mod error;
 pub(crate) mod format;
+pub mod index;
 pub mod install;
 pub mod map;
 pub mod mcp;

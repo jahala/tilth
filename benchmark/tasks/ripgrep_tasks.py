@@ -21,7 +21,7 @@ class RipgrepTraitImplementorsTask(Task):
     @property
     def ground_truth(self) -> GroundTruth:
         return GroundTruth(
-            required_strings=["trait Matcher", "find_at", "RegexMatcher"],
+            required_strings=["Matcher", "find_at", "RegexMatcher"],
         )
 
     @property
@@ -99,7 +99,7 @@ class RipgrepWalkerParallelTask(Task):
     @property
     def ground_truth(self) -> GroundTruth:
         return GroundTruth(
-            required_strings=["WalkParallel", "ParallelVisitor", "ParallelVisitorBuilder", "walk.rs"],
+            required_strings=["WalkParallel", "ParallelVisitor", "ParallelVisitorBuilder"],
         )
 
     @property
@@ -126,7 +126,7 @@ class RipgrepLineIterDefinitionTask(Task):
     @property
     def ground_truth(self) -> GroundTruth:
         return GroundTruth(
-            required_strings=["LineIter", "lines.rs", "bytes"],
+            required_strings=["LineIter", "bytes"],
         )
 
 

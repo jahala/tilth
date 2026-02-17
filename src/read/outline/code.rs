@@ -99,8 +99,8 @@ fn node_to_entry(
             (OutlineKind::Struct, name, None)
         }
 
-        // Interfaces & types
-        "interface_declaration" | "type_alias_declaration" => {
+        // Interfaces & traits
+        "interface_declaration" | "type_alias_declaration" | "trait_item" => {
             let name = find_child_text(node, "name", lines).unwrap_or_else(|| "<anonymous>".into());
             (OutlineKind::Interface, name, None)
         }
@@ -152,10 +152,10 @@ fn node_to_entry(
         _ => return None,
     };
 
-    // Collect children for classes, impls, modules
+    // Collect children for classes, impls, modules, traits/interfaces
     let children = if matches!(
         kind,
-        OutlineKind::Class | OutlineKind::Struct | OutlineKind::Module
+        OutlineKind::Class | OutlineKind::Struct | OutlineKind::Module | OutlineKind::Interface
     ) && depth < 1
     {
         collect_children(node, lines, lang, depth + 1)

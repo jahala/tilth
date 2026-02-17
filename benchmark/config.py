@@ -6,7 +6,24 @@ MODELS = {
     "haiku": "claude-haiku-4-5-20251001",
     "sonnet": "claude-sonnet-4-5-20250929",
     "opus": "claude-opus-4-6",
+    "gpt5": "gpt-5-codex",
+    "o3": "o3",
 }
+
+# Maps model short name -> runner type
+RUNNERS = {
+    "haiku": "claude",
+    "sonnet": "claude",
+    "opus": "claude",
+    "gpt5": "codex",
+    "o3": "codex",
+}
+
+# MCP config arguments for codex (tilth server)
+TILTH_MCP_CODEX_ARGS = [
+    "-c", 'mcp_servers.tilth.command="/Users/flysikring/.cargo/bin/tilth"',
+    "-c", 'mcp_servers.tilth.args=["--mcp", "--edit"]',
+]
 
 
 @dataclass

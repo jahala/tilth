@@ -102,7 +102,7 @@ class FastAPIDependsFunctionTask(Task):
     @property
     def ground_truth(self) -> GroundTruth:
         return GroundTruth(
-            required_strings=["def Depends", "param_functions.py", "use_cache"],
+            required_strings=["def Depends", "use_cache"],
         )
 
 

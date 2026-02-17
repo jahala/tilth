@@ -33,7 +33,11 @@ pub struct CallerMatch {
 }
 
 /// Find all call sites of a target symbol across the codebase using tree-sitter.
-pub fn find_callers(target: &str, scope: &Path) -> Result<Vec<CallerMatch>, TilthError> {
+pub fn find_callers(
+    target: &str,
+    scope: &Path,
+    bloom: &crate::index::bloom::BloomFilterCache,
+) -> Result<Vec<CallerMatch>, TilthError> {
     let matches: Mutex<Vec<CallerMatch>> = Mutex::new(Vec::new());
     let found_count = AtomicUsize::new(0);
     let needle = target.as_bytes();
@@ -71,6 +75,14 @@ pub fn find_callers(target: &str, scope: &Path) -> Result<Vec<CallerMatch>, Tilt
             let Ok(content) = fs::read_to_string(path) else {
                 return ignore::WalkState::Continue;
             };
+
+            // Bloom pre-filter: skip if target is definitely not in file
+            let mtime = std::fs::metadata(path)
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            if !bloom.contains(path, mtime, &content, target) {
+                return ignore::WalkState::Continue;
+            }
 
             // Fast byte check via memchr::memmem (SIMD) — skip files without the symbol
             if memchr::memmem::find(content.as_bytes(), needle).is_none() {
@@ -229,10 +241,11 @@ pub fn search_callers_expanded(
     scope: &Path,
     _cache: &OutlineCache,
     _session: &Session,
+    bloom: &crate::index::bloom::BloomFilterCache,
     expand: usize,
     context: Option<&Path>,
 ) -> Result<String, TilthError> {
-    let callers = find_callers(target, scope)?;
+    let callers = find_callers(target, scope, bloom)?;
 
     if callers.is_empty() {
         return Ok(format!(

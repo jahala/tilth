@@ -5,7 +5,10 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 
 use super::file_metadata;
-use super::treesitter::{extract_definition_name, DEFINITION_KINDS};
+use super::treesitter::{
+    definition_weight, extract_definition_name, extract_impl_trait, extract_impl_type,
+    extract_implemented_interfaces, DEFINITION_KINDS,
+};
 
 use crate::error::TilthError;
 use crate::read::detect_file_type;
@@ -17,8 +20,10 @@ use grep_searcher::sinks::UTF8;
 use grep_searcher::Searcher;
 
 const MAX_MATCHES: usize = 10;
-/// Stop walking once we have this many raw matches. Generous headroom for dedup + ranking.
-const EARLY_QUIT_THRESHOLD: usize = MAX_MATCHES * 3;
+/// Stop walking once we have this many raw definition matches.
+const EARLY_QUIT_THRESHOLD_DEFINITIONS: usize = 50;
+/// Stop walking once we have this many raw usage matches.
+const EARLY_QUIT_THRESHOLD_USAGES: usize = MAX_MATCHES * 3;
 
 /// Symbol search: find definitions via tree-sitter, usages via ripgrep, concurrently.
 /// Merge results, deduplicate, definitions first.
@@ -95,7 +100,7 @@ fn find_definitions(query: &str, scope: &Path) -> Result<Vec<Match>, TilthError>
 
         Box::new(move |entry| {
             // Early termination: enough definitions found
-            if found_count.load(Ordering::Relaxed) >= EARLY_QUIT_THRESHOLD {
+            if found_count.load(Ordering::Relaxed) >= EARLY_QUIT_THRESHOLD_DEFINITIONS {
                 return ignore::WalkState::Quit;
             }
 
@@ -234,6 +239,69 @@ fn walk_for_definitions(
                         node.end_position().row as u32 + 1,
                     )),
                     def_name: Some(query.to_string()),
+                    def_weight: definition_weight(node.kind()),
+                    impl_target: None,
+                });
+            }
+        }
+
+        // Impl/interface detection: surface `impl Trait for Type` and
+        // `class X implements Interface` blocks when searching for the trait/interface.
+        if kind == "impl_item" {
+            if let Some(trait_name) = extract_impl_trait(node, lines) {
+                if trait_name == query {
+                    let impl_type =
+                        extract_impl_type(node, lines).unwrap_or_else(|| "<unknown>".to_string());
+                    let line_num = node.start_position().row as u32 + 1;
+                    let line_text = lines
+                        .get(node.start_position().row)
+                        .unwrap_or(&"")
+                        .trim_end();
+                    defs.push(Match {
+                        path: path.to_path_buf(),
+                        line: line_num,
+                        column: node.start_position().column as u32,
+                        text: line_text.to_string(),
+                        is_definition: true,
+                        exact: true,
+                        file_lines,
+                        mtime,
+                        def_range: Some((
+                            node.start_position().row as u32 + 1,
+                            node.end_position().row as u32 + 1,
+                        )),
+                        def_name: Some(format!("impl {query} for {impl_type}")),
+                        def_weight: 80,
+                        impl_target: Some(query.to_string()),
+                    });
+                }
+            }
+        } else if kind == "class_declaration" || kind == "class_definition" {
+            let interfaces = extract_implemented_interfaces(node, lines);
+            if interfaces.iter().any(|i| i == query) {
+                let class_name = extract_definition_name(node, lines)
+                    .unwrap_or_else(|| "<anonymous>".to_string());
+                let line_num = node.start_position().row as u32 + 1;
+                let line_text = lines
+                    .get(node.start_position().row)
+                    .unwrap_or(&"")
+                    .trim_end();
+                defs.push(Match {
+                    path: path.to_path_buf(),
+                    line: line_num,
+                    column: node.start_position().column as u32,
+                    text: line_text.to_string(),
+                    is_definition: true,
+                    exact: true,
+                    file_lines,
+                    mtime,
+                    def_range: Some((
+                        node.start_position().row as u32 + 1,
+                        node.end_position().row as u32 + 1,
+                    )),
+                    def_name: Some(format!("{class_name} implements {query}")),
+                    def_weight: 80,
+                    impl_target: Some(query.to_string()),
                 });
             }
         }
@@ -279,6 +347,8 @@ fn find_defs_heuristic_buf(
                 mtime,
                 def_range: None,
                 def_name: Some(query.to_string()),
+                def_weight: 60,
+                impl_target: None,
             });
         }
     }
@@ -306,7 +376,7 @@ fn find_usages(
 
         Box::new(move |entry| {
             // Early termination: enough usages found
-            if found_count.load(Ordering::Relaxed) >= EARLY_QUIT_THRESHOLD {
+            if found_count.load(Ordering::Relaxed) >= EARLY_QUIT_THRESHOLD_USAGES {
                 return ignore::WalkState::Quit;
             }
 
@@ -347,6 +417,8 @@ fn find_usages(
                         mtime,
                         def_range: None,
                         def_name: None,
+                        def_weight: 0,
+                        impl_target: None,
                     });
                     Ok(true)
                 }),

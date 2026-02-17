@@ -87,3 +87,67 @@ pub(crate) fn node_text_simple(node: tree_sitter::Node, lines: &[&str]) -> Strin
         String::new()
     }
 }
+
+/// Extract trait name from Rust `impl Trait for Type` node.
+/// Returns None for inherent impls (no trait).
+pub(crate) fn extract_impl_trait(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
+    let trait_node = node.child_by_field_name("trait")?;
+    Some(node_text_simple(trait_node, lines))
+}
+
+/// Extract implementing type from Rust `impl ... for Type` node.
+pub(crate) fn extract_impl_type(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
+    let type_node = node.child_by_field_name("type")?;
+    Some(node_text_simple(type_node, lines))
+}
+
+/// Extract implemented interface names from TS/Java class declaration.
+/// Walks `implements_clause` (TS) and `super_interfaces` (Java) children.
+pub(crate) fn extract_implemented_interfaces(
+    node: tree_sitter::Node,
+    lines: &[&str],
+) -> Vec<String> {
+    let mut interfaces = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "implements_clause" || child.kind() == "super_interfaces" {
+            let mut inner = child.walk();
+            for ident in child.children(&mut inner) {
+                if ident.kind().contains("identifier") {
+                    let text = node_text_simple(ident, lines);
+                    if !text.is_empty() {
+                        interfaces.push(text);
+                    }
+                }
+            }
+        }
+    }
+    interfaces
+}
+
+/// Semantic weight for definition kinds. Primary declarations rank highest.
+pub(crate) fn definition_weight(kind: &str) -> u16 {
+    match kind {
+        "function_declaration"
+        | "function_definition"
+        | "function_item"
+        | "method_definition"
+        | "method_declaration"
+        | "class_declaration"
+        | "class_definition"
+        | "struct_item"
+        | "interface_declaration"
+        | "trait_item"
+        | "enum_item"
+        | "enum_declaration"
+        | "type_item"
+        | "type_declaration"
+        | "decorated_definition" => 100,
+        "impl_item" => 90,
+        "const_item" | "static_item" => 80,
+        "mod_item" => 70,
+        "lexical_declaration" | "variable_declaration" => 40,
+        "export_statement" => 30,
+        _ => 50,
+    }
+}

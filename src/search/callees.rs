@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use streaming_iterator::StreamingIterator;
@@ -14,6 +15,14 @@ pub struct ResolvedCallee {
     pub start_line: u32,
     pub end_line: u32,
     pub signature: Option<String>,
+}
+
+/// A resolved callee with its own callees (2nd hop).
+#[derive(Debug)]
+pub struct ResolvedCalleeNode {
+    pub callee: ResolvedCallee,
+    /// 2nd-hop callees resolved from within this callee's body.
+    pub children: Vec<ResolvedCallee>,
 }
 
 /// Return the tree-sitter query string for extracting callee names in the given language.
@@ -191,6 +200,7 @@ pub fn resolve_callees(
     source_path: &Path,
     source_content: &str,
     _cache: &OutlineCache,
+    bloom: &crate::index::bloom::BloomFilterCache,
 ) -> Vec<ResolvedCallee> {
     if callee_names.is_empty() {
         return Vec::new();
@@ -222,9 +232,29 @@ pub fn resolve_callees(
             break;
         }
 
+        // Read file content once for both bloom check and parsing
         let Ok(import_content) = std::fs::read_to_string(&import_path) else {
             continue;
         };
+
+        // Get mtime for bloom cache
+        let mtime = std::fs::metadata(&import_path)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+
+        // Bloom pre-filter: check if ANY of the remaining symbols might be in this file
+        let mut might_have_any = false;
+        for name in &remaining {
+            if bloom.contains(&import_path, mtime, &import_content, name) {
+                might_have_any = true;
+                break;
+            }
+        }
+
+        if !might_have_any {
+            // Bloom filter says none of the symbols are in this file
+            continue;
+        }
 
         let import_type = crate::read::detect_file_type(&import_path);
         let crate::types::FileType::Code(import_lang) = import_type else {
@@ -298,4 +328,114 @@ fn resolve_same_package(
         let outline = get_outline_entries(&content, Lang::Go);
         resolve_from_entries(&outline, &go_path, remaining, resolved);
     }
+}
+
+/// Resolve callees transitively up to `depth_limit` hops with budget cap.
+///
+/// First hop uses `resolve_callees()` on the source content. For each resolved
+/// callee at depth < `depth_limit`, reads the callee's file, extracts nested
+/// callee names from the definition range, and resolves them as children.
+///
+/// `budget` caps the total number of 2nd-hop (child) callees across all parents.
+/// Cycle detection prevents infinite loops via `(file, start_line)` tracking.
+pub fn resolve_callees_transitive(
+    initial_names: &[String],
+    source_path: &Path,
+    source_content: &str,
+    cache: &OutlineCache,
+    bloom: &crate::index::bloom::BloomFilterCache,
+    depth_limit: u32,
+    budget: usize,
+) -> Vec<ResolvedCalleeNode> {
+    // 1st hop: resolve direct callees (existing logic)
+    let first_hop = resolve_callees(initial_names, source_path, source_content, cache, bloom);
+
+    if depth_limit < 2 || first_hop.is_empty() {
+        return first_hop
+            .into_iter()
+            .map(|c| ResolvedCalleeNode {
+                callee: c,
+                children: Vec::new(),
+            })
+            .collect();
+    }
+
+    // Cycle detection: track visited (file, start_line) pairs
+    let mut visited: HashSet<(PathBuf, u32)> = HashSet::new();
+
+    // Mark all 1st-hop callees as visited
+    for c in &first_hop {
+        visited.insert((c.file.clone(), c.start_line));
+    }
+
+    let mut budget_remaining = budget;
+    let mut result = Vec::with_capacity(first_hop.len());
+
+    for parent in first_hop {
+        let children = if budget_remaining > 0 {
+            resolve_second_hop(&parent, cache, bloom, &mut visited, &mut budget_remaining)
+        } else {
+            Vec::new()
+        };
+        result.push(ResolvedCalleeNode {
+            callee: parent,
+            children,
+        });
+    }
+
+    result
+}
+
+/// Resolve 2nd-hop callees for a single parent callee.
+fn resolve_second_hop(
+    parent: &ResolvedCallee,
+    cache: &OutlineCache,
+    bloom: &crate::index::bloom::BloomFilterCache,
+    visited: &mut HashSet<(PathBuf, u32)>,
+    budget: &mut usize,
+) -> Vec<ResolvedCallee> {
+    let file_type = crate::read::detect_file_type(&parent.file);
+    let crate::types::FileType::Code(lang) = file_type else {
+        return Vec::new();
+    };
+
+    let Ok(content) = std::fs::read_to_string(&parent.file) else {
+        return Vec::new();
+    };
+
+    let def_range = Some((parent.start_line, parent.end_line));
+    let nested_names = extract_callee_names(&content, lang, def_range);
+
+    if nested_names.is_empty() {
+        return Vec::new();
+    }
+
+    let mut resolved = resolve_callees(&nested_names, &parent.file, &content, cache, bloom);
+
+    // Filter: skip self-recursive calls and already-visited callees
+    resolved.retain(|c| {
+        let key = (c.file.clone(), c.start_line);
+        // Skip if same definition as parent
+        if c.file == parent.file && c.start_line == parent.start_line {
+            return false;
+        }
+        // Skip if already visited (cycle detection)
+        if visited.contains(&key) {
+            return false;
+        }
+        true
+    });
+
+    // Apply budget cap
+    if resolved.len() > *budget {
+        resolved.truncate(*budget);
+    }
+
+    // Mark children as visited and decrement budget
+    for c in &resolved {
+        visited.insert((c.file.clone(), c.start_line));
+    }
+    *budget = budget.saturating_sub(resolved.len());
+
+    resolved
 }

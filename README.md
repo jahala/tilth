@@ -1,6 +1,6 @@
 # tilth
 
-**Smart code reading for humans and AI agents.**
+**Smart code reading for humans and AI agents.** Reduces cost per correct answer by **29%** on Sonnet and **22%** on Opus across 114 benchmark runs. ([benchmarks](#benchmarks))
 
 tilth is what happens when you give `ripgrep`, `tree-sitter`, and `cat` a shared brain.
 
@@ -85,11 +85,12 @@ Code navigation tasks across 4 real-world repos (Express, FastAPI, Gin, ripgrep)
 
 | Model | Tasks | Baseline $/correct | tilth $/correct | Change | Baseline acc | tilth acc |
 |---|---|---|---|---|---|---|
-| Sonnet 4.5 | 21 (126 runs) | $0.31 | $0.23 | **-26%** | 79% | 86% |
-| Opus 4.6 | 6 hard (36 runs) | $0.49 | $0.42 | **-14%** | 83% | 78% |
-| Haiku 4.5 | 7 forced* (7 runs) | $0.22 | $0.04 | **-82%** | 69% | 100% |
+| Sonnet 4.5 | 26 (52 runs) | $0.26 | $0.19 | **-29%** | 96% | 92% |
+| Opus 4.6 | 5 hard (10 runs) | $0.29 | $0.23 | **-22%** | 100% | 100% |
+| Haiku 4.5 | 26 (52 runs) | $0.17 | $0.19 | +12% | 58% | 69% |
+| **Average** | **114 runs** | **$0.23** | **$0.19** | **-18%** | **79%** | **82%** |
 
-\*Haiku ignores tilth tools when offered alongside built-in tools (9% adoption rate). In **forced mode** (`--disallowedTools "Bash,Grep,Glob"`), it adopts tilth and results improve dramatically. See [Smaller models](#smaller-models).
+Sonnet achieves 98% tilth tool adoption and wins 19 of 26 tasks on cost. Opus solves all 5 hard tasks with 100% adoption and -22% $/correct. Haiku gains +12pp accuracy with tilth (5 new tasks solved) but costs more per attempt — net +12% $/correct. Forced mode (`--disallowedTools`) is recommended for Haiku.
 
 See [benchmark/](benchmark/) for per-task results, by-language breakdowns, and model comparison.
 
@@ -135,7 +136,7 @@ Smaller models (e.g. Haiku) may ignore tilth tools in favor of built-in Bash/Gre
 claude --disallowedTools "Bash,Grep,Glob"
 ```
 
-Benchmarks show this improves Haiku accuracy from 69% to 100% and reduces cost per correct answer by 82% on code navigation tasks.
+Benchmarks show Haiku only adopts tilth tools 42% of the time in hybrid mode. Forced mode ensures consistent tool adoption and improves accuracy.
 
 ## How it decides what to show
 
