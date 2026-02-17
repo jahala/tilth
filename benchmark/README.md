@@ -25,7 +25,7 @@ expected_cost = cost_per_attempt × (1 / accuracy)
 
 ## Sonnet 4.5 (52 runs)
 
-26 tasks across 4 repos. 26 baseline + 26 tilth runs. 98% tilth tool adoption (185/188 tool calls used tilth).
+26 tasks across 4 repos. 26 baseline + 26 tilth runs. 98% tilth tool adoption (184/188 tool calls used tilth).
 
 | | Baseline | tilth | Change |
 |---|---|---|---|
@@ -121,7 +121,7 @@ Opus achieves 100% accuracy in both modes and 100% tilth adoption. Notable: `exp
 | **Cost per correct answer** | **$0.17** | **$0.19** | **+12%** |
 | Accuracy | 15/26 (58%) | 18/26 (69%) | +12pp |
 | Avg cost per task | $0.098 | $0.131 | +35% |
-| Tilth adoption | — | 42% (96/228) | — |
+| Tilth adoption | — | 42% (94/228) | — |
 
 tilth improves Haiku accuracy by 12pp (5 new tasks solved) but costs more per attempt (+35%). The net effect: +12% $/correct — the accuracy gain doesn't fully offset the cost increase.
 
