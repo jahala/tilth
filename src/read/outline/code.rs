@@ -31,6 +31,7 @@ pub fn outline_language(lang: Lang) -> Option<tree_sitter::Language> {
         Lang::Tsx => tree_sitter_typescript::LANGUAGE_TSX,
         Lang::JavaScript => tree_sitter_javascript::LANGUAGE,
         Lang::Python => tree_sitter_python::LANGUAGE,
+        Lang::Scala => tree_sitter_scala::LANGUAGE,
         Lang::Go => tree_sitter_go::LANGUAGE,
         Lang::Java => tree_sitter_java::LANGUAGE,
         Lang::C => tree_sitter_c::LANGUAGE,
