@@ -47,7 +47,7 @@ pub(crate) fn callee_query_str(lang: Lang) -> Option<&'static str> {
             "(call_expression function: (identifier) @callee)\n",
             "(call_expression function: (member_expression property: (property_identifier) @callee))\n",
         )),
-        Lang::Java => Some(
+        Lang::Java | Lang::Scala => Some(
             "(method_invocation name: (identifier) @callee)\n",
         ),
         Lang::C | Lang::Cpp => Some(concat!(

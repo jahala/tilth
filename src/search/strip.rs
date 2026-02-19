@@ -24,7 +24,7 @@ fn detect_lang(path: &Path) -> Option<StripLang> {
         "py" | "pyi" => Some(StripLang::Python),
         "go" => Some(StripLang::Go),
         "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" => Some(StripLang::JsTs),
-        "java" | "kt" | "kts" | "cs" => Some(StripLang::JavaKotlinCSharp),
+        "java" | "kt" | "kts" | "cs" | "scala" | "sc" => Some(StripLang::JavaKotlinCSharp),
         "c" | "h" | "cpp" | "hpp" | "cc" | "cxx" => Some(StripLang::CppC),
         _ => None,
     }
@@ -128,7 +128,7 @@ fn is_debug_log(trimmed: &str, lang: StripLang) -> bool {
                 || trimmed.starts_with("logger.debug(")
                 || trimmed.starts_with("log.debug(")
                 || trimmed.starts_with("Log.d(")
-                || trimmed.starts_with("println(") // Kotlin
+                || trimmed.starts_with("println(") // Kotlin, Scala
         }
         StripLang::CppC => {
             trimmed.starts_with("printf(")

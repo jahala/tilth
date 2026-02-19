@@ -30,6 +30,7 @@ tree-sitter-java = "0.23"
 tree-sitter-c = "0.24"
 tree-sitter-cpp = "0.23"
 tree-sitter-ruby = "0.23"
+tree-sitter-scala = "0.24"
 
 # Search (ripgrep internals)
 grep-regex = "0.1"

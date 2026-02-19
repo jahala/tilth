@@ -30,7 +30,7 @@ fn sibling_query_str(lang: Lang) -> Option<&'static str> {
         Lang::TypeScript | Lang::JavaScript | Lang::Tsx => Some(
             "(member_expression object: (this) property: (property_identifier) @ref)\n",
         ),
-        Lang::Java => Some(concat!(
+        Lang::Java | Lang::Scala => Some(concat!(
             "(field_access object: (this) field: (identifier) @ref)\n",
             "(method_invocation object: (this) name: (identifier) @ref)\n",
         )),

@@ -24,6 +24,7 @@ pub enum Lang {
     Python,
     Go,
     Java,
+    Scala,
     C,
     Cpp,
     Ruby,

@@ -346,6 +346,7 @@ pub fn detect_file_type(path: &Path) -> FileType {
         Some("rs") => FileType::Code(Lang::Rust),
         Some("go") => FileType::Code(Lang::Go),
         Some("java") => FileType::Code(Lang::Java),
+        Some("scala" | "sc") => FileType::Code(Lang::Scala),
         Some("c" | "h") => FileType::Code(Lang::C),
         Some("cpp" | "hpp" | "cc" | "cxx") => FileType::Code(Lang::Cpp),
         Some("rb") => FileType::Code(Lang::Ruby),
