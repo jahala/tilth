@@ -118,6 +118,7 @@ tilth install cursor           # ~/.cursor/mcp.json
 tilth install windsurf         # ~/.codeium/windsurf/mcp_config.json
 tilth install vscode           # .vscode/mcp.json (project scope)
 tilth install claude-desktop
+tilth install opencode         # ~/.opencode.json
 ```
 
 Add `--edit` to enable hash-anchored file editing (see [Edit mode](#edit-mode)):
