@@ -50,7 +50,7 @@ pub(crate) const SKIP_DIRS: &[&str] = &[
     "coverage",
     ".cache",
     ".tox",
-    ".venv",    
+    ".venv",
     ".eggs",
     ".mypy_cache",
     ".ruff_cache",
@@ -64,11 +64,10 @@ pub(crate) const SKIP_DIRS: &[&str] = &[
     ".netlify",
     ".gradle",
     ".idea",
-    "target", 
-    ".scala-build", 
-    ".bloop", 
-    ".metals", 
-    ".vscode", 
+    ".scala-build",
+    "target",
+    ".bloop",
+    ".metals",
 ];
 
 const EXPAND_FULL_FILE_THRESHOLD: u64 = 800;
