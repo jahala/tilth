@@ -11,12 +11,14 @@ use serde_json::{json, Value};
 //   windsurf:       ~/.codeium/windsurf/mcp_config.json       (global)
 //   vscode:         .vscode/mcp.json                          (project scope)
 //   claude-desktop: ~/Library/Application Support/Claude/...  (global)
+//   opencode:       ~/.opencode.json                          (user scope)
 const SUPPORTED_HOSTS: &[&str] = &[
     "claude-code",
     "cursor",
     "windsurf",
     "vscode",
     "claude-desktop",
+    "opencode",
 ];
 
 /// The tilth server entry injected into each host config.
@@ -148,6 +150,14 @@ fn resolve_host(host: &str) -> Result<HostInfo, String> {
             path: claude_desktop_path()?,
             servers_key: "mcpServers",
             note: None,
+        }),
+
+        // OpenCode user scope: ~/.opencode.json → mcpServers
+        // Verified from opencode source: internal/config/config.go (viper config name ".opencode")
+        "opencode" => Ok(HostInfo {
+            path: home.join(".opencode.json"),
+            servers_key: "mcpServers",
+            note: Some("User scope — available in all projects."),
         }),
 
         _ => Err(format!(
