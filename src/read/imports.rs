@@ -57,7 +57,7 @@ fn is_import_line(line: &str, lang: Lang) -> bool {
             trimmed.starts_with("import ") || trimmed.starts_with("import{")
         }
         Lang::Python => trimmed.starts_with("import ") || trimmed.starts_with("from "),
-        Lang::Go | Lang::Java | Lang::Kotlin => trimmed.starts_with("import "),
+        Lang::Go | Lang::Java | Lang::Scala | Lang::Kotlin => trimmed.starts_with("import "),
         Lang::C | Lang::Cpp => trimmed.starts_with("#include"),
         _ => false,
     }
@@ -75,7 +75,7 @@ fn is_external(source: &str, lang: Lang) -> bool {
         }
         Lang::Python => !source.starts_with('.'),
         Lang::C | Lang::Cpp => !source.starts_with('"'),
-        // Go, Java, Kotlin — can't resolve without build system knowledge.
+        // Go, Java, Scala, Kotlin — can't resolve without build system knowledge.
         _ => true,
     }
 }

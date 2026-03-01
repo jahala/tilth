@@ -64,6 +64,10 @@ pub(crate) const SKIP_DIRS: &[&str] = &[
     ".netlify",
     ".gradle",
     ".idea",
+    ".scala-build",
+    "target",
+    ".bloop",
+    ".metals"
 ];
 
 const EXPAND_FULL_FILE_THRESHOLD: u64 = 800;
@@ -79,6 +83,7 @@ pub(crate) fn package_root(path: &Path) -> Option<&Path> {
         "go.mod",
         "pom.xml",
         "build.gradle",
+        "build.sbt"
     ];
     let mut dir = path;
     loop {

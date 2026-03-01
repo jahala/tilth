@@ -24,6 +24,7 @@ pub enum Lang {
     Python,
     Go,
     Java,
+    Scala,
     C,
     Cpp,
     Ruby,
@@ -138,6 +139,7 @@ pub enum OutlineKind {
     Enum,
     Constant,
     Variable,
+    ImmutableVariable,
     Export,
     #[allow(dead_code)]
     Property,

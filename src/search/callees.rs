@@ -50,6 +50,11 @@ pub(crate) fn callee_query_str(lang: Lang) -> Option<&'static str> {
         Lang::Java => Some(
             "(method_invocation name: (identifier) @callee)\n",
         ),
+        Lang::Scala => Some(concat!(
+            "(call_expression function: (identifier) @callee)\n",
+            "(call_expression function: (field_expression field: (identifier) @callee))\n",
+            "(infix_expression operator: (identifier) @callee)\n",
+        )),
         Lang::C | Lang::Cpp => Some(concat!(
             "(call_expression function: (identifier) @callee)\n",
             "(call_expression function: (field_expression field: (field_identifier) @callee))\n",
@@ -438,4 +443,46 @@ fn resolve_second_hop(
     *budget = budget.saturating_sub(resolved.len());
 
     resolved
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scala_callee_extraction() {
+        let scala_code = r#"
+class Example {
+  def process(): Unit = {
+    // Method invocation
+    helper()
+
+    // Method with object
+    obj.method()
+
+    // Field access method
+    config.database.connect()
+
+    // Function call (apply)
+    func(arg)
+
+    // Infix operator
+    a plus b
+  }
+}
+"#;
+
+        let callees = extract_callee_names(
+            scala_code,
+            Lang::Scala,
+            None
+        );
+
+        // Should capture: helper, method, connect, func, plus
+        assert!(callees.contains(&"helper".to_string()));
+        assert!(callees.contains(&"method".to_string()));
+        assert!(callees.contains(&"connect".to_string()));
+        assert!(callees.contains(&"func".to_string()));
+        assert!(callees.contains(&"plus".to_string()));
+    }
 }

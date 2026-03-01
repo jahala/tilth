@@ -20,7 +20,7 @@ pub fn outline(content: &str, lang: Lang, max_lines: usize) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let entries = walk_top_level(root, &lines, lang);
 
-    format_entries(&entries, &lines, max_lines)
+    format_entries(&entries, &lines, max_lines, lang)
 }
 
 /// Get the tree-sitter Language for a given Lang variant.
@@ -31,6 +31,7 @@ pub fn outline_language(lang: Lang) -> Option<tree_sitter::Language> {
         Lang::Tsx => tree_sitter_typescript::LANGUAGE_TSX,
         Lang::JavaScript => tree_sitter_javascript::LANGUAGE,
         Lang::Python => tree_sitter_python::LANGUAGE,
+        Lang::Scala => tree_sitter_scala::LANGUAGE,
         Lang::Go => tree_sitter_go::LANGUAGE,
         Lang::Java => tree_sitter_java::LANGUAGE,
         Lang::C => tree_sitter_c::LANGUAGE,
@@ -100,17 +101,17 @@ fn node_to_entry(
         }
 
         // Interfaces & traits
-        "interface_declaration" | "type_alias_declaration" | "trait_item" => {
+        "interface_declaration" | "type_alias_declaration" | "trait_item" | "trait_definition" => {
             let name = find_child_text(node, "name", lines).unwrap_or_else(|| "<anonymous>".into());
             (OutlineKind::Interface, name, None)
         }
-        "type_item" => {
+        "type_item" | "type_definition" => {
             let name = find_child_text(node, "name", lines).unwrap_or_else(|| "<anonymous>".into());
             (OutlineKind::TypeAlias, name, None)
         }
 
         // Enums
-        "enum_item" | "enum_declaration" => {
+        "enum_item" | "enum_declaration" | "enum_definition" => {
             let name = find_child_text(node, "name", lines).unwrap_or_else(|| "<anonymous>".into());
             (OutlineKind::Enum, name, None)
         }
@@ -121,12 +122,24 @@ fn node_to_entry(
             (OutlineKind::Module, format!("impl {name}"), None)
         }
 
+        // Objects (Scala companion objects, singletons)
+        "object_definition" => {
+            let name = find_child_text(node, "name", lines)
+                .or_else(|| find_child_text(node, "identifier", lines))
+                .unwrap_or_else(|| "<anonymous>".into());
+            (OutlineKind::Module, name, None)
+        }
+
         // Constants and variables
         "const_item" | "static_item" => {
             let name = find_child_text(node, "name", lines).unwrap_or_else(|| "<const>".into());
             (OutlineKind::Constant, name, None)
         }
-        "lexical_declaration" | "variable_declaration" => {
+        "val_definition" => {
+            let name = first_identifier_text(node, lines).unwrap_or_else(|| "<val>".into());
+            (OutlineKind::ImmutableVariable, name, None)
+        }
+        "lexical_declaration" | "variable_declaration" | "var_definition" => {
             let name = first_identifier_text(node, lines).unwrap_or_else(|| "<var>".into());
             (OutlineKind::Variable, name, None)
         }
@@ -307,7 +320,7 @@ fn extract_doc(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
 }
 
 /// Format outline entries into the spec'd output format.
-fn format_entries(entries: &[OutlineEntry], _lines: &[&str], max_lines: usize) -> String {
+fn format_entries(entries: &[OutlineEntry], _lines: &[&str], max_lines: usize, lang: Lang) -> String {
     let mut out = Vec::new();
     let mut import_groups: Vec<&str> = Vec::new();
 
@@ -330,13 +343,13 @@ fn format_entries(entries: &[OutlineEntry], _lines: &[&str], max_lines: usize) -
             }
         }
 
-        out.push(format_entry(entry, 0));
+        out.push(format_entry(entry, 0, lang));
 
         for child in &entry.children {
             if out.len() >= max_lines {
                 break;
             }
-            out.push(format_entry(child, 1));
+            out.push(format_entry(child, 1, lang));
         }
     }
 
@@ -443,7 +456,7 @@ pub(crate) fn extract_import_source(text: &str) -> String {
 }
 
 /// Format a single outline entry with optional indentation.
-fn format_entry(entry: &OutlineEntry, indent: usize) -> String {
+fn format_entry(entry: &OutlineEntry, indent: usize, lang: Lang) -> String {
     let prefix = "  ".repeat(indent);
     let range = if entry.start_line == entry.end_line {
         format!("[{}]", entry.start_line)
@@ -452,18 +465,43 @@ fn format_entry(entry: &OutlineEntry, indent: usize) -> String {
     };
 
     let kind_label = match entry.kind {
-        OutlineKind::Function => "fn",
+        OutlineKind::Function => {
+            if lang == Lang::Scala {
+                "def"
+            } else {
+                "fn"
+            }
+        }
         OutlineKind::Method => "method",
         OutlineKind::Class => "class",
         OutlineKind::Struct => "struct",
-        OutlineKind::Interface => "interface",
+        OutlineKind::Interface => {
+            if lang == Lang::Scala {
+                "trait"
+            } else {
+                "interface"
+            }
+        }
         OutlineKind::TypeAlias => "type",
         OutlineKind::Enum => "enum",
         OutlineKind::Constant => "const",
-        OutlineKind::Variable => "let",
+        OutlineKind::ImmutableVariable => "val",
+        OutlineKind::Variable => {
+            if lang == Lang::Scala {
+                "var"
+            } else {
+                "let"
+            }
+        }
         OutlineKind::Export => "export",
         OutlineKind::Property => "prop",
-        OutlineKind::Module => "mod",
+        OutlineKind::Module => {
+            if lang == Lang::Scala {
+                "object"
+            } else {
+                "mod"
+            }
+        }
         OutlineKind::Import => "import",
         OutlineKind::TestSuite => "suite",
         OutlineKind::TestCase => "test",
@@ -492,4 +530,52 @@ fn format_entry(entry: &OutlineEntry, indent: usize) -> String {
 /// Fallback when tree-sitter grammar isn't available.
 fn fallback_outline(content: &str, _max_lines: usize) -> String {
     super::fallback::head_tail(content)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scala_outline_constructs() {
+        let scala_code = r#"
+package example
+
+import scala.util.Try
+
+trait DataSource {
+  def load(): String
+}
+
+class Database {
+  val connectionString = "jdbc:..."
+  var connected = false
+  
+  def connect(): Unit = {}
+}
+
+object Database {
+  def create(): Database = new Database()
+}
+
+enum Color {
+  case Red, Green, Blue
+}
+
+type UserId = String
+"#;
+
+        let outline = outline(scala_code, Lang::Scala, 1000);
+
+        assert!(outline.contains("trait DataSource"));
+        assert!(outline.contains("class Database"));
+        assert!(outline.contains("object Database"));
+        assert!(outline.contains("enum Color"));
+        assert!(outline.contains("type UserId"));
+        assert!(outline.contains("val connectionString"));
+        assert!(outline.contains("var connected"));
+        assert!(outline.contains("def load"));
+        assert!(outline.contains("def connect"));
+        assert!(outline.contains("def create"));
+    }
 }

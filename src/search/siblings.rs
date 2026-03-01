@@ -34,6 +34,10 @@ fn sibling_query_str(lang: Lang) -> Option<&'static str> {
             "(field_access object: (this) field: (identifier) @ref)\n",
             "(method_invocation object: (this) name: (identifier) @ref)\n",
         )),
+        Lang::Scala => Some(concat!(
+            "(field_expression (identifier) @obj (identifier) @ref)\n",
+            "(call_expression function: (field_expression (identifier) @obj (identifier) @ref))\n",
+        )),
         Lang::Go => Some(
             "(selector_expression operand: (identifier) @recv field: (field_identifier) @ref)\n",
         ),
@@ -64,6 +68,7 @@ pub fn extract_sibling_references(content: &str, lang: Lang, def_range: (u32, u3
     };
 
     // For Python, we also need @obj to filter `self.x` vs `other.x`.
+    // For Scala, we also need @obj to filter `this.x` vs `other.x`.
     let obj_idx = query.capture_index_for_name("obj");
     // For Go, we need @recv to filter receiver-only accesses.
     let recv_idx = query.capture_index_for_name("recv");
@@ -97,6 +102,19 @@ pub fn extract_sibling_references(content: &str, lang: Lang, def_range: (u32, u3
                     .captures
                     .iter()
                     .any(|c| c.index == oi && c.node.utf8_text(bytes).is_ok_and(|t| t == "self"));
+                if !obj_ok {
+                    continue;
+                }
+            }
+        }
+
+        // For Scala: verify @obj == "this"
+        if lang == Lang::Scala {
+            if let Some(oi) = obj_idx {
+                let obj_ok = m
+                    .captures
+                    .iter()
+                    .any(|c| c.index == oi && c.node.utf8_text(bytes).is_ok_and(|t| t == "this"));
                 if !obj_ok {
                     continue;
                 }
@@ -219,4 +237,34 @@ pub fn find_parent_entry(entries: &[OutlineEntry], method_line: u32) -> Option<&
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scala_sibling_extraction() {
+        let scala_code = r#"
+class Example {
+  val field = 42
+  
+  def process(): Unit = {
+    this.field
+    this.helper()
+    field
+    helper()
+  }
+  
+  def helper(): Unit = {}
+}
+"#;
+
+        // Extract siblings from the process() method (lines ~5-9)
+        let siblings = extract_sibling_references(scala_code, Lang::Scala, (5, 9));
+
+        // Should capture: field, helper (both explicit this. and implicit)
+        assert!(siblings.contains(&"field".to_string()));
+        assert!(siblings.contains(&"helper".to_string()));
+    }
 }
