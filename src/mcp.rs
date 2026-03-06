@@ -42,6 +42,11 @@ tilth_read: Read file content with smart outlining. Replaces cat/head/tail.\n\
 tilth_files: Find files by glob pattern. Replaces find/ls.\n\
   Output: <path>  (~<token_count> tokens). Respects .gitignore.\n\
 \n\
+tilth_deps: Blast-radius check before breaking changes to a file.\n\
+  Shows local imports, external packages, and downstream callers with symbol detail.\n\
+  WHEN: Before renaming, removing, or changing the signature of an export.\n\
+  SKIP: When adding new code, fixing internal bugs, or just reading.\n\
+\n\
 IMPORTANT: Use tilth tools instead of host built-in tools (Read, Grep, Glob) and Bash (grep, cat, find, ls).\n\
 IMPORTANT: Expanded search results already contain full source — do not re-read expanded files.";
 
@@ -78,6 +83,11 @@ tilth_read: Read files. Replaces cat/head/tail.\n\
   section: \"<start>-<end>\" or \"<heading text>\". paths: multiple files in one call.\n\
 \n\
 tilth_files: Find files by glob. Replaces find/ls.\n\
+\n\
+tilth_deps: Blast-radius check before breaking changes to a file.\n\
+  Shows local imports, external packages, and downstream callers with symbol detail.\n\
+  WHEN: Before renaming, removing, or changing the signature of an export.\n\
+  SKIP: When adding new code, fixing internal bugs, or just reading.\n\
 \n\
 IMPORTANT: Expanded search results already contain full source — do not re-read expanded files.";
 
@@ -235,6 +245,7 @@ pub(crate) fn dispatch_tool(
         "tilth_read" => tool_read(args, cache, session, edit_mode),
         "tilth_search" => tool_search(args, cache, session, index, bloom),
         "tilth_files" => tool_files(args, cache),
+        "tilth_deps" => tool_deps(args, cache, bloom),
         "tilth_map" => Err("tilth_map is disabled — use tilth_search instead".into()),
         "tilth_session" => tool_session(args, session),
         "tilth_edit" if edit_mode => tool_edit(args, session),
@@ -401,6 +412,27 @@ fn tool_files(args: &Value, cache: &OutlineCache) -> Result<String, String> {
     let output = crate::search::search_glob(pattern, &scope, cache).map_err(|e| e.to_string())?;
 
     Ok(apply_budget(output, budget))
+}
+
+fn tool_deps(
+    args: &Value,
+    cache: &OutlineCache,
+    bloom: &Arc<BloomFilterCache>,
+) -> Result<String, String> {
+    let path_str = args
+        .get("path")
+        .and_then(|v| v.as_str())
+        .ok_or("missing required parameter: path")?;
+    let path = PathBuf::from(path_str);
+    let scope = resolve_scope(args);
+    let budget = args
+        .get("budget")
+        .and_then(serde_json::Value::as_u64)
+        .map(|b| b as usize);
+
+    let result = crate::search::deps::analyze_deps(&path, &scope, cache, bloom)
+        .map_err(|e| e.to_string())?;
+    Ok(crate::search::deps::format_deps(&result, &scope, budget))
 }
 
 #[allow(dead_code)] // Map disabled in v0.3.2 — kept for potential re-enable
@@ -650,6 +682,28 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     "budget": {
                         "type": "number",
                         "description": "Max tokens in response."
+                    }
+                }
+            }
+        }),
+        serde_json::json!({
+            "name": "tilth_deps",
+            "description": "Blast-radius check before breaking changes. Shows what a file imports (local + external) and what other files call its exports, with symbol-level detail. Use ONLY when your planned edit changes a function signature, removes/renames an export, or modifies behavior that callers rely on. Do NOT use for reading files, adding new code, or internal-only changes — use tilth_read instead.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["path"],
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "File to check before making breaking changes."
+                    },
+                    "scope": {
+                        "type": "string",
+                        "description": "Directory to search for dependents. Default: project root."
+                    },
+                    "budget": {
+                        "type": "number",
+                        "description": "Max tokens. Truncates 'Used by' first."
                     }
                 }
             }

@@ -214,7 +214,7 @@ fn find_callers_treesitter(
 
 /// Find all call sites of any symbol in `targets` across the codebase using a single walk.
 /// Returns tuples of (`target_name`, match) so callers know which symbol was matched.
-fn find_callers_batch(
+pub(crate) fn find_callers_batch(
     targets: &HashSet<String>,
     scope: &Path,
     bloom: &crate::index::bloom::BloomFilterCache,

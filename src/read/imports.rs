@@ -49,7 +49,7 @@ pub fn resolve_related_files_with_content(file_path: &Path, content: &str) -> Ve
     results
 }
 
-fn is_import_line(line: &str, lang: Lang) -> bool {
+pub(crate) fn is_import_line(line: &str, lang: Lang) -> bool {
     let trimmed = line.trim_start();
     match lang {
         Lang::Rust => trimmed.starts_with("use "),
@@ -63,7 +63,7 @@ fn is_import_line(line: &str, lang: Lang) -> bool {
     }
 }
 
-fn is_external(source: &str, lang: Lang) -> bool {
+pub(crate) fn is_external(source: &str, lang: Lang) -> bool {
     match lang {
         Lang::Rust => {
             !(source.starts_with("crate::")

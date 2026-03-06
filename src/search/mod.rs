@@ -1,6 +1,7 @@
 pub mod callees;
 pub mod callers;
 pub mod content;
+pub mod deps;
 pub mod facets;
 pub mod glob;
 pub mod rank;
