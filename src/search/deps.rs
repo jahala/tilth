@@ -27,6 +27,8 @@ pub struct DepsResult {
     pub uses_local: Vec<LocalDep>,
     pub uses_external: Vec<String>,
     pub used_by: Vec<Dependent>,
+    /// Total dependents found before truncation.
+    pub total_dependents: usize,
     pub exported_count: usize,
     /// Actual number of symbols searched (may be < `exported_count` if capped).
     pub searched_count: usize,
@@ -75,6 +77,7 @@ pub fn analyze_deps(
             uses_local: Vec::new(),
             uses_external: Vec::new(),
             used_by: Vec::new(),
+            total_dependents: 0,
             exported_count: 0,
             searched_count: 0,
         });
@@ -170,7 +173,7 @@ pub fn analyze_deps(
 
     // ── Phase 3: Reverse dependencies ────────────────────────────────────────
 
-    let used_by = if searched_count > 0 {
+    let mut used_by = if searched_count > 0 {
         let symbols_set: HashSet<String> = all_names.iter().cloned().collect();
         let raw_matches = find_callers_batch(&symbols_set, scope, bloom)?;
 
@@ -213,18 +216,20 @@ pub fn analyze_deps(
                 .then_with(|| a.path.cmp(&b.path))
         });
 
-        // Cap total shown
-        dependents.truncate(MAX_DEPENDENTS);
         dependents
     } else {
         Vec::new()
     };
+
+    let total_dependents = used_by.len();
+    used_by.truncate(MAX_DEPENDENTS);
 
     Ok(DepsResult {
         target: path.clone(),
         uses_local,
         uses_external,
         used_by,
+        total_dependents,
         exported_count,
         searched_count,
     })
@@ -238,7 +243,7 @@ pub fn analyze_deps(
 /// 3. Truncate "Uses (local)" symbol lists to file paths only
 /// 4. Never truncate the header line
 pub fn format_deps(result: &DepsResult, scope: &Path, budget: Option<usize>) -> String {
-    let dep_count = result.used_by.len();
+    let dep_count = result.total_dependents;
     let (prod_deps, test_deps): (Vec<_>, Vec<_>) = result.used_by.iter().partition(|d| !d.is_test);
 
     // ── Build sections (full fidelity first) ─────────────────────────────────
@@ -287,6 +292,10 @@ pub fn format_deps(result: &DepsResult, scope: &Path, budget: Option<usize>) -> 
     }
     if !used_by_tests_section.is_empty() {
         parts.push(used_by_tests_section.clone());
+    }
+    let truncated = result.total_dependents.saturating_sub(result.used_by.len());
+    if truncated > 0 {
+        parts.push(format!("... and {truncated} more dependents"));
     }
     if !barrel_note.is_empty() {
         parts.push(barrel_note.clone());
@@ -528,8 +537,12 @@ fn apply_budget_truncation(
         |hdr, ul, _ue, _pd, _td, bn, _sc| assemble(&[hdr, ul, bn]),
         // Level 3: local as paths only (no symbols)
         |hdr, ul, _ue, _pd, _td, _bn, _sc| {
-            // Re-extract paths from the full section (strip symbol lists)
-            let local_lines: Vec<&str> = ul.lines().skip(1).collect();
+            // Strip symbol lists: each line is "path_padded  symbols" — take only up to first space run
+            let local_lines: Vec<&str> = ul
+                .lines()
+                .skip(1) // skip heading
+                .map(|l| l.split_whitespace().next().unwrap_or(l))
+                .collect();
             let paths_only = if local_lines.is_empty() {
                 String::new()
             } else {
