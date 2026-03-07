@@ -285,7 +285,8 @@ pub fn search_glob(
     format_glob_result(&result, scope)
 }
 
-/// Format match entries with optional expansion and related file hints.
+/// Format match entries with optional expansion.
+/// Groups consecutive usage matches in the same enclosing function to reduce token noise.
 /// Shared expand state enables cross-query dedup in multi-symbol search.
 fn format_matches(
     matches: &[Match],
@@ -303,226 +304,329 @@ fn format_matches(
         .first()
         .is_some_and(|first| matches.iter().any(|m| m.path != first.path));
 
-    for m in matches {
-        let kind = if m.impl_target.is_some() {
-            "impl"
-        } else if m.is_definition {
-            "definition"
-        } else {
-            "usage"
-        };
+    // Group consecutive non-definition matches by (path, enclosing_outline_idx).
+    // Definitions are never grouped — they need individual expand with callees/siblings.
+    let groups = group_matches(matches, cache);
 
-        // Show line range for definitions with def_range, otherwise just the line
-        if m.is_definition {
-            if let Some((start, end)) = m.def_range {
-                let _ = write!(
-                    out,
-                    "\n\n## {}:{}-{} [{kind}]",
-                    rel(&m.path, scope),
-                    start,
-                    end
-                );
-            } else {
-                let _ = write!(out, "\n\n## {}:{} [{kind}]", rel(&m.path, scope), m.line);
+    for group in &groups {
+        if group.len() == 1 {
+            // Single match — format as before
+            format_single_match(
+                group[0],
+                scope,
+                cache,
+                session,
+                bloom,
+                expand_remaining,
+                expanded_files,
+                multi_file,
+                out,
+            );
+        } else {
+            // Multiple usages collapsed into one entry
+            format_grouped_usages(group, scope, cache, out);
+        }
+    }
+}
+
+/// Group consecutive non-definition matches by (path, enclosing outline entry).
+/// Returns a Vec of groups, where each group is a slice of matches.
+/// Definitions and impl matches are always singleton groups.
+fn group_matches<'a>(matches: &'a [Match], cache: &OutlineCache) -> Vec<Vec<&'a Match>> {
+    let mut groups: Vec<Vec<&Match>> = Vec::new();
+
+    for m in matches {
+        // Definitions and impls are never grouped
+        if m.is_definition || m.impl_target.is_some() {
+            groups.push(vec![m]);
+            continue;
+        }
+
+        // For usages: try to merge with previous group if same (path, outline_idx)
+        if let Some(last_group) = groups.last_mut() {
+            let prev = last_group[0];
+            // Only merge usages (previous must also be a usage in the same file)
+            if !prev.is_definition
+                && prev.impl_target.is_none()
+                && prev.path == m.path
+                && m.file_lines >= 50
+            {
+                let prev_idx = find_enclosing_outline_idx(&prev.path, prev.line, cache);
+                let curr_idx = find_enclosing_outline_idx(&m.path, m.line, cache);
+                if prev_idx.is_some() && prev_idx == curr_idx {
+                    last_group.push(m);
+                    continue;
+                }
             }
+        }
+        groups.push(vec![m]);
+    }
+    groups
+}
+
+/// Format a group of usages collapsed into a single entry.
+fn format_grouped_usages(group: &[&Match], scope: &Path, cache: &OutlineCache, out: &mut String) {
+    let first = group[0];
+    let path_str = rel(&first.path, scope);
+
+    // Build comma-separated line list, collapsing consecutive runs (e.g. 55,56,57 → 55-57)
+    let lines: Vec<u32> = group.iter().map(|m| m.line).collect();
+    let line_str = format_line_list(&lines);
+
+    // Get enclosing function name from outline
+    let fn_name = get_outline_str(&first.path, cache).and_then(|outline_str| {
+        let outline_lines: Vec<&str> = outline_str.lines().collect();
+        let idx = outline_lines.iter().position(|line| {
+            extract_line_range(line).is_some_and(|(s, e)| first.line >= s && first.line <= e)
+        })?;
+        // Extract name: outline lines look like "  [45-79]      fn TestMiddlewareNoRoute"
+        let entry = outline_lines[idx].trim();
+        // Find the name after "fn " or similar keyword
+        entry.split_whitespace().last().map(String::from)
+    });
+
+    let _ = write!(out, "\n\n## {path_str}:{line_str} [{} usages", group.len());
+    if let Some(ref name) = fn_name {
+        let _ = write!(out, " in {name}");
+    }
+    out.push(']');
+
+    // Show outline context once for the group
+    if let Some(context) = outline_context_for_match(&first.path, first.line, cache) {
+        out.push_str(&context);
+    }
+}
+
+/// Format a comma-separated line list, collapsing consecutive runs.
+/// e.g. [50, 55, 56, 57, 58, 63, 67] → "50,55-58,63,67"
+fn format_line_list(lines: &[u32]) -> String {
+    if lines.is_empty() {
+        return String::new();
+    }
+    let mut parts: Vec<String> = Vec::new();
+    let mut run_start = lines[0];
+    let mut run_end = lines[0];
+    for &line in &lines[1..] {
+        if line == run_end + 1 {
+            run_end = line;
+        } else {
+            if run_end > run_start + 1 {
+                parts.push(format!("{run_start}-{run_end}"));
+            } else if run_end > run_start {
+                parts.push(format!("{run_start},{run_end}"));
+            } else {
+                parts.push(format!("{run_start}"));
+            }
+            run_start = line;
+            run_end = line;
+        }
+    }
+    if run_end > run_start + 1 {
+        parts.push(format!("{run_start}-{run_end}"));
+    } else if run_end > run_start {
+        parts.push(format!("{run_start},{run_end}"));
+    } else {
+        parts.push(format!("{run_start}"));
+    }
+    parts.join(",")
+}
+
+/// Format a single match entry (unchanged from original behavior).
+fn format_single_match(
+    m: &Match,
+    scope: &Path,
+    cache: &OutlineCache,
+    session: Option<&Session>,
+    bloom: &crate::index::bloom::BloomFilterCache,
+    expand_remaining: &mut usize,
+    expanded_files: &mut HashSet<PathBuf>,
+    multi_file: bool,
+    out: &mut String,
+) {
+    let kind = if m.impl_target.is_some() {
+        "impl"
+    } else if m.is_definition {
+        "definition"
+    } else {
+        "usage"
+    };
+
+    // Show line range for definitions with def_range, otherwise just the line
+    if m.is_definition {
+        if let Some((start, end)) = m.def_range {
+            let _ = write!(
+                out,
+                "\n\n## {}:{}-{} [{kind}]",
+                rel(&m.path, scope),
+                start,
+                end
+            );
         } else {
             let _ = write!(out, "\n\n## {}:{} [{kind}]", rel(&m.path, scope), m.line);
         }
+    } else {
+        let _ = write!(out, "\n\n## {}:{} [{kind}]", rel(&m.path, scope), m.line);
+    }
 
-        // Skip outline for small files — the expanded code speaks for itself
-        if m.file_lines < 50 {
-            let _ = write!(out, "\n→ [{}]   {}", m.line, m.text);
-        } else if let Some(context) = outline_context_for_match(&m.path, m.line, cache) {
-            out.push_str(&context);
+    // Skip outline for small files — the expanded code speaks for itself
+    if m.file_lines < 50 {
+        let _ = write!(out, "\n→ [{}]   {}", m.line, m.text);
+    } else if let Some(context) = outline_context_for_match(&m.path, m.line, cache) {
+        out.push_str(&context);
+    } else {
+        let _ = write!(out, "\n→ [{}]   {}", m.line, m.text);
+    }
+
+    if *expand_remaining > 0 {
+        // Check session dedup for definitions with def_range
+        let deduped = m.is_definition
+            && m.def_range.is_some()
+            && session.is_some_and(|s| s.is_expanded(&m.path, m.line));
+
+        if deduped {
+            if let Some((start, end)) = m.def_range {
+                let _ = write!(
+                    out,
+                    "\n\n[shown earlier] {}:{}-{} {}",
+                    rel(&m.path, scope),
+                    start,
+                    end,
+                    m.text
+                );
+            }
         } else {
-            let _ = write!(out, "\n→ [{}]   {}", m.line, m.text);
-        }
-
-        if *expand_remaining > 0 {
-            // Check session dedup for definitions with def_range
-            let deduped = m.is_definition
-                && m.def_range.is_some()
-                && session.is_some_and(|s| s.is_expanded(&m.path, m.line));
-
-            if deduped {
-                // Abbreviated: show signature + location instead of full body
-                if let Some((start, end)) = m.def_range {
-                    let _ = write!(
-                        out,
-                        "\n\n[shown earlier] {}:{}-{} {}",
-                        rel(&m.path, scope),
-                        start,
-                        end,
-                        m.text
-                    );
-                }
-            } else {
-                // Multi-file or cross-query: skip files already expanded.
-                // Single-file within one query: expand sequentially (no per-file dedup).
-                let skip = multi_file && expanded_files.contains(&m.path);
-                if !skip {
-                    if let Some((code, content)) = expand_match(m, scope) {
-                        // Record expansion for future dedup
-                        if m.is_definition && m.def_range.is_some() {
-                            if let Some(s) = session {
-                                s.record_expand(&m.path, m.line);
-                            }
+            let skip = multi_file && expanded_files.contains(&m.path);
+            if !skip {
+                if let Some((code, content)) = expand_match(m, scope) {
+                    if m.is_definition && m.def_range.is_some() {
+                        if let Some(s) = session {
+                            s.record_expand(&m.path, m.line);
                         }
+                    }
 
-                        // Detect language once for truncation + callees + siblings
-                        let file_type = crate::read::detect_file_type(&m.path);
+                    let file_type = crate::read::detect_file_type(&m.path);
+                    let mut skip_lines = strip::strip_noise(&content, &m.path, m.def_range);
 
-                        // Strip cognitive noise (debug logs, plain comments)
-                        let mut skip_lines = strip::strip_noise(&content, &m.path, m.def_range);
-
-                        // Smart truncation: for long definitions, select diverse
-                        // lines instead of showing everything
-                        if let Some((def_start, def_end)) = m.def_range {
-                            if let crate::types::FileType::Code(lang) = file_type {
-                                if let Some(keep) = truncate::select_diverse_lines(
-                                    &content, def_start, def_end, lang,
-                                ) {
-                                    let keep_set: HashSet<u32> = keep.into_iter().collect();
-                                    for ln in def_start..=def_end {
-                                        if !keep_set.contains(&ln) {
-                                            skip_lines.insert(ln);
-                                        }
+                    if let Some((def_start, def_end)) = m.def_range {
+                        if let crate::types::FileType::Code(lang) = file_type {
+                            if let Some(keep) =
+                                truncate::select_diverse_lines(&content, def_start, def_end, lang)
+                            {
+                                let keep_set: HashSet<u32> = keep.into_iter().collect();
+                                for ln in def_start..=def_end {
+                                    if !keep_set.contains(&ln) {
+                                        skip_lines.insert(ln);
                                     }
                                 }
                             }
                         }
+                    }
 
-                        let stripped_code = if skip_lines.is_empty() {
-                            code
-                        } else {
-                            filter_code_lines(&code, &skip_lines)
-                        };
+                    let stripped_code = if skip_lines.is_empty() {
+                        code
+                    } else {
+                        filter_code_lines(&code, &skip_lines)
+                    };
 
-                        out.push('\n');
-                        out.push_str(&stripped_code);
+                    out.push('\n');
+                    out.push_str(&stripped_code);
 
-                        if m.is_definition && m.def_range.is_some() {
-                            // Definition expansion: transitive callee resolution footer
-                            if let crate::types::FileType::Code(lang) = file_type {
-                                let callee_names =
-                                    callees::extract_callee_names(&content, lang, m.def_range);
-                                if !callee_names.is_empty() {
-                                    let mut nodes = callees::resolve_callees_transitive(
-                                        &callee_names,
-                                        &m.path,
-                                        &content,
-                                        cache,
-                                        bloom,
-                                        2,  // depth_limit
-                                        15, // budget for 2nd-hop callees
-                                    );
+                    if m.is_definition && m.def_range.is_some() {
+                        if let crate::types::FileType::Code(lang) = file_type {
+                            let callee_names =
+                                callees::extract_callee_names(&content, lang, m.def_range);
+                            if !callee_names.is_empty() {
+                                let mut nodes = callees::resolve_callees_transitive(
+                                    &callee_names,
+                                    &m.path,
+                                    &content,
+                                    cache,
+                                    bloom,
+                                    2,
+                                    15,
+                                );
 
-                                    // Filter out self-recursive calls (current function name)
-                                    if let Some(ref name) = m.def_name {
-                                        nodes.retain(|n| n.callee.name != *name);
-                                    }
+                                if let Some(ref name) = m.def_name {
+                                    nodes.retain(|n| n.callee.name != *name);
+                                }
+                                if nodes.len() > 8 {
+                                    nodes.sort_by_key(|n| i32::from(n.callee.file == m.path));
+                                    nodes.truncate(8);
+                                }
 
-                                    // Cap 1st-hop at 8, prioritize cross-file over same-file
-                                    if nodes.len() > 8 {
-                                        nodes.sort_by_key(|n| i32::from(n.callee.file == m.path));
-                                        nodes.truncate(8);
-                                    }
-
-                                    if !nodes.is_empty() {
-                                        out.push_str("\n\n\u{2500}\u{2500} calls \u{2500}\u{2500}");
-                                        for n in &nodes {
-                                            let c = &n.callee;
+                                if !nodes.is_empty() {
+                                    out.push_str("\n\n\u{2500}\u{2500} calls \u{2500}\u{2500}");
+                                    for n in &nodes {
+                                        let c = &n.callee;
+                                        let _ = write!(
+                                            out,
+                                            "\n  {}  {}:{}-{}",
+                                            c.name,
+                                            rel(&c.file, scope),
+                                            c.start_line,
+                                            c.end_line
+                                        );
+                                        if let Some(ref sig) = c.signature {
+                                            let _ = write!(out, "  {sig}");
+                                        }
+                                        for child in &n.children {
                                             let _ = write!(
                                                 out,
-                                                "\n  {}  {}:{}-{}",
-                                                c.name,
-                                                rel(&c.file, scope),
-                                                c.start_line,
-                                                c.end_line
+                                                "\n    \u{2192} {}  {}:{}-{}",
+                                                child.name,
+                                                rel(&child.file, scope),
+                                                child.start_line,
+                                                child.end_line
                                             );
-                                            if let Some(ref sig) = c.signature {
+                                            if let Some(ref sig) = child.signature {
                                                 let _ = write!(out, "  {sig}");
-                                            }
-                                            for child in &n.children {
-                                                let _ = write!(
-                                                    out,
-                                                    "\n    \u{2192} {}  {}:{}-{}",
-                                                    child.name,
-                                                    rel(&child.file, scope),
-                                                    child.start_line,
-                                                    child.end_line
-                                                );
-                                                if let Some(ref sig) = child.signature {
-                                                    let _ = write!(out, "  {sig}");
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-
-                                // Sibling surfacing: show referenced fields/methods
-                                // from the same struct/class/impl
-                                if let Some(def_range) = m.def_range {
-                                    let entries = callees::get_outline_entries(&content, lang);
-                                    if let Some(parent) =
-                                        siblings::find_parent_entry(&entries, m.line)
-                                    {
-                                        let refs = siblings::extract_sibling_references(
-                                            &content, lang, def_range,
-                                        );
-                                        if !refs.is_empty() {
-                                            // Filter out the current method itself
-                                            let filtered: Vec<String> =
-                                                if let Some(ref name) = m.def_name {
-                                                    refs.into_iter().filter(|r| r != name).collect()
-                                                } else {
-                                                    refs
-                                                };
-
-                                            let resolved = siblings::resolve_siblings(
-                                                &filtered,
-                                                &parent.children,
-                                            );
-                                            if !resolved.is_empty() {
-                                                out.push_str(
-                                                    "\n\n\u{2500}\u{2500} siblings \u{2500}\u{2500}",
-                                                );
-                                                for s in &resolved {
-                                                    let _ = write!(
-                                                        out,
-                                                        "\n  {}  {}:{}-{}  {}",
-                                                        s.name,
-                                                        rel(&m.path, scope),
-                                                        s.start_line,
-                                                        s.end_line,
-                                                        s.signature,
-                                                    );
-                                                }
                                             }
                                         }
                                     }
                                 }
                             }
-                        } else {
-                            // Usage expansion: related file hints
-                            let related = crate::read::imports::resolve_related_files_with_content(
-                                &m.path, &content,
-                            );
-                            if !related.is_empty() {
-                                out.push_str("\n\n> Related: ");
-                                for (i, p) in related.iter().enumerate() {
-                                    if i > 0 {
-                                        out.push_str(", ");
+
+                            if let Some(def_range) = m.def_range {
+                                let entries = callees::get_outline_entries(&content, lang);
+                                if let Some(parent) = siblings::find_parent_entry(&entries, m.line)
+                                {
+                                    let refs = siblings::extract_sibling_references(
+                                        &content, lang, def_range,
+                                    );
+                                    if !refs.is_empty() {
+                                        let filtered: Vec<String> =
+                                            if let Some(ref name) = m.def_name {
+                                                refs.into_iter().filter(|r| r != name).collect()
+                                            } else {
+                                                refs
+                                            };
+
+                                        let resolved =
+                                            siblings::resolve_siblings(&filtered, &parent.children);
+                                        if !resolved.is_empty() {
+                                            out.push_str(
+                                                "\n\n\u{2500}\u{2500} siblings \u{2500}\u{2500}",
+                                            );
+                                            for s in &resolved {
+                                                let _ = write!(
+                                                    out,
+                                                    "\n  {}  {}:{}-{}  {}",
+                                                    s.name,
+                                                    rel(&m.path, scope),
+                                                    s.start_line,
+                                                    s.end_line,
+                                                    s.signature,
+                                                );
+                                            }
+                                        }
                                     }
-                                    let _ = write!(out, "{}", rel(p, scope));
                                 }
                             }
                         }
-
-                        *expand_remaining -= 1;
-                        // Always insert for cross-query tracking.
-                        expanded_files.insert(m.path.clone());
                     }
+
+                    *expand_remaining -= 1;
+                    expanded_files.insert(m.path.clone());
                 }
             }
         }
@@ -590,16 +694,16 @@ fn format_search_result(
 
         if !faceted.tests.is_empty() {
             let _ = write!(out, "\n\n### Tests ({})", faceted.tests.len());
-            format_matches(
-                &faceted.tests,
-                &result.scope,
-                cache,
-                session,
-                bloom,
-                &mut expand_remaining,
-                &mut expanded_files,
-                &mut out,
-            );
+            // Compact test format — one line per match, no expand budget consumed
+            for m in &faceted.tests {
+                let _ = write!(
+                    out,
+                    "\n  {}:{} — {}",
+                    rel(&m.path, &result.scope),
+                    m.line,
+                    m.text.trim()
+                );
+            }
         }
 
         if !faceted.usages_local.is_empty() {
@@ -658,6 +762,15 @@ fn format_search_result(
             "\n\n... and {omitted} more matches. Narrow with scope."
         );
     }
+
+    let tokens = estimate_tokens(out.len() as u64);
+    let token_str = if tokens >= 1000 {
+        format!("~{}.{}k", tokens / 1000, (tokens % 1000) / 100)
+    } else {
+        format!("~{tokens}")
+    };
+    let _ = write!(out, "\n\n({token_str} tokens)");
+
     Ok(out)
 }
 
@@ -778,46 +891,53 @@ fn flush_gap_marker(kept: &mut Vec<String>, consecutive_skipped: &mut u32) {
     *consecutive_skipped = 0;
 }
 
-/// Generate outline context for a search match: show nearby outline entries
-/// with the matching entry highlighted using →.
+/// Get cached outline string for a file. Returns None for non-code or huge files.
+fn get_outline_str(path: &std::path::Path, cache: &OutlineCache) -> Option<std::sync::Arc<str>> {
+    let file_type = read::detect_file_type(path);
+    if !matches!(file_type, FileType::Code(_)) {
+        return None;
+    }
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    if meta.len() > 500_000 {
+        return None;
+    }
+    Some(cache.get_or_compute(path, mtime, || {
+        let content = std::fs::read_to_string(path).unwrap_or_default();
+        let buf = content.as_bytes();
+        read::outline::generate(path, file_type, &content, buf, false)
+    }))
+}
+
+/// Find the outline entry index that encloses the given line.
+fn find_enclosing_outline_idx(
+    path: &std::path::Path,
+    match_line: u32,
+    cache: &OutlineCache,
+) -> Option<usize> {
+    let outline_str = get_outline_str(path, cache)?;
+    let outline_lines: Vec<&str> = outline_str.lines().collect();
+    outline_lines.iter().position(|line| {
+        extract_line_range(line).is_some_and(|(s, e)| match_line >= s && match_line <= e)
+    })
+}
+
+/// Build outline context around a match — ±2 entries around the enclosing one.
 fn outline_context_for_match(
     path: &std::path::Path,
     match_line: u32,
     cache: &OutlineCache,
 ) -> Option<String> {
-    let file_type = read::detect_file_type(path);
-    if !matches!(file_type, FileType::Code(_)) {
-        return None;
-    }
-
-    // Get or compute the file's outline
-    let meta = std::fs::metadata(path).ok()?;
-    let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-    let byte_len = meta.len();
-
-    // Only compute outline context for reasonably sized files
-    if byte_len > 500_000 {
-        return None;
-    }
-
-    let outline_str = cache.get_or_compute(path, mtime, || {
-        let content = std::fs::read_to_string(path).unwrap_or_default();
-        let buf = content.as_bytes();
-        read::outline::generate(path, file_type, &content, buf, false)
-    });
-
-    // Parse the outline to find entries near the match line
+    let outline_str = get_outline_str(path, cache)?;
     let outline_lines: Vec<&str> = outline_str.lines().collect();
     if outline_lines.is_empty() {
         return None;
     }
 
-    // Find index of the outline entry containing the match line.
     let match_idx = outline_lines.iter().position(|line| {
         extract_line_range(line).is_some_and(|(s, e)| match_line >= s && match_line <= e)
     })?;
 
-    // Show ±2 entries around the match, clamped to bounds.
     let start = match_idx.saturating_sub(2);
     let end = (match_idx + 3).min(outline_lines.len());
 
