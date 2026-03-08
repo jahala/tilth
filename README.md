@@ -1,6 +1,6 @@
 # tilth
 
-**Smart code reading for humans and AI agents.** Reduces cost per correct answer by **34%** on Sonnet, **19%** on Opus, and **38%** on Haiku across 195 benchmark runs. ([benchmarks](#benchmarks))
+**Smart code reading for humans and AI agents.** Reduces cost per correct answer by **44%** on Sonnet, **39%** on Opus, and **38%** on Haiku across 160 benchmark runs. ([benchmarks](#benchmarks))
 
 tilth is what happens when you give `ripgrep`, `tree-sitter`, and `cat` a shared brain.
 
@@ -83,16 +83,16 @@ In MCP mode, previously expanded definitions show `[shown earlier]` instead of t
 
 Code navigation tasks across 4 real-world repos (Express, FastAPI, Gin, ripgrep). Baseline = Claude Code built-in tools. tilth = built-in tools + tilth MCP server. We report **cost per correct answer** (`total_spend / correct_answers`) — the expected cost under retry. See [benchmark/](benchmark/) for full methodology.
 
-| Model | Tasks | Baseline $/correct | tilth $/correct | Change | Baseline acc | tilth acc |
-|---|---|---|---|---|---|---|
-| Sonnet 4.6 | 26 (78 runs) | $0.26 | $0.17 | **-34%** | 96% | 100% |
-| Opus 4.6 | 26 (52 runs) | $0.20 | $0.16 | **-19%** | 96% | 96% |
-| Haiku 4.5 | 22 (65 runs†) | $0.17 | $0.11 | **-38%** | 58% | 87% |
-| **Average** | **195 runs** | **$0.21** | **$0.15** | **-31%** | **83%** | **95%** |
+| Model | Tasks | Runs | Baseline $/correct | tilth $/correct | Change | Baseline acc | tilth acc |
+|---|---|---|---|---|---|---|---|
+| Sonnet 4.6 | 26 | 86 | $0.26 | $0.15 | **-44%** | 84% | 94% |
+| Opus 4.6 | 26 | 25 | $0.22 | $0.14 | **-39%** | 91% | 92% |
+| Haiku 4.5 | 26 | 49 | $0.12 | $0.08 | **-38%** | 54% | 73% |
+| **Average** | | **160** | **$0.20** | **$0.12** | **-40%** | **76%** | **86%** |
 
-† Haiku tilth runs filtered to tilth-using only (78% adoption). Use `--disallowedTools` for full adoption.
+v0.5.0 introduces top-weighted MCP instructions and scope fallback, achieving 40% average cost reduction across all three models. Sonnet accuracy improves from 84% to 94%, Haiku from 54% to 73%. All models show significant turn reduction (25% average fewer turns).
 
-Sonnet achieves 91% tilth tool adoption with 100% accuracy and wins 19 of 26 tasks on cost. Opus wins 12 of 26 tasks with 96% adoption, both modes at 96% accuracy. Haiku gains +29pp accuracy with tilth (10 new tasks solved) and -38% $/correct — a reversal from v0.4.1 where tilth cost more. Adoption improved from 42% to 78%; forced mode (`--disallowedTools`) is still recommended.
+Scope confusion (models passing invalid directory paths) is now handled with automatic fallback to cwd with a warning. DO NOT rules at the top of MCP instructions reduced redundant built-in tool usage (Grep, Read, Glob) to near-zero across all models.
 
 See [benchmark/](benchmark/) for per-task results, by-language breakdowns, and model comparison.
 
@@ -121,6 +121,7 @@ tilth install windsurf         # ~/.codeium/windsurf/mcp_config.json
 tilth install vscode           # .vscode/mcp.json (project scope)
 tilth install claude-desktop
 tilth install opencode         # ~/.opencode.json
+tilth install gemini           # ~/.gemini/settings.json
 ```
 
 Add `--edit` to enable hash-anchored file editing (see [Edit mode](#edit-mode)):
@@ -139,7 +140,7 @@ Smaller models (e.g. Haiku) may ignore tilth tools in favor of built-in Bash/Gre
 claude --disallowedTools "Bash,Grep,Glob"
 ```
 
-Benchmarks show Haiku adopts tilth tools 78% of the time in hybrid mode (up from 42% in v0.4.1). Forced mode ensures consistent tool adoption and improves accuracy.
+Benchmarks show Haiku benefits significantly from tilth (54% → 73% accuracy) but may still fall back to built-in tools. Forced mode ensures consistent tool adoption.
 
 ## How it decides what to show
 

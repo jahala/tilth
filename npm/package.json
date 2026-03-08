@@ -1,6 +1,6 @@
 {
   "name": "tilth",
-  "version": "0.4.9",
+  "version": "0.5.0",
   "description": "Tree-sitter indexed lookups — smart code reading for AI agents",
   "bin": {
     "tilth": "run.js"

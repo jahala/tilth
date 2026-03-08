@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 //   vscode:         .vscode/mcp.json                          (project scope)
 //   claude-desktop: ~/Library/Application Support/Claude/...  (global)
 //   opencode:       ~/.opencode.json                          (user scope)
+//   gemini:         ~/.gemini/settings.json                   (user scope)
 const SUPPORTED_HOSTS: &[&str] = &[
     "claude-code",
     "cursor",
@@ -19,6 +20,7 @@ const SUPPORTED_HOSTS: &[&str] = &[
     "vscode",
     "claude-desktop",
     "opencode",
+    "gemini",
 ];
 
 /// The tilth server entry injected into each host config.
@@ -156,6 +158,13 @@ fn resolve_host(host: &str) -> Result<HostInfo, String> {
         // Verified from opencode source: internal/config/config.go (viper config name ".opencode")
         "opencode" => Ok(HostInfo {
             path: home.join(".opencode.json"),
+            servers_key: "mcpServers",
+            note: Some("User scope — available in all projects."),
+        }),
+
+        // Gemini CLI user scope: ~/.gemini/settings.json → mcpServers
+        "gemini" => Ok(HostInfo {
+            path: home.join(".gemini/settings.json"),
             servers_key: "mcpServers",
             note: Some("User scope — available in all projects."),
         }),

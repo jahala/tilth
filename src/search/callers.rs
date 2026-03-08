@@ -481,7 +481,9 @@ pub fn search_callers_expanded(
 
     if callers.is_empty() {
         return Ok(format!(
-            "# Callers of \"{}\" in {} — no call sites found",
+            "# Callers of \"{}\" in {} — no call sites found\n\n\
+             Tip: the symbol may be called via interface/trait dispatch. \
+             Try symbol search instead.",
             target,
             scope.display()
         ));
@@ -615,10 +617,13 @@ pub fn search_callers_expanded(
         }
     }
 
-    // Show token estimate
-    let token_est = crate::types::estimate_tokens(output.len() as u64);
-    let _ = writeln!(output, "\n[~{token_est} tokens]");
-
+    let tokens = crate::types::estimate_tokens(output.len() as u64);
+    let token_str = if tokens >= 1000 {
+        format!("~{}.{}k", tokens / 1000, (tokens % 1000) / 100)
+    } else {
+        format!("~{tokens}")
+    };
+    let _ = write!(output, "\n\n({token_str} tokens)");
     Ok(output)
 }
 

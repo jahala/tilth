@@ -16,7 +16,13 @@ use crate::session::Session;
 const SERVER_INSTRUCTIONS: &str = "\
 tilth — code intelligence MCP server. Replaces grep, cat, find, ls with AST-aware equivalents.\n\
 \n\
-tilth_search: Find symbol definitions, usages, and callers. Replaces grep/rg for code navigation.\n\
+To explore code, always search first. tilth_search finds definitions, usages, and file locations in one call.\n\
+Usage: tilth_search(query: \"handleRequest\").\n\
+tilth_files is ONLY for listing directory contents when you have no symbol or text to search for.\n\
+DO NOT use Read if content is already shown in expanded search results.\n\
+DO NOT use Grep, Read, or Glob. Always use the better tools tilth_search (grep), tilth_read (read), tilth_files (glob).\n\
+\n\
+tilth_search: Search code — finds definitions, usages, and text. Replaces grep/rg for all code search.\n\
   Comma-separated symbols for multi-symbol lookup (max 5).\n\
   kind: \"symbol\" (default) | \"content\" (strings/comments) | \"callers\" (call sites)\n\
   expand (default 2): inline full source for top matches.\n\
@@ -39,19 +45,18 @@ tilth_read: Read file content with smart outlining. Replaces cat/head/tail.\n\
     <line_number> │ <content>                  ← full/section mode\n\
     [<start>-<end>]  <symbol name>             ← outline mode\n\
 \n\
-tilth_files: Find files by glob pattern. Replaces find/ls.\n\
+tilth_files: Find files by glob pattern. Replaces find, ls, pwd, and the host Glob tool.\n\
   Output: <path>  (~<token_count> tokens). Respects .gitignore.\n\
 \n\
-tilth_deps: Blast-radius check before breaking changes to a file.\n\
-  Shows local imports, external packages, and downstream callers with symbol detail.\n\
-  WHEN: Before renaming, removing, or changing the signature of an export.\n\
-  SKIP: When adding new code, fixing internal bugs, or just reading.\n\
+tilth_deps: Blast-radius check — what imports this file and what it imports.\n\
+  Use ONLY before renaming, removing, or changing an export's signature.\n\
 \n\
-IMPORTANT: Use tilth tools instead of host built-in tools (Read, Grep, Glob) and Bash (grep, cat, find, ls).\n\
-IMPORTANT: Expanded search results already contain full source — do not re-read expanded files.";
+To search code, use tilth_search instead of Grep or Bash(grep/rg).\n\
+To read files, use tilth_read instead of Read or Bash(cat).\n\
+To find files, use tilth_files instead of Glob or Bash(find/ls).\n\
+DO NOT re-read files already shown in expanded search results.";
 
-const EDIT_MODE_INSTRUCTIONS: &str = "\
-tilth — code intelligence + edit MCP server. Replaces grep, cat, find, ls, and file editing with AST-aware equivalents.\n\
+const EDIT_MODE_EXTRA: &str = "\n\
 \n\
 IMPORTANT: Always use tilth tools instead of host built-in tools (Read, Edit, Grep, Glob) for all file operations.\n\
 tilth_read output contains line:hash anchors that tilth_edit depends on.\n\
@@ -66,30 +71,7 @@ EDIT WORKFLOW:\n\
    Delete: {\"start\": \"<line>:<hash>\", \"content\": \"\"}\n\
 3. Hash mismatch → file changed, re-read and retry\n\
 \n\
-LARGE FILES: tilth_read returns outline (no hashlines). Use section to get hashlined content.\n\
-\n\
-tilth_search: Find symbol definitions, usages, and callers. Replaces grep/rg.\n\
-  Comma-separated symbols for multi-symbol lookup (max 5).\n\
-  kind: \"symbol\" (default) | \"content\" | \"callers\"\n\
-  expand (default 2): inline full source for top matches.\n\
-  Output per match:\n\
-    ## <path>:<start>-<end> [definition|usage|impl]\n\
-    <expanded source block>\n\
-    ── calls ──\n\
-      <name>  <path>:<start>-<end>  <signature>\n\
-  Re-expanding a shown definition returns [shown earlier].\n\
-\n\
-tilth_read: Read files. Replaces cat/head/tail.\n\
-  section: \"<start>-<end>\" or \"<heading text>\". paths: multiple files in one call.\n\
-\n\
-tilth_files: Find files by glob. Replaces find/ls.\n\
-\n\
-tilth_deps: Blast-radius check before breaking changes to a file.\n\
-  Shows local imports, external packages, and downstream callers with symbol detail.\n\
-  WHEN: Before renaming, removing, or changing the signature of an export.\n\
-  SKIP: When adding new code, fixing internal bugs, or just reading.\n\
-\n\
-IMPORTANT: Expanded search results already contain full source — do not re-read expanded files.";
+LARGE FILES: tilth_read returns outline (no hashlines). Use section to get hashlined content.";
 
 /// MCP server over stdio. When `edit_mode` is true, exposes `tilth_edit` and
 /// switches `tilth_read` to hashline output format.
@@ -174,9 +156,9 @@ fn handle_request(
     match req.method.as_str() {
         "initialize" => {
             let instructions = if edit_mode {
-                EDIT_MODE_INSTRUCTIONS
+                format!("{SERVER_INSTRUCTIONS}{EDIT_MODE_EXTRA}")
             } else {
-                SERVER_INSTRUCTIONS
+                SERVER_INSTRUCTIONS.to_string()
             };
             JsonRpcResponse {
                 jsonrpc: "2.0",
@@ -327,7 +309,7 @@ fn tool_search(
         .get("query")
         .and_then(|v| v.as_str())
         .ok_or("missing required parameter: query")?;
-    let scope = resolve_scope(args);
+    let (scope, scope_warning) = resolve_scope(args);
     let kind = args
         .get("kind")
         .and_then(|v| v.as_str())
@@ -398,7 +380,9 @@ fn tool_search(
     }
     .map_err(|e| e.to_string())?;
 
-    Ok(apply_budget(output, budget))
+    let mut result = scope_warning.unwrap_or_default();
+    result.push_str(&apply_budget(output, budget));
+    Ok(result)
 }
 
 fn tool_files(args: &Value, cache: &OutlineCache) -> Result<String, String> {
@@ -406,12 +390,14 @@ fn tool_files(args: &Value, cache: &OutlineCache) -> Result<String, String> {
         .get("pattern")
         .and_then(|v| v.as_str())
         .ok_or("missing required parameter: pattern")?;
-    let scope = resolve_scope(args);
+    let (scope, scope_warning) = resolve_scope(args);
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
 
     let output = crate::search::search_glob(pattern, &scope, cache).map_err(|e| e.to_string())?;
 
-    Ok(apply_budget(output, budget))
+    let mut result = scope_warning.unwrap_or_default();
+    result.push_str(&apply_budget(output, budget));
+    Ok(result)
 }
 
 fn tool_deps(
@@ -424,15 +410,21 @@ fn tool_deps(
         .and_then(|v| v.as_str())
         .ok_or("missing required parameter: path")?;
     let path = PathBuf::from(path_str);
-    let scope = resolve_scope(args);
+    let (scope, scope_warning) = resolve_scope(args);
     let budget = args
         .get("budget")
         .and_then(serde_json::Value::as_u64)
         .map(|b| b as usize);
 
-    let result = crate::search::deps::analyze_deps(&path, &scope, cache, bloom)
+    let deps_result = crate::search::deps::analyze_deps(&path, &scope, cache, bloom)
         .map_err(|e| e.to_string())?;
-    Ok(crate::search::deps::format_deps(&result, &scope, budget))
+    let mut output = scope_warning.unwrap_or_default();
+    output.push_str(&crate::search::deps::format_deps(
+        &deps_result,
+        &scope,
+        budget,
+    ));
+    Ok(output)
 }
 
 fn tool_session(args: &Value, session: &Session) -> Result<String, String> {
@@ -501,14 +493,24 @@ fn tool_edit(args: &Value, session: &Session) -> Result<String, String> {
     }
 }
 
-/// Canonicalize scope path, falling back to the raw path if canonicalization fails.
-fn resolve_scope(args: &Value) -> PathBuf {
-    let raw: PathBuf = args
-        .get("scope")
-        .and_then(|v| v.as_str())
-        .unwrap_or(".")
-        .into();
-    raw.canonicalize().unwrap_or(raw)
+/// Falls back to cwd when scope is invalid, with a warning message.
+fn resolve_scope(args: &Value) -> (PathBuf, Option<String>) {
+    let raw_str = args.get("scope").and_then(|v| v.as_str()).unwrap_or(".");
+    let raw: PathBuf = raw_str.into();
+    let resolved = raw.canonicalize().unwrap_or_else(|_| raw.clone());
+    let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+    if resolved == cwd {
+        return (".".into(), None);
+    }
+    if !resolved.is_dir() {
+        return (
+            ".".into(),
+            Some(format!(
+                "scope \"{raw_str}\" is not a valid directory, searching current directory instead.\n\n"
+            )),
+        );
+    }
+    (resolved, None)
 }
 
 fn apply_budget(output: String, budget: Option<u64>) -> String {
@@ -592,11 +594,11 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Symbol name, text string, or regex pattern to search for. For symbol search, comma-separated names for multi-symbol lookup."
+                        "description": "Symbol name, text string, or regex pattern to search for. e.g. 'resolve_dependencies' or 'ServeHTTP,Next' for multi-symbol lookup."
                     },
                     "scope": {
                         "type": "string",
-                        "description": "Directory to search within. Default: current directory."
+                        "description": "Only use scope to search a specific subdirectory. DO NOT USE scope if you want to search the current working directory (initial search)."
                     },
                     "kind": {
                         "type": "string",
@@ -653,18 +655,18 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "tilth_files",
-            "description": "Find files matching a glob pattern. Replaces find/ls and the host Glob tool — use this for all file discovery. Returns matched file paths sorted by relevance with token size estimates. Respects .gitignore.",
+            "description": "Find files matching a glob pattern. Replaces find/ls/pwd and the host Glob tool — use this for all file discovery. Returns matched file paths sorted by relevance with token size estimates. Respects .gitignore.",
             "inputSchema": {
                 "type": "object",
                 "required": ["pattern"],
                 "properties": {
                     "pattern": {
                         "type": "string",
-                        "description": "Glob pattern e.g. '*.rs', 'src/**/*.ts', '*.test.*'"
+                        "description": "Glob pattern e.g. '*' (list directory), '*.rs', 'src/**/*.ts'"
                     },
                     "scope": {
                         "type": "string",
-                        "description": "Directory to search within. Default: current directory."
+                        "description": "Only use scope to list a specific subdirectory. DO NOT USE scope if you want to list the current working directory."
                     },
                     "budget": {
                         "type": "number",

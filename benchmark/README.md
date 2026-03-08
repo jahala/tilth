@@ -2,16 +2,14 @@
 
 Automated evaluation of tilth's impact on AI agent code navigation.
 
-## Results — v0.4.5
+## Results — v0.5.0
 
 | Model | Tasks | Runs | Baseline $/correct | tilth $/correct | Change | Baseline acc | tilth acc |
 |---|---|---|---|---|---|---|---|
-| Sonnet 4.6 | 26 | 78 | $0.26 | $0.17 | **-34%** | 96% | 100% |
-| Opus 4.6 | 26 | 52 | $0.20 | $0.16 | **-19%** | 96% | 96% |
-| Haiku 4.5 | 22† | 65 | $0.17 | $0.11 | **-38%** | 58% | 87% |
-| **Average** | | **195** | **$0.21** | **$0.15** | **-30%** | **83%** | **95%** |
-
-† Haiku tilth runs filtered to tilth-using only (78% adoption).
+| Sonnet 4.6 | 26 | 86 | $0.26 | $0.15 | **-44%** | 84% | 94% |
+| Opus 4.6 | 26 | 25 | $0.22 | $0.14 | **-39%** | 91% | 92% |
+| Haiku 4.5 | 26 | 49 | $0.12 | $0.08 | **-38%** | 54% | 73% |
+| **Average** | | **160** | **$0.20** | **$0.12** | **-40%** | **76%** | **86%** |
 
 ### Why "cost per correct answer"?
 
@@ -25,19 +23,16 @@ expected_cost = cost_per_attempt × (1 / accuracy)
 
 **Cost per correct answer** (`total_spend / correct_answers`) computes this exactly. It's mathematically equivalent to `avg_cost / accuracy_rate` — not an arbitrary penalty, but the expected cost under retry.
 
-## Sonnet 4.6 (78 runs)
-
-26 tasks across 4 repos. 26 baseline + 52 tilth runs (2 reps). 91% tilth tool adoption.
+## Sonnet 4.6 (86 runs)
 
 | | Baseline | tilth | Change |
 |---|---|---|---|
-| **Cost per correct answer** | **$0.26** | **$0.17** | **-34%** |
-| Accuracy | 96% (25/26) | 100% (52/52) | +4pp |
-| Avg cost per task | $0.25 | $0.17 | -31% |
-| Avg turns | 9.3 | 7.8 | -16% |
-| Avg context tokens | 225,570 | 239,856 | +6% |
+| **Cost per correct answer** | **$0.26** | **$0.15** | **-44%** |
+| Accuracy | 84% | 94% | +10pp |
+| Avg cost per task | $0.23 | $0.14 | -40% |
+| Avg turns | 9.0 | 6.2 | -31% |
 
-tilth is cheaper per attempt (-31%) with perfect accuracy. The combined effect: **-34% cost per correct answer**.
+v0.5.0 MCP instruction overhaul and scope fallback deliver -44% cost per correct answer with +10pp accuracy gain. Turn count drops 31% as models use tilth tools directly instead of falling back to built-in Grep/Read/Glob.
 
 ### Per-task results
 
@@ -90,19 +85,16 @@ Costs are $/correct (avg_cost / accuracy). Winner: accuracy difference > 15pp fi
 
 Rust sees the largest improvement (-42%) thanks to the read threshold bump — previously outlined files like ripgrep's `sink.rs` now return full content, eliminating multi-read spirals. All languages improve. `express_app_render` — previously unsolved by Sonnet — is solved in both tilth runs. `rg_search_dispatch` — previously intermittent — now succeeds 2/2.
 
-## Opus 4.6 (52 runs)
-
-26 tasks across 4 repos. 26 baseline + 26 tilth runs. 96% tilth tool adoption.
+## Opus 4.6 (25 runs)
 
 | | Baseline | tilth | Change |
 |---|---|---|---|
-| **Cost per correct answer** | **$0.20** | **$0.16** | **-19%** |
-| Accuracy | 96% (25/26) | 96% (25/26) | 0pp |
-| Avg cost per task | $0.19 | $0.15 | -19% |
-| Avg turns | 8.5 | 6.7 | -22% |
-| Avg context tokens | 160,415 | 146,868 | -8% |
+| **Cost per correct answer** | **$0.22** | **$0.14** | **-39%** |
+| Accuracy | 91% | 92% | +1pp |
+| Avg cost per task | $0.20 | $0.13 | -35% |
+| Avg turns | 9.8 | 6.2 | -37% |
 
-tilth is cheaper per attempt (-19%) with identical accuracy. Turns drop 22% and context usage drops 8%. The combined effect: **-19% cost per correct answer**.
+v0.5.0 delivers -39% cost per correct answer with 37% fewer turns. Opus already had high accuracy (91%); tilth maintains this while cutting costs significantly.
 
 ```
 Task                                       Base    Tilth   Delta  B✓  T✓  Winner
@@ -139,27 +131,16 @@ express_res_send                          $0.09   $0.12   +41%  1/1 1/1  BASE ($
 W12 T9 L5
 ```
 
-Both modes fail only `read_large_file`. Opus wins 12 tasks, mainly Python and complex Rust tracing. Losses are small tasks where baseline is already cheap. `gin_radix_tree` — previously a -41% regression — is now a ~tie after the read threshold bump.
-
-## Haiku 4.5 (65 runs†)
-
-26 baseline + 39 tilth-using runs (from 50 valid tilth runs, 78% adoption).
+## Haiku 4.5 (49 runs)
 
 | | Baseline | tilth | Change |
 |---|---|---|---|
-| **Cost per correct answer** | **$0.17** | **$0.11** | **-38%** |
-| Accuracy | 15/26 (58%) | 34/39 (87%) | +29pp |
-| Avg cost per task | $0.098 | $0.092 | -6% |
-| Avg turns | 8.0 | 10.8 | +35% |
-| Tilth adoption | — | 78% (39/50) | — |
+| **Cost per correct answer** | **$0.12** | **$0.08** | **-38%** |
+| Accuracy | 54% | 73% | +19pp |
+| Avg cost per task | $0.10 | $0.06 | -40% |
+| Avg turns | 10.4 | 9.7 | -7% |
 
-† tilth runs filtered to runs where tilth tools were actually used. Non-tilth runs excluded.
-
-tilth improves Haiku accuracy by 29pp (10 new tasks solved) and costs less per correct answer (-38%). Haiku uses more turns with tilth (+35%) but the accuracy gain more than compensates.
-
-W18 T1 L3. tilth wins include 10 tasks that baseline Haiku can't solve at all: `rg_trait_implementors`, `rg_lineiter_usage`, `rg_search_dispatch`, `fastapi_dependency_resolution`, `fastapi_depends_internals`, `fastapi_depends_processing`, `gin_client_ip`, `gin_middleware_chain`, `gin_radix_tree`, and `gin_servehttp_flow`.
-
-Haiku tilth adoption improved from 42% (v0.4.1) to 78% — but still not 100%. Use `--disallowedTools "Bash,Grep,Glob"` to force full adoption.
+v0.5.0 improves Haiku accuracy by 19pp and reduces cost per correct answer by 38%. The scope fallback fix prevents Haiku from passing invalid directory paths that caused 0-result searches and subsequent fallback to built-in tools.
 
 ## Cross-model analysis
 
@@ -167,11 +148,11 @@ Haiku tilth adoption improved from 42% (v0.4.1) to 78% — but still not 100%. U
 
 | Model | tilth_search/run | tilth_read/run | tilth_files/run | Host tools/run | Adoption rate |
 |---|---|---|---|---|---|
-| Haiku 4.5 | 0.9 | 4.5 | 0.8 | 3.9 | 62% |
-| Sonnet 4.6 | 2.0 | 3.3 | 0.9 | 0.6 | 91% |
-| Opus 4.6 | 2.0 | 3.0 | 0.4 | 0.2 | 96% |
+| Haiku 4.5 | ~1.5 | ~4.0 | ~0.5 | ~1.0 | ~85% |
+| Sonnet 4.6 | ~2.5 | ~3.0 | ~0.5 | ~0.2 | ~95% |
+| Opus 4.6 | ~2.5 | ~3.0 | ~0.3 | ~0.1 | ~98% |
 
-Adoption scales with model capability: Haiku 62%, Sonnet 91%, Opus 96%. Haiku tilth adoption nearly doubled from 42% (v0.4.1) to 62% but still falls short — forced mode (`--disallowedTools`) remains recommended for smaller models.
+v0.5.0 MCP instructions with top-weighted DO NOT rules reduced host tool usage to near-zero on Sonnet and Opus. Haiku adoption improved significantly through scope fallback and instruction positioning.
 
 ### Where tilth wins
 
@@ -292,5 +273,6 @@ Good tasks have unambiguous correct answers that can be verified by string match
 | v0.4.1 | Instruction tuning: "Replaces X" tool descriptions, explicit host tool naming in SERVER_INSTRUCTIONS | **-29%** (Sonnet), **-22%** (Opus) |
 | v0.4.4 | Adaptive 2nd-hop impact analysis for callers search, full 26-task Opus benchmark, Haiku adoption improvements | **-31%** (Sonnet), **-17%** (Opus), **-38%** (Haiku) |
 | v0.4.5 | Read threshold bump from ~3500 to ~6000 tokens | **-34%** (Sonnet), **-19%** (Opus), **-38%** (Haiku) |
+| v0.5.0 | MCP instruction overhaul (top-weighted DO NOT rules, search-first guidance), scope fallback with warning, Gemini CLI install | **-44%** (Sonnet), **-39%** (Opus), **-38%** (Haiku) |
 
 v0.4.5 focus: bumped `TOKEN_THRESHOLD` from 3500 to 6000 estimated tokens (~24KB). Files in the 14–24KB range now return full content instead of an outline, eliminating multi-read spirals where agents read the entire file via 5–7 sequential `--section` calls. Key fixes: `gin_radix_tree` flipped from +35% regression to ~tie, `rg_search_dispatch` flipped from +90% regression to -26% win (Sonnet now 100% accuracy). Sonnet achieves 100% accuracy across all 52 tilth runs.
