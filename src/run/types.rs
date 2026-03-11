@@ -1,5 +1,6 @@
 use std::fmt;
 
+#[allow(dead_code)] // fields read in format.rs + tests, clippy can't trace pub(crate) API
 pub struct ParsedOutput {
     pub tool: &'static str,
     pub summary: String,
@@ -20,6 +21,7 @@ pub struct ParsedOutput {
 /// Test runners use `failed` for test failures and leave `errors` at 0.
 /// Linters/compilers use `errors`/`warnings` and leave test fields at 0.
 #[derive(Default)]
+#[allow(dead_code)] // fields read in tests, clippy can't trace pub(crate) API
 pub struct Counts {
     pub passed: u32,
     pub failed: u32,
@@ -210,4 +212,34 @@ pub fn extract_count(haystack: &str, label: &str) -> Option<u32> {
         .rev()
         .collect();
     digits.parse().ok()
+}
+
+/// Build a human-readable test summary, omitting zero categories except `passed`.
+pub fn build_test_summary(passed: u32, failed: u32, skipped: u32) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    parts.push(format!("{passed} passed"));
+    if failed > 0 {
+        parts.push(format!("{failed} failed"));
+    }
+    if skipped > 0 {
+        parts.push(format!("{skipped} skipped"));
+    }
+    parts.join(", ")
+}
+
+/// Parse "Found N ..." lines (used by tsc and mypy).
+pub fn parse_found_count(line: &str) -> Option<u32> {
+    let rest = line.trim().strip_prefix("Found ")?;
+    let space = rest.find(' ')?;
+    rest[..space].parse().ok()
+}
+
+/// Build summary for linter/compiler output.
+pub fn build_lint_summary(errors: u32, warnings: u32) -> String {
+    match (errors, warnings) {
+        (0, 0) => "no issues".to_string(),
+        (0, w) => format!("{w} warning(s)"),
+        (e, 0) => format!("{e} error(s)"),
+        (e, w) => format!("{e} error(s), {w} warning(s)"),
+    }
 }

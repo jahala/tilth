@@ -1,6 +1,8 @@
 use memchr::memmem;
 
-use crate::run::types::{Counts, Diagnostic, Location, ParsedOutput, Severity};
+use crate::run::types::{
+    build_lint_summary, parse_found_count, Counts, Diagnostic, Location, ParsedOutput, Severity,
+};
 
 use super::Parser;
 
@@ -54,7 +56,7 @@ fn parse_text(input: &str, raw_lines: usize, raw_bytes: usize) -> ParsedOutput {
             continue;
         }
 
-        if let Some(n) = parse_summary_line(line) {
+        if let Some(n) = parse_found_count(line) {
             found_summary_errors = Some(n);
         }
     }
@@ -66,7 +68,7 @@ fn parse_text(input: &str, raw_lines: usize, raw_bytes: usize) -> ParsedOutput {
         }
     }
 
-    let summary = build_summary(error_count, warning_count);
+    let summary = build_lint_summary(error_count, warning_count);
 
     ParsedOutput {
         tool: "tsc",
@@ -88,7 +90,7 @@ fn parse_text(input: &str, raw_lines: usize, raw_bytes: usize) -> ParsedOutput {
 /// Format: `path/to/file.ts(line,col): error TS2322: message text`
 fn parse_text_line(line: &str) -> Option<Diagnostic> {
     // Find the `(line,col): ` location suffix — look for `):` after a `(`
-    let paren_open = line.find('(')?;
+    let paren_open = line.rfind('(')?;
     let paren_close = line[paren_open..].find("):")?;
     let paren_close = paren_open + paren_close;
 
@@ -141,25 +143,6 @@ fn parse_coords(coords: &str) -> Option<(u32, u32)> {
     let line_num: u32 = coords[..comma].trim().parse().ok()?;
     let col: u32 = coords[comma + 1..].trim().parse().ok()?;
     Some((line_num, col))
-}
-
-/// Extract error count from `Found N errors in M files.` summary lines.
-fn parse_summary_line(line: &str) -> Option<u32> {
-    let rest = line.trim().strip_prefix("Found ")?;
-    let space = rest.find(' ')?;
-    rest[..space].parse().ok()
-}
-
-// ---------------------------------------------------------------------------
-// Shared helpers
-// ---------------------------------------------------------------------------
-
-fn build_summary(errors: u32, warnings: u32) -> String {
-    if errors == 0 && warnings == 0 {
-        "no issues found".to_string()
-    } else {
-        format!("{errors} error(s), {warnings} warning(s)")
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -225,7 +208,7 @@ mod tests {
 
         assert_eq!(out.counts.errors, 2);
         assert_eq!(out.counts.warnings, 0);
-        assert_eq!(out.summary, "2 error(s), 0 warning(s)");
+        assert_eq!(out.summary, "2 error(s)");
     }
 
     #[test]
@@ -243,7 +226,7 @@ mod tests {
 
         assert_eq!(out.counts.warnings, 1);
         assert_eq!(out.counts.errors, 0);
-        assert_eq!(out.summary, "0 error(s), 1 warning(s)");
+        assert_eq!(out.summary, "1 warning(s)");
     }
 
     #[test]
@@ -251,6 +234,6 @@ mod tests {
         let input = "Found 2 errors in 2 files.\n";
         let out = PARSER.parse(input);
         assert_eq!(out.counts.errors, 2);
-        assert_eq!(out.summary, "2 error(s), 0 warning(s)");
+        assert_eq!(out.summary, "2 error(s)");
     }
 }

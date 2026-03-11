@@ -3,7 +3,9 @@ use std::collections::HashMap;
 use memchr::memmem;
 use serde_json::Value;
 
-use crate::run::types::{truncate_detail, Counts, Diagnostic, Location, ParsedOutput, Severity};
+use crate::run::types::{
+    build_test_summary, truncate_detail, Counts, Diagnostic, Location, ParsedOutput, Severity,
+};
 
 use super::Parser;
 
@@ -158,11 +160,10 @@ impl GoTestParser {
         } else {
             None
         };
-        let summary = build_summary(passed, failed, skipped);
+        let summary = build_test_summary(passed, failed, skipped);
         let counts = Counts {
             passed,
             failed,
-            errors: failed,
             skipped,
             ..Counts::default()
         };
@@ -251,11 +252,10 @@ impl GoTestParser {
         // Failure count comes directly from the collected diagnostics.
         let failed = diagnostics.len() as u32;
 
-        let summary = build_summary(passed, failed, skipped);
+        let summary = build_test_summary(passed, failed, skipped);
         let counts = Counts {
             passed,
             failed,
-            errors: failed,
             skipped,
             ..Counts::default()
         };
@@ -288,19 +288,6 @@ fn build_text_diagnostic(name: String, lines: &[String]) -> Diagnostic {
         message,
         detail,
     }
-}
-
-/// Build a human-readable summary, omitting zero categories except `passed`.
-fn build_summary(passed: u32, failed: u32, skipped: u32) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    parts.push(format!("{passed} passed"));
-    if failed > 0 {
-        parts.push(format!("{failed} failed"));
-    }
-    if skipped > 0 {
-        parts.push(format!("{skipped} skipped"));
-    }
-    parts.join(", ")
 }
 
 /// Extract the most useful failure message from accumulated output text.

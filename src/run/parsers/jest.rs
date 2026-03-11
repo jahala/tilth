@@ -51,7 +51,7 @@ impl Parser for JestParser {
 
     fn parse(&self, input: &str) -> ParsedOutput {
         let trimmed = input.trim_start();
-        if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        if trimmed.starts_with('{') {
             if let Some(parsed) = self.try_json(input) {
                 return parsed;
             }
@@ -158,7 +158,6 @@ impl JestParser {
         let counts = Counts {
             passed,
             failed,
-            errors: failed,
             skipped: pending,
             ..Counts::default()
         };
@@ -245,7 +244,6 @@ impl JestParser {
         let counts = Counts {
             passed,
             failed,
-            errors: failed,
             skipped: pending,
             ..Counts::default()
         };

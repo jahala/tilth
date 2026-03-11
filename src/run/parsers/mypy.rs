@@ -1,7 +1,9 @@
 use memchr::memmem;
 use serde_json::Value;
 
-use crate::run::types::{Counts, Diagnostic, Location, ParsedOutput, Severity};
+use crate::run::types::{
+    build_lint_summary, parse_found_count, Counts, Diagnostic, Location, ParsedOutput, Severity,
+};
 
 use super::Parser;
 
@@ -44,7 +46,10 @@ impl Parser for MypyParser {
         let trimmed = input.trim_start();
         if trimmed.starts_with('{') {
             let severity_finder = memmem::Finder::new(b"\"severity\"");
-            if severity_finder.find(trimmed.as_bytes()).is_some() {
+            let message_finder = memmem::Finder::new(b"\"message\"");
+            if severity_finder.find(trimmed.as_bytes()).is_some()
+                && message_finder.find(trimmed.as_bytes()).is_some()
+            {
                 return parse_json(input, raw_lines, raw_bytes);
             }
         }
@@ -117,7 +122,7 @@ fn parse_json(input: &str, raw_lines: usize, raw_bytes: usize) -> ParsedOutput {
         diagnostics.push(diag);
     }
 
-    let summary = build_summary(error_count, warning_count);
+    let summary = build_lint_summary(error_count, warning_count);
 
     ParsedOutput {
         tool: "mypy",
@@ -208,7 +213,7 @@ fn parse_text(input: &str, raw_lines: usize, raw_bytes: usize) -> ParsedOutput {
         }
 
         // `Found N errors in M file(s)` or `Found N errors`
-        if let Some(n) = parse_summary_line(line) {
+        if let Some(n) = parse_found_count(line) {
             found_summary_errors = Some(n);
         }
     }
@@ -220,7 +225,7 @@ fn parse_text(input: &str, raw_lines: usize, raw_bytes: usize) -> ParsedOutput {
         }
     }
 
-    let summary = build_summary(error_count, warning_count);
+    let summary = build_lint_summary(error_count, warning_count);
 
     ParsedOutput {
         tool: "mypy",
@@ -278,7 +283,7 @@ fn parse_text_line(line: &str) -> Option<Diagnostic> {
 
     // Extract optional `[code]` at the end of the message
     let (message, name) = if message_raw.ends_with(']') {
-        if let Some(bracket_start) = message_raw.rfind("  [") {
+        if let Some(bracket_start) = message_raw.rfind("  [").or_else(|| message_raw.rfind(" [")) {
             let msg = message_raw[..bracket_start].trim().to_string();
             let code = message_raw[bracket_start + 3..message_raw.len() - 1].to_string();
             (msg, code)
@@ -300,25 +305,6 @@ fn parse_text_line(line: &str) -> Option<Diagnostic> {
         message,
         detail: None,
     })
-}
-
-/// Extract error count from `Found N errors in M file(s)` summary lines.
-fn parse_summary_line(line: &str) -> Option<u32> {
-    let rest = line.trim().strip_prefix("Found ")?;
-    let space = rest.find(' ')?;
-    rest[..space].parse().ok()
-}
-
-// ---------------------------------------------------------------------------
-// Shared helpers
-// ---------------------------------------------------------------------------
-
-fn build_summary(errors: u32, warnings: u32) -> String {
-    if errors == 0 && warnings == 0 {
-        "no issues found".to_string()
-    } else {
-        format!("{errors} error(s), {warnings} warning(s)")
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -372,7 +358,7 @@ mod tests {
 
         assert_eq!(out.counts.errors, 1);
         assert_eq!(out.counts.warnings, 0);
-        assert_eq!(out.summary, "1 error(s), 0 warning(s)");
+        assert_eq!(out.summary, "1 error(s)");
     }
 
     // --- Text path ---
@@ -400,7 +386,7 @@ mod tests {
         assert_eq!(second.severity, Severity::Info);
 
         assert_eq!(out.counts.errors, 1);
-        assert_eq!(out.summary, "1 error(s), 0 warning(s)");
+        assert_eq!(out.summary, "1 error(s)");
     }
 
     #[test]
@@ -410,6 +396,6 @@ mod tests {
         let input = "Found 3 errors in 2 files (checked 10 source files)\n";
         let out = PARSER.parse(input);
         assert_eq!(out.counts.errors, 3);
-        assert_eq!(out.summary, "3 error(s), 0 warning(s)");
+        assert_eq!(out.summary, "3 error(s)");
     }
 }
