@@ -110,7 +110,10 @@ impl Location {
                 .and_then(|s| s.parse().ok())
             {
                 Some(n) => n,
-                None => { i += 1; continue; }
+                None => {
+                    i += 1;
+                    continue;
+                }
             };
 
             // Optional column after another colon.

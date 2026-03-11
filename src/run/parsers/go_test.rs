@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use memchr::memmem;
 use serde_json::Value;
 
-use crate::run::types::{Counts, Diagnostic, Location, ParsedOutput, Severity, truncate_detail};
+use crate::run::types::{truncate_detail, Counts, Diagnostic, Location, ParsedOutput, Severity};
 
 use super::Parser;
 

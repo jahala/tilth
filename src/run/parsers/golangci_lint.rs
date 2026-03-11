@@ -72,7 +72,7 @@ fn looks_like_lint_line(line: &str) -> bool {
         return false;
     };
     let after_go = &line[go_pos + 4..]; // skip ".go:"
-    // Expect a digit immediately after `.go:`
+                                        // Expect a digit immediately after `.go:`
     let Some(first) = after_go.chars().next() else {
         return false;
     };
@@ -291,10 +291,7 @@ fn build_summary(issue_count: usize, linter_count: usize) -> String {
     if issue_count == 0 {
         "no issues found".to_string()
     } else {
-        format!(
-            "{} issue(s) from {} linter(s)",
-            issue_count, linter_count
-        )
+        format!("{} issue(s) from {} linter(s)", issue_count, linter_count)
     }
 }
 
@@ -352,7 +349,10 @@ mod tests {
         let govet = &out.diagnostics[0];
         assert_eq!(govet.name, "govet");
         assert_eq!(govet.severity, Severity::Warning);
-        assert_eq!(govet.location.as_ref().map(|l| l.file.as_str()), Some("main.go"));
+        assert_eq!(
+            govet.location.as_ref().map(|l| l.file.as_str()),
+            Some("main.go")
+        );
         assert_eq!(govet.location.as_ref().map(|l| l.line), Some(42));
         assert_eq!(govet.location.as_ref().and_then(|l| l.column), Some(5));
 
@@ -383,7 +383,10 @@ mod tests {
         let first = &out.diagnostics[0];
         assert_eq!(first.name, "govet");
         assert_eq!(first.message, "printf: wrong type");
-        assert_eq!(first.location.as_ref().map(|l| l.file.as_str()), Some("main.go"));
+        assert_eq!(
+            first.location.as_ref().map(|l| l.file.as_str()),
+            Some("main.go")
+        );
         assert_eq!(first.location.as_ref().map(|l| l.line), Some(42));
         assert_eq!(first.location.as_ref().and_then(|l| l.column), Some(5));
 
@@ -394,7 +397,8 @@ mod tests {
 
     #[test]
     fn parse_text_groups_by_linter() {
-        let input = "a.go:1:1: govet: msg one\nb.go:2:3: govet: msg two\nc.go:5:1: errcheck: msg three\n";
+        let input =
+            "a.go:1:1: govet: msg one\nb.go:2:3: govet: msg two\nc.go:5:1: errcheck: msg three\n";
         let out = PARSER.parse(input);
         assert_eq!(out.diagnostics.len(), 3);
         // Two govet issues, one errcheck — 2 distinct linters.

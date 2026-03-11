@@ -73,9 +73,7 @@ fn looks_like_ruff_text_line(line: &str) -> bool {
     }
     // After `: ` the next token should be a Ruff rule code: letters then digits.
     let after = line[colon_space + 2..].trim_start();
-    let code_end = after
-        .find([' ', '\t'])
-        .unwrap_or(after.len());
+    let code_end = after.find([' ', '\t']).unwrap_or(after.len());
     let code = &after[..code_end];
     is_ruff_code(code)
 }
@@ -89,7 +87,10 @@ fn is_ruff_code(s: &str) -> bool {
     if letters == 0 {
         return false;
     }
-    let digits: usize = s[letters..].chars().take_while(|c| c.is_ascii_digit()).count();
+    let digits: usize = s[letters..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .count();
     if digits == 0 {
         return false;
     }
@@ -374,10 +375,7 @@ mod tests {
         let second = &out.diagnostics[1];
         assert_eq!(second.name, "E501");
         assert_eq!(second.message, "Line too long (120 > 88)");
-        assert_eq!(
-            second.location.as_ref().map(|l| l.line),
-            Some(12)
-        );
+        assert_eq!(second.location.as_ref().map(|l| l.line), Some(12));
 
         assert_eq!(out.counts.warnings, 2);
         assert_eq!(out.summary, "2 issue(s)");

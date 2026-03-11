@@ -1,6 +1,8 @@
 use memchr::memmem;
 
-use crate::run::types::{Counts, Diagnostic, Location, ParsedOutput, Severity, extract_count, truncate_detail};
+use crate::run::types::{
+    extract_count, truncate_detail, Counts, Diagnostic, Location, ParsedOutput, Severity,
+};
 
 use super::Parser;
 
@@ -74,10 +76,7 @@ impl CargoTestParser {
                         .and_then(|v| v.as_str())
                         .unwrap_or("<unknown>")
                         .to_string();
-                    let stdout = event
-                        .get("stdout")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                    let stdout = event.get("stdout").and_then(|v| v.as_str()).unwrap_or("");
                     let message = extract_failure_message(stdout);
                     let location = Location::scan_text(stdout);
                     let detail = truncate_detail(stdout);
@@ -136,10 +135,7 @@ impl CargoTestParser {
             if let Some(rest) = line.find("test result:").map(|i| &line[i + 12..]) {
                 let rest = rest.trim();
                 // Strip leading "ok." or "FAILED." status word
-                let rest = rest
-                    .find('.')
-                    .map(|i| rest[i + 1..].trim())
-                    .unwrap_or(rest);
+                let rest = rest.find('.').map(|i| rest[i + 1..].trim()).unwrap_or(rest);
 
                 passed = extract_count(rest, "passed").unwrap_or(0);
                 failed = extract_count(rest, "failed").unwrap_or(0);
@@ -311,7 +307,6 @@ fn parse_failure_block_header(line: &str) -> Option<String> {
     Some(name.to_string())
 }
 
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -370,7 +365,8 @@ mod tests {
 
     #[test]
     fn parse_json_with_failure() {
-        let stdout = "thread 'a::test_bad' panicked at 'assertion failed: 1 == 2', src/lib.rs:10:5\n";
+        let stdout =
+            "thread 'a::test_bad' panicked at 'assertion failed: 1 == 2', src/lib.rs:10:5\n";
         let event = format!(
             "{{\"type\":\"test\",\"event\":\"failed\",\"name\":\"a::test_bad\",\"stdout\":{}}}\n",
             serde_json::to_string(stdout).unwrap()

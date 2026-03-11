@@ -99,9 +99,7 @@ fn try_json(input: &str, raw_lines: usize, raw_bytes: usize) -> ParsedOutput {
                 }
             }
             "build-finished" => {
-                build_success = value
-                    .get("success")
-                    .and_then(Value::as_bool);
+                build_success = value.get("success").and_then(Value::as_bool);
             }
             // compiler-artifact, build-script-executed, etc.: skip
             _ => {}
@@ -400,7 +398,9 @@ fn is_decoration_line(line: &str) -> bool {
     }
     // Lines that start with `|` (with optional leading whitespace and line numbers)
     // or consist only of `^`, `~`, `-`, `=` mixed with spaces are decoration.
-    let stripped = trimmed.trim_start_matches(|c: char| c.is_ascii_digit()).trim_start();
+    let stripped = trimmed
+        .trim_start_matches(|c: char| c.is_ascii_digit())
+        .trim_start();
     if stripped.starts_with('|') {
         return true;
     }
@@ -478,7 +478,10 @@ mod tests {
         assert_eq!(diag.severity, Severity::Error);
         assert_eq!(diag.name, "E0308");
         assert_eq!(diag.message, "mismatched types");
-        assert_eq!(diag.location.as_ref().map(|l| l.file.as_str()), Some("src/lib.rs"));
+        assert_eq!(
+            diag.location.as_ref().map(|l| l.file.as_str()),
+            Some("src/lib.rs")
+        );
         assert_eq!(diag.location.as_ref().map(|l| l.line), Some(10));
         assert_eq!(diag.location.as_ref().and_then(|l| l.column), Some(5));
         assert_eq!(out.counts.errors, 1);
@@ -512,7 +515,10 @@ mod tests {
         assert_eq!(diag.severity, Severity::Error);
         assert_eq!(diag.name, "E0308");
         assert_eq!(diag.message, "mismatched types");
-        assert_eq!(diag.location.as_ref().map(|l| l.file.as_str()), Some("src/lib.rs"));
+        assert_eq!(
+            diag.location.as_ref().map(|l| l.file.as_str()),
+            Some("src/lib.rs")
+        );
         assert_eq!(diag.location.as_ref().map(|l| l.line), Some(42));
         assert_eq!(diag.location.as_ref().and_then(|l| l.column), Some(5));
     }

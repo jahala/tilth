@@ -2,7 +2,9 @@ use memchr::memmem;
 use serde_json::Value;
 
 use crate::run::ansi;
-use crate::run::types::{Counts, Diagnostic, Location, ParsedOutput, Severity, extract_count, truncate_detail};
+use crate::run::types::{
+    extract_count, truncate_detail, Counts, Diagnostic, Location, ParsedOutput, Severity,
+};
 
 use super::Parser;
 
@@ -109,9 +111,7 @@ impl JestParser {
                     }
                 }
 
-                let assertions = suite
-                    .get("assertionResults")
-                    .and_then(|v| v.as_array());
+                let assertions = suite.get("assertionResults").and_then(|v| v.as_array());
                 let Some(assertions) = assertions else {
                     continue;
                 };
@@ -130,11 +130,7 @@ impl JestParser {
                     let failure_messages: Vec<&str> = assertion
                         .get("failureMessages")
                         .and_then(|v| v.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|v| v.as_str())
-                                .collect()
-                        })
+                        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
                         .unwrap_or_default();
 
                     let first_message = failure_messages.first().copied().unwrap_or("");
@@ -438,7 +434,6 @@ fn parse_bullet_header(line: &str) -> Option<String> {
     }
     Some(name.to_string())
 }
-
 
 // ---------------------------------------------------------------------------
 // Tests

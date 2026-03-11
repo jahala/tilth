@@ -19,7 +19,6 @@ pub fn format_output(parsed: &ParsedOutput, groups: &[DiagnosticGroup]) -> Strin
     format_summary(parsed, groups)
 }
 
-
 // ---------------------------------------------------------------------------
 // Summary format (non-generic tools)
 // ---------------------------------------------------------------------------
@@ -52,7 +51,6 @@ fn write_header_line(out: &mut String, parsed: &ParsedOutput) {
     let _ = out.write_char('\n');
 }
 
-
 fn write_group_block(out: &mut String, group: &DiagnosticGroup) {
     // Header line
     let cascade_tag = if group.cascading { " [cascading]" } else { "" };
@@ -62,9 +60,7 @@ fn write_group_block(out: &mut String, group: &DiagnosticGroup) {
         let _ = writeln!(
             out,
             "# {} {} — {} occurrence(s){cascade_tag}",
-            group.severity,
-            group.signature,
-            group.total,
+            group.severity, group.signature, group.total,
         );
         // List locations
         if !group.locations.is_empty() {
@@ -94,8 +90,7 @@ fn write_group_block(out: &mut String, group: &DiagnosticGroup) {
         let _ = writeln!(
             out,
             "# {}{loc_str} {}{cascade_tag}",
-            group.severity,
-            group.signature,
+            group.severity, group.signature,
         );
     }
 
@@ -183,7 +178,9 @@ pub fn format_generic_with_raw(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::run::types::{Counts, Diagnostic, DiagnosticGroup, Location, ParsedOutput, Severity};
+    use crate::run::types::{
+        Counts, Diagnostic, DiagnosticGroup, Location, ParsedOutput, Severity,
+    };
 
     fn make_parsed(tool: &'static str, summary: &str, raw_lines: usize) -> ParsedOutput {
         ParsedOutput {

@@ -124,7 +124,7 @@ impl Parser for GenericParser {
 fn normalize_message(msg: &str) -> String {
     // Strip trailing " at path:line:col" or " at path:line" patterns
     let trimmed = msg.trim();
-    
+
     // Strip leading "path:line:col: " prefix (common in compiler output)
     let after_prefix = if let Some(loc_end) = find_location_prefix_end(trimmed) {
         trimmed[loc_end..].trim_start_matches([' ', ':'])
@@ -155,29 +155,43 @@ fn find_location_prefix_end(s: &str) -> Option<usize> {
     let bytes = s.as_bytes();
     let mut i = 0;
     let mut saw_dot = false;
-    
+
     // Scan the path part
     while i < bytes.len() && bytes[i] != b':' {
-        if bytes[i] == b'.' || bytes[i] == b'/' { saw_dot = true; }
-        if bytes[i] == b' ' { return None; } // paths don't have spaces
+        if bytes[i] == b'.' || bytes[i] == b'/' {
+            saw_dot = true;
+        }
+        if bytes[i] == b' ' {
+            return None;
+        } // paths don't have spaces
         i += 1;
     }
-    if !saw_dot || i == 0 || i >= bytes.len() { return None; }
-    
+    if !saw_dot || i == 0 || i >= bytes.len() {
+        return None;
+    }
+
     // Must have :digits
     i += 1; // skip :
     let num_start = i;
-    while i < bytes.len() && bytes[i].is_ascii_digit() { i += 1; }
-    if i == num_start { return None; }
-    
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == num_start {
+        return None;
+    }
+
     // Optional :digits (column)
     if i < bytes.len() && bytes[i] == b':' {
         let col_start = i + 1;
         let mut j = col_start;
-        while j < bytes.len() && bytes[j].is_ascii_digit() { j += 1; }
-        if j > col_start { i = j; }
+        while j < bytes.len() && bytes[j].is_ascii_digit() {
+            j += 1;
+        }
+        if j > col_start {
+            i = j;
+        }
     }
-    
+
     // Must be followed by : or space
     if i < bytes.len() && (bytes[i] == b':' || bytes[i] == b' ') {
         Some(i)
@@ -265,7 +279,10 @@ mod tests {
     fn duplicate_errors_group_by_message() {
         let mut lines = Vec::new();
         for i in 0..30 {
-            lines.push(format!("error: unused variable `x` at src/lib.rs:{}", i + 1));
+            lines.push(format!(
+                "error: unused variable `x` at src/lib.rs:{}",
+                i + 1
+            ));
         }
         let input = lines.join("\n");
         let out = PARSER.parse(&input);

@@ -75,7 +75,10 @@ mod tests {
 
     #[test]
     fn strips_osc_with_st() {
-        assert_eq!(strip("\x1b]8;;http://example.com\x1b\\link\x1b]8;;\x1b\\"), "link");
+        assert_eq!(
+            strip("\x1b]8;;http://example.com\x1b\\link\x1b]8;;\x1b\\"),
+            "link"
+        );
     }
 
     #[test]

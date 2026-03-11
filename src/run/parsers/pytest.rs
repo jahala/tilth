@@ -1,6 +1,8 @@
 use memchr::memmem;
 
-use crate::run::types::{Counts, Diagnostic, Location, ParsedOutput, Severity, extract_count, truncate_detail};
+use crate::run::types::{
+    extract_count, truncate_detail, Counts, Diagnostic, Location, ParsedOutput, Severity,
+};
 
 use super::Parser;
 
@@ -56,33 +58,16 @@ impl PytestParser {
         let value: serde_json::Value = serde_json::from_str(input).ok()?;
         let summary = value.get("summary")?;
 
-        let passed = summary
-            .get("passed")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
-        let failed = summary
-            .get("failed")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
-        let skipped = summary
-            .get("skipped")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
-        let errors = summary
-            .get("error")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
-        let duration_secs = value
-            .get("duration")
-            .and_then(|v| v.as_f64());
+        let passed = summary.get("passed").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let failed = summary.get("failed").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let skipped = summary.get("skipped").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let errors = summary.get("error").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let duration_secs = value.get("duration").and_then(|v| v.as_f64());
 
         let mut diagnostics: Vec<Diagnostic> = Vec::new();
         if let Some(tests) = value.get("tests").and_then(|v| v.as_array()) {
             for test in tests {
-                let outcome = test
-                    .get("outcome")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let outcome = test.get("outcome").and_then(|v| v.as_str()).unwrap_or("");
                 if outcome != "failed" && outcome != "error" {
                     continue;
                 }
@@ -153,20 +138,19 @@ impl PytestParser {
         let mut failure_block_name: Option<String> = None;
         let mut failure_block_lines: Vec<&str> = Vec::new();
 
-        let finish_block =
-            |name: &str, block_lines: &[&str], diagnostics: &mut Vec<Diagnostic>| {
-                let block = block_lines.join("\n");
-                let message = extract_error_message(&block);
-                let location = Location::scan_text(&block);
-                let detail = truncate_detail(&block);
-                diagnostics.push(Diagnostic {
-                    severity: Severity::Error,
-                    location,
-                    name: name.to_string(),
-                    message,
-                    detail,
-                });
-            };
+        let finish_block = |name: &str, block_lines: &[&str], diagnostics: &mut Vec<Diagnostic>| {
+            let block = block_lines.join("\n");
+            let message = extract_error_message(&block);
+            let location = Location::scan_text(&block);
+            let detail = truncate_detail(&block);
+            diagnostics.push(Diagnostic {
+                severity: Severity::Error,
+                location,
+                name: name.to_string(),
+                message,
+                detail,
+            });
+        };
 
         for line in &lines {
             // Detect `___ test_name ___` failure block headers.
@@ -233,14 +217,12 @@ impl PytestParser {
                     // Block names come from `___ test_name ___` headers (just the
                     // function name), while summary names are full node ids like
                     // `tests/foo.py::test_name`.  Match on the trailing component.
-                    let fn_name = diag
-                        .name
-                        .rsplit("::")
-                        .next()
-                        .unwrap_or(&diag.name);
-                    let already_captured = diagnostics
-                        .iter()
-                        .any(|d| d.name == diag.name || d.name == fn_name || diag.name.ends_with(&format!("::{}", d.name)));
+                    let fn_name = diag.name.rsplit("::").next().unwrap_or(&diag.name);
+                    let already_captured = diagnostics.iter().any(|d| {
+                        d.name == diag.name
+                            || d.name == fn_name
+                            || diag.name.ends_with(&format!("::{}", d.name))
+                    });
                     if !already_captured {
                         diagnostics.push(diag);
                     }
@@ -296,10 +278,7 @@ fn parse_pytest_block_header(line: &str) -> Option<String> {
     if !trimmed.starts_with("___") || !trimmed.ends_with("___") || trimmed.len() < 7 {
         return None;
     }
-    let inner = trimmed
-        .trim_start_matches('_')
-        .trim_end_matches('_')
-        .trim();
+    let inner = trimmed.trim_start_matches('_').trim_end_matches('_').trim();
     if inner.is_empty() {
         return None;
     }
@@ -447,8 +426,6 @@ fn build_summary(passed: u32, failed: u32, skipped: u32, errors: u32) -> String 
     parts.join(", ")
 }
 
-
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -549,7 +526,10 @@ mod tests {
         );
         let detail = diag.detail.as_ref().unwrap();
         assert!(detail.contains("assert add(1, 2) == 4"));
-        let loc = diag.location.as_ref().expect("location should be extracted");
+        let loc = diag
+            .location
+            .as_ref()
+            .expect("location should be extracted");
         assert_eq!(loc.file, "tests/test_foo.py");
         assert_eq!(loc.line, 10);
     }

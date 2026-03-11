@@ -33,9 +33,7 @@ impl Parser for MypyParser {
         if error_finder.find(bytes).is_none() {
             return false;
         }
-        sample
-            .lines()
-            .any(looks_like_mypy_text_line)
+        sample.lines().any(looks_like_mypy_text_line)
     }
 
     fn parse(&self, input: &str) -> ParsedOutput {
@@ -137,7 +135,10 @@ fn parse_json(input: &str, raw_lines: usize, raw_bytes: usize) -> ParsedOutput {
 }
 
 fn extract_json_diagnostic(value: &Value) -> Option<Diagnostic> {
-    let severity_str = value.get("severity").and_then(Value::as_str).unwrap_or("note");
+    let severity_str = value
+        .get("severity")
+        .and_then(Value::as_str)
+        .unwrap_or("note");
     let severity = match severity_str {
         "error" => Severity::Error,
         "warning" => Severity::Warning,
@@ -159,7 +160,10 @@ fn extract_json_diagnostic(value: &Value) -> Option<Diagnostic> {
         .to_string();
 
     let line = value.get("line").and_then(Value::as_u64).unwrap_or(0) as u32;
-    let column = value.get("column").and_then(Value::as_u64).map(|c| c as u32);
+    let column = value
+        .get("column")
+        .and_then(Value::as_u64)
+        .map(|c| c as u32);
 
     let location = if !file.is_empty() {
         Some(Location { file, line, column })
