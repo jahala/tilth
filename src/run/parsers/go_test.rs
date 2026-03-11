@@ -36,26 +36,6 @@ impl Parser for GoTestParser {
         fail_marker.find(bytes).is_some() || pass_marker.find(bytes).is_some()
     }
 
-    /// Insert `-json` after `go test` when it is absent, enabling structured output.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// // go test ./...  →  go test -json ./...
-    /// // go test -json ./...  →  None (already present)
-    /// ```
-    fn rewrite(&self, command: &str) -> Option<String> {
-        // Already has -json — nothing to do.
-        if command.contains("-json") {
-            return None;
-        }
-        // Find "go test" and insert "-json " immediately after.
-        let needle = "go test";
-        let pos = command.find(needle)?;
-        let after = pos + needle.len();
-        Some(format!("{}{}{}", &command[..after], " -json", &command[after..]))
-    }
-
     fn parse(&self, input: &str) -> ParsedOutput {
         // Try JSON (NDJSON) first — any line starting with `{` signals JSON mode.
         if input.lines().any(|l| l.trim_start().starts_with('{')) {
@@ -432,20 +412,6 @@ mod tests {
     fn detect_rejects_generic() {
         let sample = "Building foo...\nDone.\nAll steps completed.\n";
         assert!(!PARSER.detect(sample));
-    }
-
-    // -- Rewrite -------------------------------------------------------------
-
-    #[test]
-    fn rewrite_inserts_json() {
-        let result = PARSER.rewrite("go test ./...").unwrap();
-        assert_eq!(result, "go test -json ./...");
-    }
-
-    #[test]
-    fn rewrite_skips_if_present() {
-        assert!(PARSER.rewrite("go test -json ./...").is_none());
-        assert!(PARSER.rewrite("go test -count=1 -json ./...").is_none());
     }
 
     // -- JSON parse ----------------------------------------------------------

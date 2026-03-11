@@ -1,7 +1,7 @@
 mod ansi;
 mod format;
 mod group;
-pub mod parsers;
+mod parsers;
 mod types;
 
 use std::panic::AssertUnwindSafe;
@@ -51,7 +51,7 @@ fn process_inner(input: &str) -> String {
     let formatted = if parsed.tool == "unknown" {
         format::format_generic_with_raw(&parsed, &groups, &cleaned)
     } else {
-        format::format_output(&parsed, &groups, None)
+        format::format_output(&parsed, &groups)
     };
 
     // Never-worse: formatted must be strictly shorter than original.

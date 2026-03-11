@@ -37,13 +37,6 @@ impl Parser for CargoBuildParser {
             || warning_colon.find(bytes).is_some()
     }
 
-    fn rewrite(&self, command: &str) -> Option<String> {
-        if command.contains("--message-format") {
-            return None;
-        }
-        Some(format!("{command} --message-format=json"))
-    }
-
     fn parse(&self, input: &str) -> ParsedOutput {
         let raw_bytes = input.len();
         let raw_lines = input.lines().count();
@@ -471,20 +464,6 @@ mod tests {
     fn detect_rejects_generic() {
         let sample = "some random\noutput\nwith no rust compiler markers\n";
         assert!(!PARSER.detect(sample));
-    }
-
-    // --- rewrite ---
-
-    #[test]
-    fn rewrite_appends_message_format() {
-        let result = PARSER.rewrite("cargo build");
-        assert_eq!(result, Some("cargo build --message-format=json".to_string()));
-    }
-
-    #[test]
-    fn rewrite_skips_if_present() {
-        let result = PARSER.rewrite("cargo build --message-format=json");
-        assert!(result.is_none());
     }
 
     // --- JSON path ---

@@ -40,13 +40,6 @@ impl Parser for GolangciLintParser {
         sample.lines().any(looks_like_lint_line)
     }
 
-    fn rewrite(&self, command: &str) -> Option<String> {
-        if command.contains("--out-format") {
-            return None;
-        }
-        Some(format!("{command} --out-format=json"))
-    }
-
     fn parse(&self, input: &str) -> ParsedOutput {
         let raw_bytes = input.len();
         let raw_lines = input.lines().count();
@@ -331,23 +324,6 @@ mod tests {
     fn detect_rejects_generic() {
         let sample = "some random\noutput\nwith no golang lint markers\n";
         assert!(!PARSER.detect(sample));
-    }
-
-    // --- rewrite ---
-
-    #[test]
-    fn rewrite_appends_format() {
-        let result = PARSER.rewrite("golangci-lint run");
-        assert_eq!(
-            result,
-            Some("golangci-lint run --out-format=json".to_string())
-        );
-    }
-
-    #[test]
-    fn rewrite_skips_if_present() {
-        let result = PARSER.rewrite("golangci-lint run --out-format=json");
-        assert!(result.is_none());
     }
 
     // --- JSON path ---

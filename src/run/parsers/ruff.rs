@@ -32,13 +32,6 @@ impl Parser for RuffParser {
         sample.lines().any(looks_like_ruff_text_line)
     }
 
-    fn rewrite(&self, command: &str) -> Option<String> {
-        if command.contains("--output-format") {
-            return None;
-        }
-        Some(format!("{command} --output-format json"))
-    }
-
     fn parse(&self, input: &str) -> ParsedOutput {
         let raw_bytes = input.len();
         let raw_lines = input.lines().count();
@@ -312,23 +305,6 @@ mod tests {
     fn detect_rejects() {
         let sample = "some random\noutput with no ruff markers\n";
         assert!(!PARSER.detect(sample));
-    }
-
-    // --- rewrite ---
-
-    #[test]
-    fn rewrite_appends() {
-        let result = PARSER.rewrite("ruff check src/");
-        assert_eq!(
-            result,
-            Some("ruff check src/ --output-format json".to_string())
-        );
-    }
-
-    #[test]
-    fn rewrite_skips() {
-        let result = PARSER.rewrite("ruff check src/ --output-format json");
-        assert!(result.is_none());
     }
 
     // --- JSON path ---

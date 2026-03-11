@@ -37,14 +37,6 @@ impl Parser for PytestParser {
         false
     }
 
-    /// Append `--tb=short -q` when no `--tb=` flag is already present.
-    fn rewrite(&self, command: &str) -> Option<String> {
-        if command.contains("--tb=") {
-            return None;
-        }
-        Some(format!("{command} --tb=short -q"))
-    }
-
     fn parse(&self, input: &str) -> ParsedOutput {
         // JSON is only available with the pytest-json-report plugin — very rare.
         // Attempt it opportunistically; fall through to text parsing otherwise.
@@ -483,20 +475,6 @@ mod tests {
     fn detect_rejects_generic() {
         let sample = "Building project...\nCompiling foo\nDone in 1.2s";
         assert!(!PARSER.detect(sample));
-    }
-
-    // -- Rewrite -------------------------------------------------------------
-
-    #[test]
-    fn rewrite_appends_tb_short() {
-        let result = PARSER.rewrite("pytest tests/");
-        assert_eq!(result, Some("pytest tests/ --tb=short -q".to_string()));
-    }
-
-    #[test]
-    fn rewrite_skips_if_present() {
-        let result = PARSER.rewrite("pytest tests/ --tb=long");
-        assert!(result.is_none());
     }
 
     // -- Text parse ----------------------------------------------------------

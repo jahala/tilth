@@ -38,13 +38,6 @@ impl Parser for MypyParser {
             .any(looks_like_mypy_text_line)
     }
 
-    fn rewrite(&self, command: &str) -> Option<String> {
-        if command.contains("--output") {
-            return None;
-        }
-        Some(format!("{command} --output=json"))
-    }
-
     fn parse(&self, input: &str) -> ParsedOutput {
         let raw_bytes = input.len();
         let raw_lines = input.lines().count();
@@ -344,20 +337,6 @@ mod tests {
     fn detect_rejects() {
         let sample = "some random\noutput with no mypy markers\n";
         assert!(!PARSER.detect(sample));
-    }
-
-    // --- rewrite ---
-
-    #[test]
-    fn rewrite_appends() {
-        let result = PARSER.rewrite("mypy src/");
-        assert_eq!(result, Some("mypy src/ --output=json".to_string()));
-    }
-
-    #[test]
-    fn rewrite_skips() {
-        let result = PARSER.rewrite("mypy src/ --output=json");
-        assert!(result.is_none());
     }
 
     // --- JSON path ---

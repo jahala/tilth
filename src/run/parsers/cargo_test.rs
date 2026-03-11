@@ -32,13 +32,6 @@ impl Parser for CargoTestParser {
         test_result.find(bytes).is_some() && passed.find(bytes).is_some()
     }
 
-    /// Rewrite is only possible on nightly (`-Zunstable-options --format json`).
-    /// On stable Rust, we fall back to text parsing, which works fine.
-    /// For now, skip rewrite entirely — the text parser is robust enough.
-    fn rewrite(&self, _command: &str) -> Option<String> {
-        None
-    }
-
     fn parse(&self, input: &str) -> ParsedOutput {
         let trimmed = input.trim_start();
         if trimmed.starts_with('{') || input.lines().any(|l| l.trim_start().starts_with('{')) {
@@ -351,16 +344,6 @@ mod tests {
     fn detect_rejects_generic() {
         let sample = "Building project...\nCompiling foo v0.1.0\nFinished in 1.2s";
         assert!(!PARSER.detect(sample));
-    }
-
-    // -- Rewrite -------------------------------------------------------------
-
-    #[test]
-    fn rewrite_returns_none() {
-        // Rewrite is disabled on stable Rust (requires nightly -Zunstable-options).
-        assert!(PARSER.rewrite("cargo test --lib").is_none());
-        assert!(PARSER.rewrite("cargo test --lib -- --format json").is_none());
-        assert!(PARSER.rewrite("cargo nextest run").is_none());
     }
 
     // -- JSON parse ----------------------------------------------------------

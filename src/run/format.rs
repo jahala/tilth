@@ -9,26 +9,19 @@ const MAX_DETAIL_LINES: usize = 10;
 ///
 /// Returns the formatted string. The caller is responsible for the never-worse
 /// check (falling back to original input when formatted >= original length).
-pub fn format_output(
-    parsed: &ParsedOutput,
-    groups: &[DiagnosticGroup],
-    focus: Option<&str>,
-) -> String {
+pub fn format_output(parsed: &ParsedOutput, groups: &[DiagnosticGroup]) -> String {
     if parsed.tool == "unknown" {
         // Unknown tools are formatted via format_generic_with_raw; this path
         // only fires if someone calls format_output directly for unknown.
         return String::new();
     }
 
-    match focus {
-        Some(f) => format_focused(parsed, groups, f),
-        None => format_summary(parsed, groups),
-    }
+    format_summary(parsed, groups)
 }
 
 
 // ---------------------------------------------------------------------------
-// Summary format (non-generic tools, no focus)
+// Summary format (non-generic tools)
 // ---------------------------------------------------------------------------
 
 fn format_summary(parsed: &ParsedOutput, groups: &[DiagnosticGroup]) -> String {
@@ -39,42 +32,6 @@ fn format_summary(parsed: &ParsedOutput, groups: &[DiagnosticGroup]) -> String {
     for group in groups {
         let _ = out.write_char('\n');
         write_group_block(&mut out, group);
-    }
-
-    out
-}
-
-// ---------------------------------------------------------------------------
-// Focused format (drill into a specific diagnostic name)
-// ---------------------------------------------------------------------------
-
-fn format_focused(parsed: &ParsedOutput, groups: &[DiagnosticGroup], focus: &str) -> String {
-    let matched: Vec<&DiagnosticGroup> = groups
-        .iter()
-        .filter(|g| g.signature.contains(focus) || g.representative.name.contains(focus))
-        .collect();
-
-    if matched.is_empty() {
-        let mut out = String::with_capacity(256);
-        let _ = writeln!(
-            out,
-            "# {} — no match for '{focus}'",
-            parsed.tool
-        );
-        let _ = out.write_str("#\n# Available diagnostics:\n");
-        for g in groups {
-            let _ = writeln!(out, "#   {} {}", g.severity, g.signature);
-        }
-        return out;
-    }
-
-    let mut out = String::with_capacity(512);
-    write_header_line(&mut out, parsed);
-
-    for group in matched {
-        let _ = out.write_char('\n');
-        // Focused mode: show all locations (not capped to MAX_LOCATIONS_PER_GROUP).
-        write_group_block_full(&mut out, group);
     }
 
     out
@@ -150,42 +107,6 @@ fn write_group_block(out: &mut String, group: &DiagnosticGroup) {
         write_detail(out, detail);
     }
 }
-
-fn write_group_block_full(out: &mut String, group: &DiagnosticGroup) {
-    let cascade_tag = if group.cascading { " [cascading]" } else { "" };
-
-    let _ = writeln!(
-        out,
-        "# {} {} — {} occurrence(s){cascade_tag}",
-        group.severity,
-        group.signature,
-        group.total,
-    );
-
-    // All locations (not capped).
-    if !group.locations.is_empty() {
-        let _ = out.write_str("#   ");
-        let mut first = true;
-        for loc in &group.locations {
-            if !first {
-                let _ = out.write_str(", ");
-            }
-            let _ = out.write_str(&loc.to_string());
-            first = false;
-        }
-        let _ = out.write_char('\n');
-    }
-
-    let _ = writeln!(out, "#   {}", group.representative.message);
-
-    if let Some(detail) = &group.representative.detail {
-        // Full detail in focused mode — no truncation.
-        for line in detail.lines() {
-            let _ = writeln!(out, "#   {line}");
-        }
-    }
-}
-
 /// Write detail lines, truncating to MAX_DETAIL_LINES.
 fn write_detail(out: &mut String, detail: &str) {
     let total: usize = detail.lines().count();
@@ -301,18 +222,9 @@ mod tests {
     fn summary_format_contains_tool() {
         let parsed = make_parsed("cargo test", "1 failed", 100);
         let group = make_group(Severity::Error, "test_foo", 1);
-        let out = format_output(&parsed, &[group], None);
+        let out = format_output(&parsed, &[group]);
         assert!(out.contains("cargo test"));
         assert!(out.contains("1 failed"));
-    }
-
-    #[test]
-    fn focused_no_match() {
-        let parsed = make_parsed("cargo test", "1 failed", 100);
-        let group = make_group(Severity::Error, "test_foo", 1);
-        let out = format_output(&parsed, &[group], Some("nonexistent"));
-        assert!(out.contains("no match for 'nonexistent'"));
-        assert!(out.contains("test_foo"));
     }
 
     #[test]
