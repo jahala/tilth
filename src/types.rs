@@ -28,6 +28,7 @@ pub enum Lang {
     C,
     Cpp,
     Ruby,
+    Php,
     Swift,
     Kotlin,
     CSharp,

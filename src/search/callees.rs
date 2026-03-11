@@ -63,6 +63,14 @@ pub(crate) fn callee_query_str(lang: Lang) -> Option<&'static str> {
         Lang::Ruby => Some(
             "(call method: (identifier) @callee)\n",
         ),
+        Lang::Php => Some(concat!(
+            "(function_call_expression function: (name) @callee)\n",
+            "(function_call_expression function: (qualified_name) @callee)\n",
+            "(function_call_expression function: (relative_name) @callee)\n",
+            "(member_call_expression name: (name) @callee)\n",
+            "(nullsafe_member_call_expression name: (name) @callee)\n",
+            "(scoped_call_expression name: (name) @callee)\n",
+        )),
         Lang::CSharp => Some(concat!(
             "(invocation_expression function: (identifier) @callee)\n",
             "(invocation_expression function: (member_access_expression name: (identifier) @callee))\n",
@@ -480,4 +488,28 @@ fn resolve_second_hop(
     *budget = budget.saturating_sub(resolved.len());
 
     resolved
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_php_callee_names() {
+        let php = r#"<?php
+function run($svc): void {
+    local_helper();
+    Foo\Bar::staticCall();
+    $svc->methodCall();
+    $svc?->nullableCall();
+}
+"#;
+
+        let names = extract_callee_names(php, Lang::Php, None);
+
+        assert!(names.contains(&"local_helper".to_string()));
+        assert!(names.contains(&"staticCall".to_string()));
+        assert!(names.contains(&"methodCall".to_string()));
+        assert!(names.contains(&"nullableCall".to_string()));
+    }
 }

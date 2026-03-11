@@ -37,6 +37,7 @@ pub fn outline_language(lang: Lang) -> Option<tree_sitter::Language> {
         Lang::C => tree_sitter_c::LANGUAGE,
         Lang::Cpp => tree_sitter_cpp::LANGUAGE,
         Lang::Ruby => tree_sitter_ruby::LANGUAGE,
+        Lang::Php => tree_sitter_php::LANGUAGE_PHP,
         // Languages without shipped grammars — fall back
         Lang::CSharp => tree_sitter_c_sharp::LANGUAGE,
         Lang::Swift => tree_sitter_swift::LANGUAGE,
@@ -117,6 +118,7 @@ fn node_to_entry(
         "interface_declaration"
         | "type_alias_declaration"
         | "trait_item"
+        | "trait_declaration"
         | "trait_definition"
         | "protocol_declaration" => {
             let name = find_child_text(node, "name", lines).unwrap_or_else(|| "<anonymous>".into());
@@ -148,8 +150,10 @@ fn node_to_entry(
         }
 
         // Constants and variables
-        "const_item" | "static_item" => {
-            let name = find_child_text(node, "name", lines).unwrap_or_else(|| "<const>".into());
+        "const_item" | "const_declaration" | "static_item" => {
+            let name = find_child_text(node, "name", lines)
+                .or_else(|| first_identifier_text(node, lines))
+                .unwrap_or_else(|| "<const>".into());
             (OutlineKind::Constant, name, None)
         }
         "val_definition" => {
@@ -169,7 +173,11 @@ fn node_to_entry(
         }
 
         // Imports — collect as a group
-        "import_statement" | "import_declaration" | "use_declaration" | "use_item"
+        "import_statement"
+        | "import_declaration"
+        | "use_declaration"
+        | "namespace_use_declaration"
+        | "use_item"
         | "using_directive" => {
             let text = node_text(node, lines);
             (OutlineKind::Import, text, None)
@@ -182,7 +190,11 @@ fn node_to_entry(
         }
 
         // Module declarations
-        "mod_item" | "module" | "namespace_declaration" | "file_scoped_namespace_declaration" => {
+        "mod_item"
+        | "module"
+        | "namespace_declaration"
+        | "namespace_definition"
+        | "file_scoped_namespace_declaration" => {
             let name = find_child_text(node, "name", lines).unwrap_or_else(|| "<module>".into());
             (OutlineKind::Module, name, None)
         }
@@ -193,7 +205,7 @@ fn node_to_entry(
     // Collect children for classes, impls, modules, traits/interfaces
     let is_namespace = matches!(
         kind_str,
-        "namespace_declaration" | "file_scoped_namespace_declaration"
+        "namespace_declaration" | "namespace_definition" | "file_scoped_namespace_declaration"
     );
     let children = if matches!(
         kind,
@@ -635,5 +647,36 @@ type UserId = String
         assert!(outline.contains("def load"));
         assert!(outline.contains("def connect"));
         assert!(outline.contains("def create"));
+    }
+
+    #[test]
+    fn php_outline_constructs() {
+        let php_code = r#"<?php
+namespace App\Services;
+
+use App\Support\Client;
+
+trait LogsQueries {
+    public function log(string $query): void {}
+}
+
+class UserService {
+    use LogsQueries;
+
+    public function __construct(private Client $client) {}
+
+    public function findUser(int $id): array {
+        return $this->client->loadUser($id);
+    }
+}
+"#;
+
+        let outline = outline(php_code, Lang::Php, 1000);
+
+        assert!(outline.contains("mod App\\Services"));
+        assert!(outline.contains("imports: App\\Support\\Client"));
+        assert!(outline.contains("interface LogsQueries"));
+        assert!(outline.contains("class UserService"));
+        assert!(outline.contains("fn findUser"));
     }
 }

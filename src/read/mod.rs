@@ -350,6 +350,7 @@ pub fn detect_file_type(path: &Path) -> FileType {
         Some("c" | "h") => FileType::Code(Lang::C),
         Some("cpp" | "hpp" | "cc" | "cxx") => FileType::Code(Lang::Cpp),
         Some("rb") => FileType::Code(Lang::Ruby),
+        Some("php" | "phtml") => FileType::Code(Lang::Php),
         Some("swift") => FileType::Code(Lang::Swift),
         Some("kt" | "kts") => FileType::Code(Lang::Kotlin),
         Some("cs") => FileType::Code(Lang::CSharp),

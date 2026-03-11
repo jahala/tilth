@@ -421,11 +421,13 @@ const TYPE_KINDS: &[&str] = &[
     "impl_item",
     "interface_declaration",
     "trait_item",
+    "trait_declaration",
     "type_declaration",
     "enum_item",
     "enum_declaration",
     "module",
     "mod_item",
+    "namespace_definition",
 ];
 
 fn find_enclosing_function(

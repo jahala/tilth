@@ -14,6 +14,7 @@ pub(crate) const DEFINITION_KINDS: &[&str] = &[
     "struct_item",
     // Interfaces & types (TS)
     "interface_declaration",
+    "trait_declaration",
     "type_alias_declaration",
     "type_item",
     // Enums
@@ -23,11 +24,13 @@ pub(crate) const DEFINITION_KINDS: &[&str] = &[
     "lexical_declaration",
     "variable_declaration",
     "const_item",
+    "const_declaration",
     "static_item",
     // Rust-specific
     "trait_item",
     "impl_item",
     "mod_item",
+    "namespace_definition",
     // Python
     "decorated_definition",
     // Go
@@ -137,6 +140,7 @@ pub(crate) fn definition_weight(kind: &str) -> u16 {
         | "class_definition"
         | "struct_item"
         | "interface_declaration"
+        | "trait_declaration"
         | "trait_item"
         | "enum_item"
         | "enum_declaration"
@@ -144,8 +148,8 @@ pub(crate) fn definition_weight(kind: &str) -> u16 {
         | "type_declaration"
         | "decorated_definition" => 100,
         "impl_item" => 90,
-        "const_item" | "static_item" => 80,
-        "mod_item" => 70,
+        "const_item" | "const_declaration" | "static_item" => 80,
+        "mod_item" | "namespace_definition" => 70,
         "lexical_declaration" | "variable_declaration" => 40,
         "export_statement" => 30,
         _ => 50,

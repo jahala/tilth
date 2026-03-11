@@ -53,7 +53,7 @@ AGENTS.md              MCP tool usage instructions shipped to users (read by Cla
 
 ## Languages supported
 
-Rust, TypeScript, TSX, JavaScript, Python, Go, Java, C, C++, Ruby, C#, Swift.
+Rust, TypeScript, TSX, JavaScript, Python, Go, Java, C, C++, Ruby, PHP, C#, Swift.
 Kotlin, Dockerfile, Make detected but have no tree-sitter grammar (outline returns None).
 
 ## Build, test, install
