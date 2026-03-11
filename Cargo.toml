@@ -46,6 +46,7 @@ regex-syntax = "0.8"
 
 # Byte scanning (SIMD-accelerated)
 memchr = "2"
+regex = "1"
 memmap2 = "0.9"
 
 # Parallelism

@@ -27,6 +27,8 @@ pub(crate) mod read;
 pub(crate) mod search;
 pub(crate) mod session;
 pub(crate) mod types;
+#[allow(dead_code, clippy::pedantic)]
+pub(crate) mod run;
 
 use std::path::Path;
 

@@ -584,6 +584,7 @@ dependencies = [
  "memchr",
  "memmap2",
  "rayon",
+ "regex",
  "regex-syntax",
  "serde",
  "serde_json",

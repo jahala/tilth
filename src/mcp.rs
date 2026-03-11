@@ -51,10 +51,16 @@ tilth_files: Find files by glob pattern. Replaces find, ls, pwd, and the host Gl
 tilth_deps: Blast-radius check — what imports this file and what it imports.\n\
   Use ONLY before renaming, removing, or changing an export's signature.\n\
 \n\
+tilth_run: Run a shell command with structured output parsing. Replaces Bash for build/test/lint.\n\
+  Automatically detects and compresses verbose output (cargo, go test, pytest, jest, eslint, etc.).\n\
+  Test failures are grouped, error counts summarized, noise removed.\n\
+  Output: exit code (if non-zero) + compressed diagnostics.\n\
+  Use tilth_run instead of Bash for any command whose output you need to understand.
+\n\
 To search code, use tilth_search instead of Grep or Bash(grep/rg).\n\
 To read files, use tilth_read instead of Read or Bash(cat).\n\
 To find files, use tilth_files instead of Glob or Bash(find/ls).\n\
-DO NOT re-read files already shown in expanded search results.";
+To run commands, use tilth_run instead of Bash for build/test/lint commands.\nDO NOT re-read files already shown in expanded search results.";
 
 const EDIT_MODE_EXTRA: &str = "\n\
 \n\
@@ -226,6 +232,7 @@ pub(crate) fn dispatch_tool(
         "tilth_map" => Err("tilth_map is disabled — use tilth_search instead".into()),
         "tilth_session" => tool_session(args, session),
         "tilth_edit" if edit_mode => tool_edit(args, session, cache, bloom),
+        "tilth_run" => tool_run(args),
         _ => Err(format!("unknown tool: {tool}")),
     }
 }
@@ -505,6 +512,56 @@ fn tool_edit(
     }
 }
 
+const DEFAULT_RUN_TIMEOUT_SECS: u64 = 120;
+
+fn tool_run(args: &Value) -> Result<String, String> {
+    let command = args
+        .get("command")
+        .and_then(|v| v.as_str())
+        .ok_or("missing required parameter: command")?;
+
+    let _timeout_secs = args
+        .get("timeout")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(DEFAULT_RUN_TIMEOUT_SECS);
+
+    let child = std::process::Command::new("sh")
+        .args(["-c", command])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn();
+
+    let child = match child {
+        Ok(c) => c,
+        Err(e) => return Err(format!("failed to spawn command: {e}")),
+    };
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("command execution failed: {e}"))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = if stderr.is_empty() {
+        stdout.into_owned()
+    } else if stdout.is_empty() {
+        stderr.into_owned()
+    } else {
+        format!("{stdout}{stderr}")
+    };
+
+    let exit_code = output.status.code().unwrap_or(-1);
+    let processed = crate::run::process(&combined);
+
+    let mut result_text = String::with_capacity(processed.len() + 32);
+    if exit_code != 0 {
+        write!(result_text, "exit code: {exit_code}\n\n").unwrap();
+    }
+    result_text.push_str(&processed);
+
+    Ok(result_text)
+}
+
 /// Falls back to cwd when scope is invalid, with a warning message.
 fn resolve_scope(args: &Value) -> (PathBuf, Option<String>) {
     let raw_str = args.get("scope").and_then(|v| v.as_str()).unwrap_or(".");
@@ -705,6 +762,24 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     "budget": {
                         "type": "number",
                         "description": "Max tokens. Truncates 'Used by' first."
+                    }
+                }
+            }
+        }),
+        serde_json::json!({
+            "name": "tilth_run",
+            "description": "Run a shell command and return structured output. Replaces Bash for build, test, and lint commands. Output is automatically parsed and compressed — test failures are grouped by type, error counts are summarized, and verbose output is reduced to actionable diagnostics. Supports cargo, go, pytest, jest, eslint, ruff, mypy, tsc, and more. Use this instead of Bash for any command whose output you need to understand.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["command"],
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "Shell command to execute (passed to sh -c)."
+                    },
+                    "timeout": {
+                        "type": "number",
+                        "description": "Timeout in seconds (default: 120)."
                     }
                 }
             }
