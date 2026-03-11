@@ -40,11 +40,25 @@ static PARSERS: &[&dyn Parser] = &[
     &tsc::PARSER,
 ];
 
+/// Truncate input to the first `n` lines without allocation.
+fn truncate_to_n_lines(input: &str, n: usize) -> &str {
+    let mut count = 0;
+    for (i, b) in input.bytes().enumerate() {
+        if b == b'\n' {
+            count += 1;
+            if count >= n {
+                return &input[..=i];
+            }
+        }
+    }
+    input
+}
+
 /// Detect the appropriate parser by scanning the first ~200 lines of content.
 pub fn detect_from_content(input: &str) -> &'static dyn Parser {
-    let sample: String = input.lines().take(200).collect::<Vec<_>>().join("\n");
+    let sample = truncate_to_n_lines(input, 200);
     for p in PARSERS {
-        if p.detect(&sample) {
+        if p.detect(sample) {
             return *p;
         }
     }

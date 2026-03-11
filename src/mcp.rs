@@ -514,6 +514,7 @@ fn tool_edit(
 }
 
 const DEFAULT_RUN_TIMEOUT_SECS: u64 = 120;
+const MAX_OUTPUT_BYTES: u64 = 10 * 1024 * 1024; // 10 MB
 
 fn tool_run(args: &Value) -> Result<String, String> {
     let command = args
@@ -526,46 +527,53 @@ fn tool_run(args: &Value) -> Result<String, String> {
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(DEFAULT_RUN_TIMEOUT_SECS);
 
+    let cwd = args.get("cwd").and_then(|v| v.as_str()).unwrap_or(".");
+    let cwd_path = std::path::Path::new(cwd);
+    if !cwd_path.is_dir() {
+        return Err(format!("cwd is not a valid directory: {cwd}"));
+    }
+
     let mut child = std::process::Command::new("sh")
         .args(["-c", command])
+        .current_dir(cwd_path)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| format!("failed to spawn command: {e}"))?;
 
     // Read stdout/stderr in background threads to avoid pipe deadlock.
+    // Bounded reads prevent OOM from runaway commands.
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
-    let stdout_handle = std::thread::spawn(move || std::io::read_to_string(stdout));
-    let stderr_handle = std::thread::spawn(move || std::io::read_to_string(stderr));
+    let stdout_handle = std::thread::spawn(move || read_bounded(stdout));
+    let stderr_handle = std::thread::spawn(move || read_bounded(stderr));
 
-    // Poll for completion with timeout.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait(); // reap zombie
-                    return Err(format!("command timed out after {timeout_secs}s"));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            Err(e) => return Err(format!("failed to wait on command: {e}")),
+    // Wait for exit on a dedicated thread so we don't block the MCP I/O loop.
+    let child_pid = child.id();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait());
+    });
+
+    let status = match rx.recv_timeout(std::time::Duration::from_secs(timeout_secs)) {
+        Ok(Ok(status)) => status,
+        Ok(Err(e)) => return Err(format!("failed to wait on command: {e}")),
+        Err(_) => {
+            // Kill the child process. The wait thread will unblock and clean up.
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &child_pid.to_string()])
+                .status();
+            return Err(format!("command timed out after {timeout_secs}s"));
         }
     };
-
     let stdout_str = stdout_handle
         .join()
-        .ok()
-        .and_then(std::result::Result::ok)
-        .unwrap_or_default();
+        .map_err(|_| "stdout reader thread panicked".to_string())?
+        .map_err(|e| format!("failed to read stdout: {e}"))?;
     let stderr_str = stderr_handle
         .join()
-        .ok()
-        .and_then(std::result::Result::ok)
-        .unwrap_or_default();
+        .map_err(|_| "stderr reader thread panicked".to_string())?
+        .map_err(|e| format!("failed to read stderr: {e}"))?;
 
     let combined = match (stdout_str.is_empty(), stderr_str.is_empty()) {
         (_, true) => stdout_str,
@@ -583,6 +591,14 @@ fn tool_run(args: &Value) -> Result<String, String> {
     result_text.push_str(&processed);
 
     Ok(result_text)
+}
+
+/// Read up to `MAX_OUTPUT_BYTES` from a reader into a String.
+fn read_bounded(reader: impl std::io::Read) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut buf = String::new();
+    reader.take(MAX_OUTPUT_BYTES).read_to_string(&mut buf)?;
+    Ok(buf)
 }
 
 /// Falls back to cwd when scope is invalid, with a warning message.
@@ -799,6 +815,10 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     "command": {
                         "type": "string",
                         "description": "Shell command to execute (passed to sh -c)."
+                    },
+                    "cwd": {
+                        "type": "string",
+                        "description": "Working directory for the command. Default: current directory."
                     },
                     "timeout": {
                         "type": "number",

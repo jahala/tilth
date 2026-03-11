@@ -1,7 +1,8 @@
 use memchr::memmem;
 
 use crate::run::types::{
-    extract_count, truncate_detail, Counts, Diagnostic, Location, ParsedOutput, Severity,
+    build_test_summary, extract_count, truncate_detail, Counts, Diagnostic, Location, ParsedOutput,
+    Severity,
 };
 
 use super::Parser;
@@ -100,11 +101,10 @@ impl CargoTestParser {
             }
         }
 
-        let summary = build_summary(passed, failed, ignored);
+        let summary = build_test_summary(passed, failed, ignored);
         let counts = Counts {
             passed,
             failed,
-            errors: failed,
             skipped: ignored,
             ..Counts::default()
         };
@@ -178,11 +178,10 @@ impl CargoTestParser {
             i += 1;
         }
 
-        let summary = build_summary(passed, failed, ignored);
+        let summary = build_test_summary(passed, failed, ignored);
         let counts = Counts {
             passed,
             failed,
-            errors: failed,
             skipped: ignored,
             ..Counts::default()
         };
@@ -209,19 +208,6 @@ fn parse_ndjson(input: &str) -> Vec<serde_json::Value> {
         .filter(|line| line.trim_start().starts_with('{'))
         .filter_map(|line| serde_json::from_str(line).ok())
         .collect()
-}
-
-/// Build a human-readable summary, omitting zero categories except `passed`.
-fn build_summary(passed: u32, failed: u32, ignored: u32) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    parts.push(format!("{passed} passed"));
-    if failed > 0 {
-        parts.push(format!("{failed} failed"));
-    }
-    if ignored > 0 {
-        parts.push(format!("{ignored} ignored"));
-    }
-    parts.join(", ")
 }
 
 /// Extract the most useful failure message from a test's stdout.

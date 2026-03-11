@@ -56,13 +56,12 @@ impl Parser for GolangciLintParser {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Heuristic: treat as JSON if any of the first 5 non-empty lines starts with `{`.
+/// Check for golangci-lint JSON fingerprints (`"FromLinter"` or `"Issues"` keys).
 fn looks_like_json(input: &str) -> bool {
-    input
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .take(5)
-        .any(|l| l.trim_start().starts_with('{'))
+    let bytes = input.as_bytes();
+    let from_linter = memchr::memmem::Finder::new(b"\"FromLinter\"");
+    let issues_key = memchr::memmem::Finder::new(b"\"Issues\"");
+    from_linter.find(bytes).is_some() || issues_key.find(bytes).is_some()
 }
 
 /// Returns true if `line` matches `path.go:N:M: linterName: message` (with or without column).
@@ -80,8 +79,7 @@ fn looks_like_lint_line(line: &str) -> bool {
         return false;
     }
     // Must have at least two `: ` separators after the path (location + linter name + message)
-    let colons: Vec<_> = after_go.match_indices(": ").collect();
-    colons.len() >= 2
+    after_go.matches(": ").count() >= 2
 }
 
 // ---------------------------------------------------------------------------
@@ -121,7 +119,8 @@ fn try_json(input: &str, raw_lines: usize, raw_bytes: usize) -> ParsedOutput {
             if let Some(diag) = extract_json_issue(&value) {
                 match diag.severity {
                     Severity::Error => error_count += 1,
-                    Severity::Warning | Severity::Info => warning_count += 1,
+                    Severity::Warning => warning_count += 1,
+                    Severity::Info => {}
                 }
                 diagnostics.push(diag);
             }
