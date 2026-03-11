@@ -51,10 +51,9 @@ fn collect_touched(
     });
 
     if triggered {
-        seen.insert(entry.name.clone());
-        result.push(TouchedSymbol {
-            name: entry.name.clone(),
-        });
+        let name = entry.name.clone();
+        seen.insert(name.clone());
+        result.push(TouchedSymbol { name });
     }
 }
 
@@ -88,7 +87,7 @@ pub(crate) fn blast_radius(
     let canonical = path.canonicalize().ok()?;
     let callers: Vec<(String, CallerMatch)> = callers
         .into_iter()
-        .filter(|(_, m)| m.path.canonicalize().ok().as_deref() != Some(&canonical))
+        .filter(|(_, m)| m.path != canonical)
         .collect();
 
     if callers.is_empty() {
@@ -176,4 +175,121 @@ fn format_blast_radius(
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::OutlineKind;
+
+    fn make_edit(start: usize, end: usize) -> Edit {
+        Edit {
+            start_line: start,
+            start_hash: 0,
+            end_line: end,
+            end_hash: 0,
+            content: String::new(),
+        }
+    }
+
+    fn make_fn(name: &str, start: u32, end: u32) -> OutlineEntry {
+        OutlineEntry {
+            kind: OutlineKind::Function,
+            name: name.to_string(),
+            start_line: start,
+            end_line: end,
+            signature: None,
+            children: Vec::new(),
+            doc: None,
+        }
+    }
+
+    fn make_entry(kind: OutlineKind, name: &str, start: u32, end: u32) -> OutlineEntry {
+        OutlineEntry {
+            kind,
+            name: name.to_string(),
+            start_line: start,
+            end_line: end,
+            signature: None,
+            children: Vec::new(),
+            doc: None,
+        }
+    }
+
+    #[test]
+    fn signature_edit_triggers() {
+        let entries = vec![make_fn("foo", 10, 30)];
+        let edits = vec![make_edit(10, 10)];
+        let result = touched_symbols(&edits, &entries);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "foo");
+    }
+
+    #[test]
+    fn signature_end_triggers() {
+        // Edit at line 13 (start_line + 3) should still trigger.
+        let entries = vec![make_fn("foo", 10, 30)];
+        let edits = vec![make_edit(13, 13)];
+        let result = touched_symbols(&edits, &entries);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn body_edit_does_not_trigger() {
+        let entries = vec![make_fn("foo", 10, 30)];
+        let edits = vec![make_edit(20, 25)];
+        let result = touched_symbols(&edits, &entries);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn struct_does_not_trigger() {
+        let entries = vec![make_entry(OutlineKind::Struct, "Bar", 5, 20)];
+        let edits = vec![make_edit(5, 5)];
+        let result = touched_symbols(&edits, &entries);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn child_method_triggers() {
+        let mut class = make_entry(OutlineKind::Class, "MyClass", 1, 50);
+        class.children.push(make_fn("method", 10, 25));
+        let entries = vec![class];
+        let edits = vec![make_edit(10, 12)];
+        let result = touched_symbols(&edits, &entries);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "method");
+    }
+
+    #[test]
+    fn dedup_same_symbol() {
+        let entries = vec![make_fn("foo", 10, 30)];
+        // Two edits both hitting the signature.
+        let edits = vec![make_edit(10, 10), make_edit(11, 12)];
+        let result = touched_symbols(&edits, &entries);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn short_function_clamps_sig_end() {
+        // Function with only 2 lines: sig_end = min(10+3, 11) = 11.
+        let entries = vec![make_fn("tiny", 10, 11)];
+        let edits = vec![make_edit(11, 11)];
+        let result = touched_symbols(&edits, &entries);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn no_edits_no_results() {
+        let entries = vec![make_fn("foo", 10, 30)];
+        let result = touched_symbols(&[], &entries);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn no_entries_no_results() {
+        let edits = vec![make_edit(10, 10)];
+        let result = touched_symbols(&edits, &[]);
+        assert!(result.is_empty());
+    }
 }
