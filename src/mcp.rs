@@ -60,7 +60,8 @@ tilth_run: Run a shell command with structured output parsing. Replaces Bash for
 To search code, use tilth_search instead of Grep or Bash(grep/rg).\n\
 To read files, use tilth_read instead of Read or Bash(cat).\n\
 To find files, use tilth_files instead of Glob or Bash(find/ls).\n\
-To run commands, use tilth_run instead of Bash for build/test/lint commands.\nDO NOT re-read files already shown in expanded search results.";
+To run commands, use tilth_run instead of Bash for build/test/lint commands.\n\
+DO NOT re-read files already shown in expanded search results.";
 
 const EDIT_MODE_EXTRA: &str = "\n\
 \n\
@@ -520,37 +521,51 @@ fn tool_run(args: &Value) -> Result<String, String> {
         .and_then(|v| v.as_str())
         .ok_or("missing required parameter: command")?;
 
-    let _timeout_secs = args
+    let timeout_secs = args
         .get("timeout")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(DEFAULT_RUN_TIMEOUT_SECS);
 
-    let child = std::process::Command::new("sh")
+    let mut child = std::process::Command::new("sh")
         .args(["-c", command])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .spawn();
+        .spawn()
+        .map_err(|e| format!("failed to spawn command: {e}"))?;
 
-    let child = match child {
-        Ok(c) => c,
-        Err(e) => return Err(format!("failed to spawn command: {e}")),
+    // Read stdout/stderr in background threads to avoid pipe deadlock.
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let stdout_handle = std::thread::spawn(move || std::io::read_to_string(stdout));
+    let stderr_handle = std::thread::spawn(move || std::io::read_to_string(stderr));
+
+    // Poll for completion with timeout.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait(); // reap zombie
+                    return Err(format!("command timed out after {timeout_secs}s"));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => return Err(format!("failed to wait on command: {e}")),
+        }
     };
 
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("command execution failed: {e}"))?;
+    let stdout_str = stdout_handle.join().ok().and_then(std::result::Result::ok).unwrap_or_default();
+    let stderr_str = stderr_handle.join().ok().and_then(std::result::Result::ok).unwrap_or_default();
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = if stderr.is_empty() {
-        stdout.into_owned()
-    } else if stdout.is_empty() {
-        stderr.into_owned()
-    } else {
-        format!("{stdout}{stderr}")
+    let combined = match (stdout_str.is_empty(), stderr_str.is_empty()) {
+        (_, true) => stdout_str,
+        (true, _) => stderr_str,
+        _ => format!("{stdout_str}{stderr_str}"),
     };
 
-    let exit_code = output.status.code().unwrap_or(-1);
+    let exit_code = status.code().unwrap_or(-1);
     let processed = crate::run::process(&combined);
 
     let mut result_text = String::with_capacity(processed.len() + 32);

@@ -21,11 +21,6 @@ impl Parser for TscParser {
         error_finder.find(bytes).is_some() || warning_finder.find(bytes).is_some()
     }
 
-    /// tsc has no JSON output mode; nothing to rewrite.
-    fn rewrite(&self, _command: &str) -> Option<String> {
-        None
-    }
-
     fn parse(&self, input: &str) -> ParsedOutput {
         let raw_bytes = input.len();
         let raw_lines = input.lines().count();
@@ -193,14 +188,6 @@ mod tests {
     fn detect_rejects() {
         let sample = "some random\noutput with no tsc markers\n";
         assert!(!PARSER.detect(sample));
-    }
-
-    // --- rewrite ---
-
-    #[test]
-    fn rewrite_none() {
-        assert!(PARSER.rewrite("tsc --noEmit").is_none());
-        assert!(PARSER.rewrite("npx tsc").is_none());
     }
 
     // --- Text path ---

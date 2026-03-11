@@ -47,18 +47,6 @@ impl Parser for JestParser {
             || vitest_fail.find(bytes).is_some()
     }
 
-    /// Append `--json` to the command unless it is already present.
-    ///
-    /// Handles bare `jest`, `vitest`, and package-manager–prefixed invocations
-    /// (`npx jest`, `yarn jest`, `pnpm jest`, etc.).
-    fn rewrite(&self, command: &str) -> Option<String> {
-        let json_flag = memmem::Finder::new("--json");
-        if json_flag.find(command.as_bytes()).is_some() {
-            return None;
-        }
-        Some(format!("{command} --json"))
-    }
-
     fn parse(&self, input: &str) -> ParsedOutput {
         let trimmed = input.trim_start();
         if trimmed.starts_with('{') || trimmed.starts_with('[') {
@@ -478,26 +466,6 @@ mod tests {
     fn detect_rejects_generic() {
         let sample = "Building project...\nCompiling foo v0.1.0\nFinished in 1.2s";
         assert!(!PARSER.detect(sample));
-    }
-
-    // -- Rewrite -------------------------------------------------------------
-
-    #[test]
-    fn rewrite_appends_json() {
-        assert_eq!(
-            PARSER.rewrite("npx jest"),
-            Some("npx jest --json".to_string())
-        );
-        assert_eq!(
-            PARSER.rewrite("yarn vitest run"),
-            Some("yarn vitest run --json".to_string())
-        );
-    }
-
-    #[test]
-    fn rewrite_skips_if_present() {
-        assert!(PARSER.rewrite("jest --json").is_none());
-        assert!(PARSER.rewrite("npx jest --json --coverage").is_none());
     }
 
     // -- JSON parse ----------------------------------------------------------
