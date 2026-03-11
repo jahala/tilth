@@ -80,9 +80,8 @@ pub fn group(diagnostics: &[Diagnostic]) -> Vec<DiagnosticGroup> {
 
     // Retain only within caps; collect remaining info groups too (uncapped for now).
     let info_start = warn_end_raw;
-    let mut result: Vec<DiagnosticGroup> = Vec::with_capacity(
-        error_end_capped + warn_count + (groups.len() - info_start),
-    );
+    let mut result: Vec<DiagnosticGroup> =
+        Vec::with_capacity(error_end_capped + warn_count + (groups.len() - info_start));
 
     result.extend(groups.drain(..error_end).take(MAX_ERROR_GROUPS));
     let remaining = groups;
@@ -214,7 +213,10 @@ mod tests {
             .map(|i| make_diag(Severity::Error, &format!("E{i:03}"), "msg"))
             .collect();
         let groups = group(&diags);
-        let error_count = groups.iter().filter(|g| g.severity == Severity::Error).count();
+        let error_count = groups
+            .iter()
+            .filter(|g| g.severity == Severity::Error)
+            .count();
         assert!(error_count <= MAX_ERROR_GROUPS);
     }
 

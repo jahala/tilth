@@ -174,7 +174,8 @@ mod tests {
 
     #[test]
     fn detect_error_ts() {
-        let sample = "src/index.ts(10,5): error TS2322: Type 'string' is not assignable to type 'number'.\n";
+        let sample =
+            "src/index.ts(10,5): error TS2322: Type 'string' is not assignable to type 'number'.\n";
         assert!(PARSER.detect(sample));
     }
 
@@ -229,8 +230,7 @@ mod tests {
 
     #[test]
     fn parse_text_warnings() {
-        let input =
-            "src/utils.ts(15,3): warning TS6133: 'unused' is declared but never used.\n";
+        let input = "src/utils.ts(15,3): warning TS6133: 'unused' is declared but never used.\n";
         let out = PARSER.parse(input);
         assert_eq!(out.diagnostics.len(), 1);
 
@@ -238,10 +238,7 @@ mod tests {
         assert_eq!(diag.severity, Severity::Warning);
         assert_eq!(diag.name, "TS6133");
         assert_eq!(diag.message, "'unused' is declared but never used.");
-        assert_eq!(
-            diag.location.as_ref().map(|l| l.line),
-            Some(15)
-        );
+        assert_eq!(diag.location.as_ref().map(|l| l.line), Some(15));
         assert_eq!(diag.location.as_ref().and_then(|l| l.column), Some(3));
 
         assert_eq!(out.counts.warnings, 1);

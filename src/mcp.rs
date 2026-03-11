@@ -544,8 +544,16 @@ fn tool_run(args: &Value) -> Result<String, String> {
         }
     };
 
-    let stdout_str = stdout_handle.join().ok().and_then(std::result::Result::ok).unwrap_or_default();
-    let stderr_str = stderr_handle.join().ok().and_then(std::result::Result::ok).unwrap_or_default();
+    let stdout_str = stdout_handle
+        .join()
+        .ok()
+        .and_then(std::result::Result::ok)
+        .unwrap_or_default();
+    let stderr_str = stderr_handle
+        .join()
+        .ok()
+        .and_then(std::result::Result::ok)
+        .unwrap_or_default();
 
     let combined = match (stdout_str.is_empty(), stderr_str.is_empty()) {
         (_, true) => stdout_str,

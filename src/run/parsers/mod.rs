@@ -50,4 +50,3 @@ pub fn detect_from_content(input: &str) -> &'static dyn Parser {
     }
     &generic::PARSER
 }
-

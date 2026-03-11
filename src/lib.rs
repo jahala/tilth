@@ -24,11 +24,11 @@ pub mod install;
 pub mod map;
 pub mod mcp;
 pub(crate) mod read;
+#[allow(dead_code, clippy::pedantic)]
+pub(crate) mod run;
 pub(crate) mod search;
 pub(crate) mod session;
 pub(crate) mod types;
-#[allow(dead_code, clippy::pedantic)]
-pub(crate) mod run;
 
 use std::path::Path;
 

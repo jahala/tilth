@@ -64,7 +64,13 @@ fn looks_like_eslint_text_line(line: &str) -> bool {
         return false;
     };
     let loc = loc.trim();
-    if !loc.contains(':') || !loc.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+    if !loc.contains(':')
+        || !loc
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_digit())
+            .unwrap_or(false)
+    {
         return false;
     }
     let rest = rest.trim_start();
@@ -153,10 +159,7 @@ fn extract_json_message(msg: &Value, file_path: &str) -> Option<Diagnostic> {
         .to_string();
 
     let line = msg.get("line").and_then(Value::as_u64).unwrap_or(0) as u32;
-    let column = msg
-        .get("column")
-        .and_then(Value::as_u64)
-        .map(|c| c as u32);
+    let column = msg.get("column").and_then(Value::as_u64).map(|c| c as u32);
 
     let location = if !file_path.is_empty() && line > 0 {
         Some(Location {
@@ -191,7 +194,11 @@ fn parse_text(input: &str, raw_lines: usize, raw_bytes: usize) -> ParsedOutput {
         // File header: non-indented, non-empty line that is not the summary.
         if !line.starts_with(' ') && !line.is_empty() {
             // Skip the summary line (e.g. "✖ 2 problems (1 error, 1 warning)").
-            if !line.trim_start_matches('\u{2716}').trim().starts_with(|c: char| c.is_ascii_digit()) {
+            if !line
+                .trim_start_matches('\u{2716}')
+                .trim()
+                .starts_with(|c: char| c.is_ascii_digit())
+            {
                 current_file = line.trim().to_string();
             }
             continue;
