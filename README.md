@@ -123,6 +123,7 @@ tilth install claude-desktop
 tilth install opencode         # ~/.opencode.json
 tilth install gemini           # ~/.gemini/settings.json
 tilth install codex            # ~/.codex/config.toml
+tilth install amp              # ~/.config/amp/settings.json
 ```
 
 Add `--edit` to enable hash-anchored file editing (see [Edit mode](#edit-mode)):

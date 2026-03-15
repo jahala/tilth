@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 //   opencode:       ~/.opencode.json                          (user scope)
 //   gemini:         ~/.gemini/settings.json                   (user scope)
 //   codex:          ~/.codex/config.toml                      (user scope, TOML)
+//   amp:            ~/.config/amp/settings.json                (user scope)
 const SUPPORTED_HOSTS: &[&str] = &[
     "claude-code",
     "cursor",
@@ -23,6 +24,7 @@ const SUPPORTED_HOSTS: &[&str] = &[
     "opencode",
     "gemini",
     "codex",
+    "amp",
 ];
 
 /// The tilth server entry as JSON, for hosts that use JSON config.
@@ -74,14 +76,7 @@ fn write_json_config(host_info: &HostInfo, edit: bool) -> Result<(), String> {
         json!({})
     };
 
-    config
-        .as_object_mut()
-        .ok_or("config root is not a JSON object")?
-        .entry(servers_key)
-        .or_insert(json!({}))
-        .as_object_mut()
-        .ok_or_else(|| format!("{servers_key} is not a JSON object"))?
-        .insert("tilth".into(), tilth_server_entry(edit));
+    upsert_json_server(&mut config, servers_key, tilth_server_entry(edit))?;
 
     let out =
         serde_json::to_string_pretty(&config).expect("serde_json::Value is always serializable");
@@ -160,6 +155,7 @@ fn tilth_command_and_args(edit: bool) -> (String, Vec<String>) {
     }
 }
 
+#[derive(Debug)]
 enum ConfigFormat {
     /// JSON with a configurable servers key ("mcpServers" or "servers").
     Json { servers_key: &'static str },
@@ -167,6 +163,7 @@ enum ConfigFormat {
     Toml,
 }
 
+#[derive(Debug)]
 struct HostInfo {
     path: PathBuf,
     format: ConfigFormat,
@@ -249,6 +246,16 @@ fn resolve_host(host: &str) -> Result<HostInfo, String> {
             note: Some("User scope — available in all projects."),
         }),
 
+        // Amp user scope: ~/.config/amp/settings.json → amp.mcpServers
+        // Verified from official docs: https://ampcode.com/manual
+        "amp" => Ok(HostInfo {
+            path: home.join(".config/amp/settings.json"),
+            format: ConfigFormat::Json {
+                servers_key: "amp.mcpServers",
+            },
+            note: Some("User scope — available in all projects."),
+        }),
+
         _ => Err(format!(
             "unknown host: {host}. Supported: {}",
             SUPPORTED_HOSTS.join(", ")
@@ -272,6 +279,24 @@ fn home_dir() -> Result<PathBuf, String> {
     }
 }
 
+/// Merge a tilth server entry into a JSON config under the given servers key.
+/// Extracted for testability — used by `write_json_config` and unit tests.
+fn upsert_json_server(
+    config: &mut Value,
+    servers_key: &str,
+    entry: Value,
+) -> Result<(), String> {
+    config
+        .as_object_mut()
+        .ok_or("config root is not a JSON object")?
+        .entry(servers_key)
+        .or_insert(json!({}))
+        .as_object_mut()
+        .ok_or_else(|| format!("{servers_key} is not a JSON object"))?
+        .insert("tilth".into(), entry);
+    Ok(())
+}
+
 fn claude_desktop_path() -> Result<PathBuf, String> {
     #[cfg(target_os = "macos")]
     {
@@ -288,5 +313,101 @@ fn claude_desktop_path() -> Result<PathBuf, String> {
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         Err("claude-desktop config path unknown on this OS".into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn amp_resolve_host() {
+        let info = resolve_host("amp").expect("amp should resolve");
+        assert!(
+            info.path.ends_with(".config/amp/settings.json"),
+            "path should end with .config/amp/settings.json, got: {}",
+            info.path.display()
+        );
+        match info.format {
+            ConfigFormat::Json { servers_key } => {
+                assert_eq!(servers_key, "amp.mcpServers");
+            }
+            ConfigFormat::Toml => panic!("amp should use JSON format, not TOML"),
+        }
+    }
+
+    #[test]
+    fn amp_dotted_key_is_literal_not_nested() {
+        let mut config = json!({});
+        let entry = json!({"command": "tilth", "args": ["--mcp"]});
+        upsert_json_server(&mut config, "amp.mcpServers", entry).unwrap();
+
+        // Top-level key must be the literal "amp.mcpServers"
+        assert!(
+            config.get("amp.mcpServers").is_some(),
+            "should have literal top-level key 'amp.mcpServers'"
+        );
+        // Must NOT create a nested "amp" object
+        assert!(
+            config.get("amp").is_none(),
+            "should NOT have a nested 'amp' key"
+        );
+        // Verify tilth entry is inside
+        assert_eq!(
+            config["amp.mcpServers"]["tilth"]["command"],
+            json!("tilth")
+        );
+    }
+
+    #[test]
+    fn amp_preserves_unrelated_config() {
+        let mut config = json!({
+            "amp.theme": "dark",
+            "amp.mcpServers": {
+                "other": {"command": "foo", "args": []}
+            }
+        });
+        let entry = json!({"command": "tilth", "args": ["--mcp"]});
+        upsert_json_server(&mut config, "amp.mcpServers", entry).unwrap();
+
+        assert_eq!(config["amp.theme"], json!("dark"));
+        assert_eq!(config["amp.mcpServers"]["other"]["command"], json!("foo"));
+        assert!(config["amp.mcpServers"]["tilth"].is_object());
+    }
+
+    #[test]
+    fn amp_overwrites_existing_tilth() {
+        let mut config = json!({
+            "amp.mcpServers": {
+                "tilth": {"command": "old", "args": ["--old"]}
+            }
+        });
+        let entry = json!({"command": "tilth", "args": ["--mcp"]});
+        upsert_json_server(&mut config, "amp.mcpServers", entry).unwrap();
+
+        assert_eq!(
+            config["amp.mcpServers"]["tilth"]["args"],
+            json!(["--mcp"])
+        );
+    }
+
+    #[test]
+    fn amp_error_when_servers_key_not_object() {
+        let mut config = json!({"amp.mcpServers": []});
+        let entry = json!({"command": "tilth", "args": ["--mcp"]});
+        let err = upsert_json_server(&mut config, "amp.mcpServers", entry).unwrap_err();
+        assert!(
+            err.contains("amp.mcpServers is not a JSON object"),
+            "error should mention the key, got: {err}"
+        );
+    }
+
+    #[test]
+    fn unknown_host_error_includes_amp() {
+        let err = resolve_host("nope").unwrap_err();
+        assert!(
+            err.contains("amp"),
+            "error should list amp in supported hosts, got: {err}"
+        );
     }
 }
