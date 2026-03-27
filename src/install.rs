@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 //   gemini:         ~/.gemini/settings.json                   (user scope)
 //   codex:          ~/.codex/config.toml                      (user scope, TOML)
 //   amp:            ~/.config/amp/settings.json                (user scope)
+//   droid:          ~/.factory/mcp.json                        (user scope)
 const SUPPORTED_HOSTS: &[&str] = &[
     "claude-code",
     "cursor",
@@ -25,6 +26,7 @@ const SUPPORTED_HOSTS: &[&str] = &[
     "gemini",
     "codex",
     "amp",
+    "droid",
 ];
 
 /// The tilth server entry as JSON, for hosts that use JSON config.
@@ -255,6 +257,16 @@ fn resolve_host(host: &str) -> Result<HostInfo, String> {
             note: Some("User scope — available in all projects."),
         }),
 
+        // Factory Droid user scope: ~/.factory/mcp.json → mcpServers
+        // Verified from official docs: https://docs.factory.ai/cli/configuration/mcp
+        "droid" => Ok(HostInfo {
+            path: home.join(".factory/mcp.json"),
+            format: ConfigFormat::Json {
+                servers_key: "mcpServers",
+            },
+            note: Some("User scope — available in all projects."),
+        }),
+
         _ => Err(format!(
             "unknown host: {host}. Supported: {}",
             SUPPORTED_HOSTS.join(", ")
@@ -388,6 +400,47 @@ mod tests {
         assert!(
             err.contains("amp.mcpServers is not a JSON object"),
             "error should mention the key, got: {err}"
+        );
+    }
+
+    #[test]
+    fn droid_resolve_host() {
+        let info = resolve_host("droid").expect("droid should resolve");
+        assert!(
+            info.path.ends_with(".factory/mcp.json"),
+            "path should end with .factory/mcp.json, got: {}",
+            info.path.display()
+        );
+        match info.format {
+            ConfigFormat::Json { servers_key } => {
+                assert_eq!(servers_key, "mcpServers");
+            }
+            ConfigFormat::Toml => panic!("droid should use JSON format, not TOML"),
+        }
+    }
+
+    #[test]
+    fn droid_preserves_existing_servers() {
+        let mut config = json!({
+            "mcpServers": {
+                "playwright": {"command": "npx", "args": ["-y", "@playwright/mcp@latest"]}
+            }
+        });
+        let entry = json!({"command": "tilth", "args": ["--mcp"]});
+        upsert_json_server(&mut config, "mcpServers", entry).unwrap();
+
+        assert_eq!(config["mcpServers"]["playwright"]["command"], json!("npx"));
+        assert!(config["mcpServers"]["tilth"].is_object());
+    }
+
+    #[test]
+    fn unknown_host_error_includes_droid() {
+        let err = resolve_host("nope")
+            .err()
+            .expect("unknown host should return an error");
+        assert!(
+            err.contains("droid"),
+            "error should list droid in supported hosts, got: {err}"
         );
     }
 
