@@ -125,6 +125,7 @@ tilth install gemini           # ~/.gemini/settings.json
 tilth install codex            # ~/.codex/config.toml
 tilth install amp              # ~/.config/amp/settings.json
 tilth install droid            # ~/.factory/mcp.json
+tilth install antigravity      # ~/.gemini/antigravity/mcp_config.json
 ```
 
 Add `--edit` to enable hash-anchored file editing (see [Edit mode](#edit-mode)):

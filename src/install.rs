@@ -16,6 +16,7 @@ use serde_json::{json, Value};
 //   codex:          ~/.codex/config.toml                      (user scope, TOML)
 //   amp:            ~/.config/amp/settings.json                (user scope)
 //   droid:          ~/.factory/mcp.json                        (user scope)
+//   antigravity:    ~/.gemini/antigravity/mcp_config.json      (user scope)
 const SUPPORTED_HOSTS: &[&str] = &[
     "claude-code",
     "cursor",
@@ -27,6 +28,7 @@ const SUPPORTED_HOSTS: &[&str] = &[
     "codex",
     "amp",
     "droid",
+    "antigravity",
 ];
 
 /// The tilth server entry as JSON, for hosts that use JSON config.
@@ -257,6 +259,16 @@ fn resolve_host(host: &str) -> Result<HostInfo, String> {
             note: Some("User scope — available in all projects."),
         }),
 
+        // Google Antigravity user scope: ~/.gemini/antigravity/mcp_config.json → mcpServers
+        // Verified from official docs: https://antigravity.google/docs/mcp
+        "antigravity" => Ok(HostInfo {
+            path: home.join(".gemini/antigravity/mcp_config.json"),
+            format: ConfigFormat::Json {
+                servers_key: "mcpServers",
+            },
+            note: Some("User scope — available in all projects."),
+        }),
+
         // Factory Droid user scope: ~/.factory/mcp.json → mcpServers
         // Verified from official docs: https://docs.factory.ai/cli/configuration/mcp
         "droid" => Ok(HostInfo {
@@ -441,6 +453,47 @@ mod tests {
         assert!(
             err.contains("droid"),
             "error should list droid in supported hosts, got: {err}"
+        );
+    }
+
+    #[test]
+    fn antigravity_resolve_host() {
+        let info = resolve_host("antigravity").expect("antigravity should resolve");
+        assert!(
+            info.path.ends_with(".gemini/antigravity/mcp_config.json"),
+            "path should end with .gemini/antigravity/mcp_config.json, got: {}",
+            info.path.display()
+        );
+        match info.format {
+            ConfigFormat::Json { servers_key } => {
+                assert_eq!(servers_key, "mcpServers");
+            }
+            ConfigFormat::Toml => panic!("antigravity should use JSON format, not TOML"),
+        }
+    }
+
+    #[test]
+    fn antigravity_preserves_existing_servers() {
+        let mut config = json!({
+            "mcpServers": {
+                "firebase": {"command": "npx", "args": ["-y", "firebase-tools@latest", "mcp"]}
+            }
+        });
+        let entry = json!({"command": "tilth", "args": ["--mcp"]});
+        upsert_json_server(&mut config, "mcpServers", entry).unwrap();
+
+        assert_eq!(config["mcpServers"]["firebase"]["command"], json!("npx"));
+        assert!(config["mcpServers"]["tilth"].is_object());
+    }
+
+    #[test]
+    fn unknown_host_error_includes_antigravity() {
+        let err = resolve_host("nope")
+            .err()
+            .expect("unknown host should return an error");
+        assert!(
+            err.contains("antigravity"),
+            "error should list antigravity in supported hosts, got: {err}"
         );
     }
 
