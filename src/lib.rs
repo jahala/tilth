@@ -80,17 +80,36 @@ fn run_inner(
             let is_multi_word = text.contains(' ');
 
             if is_multi_word {
-                // Multi-word concepts: content search first (symbol search can't handle spaces)
-                let content_result = search::search_content_raw(&text, scope)?;
+                // Multi-word concepts: exact phrase first, then relaxed word proximity
+                let mut content_result = search::search_content_raw(&text, scope)?;
+                content_result.query = text.clone();
                 if content_result.total_found > 0 {
                     search::format_content_result(&content_result, cache)?
                 } else {
-                    // Try individual words as symbol searches
-                    let first_word = text.split_whitespace().next().unwrap_or(&text);
-                    let sym_result = search::search_symbol_raw(first_word, scope)?;
-                    if sym_result.total_found > 0 {
-                        search::format_symbol_result(&sym_result, cache)?
+                    // Relaxed: match all words in any order (word1.*word2|word2.*word1)
+                    let words: Vec<&str> = text.split_whitespace().collect();
+                    let relaxed = if words.len() == 2 {
+                        format!(
+                            "{}.*{}|{}.*{}",
+                            regex_syntax::escape(words[0]),
+                            regex_syntax::escape(words[1]),
+                            regex_syntax::escape(words[1]),
+                            regex_syntax::escape(words[0]),
+                        )
                     } else {
+                        // 3+ words: match any word (OR), rely on multi_word_boost in ranking
+                        words
+                            .iter()
+                            .map(|w| regex_syntax::escape(w))
+                            .collect::<Vec<_>>()
+                            .join("|")
+                    };
+                    let mut relaxed_result = search::search_regex_raw(&relaxed, scope)?;
+                    relaxed_result.query = text.clone();
+                    if relaxed_result.total_found > 0 {
+                        search::format_content_result(&relaxed_result, cache)?
+                    } else {
+                        let first_word = words.first().copied().unwrap_or(&text);
                         return Err(TilthError::NotFound {
                             path: scope.join(&text),
                             suggestion: read::suggest_similar_file(scope, first_word),

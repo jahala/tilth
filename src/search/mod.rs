@@ -277,6 +277,11 @@ pub fn search_content_raw(query: &str, scope: &Path) -> Result<SearchResult, Til
     content::search(pattern, scope, is_regex, None)
 }
 
+/// Raw regex search — returns structured result for programmatic inspection.
+pub fn search_regex_raw(pattern: &str, scope: &Path) -> Result<SearchResult, TilthError> {
+    content::search(pattern, scope, true, None)
+}
+
 /// Format a symbol search result (public for Fallthrough path in lib.rs).
 pub fn format_symbol_result(
     result: &SearchResult,
