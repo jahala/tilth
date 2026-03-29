@@ -310,14 +310,25 @@ fn incidental_text_penalty(m: &Match, query: &str) -> i32 {
         || text.starts_with("/*")
         || text.starts_with("<!--");
 
-    if is_comment {
+    // For '#' lines: only treat as comment in languages where # is always a comment
+    let is_hash_comment = text.starts_with('#') && {
+        let ext = m.path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        matches!(ext, "py" | "rb" | "sh" | "bash" | "zsh" | "yaml" | "yml" | "toml" | "pl" | "r" | "R")
+    };
+
+    if is_comment || is_hash_comment {
         return 150;
     }
 
     // Check if query only appears in a trailing comment (after //)
+    // Skip false positives: :// is a URL scheme separator, not a comment
     let t_lower = text.to_ascii_lowercase();
-    if let Some(comment_start) = t_lower.find("//") {
-        if t_lower[comment_start..].contains(&q_lower) && !t_lower[..comment_start].contains(&q_lower) {
+    if let Some(slash_pos) = t_lower.find("//") {
+        let is_url = slash_pos > 0 && t_lower.as_bytes()[slash_pos - 1] == b':';
+        if !is_url
+            && t_lower[slash_pos..].contains(&q_lower)
+            && !t_lower[..slash_pos].contains(&q_lower)
+        {
             return 100;
         }
     }
@@ -679,9 +690,16 @@ mod tests {
 
     #[test]
     fn incidental_text_penalty_no_hash_false_positive() {
-        // # should NOT trigger comment penalty (could be Python, C preprocessor, etc.)
-        let m = make_match("/repo/src/main.py", "#include <stdio.h>", false, None);
+        // # in C/Rust files should NOT trigger comment penalty
+        let m = make_match("/repo/src/main.c", "#include <stdio.h>", false, None);
         assert_eq!(super::incidental_text_penalty(&m, "stdio"), 0);
+    }
+
+    #[test]
+    fn incidental_text_penalty_hash_comment_in_python() {
+        // # in .py files IS a comment — should be penalized
+        let m = make_match("/repo/src/main.py", "# handle_auth is deprecated", false, None);
+        assert_eq!(super::incidental_text_penalty(&m, "handle_auth"), 150);
     }
 
     #[test]
@@ -703,6 +721,13 @@ mod tests {
         // Query only in trailing comment should be penalized
         let m = make_match("/repo/src/lib.rs", "let x = 1; // handleAuth workaround", false, None);
         assert_eq!(super::incidental_text_penalty(&m, "handleAuth"), 100);
+    }
+
+    #[test]
+    fn incidental_text_penalty_url_not_comment() {
+        // :// is a URL scheme — should NOT be treated as trailing comment
+        let m = make_match("/repo/src/lib.rs", r#"let url = "https://handleAuth.example.com";"#, false, None);
+        assert_eq!(super::incidental_text_penalty(&m, "handleAuth"), 0);
     }
 
     #[test]

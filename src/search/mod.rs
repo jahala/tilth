@@ -682,26 +682,8 @@ fn source_priority(path: &Path) -> u8 {
     }
 }
 
-/// When a file's basename (without extension) matches the query exactly,
-/// return a compact outline of that file. Helps concept queries like `cli`
-/// surface the file `cli.ts` with structural context instead of scattered text matches.
-///
-/// Uses the already-collected search results to find basename matches,
-/// avoiding an expensive directory walk in the formatting path.
-fn basename_file_outline(
-    query: &str,
-    matches: &[Match],
-    scope: &Path,
-    cache: &OutlineCache,
-) -> Option<String> {
-    let query_lower = query.to_ascii_lowercase();
-
-    // Only trigger for short single-word queries (concept/file-level intent)
-    if query_lower.is_empty() || query.contains(' ') || query.contains("::") {
-        return None;
-    }
-
-    // Find the best candidate among existing matches whose basename matches the query
+/// Find a basename-matching candidate among already-collected search matches.
+fn find_basename_candidate(matches: &[Match], query_lower: &str) -> Option<PathBuf> {
     let mut candidate: Option<&Path> = None;
     let mut best_priority: u8 = 0;
 
@@ -746,18 +728,77 @@ fn basename_file_outline(
         }
     }
 
-    let matched_path = candidate?;
+    candidate.map(Path::to_path_buf)
+}
+
+/// Fallback: lightweight directory walk to find a basename-matching file
+/// when it didn't survive ranking/truncation in the match set.
+fn find_basename_fallback(scope: &Path, query_lower: &str) -> Option<PathBuf> {
+    let mut candidate: Option<PathBuf> = None;
+    let mut best_priority: u8 = 0;
+
+    let walker = ignore::WalkBuilder::new(scope)
+        .hidden(true)
+        .git_ignore(true)
+        .max_depth(Some(6))
+        .build();
+
+    for entry in walker.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let stem = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(s) => s,
+            None => continue,
+        };
+        if stem.to_ascii_lowercase() != *query_lower {
+            continue;
+        }
+        let prio = source_priority(path);
+        if prio > best_priority {
+            best_priority = prio;
+            candidate = Some(path.to_path_buf());
+        }
+    }
+
+    candidate
+}
+
+/// When a file's basename (without extension) matches the query exactly,
+/// return a compact outline of that file. Helps concept queries like `cli`
+/// surface the file `cli.ts` with structural context instead of scattered text matches.
+///
+/// Uses the already-collected search results to find basename matches,
+/// avoiding an expensive directory walk in the formatting path.
+fn basename_file_outline(
+    query: &str,
+    matches: &[Match],
+    scope: &Path,
+    cache: &OutlineCache,
+) -> Option<String> {
+    let query_lower = query.to_ascii_lowercase();
+
+    // Only trigger for short single-word queries (concept/file-level intent)
+    if query_lower.is_empty() || query.contains(' ') || query.contains("::") {
+        return None;
+    }
+
+    // Find the best candidate among existing matches whose basename matches the query
+    let matched_path = find_basename_candidate(matches, &query_lower)
+        // Fallback: lightweight directory scan when basename file didn't survive truncation
+        .or_else(|| find_basename_fallback(scope, &query_lower))?;
 
     // Read file and generate outline
-    let content = std::fs::read_to_string(matched_path).ok()?;
-    let file_type = crate::read::detect_file_type(matched_path);
-    let mtime = std::fs::metadata(matched_path)
+    let content = std::fs::read_to_string(&matched_path).ok()?;
+    let file_type = crate::read::detect_file_type(&matched_path);
+    let mtime = std::fs::metadata(&matched_path)
         .and_then(|m| m.modified())
         .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
 
-    let outline = cache.get_or_compute(matched_path, mtime, || {
+    let outline = cache.get_or_compute(&matched_path, mtime, || {
         crate::read::outline::generate(
-            matched_path,
+            &matched_path,
             file_type,
             &content,
             content.as_bytes(),
@@ -769,7 +810,7 @@ fn basename_file_outline(
         return None;
     }
 
-    let rel_path = rel(matched_path, scope);
+    let rel_path = rel(&matched_path, scope);
     let line_count = content.lines().count();
     Some(format!(
         "### File overview: {rel_path} ({line_count} lines)\n{outline}"
