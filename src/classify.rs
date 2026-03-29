@@ -62,11 +62,77 @@ pub fn classify(query: &str, scope: &Path) -> QueryType {
 
     // 6. Identifier — no whitespace, starts with letter/underscore/$/@
     if is_identifier(query) {
-        return QueryType::Symbol(query.into());
+        // Sub-classify: exact symbol vs concept
+        if looks_like_exact_symbol(query) {
+            return QueryType::Symbol(query.into());
+        }
+        return QueryType::Concept(query.into());
     }
 
-    // 7. Everything else
+    // 7. Multi-word — could be concept phrase ("cli mode", "search flow")
+    if query.contains(' ') && query.split_whitespace().count() <= 4 {
+        let words: Vec<&str> = query.split_whitespace().collect();
+        let all_simple = words.iter().all(|w| {
+            !w.is_empty()
+                && w.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        });
+        if all_simple {
+            return QueryType::Concept(query.into());
+        }
+    }
+
+    // 8. Everything else
     QueryType::Content(query.into())
+}
+
+/// Does this single-token query look like an exact symbol name?
+///
+/// Heuristics (all generic, no domain knowledge):
+/// - PascalCase (starts uppercase): `SearchResult`, `MapModel`, `AuthService`
+/// - Contains `::` or `.`: `std::path`, `Auth.validate`
+/// - snake_case with underscore: `handle_auth`, `is_test_file`
+/// - Has mixed case after first char: `handleAuth`, `getElementById`
+/// - Starts with `$` or `@`: `$ref`, `@decorator`
+fn looks_like_exact_symbol(query: &str) -> bool {
+    let bytes = query.as_bytes();
+    if bytes.is_empty() {
+        return false;
+    }
+
+    // Starts uppercase → PascalCase type/class name
+    if bytes[0].is_ascii_uppercase() {
+        return true;
+    }
+
+    // Contains :: or . → qualified symbol
+    if query.contains("::") || query.contains('.') {
+        return true;
+    }
+
+    // Contains underscore → snake_case identifier
+    if query.contains('_') {
+        return true;
+    }
+
+    // Contains hyphen → kebab-case identifier (component names, npm packages)
+    if query.contains('-') {
+        return true;
+    }
+
+    // Starts with $ or @ → special symbol
+    if bytes[0] == b'$' || bytes[0] == b'@' {
+        return true;
+    }
+
+    // camelCase: starts lowercase but has uppercase later → likely function/method name
+    if bytes[0].is_ascii_lowercase() && bytes[1..].iter().any(|b| b.is_ascii_uppercase()) {
+        return true;
+    }
+
+    // Short all-lowercase without any symbol markers → concept, not symbol
+    // e.g. "thinking", "alias", "cli", "mode", "config"
+    false
 }
 
 /// Does this query look like a filename? Has an extension, or matches known extensionless names.
@@ -223,6 +289,68 @@ mod tests {
         assert!(matches!(
             classify("import { X }", &scope),
             QueryType::Content(_)
+        ));
+    }
+
+    #[test]
+    fn concept_queries() {
+        let scope = PathBuf::from(".");
+        // Single lowercase words → concept, not symbol
+        assert!(matches!(classify("thinking", &scope), QueryType::Concept(_)));
+        assert!(matches!(classify("alias", &scope), QueryType::Concept(_)));
+        assert!(matches!(classify("cli", &scope), QueryType::Concept(_)));
+        assert!(matches!(classify("mode", &scope), QueryType::Concept(_)));
+        assert!(matches!(classify("config", &scope), QueryType::Concept(_)));
+        assert!(matches!(classify("server", &scope), QueryType::Concept(_)));
+        // Multi-word phrases → concept
+        assert!(matches!(
+            classify("cli mode", &scope),
+            QueryType::Concept(_)
+        ));
+        assert!(matches!(
+            classify("search flow", &scope),
+            QueryType::Concept(_)
+        ));
+        assert!(matches!(
+            classify("model mapping", &scope),
+            QueryType::Concept(_)
+        ));
+    }
+
+    #[test]
+    fn symbol_not_concept() {
+        let scope = PathBuf::from(".");
+        // PascalCase → symbol
+        assert!(matches!(
+            classify("SearchResult", &scope),
+            QueryType::Symbol(_)
+        ));
+        assert!(matches!(
+            classify("MapModel", &scope),
+            QueryType::Symbol(_)
+        ));
+        // camelCase → symbol
+        assert!(matches!(
+            classify("handleAuth", &scope),
+            QueryType::Symbol(_)
+        ));
+        assert!(matches!(
+            classify("thinkingBudget", &scope),
+            QueryType::Symbol(_)
+        ));
+        // snake_case → symbol
+        assert!(matches!(
+            classify("is_test_file", &scope),
+            QueryType::Symbol(_)
+        ));
+        assert!(matches!(
+            classify("handle_auth", &scope),
+            QueryType::Symbol(_)
+        ));
+        // dotted → symbol
+        assert!(matches!(
+            classify("Auth.validate", &scope),
+            QueryType::Symbol(_)
         ));
     }
 

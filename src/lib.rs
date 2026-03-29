@@ -75,6 +75,50 @@ fn run_inner(
 
         QueryType::Symbol(name) => search::search_symbol(&name, scope, cache)?,
 
+        QueryType::Concept(text) => {
+            // Concept query: route differently based on word count.
+            let is_multi_word = text.contains(' ');
+
+            if is_multi_word {
+                // Multi-word concepts: content search first (symbol search can't handle spaces)
+                let content_result = search::search_content_raw(&text, scope)?;
+                if content_result.total_found > 0 {
+                    search::format_content_result(&content_result, cache)?
+                } else {
+                    // Try individual words as symbol searches
+                    let first_word = text.split_whitespace().next().unwrap_or(&text);
+                    let sym_result = search::search_symbol_raw(first_word, scope)?;
+                    if sym_result.total_found > 0 {
+                        search::format_symbol_result(&sym_result, cache)?
+                    } else {
+                        return Err(TilthError::NotFound {
+                            path: scope.join(&text),
+                            suggestion: read::suggest_similar_file(scope, first_word),
+                        });
+                    }
+                }
+            } else {
+                // Single-word concept: try symbol first (may match a definition),
+                // fall back to content.
+                let sym_result = search::search_symbol_raw(&text, scope)?;
+                if sym_result.definitions > 0 {
+                    search::format_symbol_result(&sym_result, cache)?
+                } else {
+                    let content_result = search::search_content_raw(&text, scope)?;
+                    if content_result.total_found > 0 {
+                        search::format_content_result(&content_result, cache)?
+                    } else if sym_result.total_found > 0 {
+                        search::format_symbol_result(&sym_result, cache)?
+                    } else {
+                        return Err(TilthError::NotFound {
+                            path: scope.join(&text),
+                            suggestion: read::suggest_similar_file(scope, &text),
+                        });
+                    }
+                }
+            }
+        }
+
         QueryType::Content(text) => search::search_content(&text, scope, cache)?,
 
         QueryType::Regex(pattern) => search::search_regex(&pattern, scope, cache)?,
