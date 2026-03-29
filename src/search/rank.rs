@@ -86,10 +86,12 @@ fn score(
     }
 
     s += basename_boost(&m.path, query);
+    s += exported_api_boost(m);
 
     if is_test_file(&m.path) && !looks_like_test_query(query) {
         s -= 120;
     }
+    s -= fixture_penalty(m);
 
     if is_vendor_path(&m.path) {
         s -= 200;
@@ -234,6 +236,36 @@ fn query_intent_boost(m: &Match, query: &str) -> i32 {
     0
 }
 
+fn exported_api_boost(m: &Match) -> i32 {
+    let text = m.text.trim_start();
+
+    if text.starts_with("export default ") {
+        90
+    } else if text.starts_with("export ") {
+        75
+    } else if text.starts_with("pub ") {
+        60
+    } else {
+        0
+    }
+}
+
+fn fixture_penalty(m: &Match) -> i32 {
+    let path = m.path.to_string_lossy().to_ascii_lowercase();
+    let text = m.text.to_ascii_lowercase();
+
+    let mut score = 0;
+    for needle in ["mock", "fixture", "stub", "fake", "example"] {
+        if path.contains(needle) {
+            score += 90;
+        }
+        if text.contains(needle) {
+            score += 40;
+        }
+    }
+    score
+}
+
 fn looks_like_test_query(query: &str) -> bool {
     let q = query.to_ascii_lowercase();
     q.contains("test") || q.contains("spec") || q.starts_with("should")
@@ -360,5 +392,51 @@ mod tests {
         sort(&mut matches, "handleAuth", &scope, Some(&context));
 
         assert_eq!(matches[0].path, PathBuf::from("/repo/src/auth/service.rs"));
+    }
+
+    #[test]
+    fn prefers_exported_api_over_local_definition() {
+        let scope = PathBuf::from("/repo/src");
+        let mut matches = vec![
+            make_match(
+                "/repo/src/internal/auth.ts",
+                "function handleAuth() {",
+                true,
+                Some("handleAuth"),
+            ),
+            make_match(
+                "/repo/src/public/auth.ts",
+                "export function handleAuth() {",
+                true,
+                Some("handleAuth"),
+            ),
+        ];
+
+        sort(&mut matches, "handleAuth", &scope, None);
+
+        assert_eq!(matches[0].path, PathBuf::from("/repo/src/public/auth.ts"));
+    }
+
+    #[test]
+    fn prefers_real_definition_over_fixture_match() {
+        let scope = PathBuf::from("/repo/src");
+        let mut matches = vec![
+            make_match(
+                "/repo/src/fixtures/auth-fixture.ts",
+                "export function handleAuth() {",
+                true,
+                Some("handleAuth"),
+            ),
+            make_match(
+                "/repo/src/auth.ts",
+                "export function handleAuth() {",
+                true,
+                Some("handleAuth"),
+            ),
+        ];
+
+        sort(&mut matches, "handleAuth", &scope, None);
+
+        assert_eq!(matches[0].path, PathBuf::from("/repo/src/auth.ts"));
     }
 }

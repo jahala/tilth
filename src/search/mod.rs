@@ -353,8 +353,22 @@ fn format_matches(
 /// Definitions and impl matches are always singleton groups.
 fn group_matches<'a>(matches: &'a [Match], cache: &OutlineCache) -> Vec<Vec<&'a Match>> {
     let mut groups: Vec<Vec<&Match>> = Vec::new();
+    let mut seen_defs: HashSet<(&Path, u32, Option<(u32, u32)>, Option<&str>, Option<&str>)> =
+        HashSet::new();
 
     for m in matches {
+        if m.is_definition || m.impl_target.is_some() {
+            let key = (
+                m.path.as_path(),
+                m.line,
+                m.def_range,
+                m.def_name.as_deref(),
+                m.impl_target.as_deref(),
+            );
+            if !seen_defs.insert(key) {
+                continue;
+            }
+        }
         // Definitions and impls are never grouped
         if m.is_definition || m.impl_target.is_some() {
             groups.push(vec![m]);
