@@ -1,7 +1,10 @@
 use std::fmt::Write as _;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -10,6 +13,22 @@ use crate::cache::OutlineCache;
 use crate::index::bloom::BloomFilterCache;
 use crate::index::SymbolIndex;
 use crate::session::Session;
+
+/// Tracks abandoned threads (timed out but still running). Warns on stderr
+/// when accumulation exceeds threshold to help diagnose resource pressure.
+static ABANDONED_THREADS: AtomicUsize = AtomicUsize::new(0);
+const ABANDONED_THREAD_WARN: usize = 3;
+
+/// Per-request timeout for tool calls. If a tool doesn't respond within this
+/// duration, the MCP server returns a timeout error instead of hanging.
+/// Override with `TILTH_TIMEOUT` env var (seconds). Default: 90s.
+fn request_timeout() -> Duration {
+    let secs = std::env::var("TILTH_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(90);
+    Duration::from_secs(secs)
+}
 
 // Sent to the LLM via the MCP `instructions` field during initialization.
 // Keeps the strategic guidance from AGENTS.md available to any host.
@@ -71,8 +90,8 @@ DO NOT use the host Edit tool. Use tilth_edit for all edits.";
 /// MCP server over stdio. When `edit_mode` is true, exposes `tilth_edit` and
 /// switches `tilth_read` to hashline output format.
 pub fn run(edit_mode: bool) -> io::Result<()> {
-    let cache = OutlineCache::new();
-    let session = Session::new();
+    let cache = Arc::new(OutlineCache::new());
+    let session = Arc::new(Session::new());
     let symbol_index = Arc::new(SymbolIndex::new());
     let bloom_cache = Arc::new(BloomFilterCache::new());
     let stdin = io::stdin();
@@ -142,8 +161,8 @@ struct JsonRpcError {
 
 fn handle_request(
     req: &JsonRpcRequest,
-    cache: &OutlineCache,
-    session: &Session,
+    cache: &Arc<OutlineCache>,
+    session: &Arc<Session>,
     index: &Arc<SymbolIndex>,
     bloom: &Arc<BloomFilterCache>,
     edit_mode: bool,
@@ -246,8 +265,29 @@ fn tool_read(
                 paths_arr.len()
             ));
         }
+
+        // Aggregate deadline for batch reads: 60s default, override with TILTH_BATCH_TIMEOUT
+        // Note: deadline is checked between files, so a single massive file could still
+        // exceed it. The per-request timeout (handle_tool_call) catches that case.
+        let batch_timeout = std::env::var("TILTH_BATCH_TIMEOUT")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(60);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(batch_timeout);
+
         let mut results = Vec::with_capacity(paths_arr.len());
-        for p in paths_arr {
+        for (i, p) in paths_arr.iter().enumerate() {
+            // Check deadline before each file
+            if std::time::Instant::now() > deadline {
+                results.push(format!(
+                    "# batch read stopped — deadline exceeded after {}/{} files. \
+                     Reduce batch size or set TILTH_BATCH_TIMEOUT=<seconds>.",
+                    i,
+                    paths_arr.len()
+                ));
+                break;
+            }
+
             let path_str = p.as_str().ok_or("paths must be an array of strings")?;
             let path = PathBuf::from(path_str);
             session.record_read(&path);
@@ -538,8 +578,8 @@ fn apply_budget(output: String, budget: Option<u64>) -> String {
 
 fn handle_tool_call(
     req: &JsonRpcRequest,
-    cache: &OutlineCache,
-    session: &Session,
+    cache: &Arc<OutlineCache>,
+    session: &Arc<Session>,
     index: &Arc<SymbolIndex>,
     bloom: &Arc<BloomFilterCache>,
     edit_mode: bool,
@@ -548,7 +588,62 @@ fn handle_tool_call(
     let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let args = params.get("arguments").unwrap_or(&Value::Null);
 
-    let result = dispatch_tool(tool_name, args, cache, session, index, bloom, edit_mode);
+    // Clone values needed by the worker thread
+    let tool_name_owned = tool_name.to_string();
+    let args_owned = args.clone();
+    let cache_clone = Arc::clone(cache);
+    let session_clone = Arc::clone(session);
+    let index_clone = Arc::clone(index);
+    let bloom_clone = Arc::clone(bloom);
+
+    let (tx, rx) = mpsc::channel();
+    let timeout = request_timeout();
+
+    let handle = std::thread::spawn(move || {
+        let result = dispatch_tool(
+            &tool_name_owned,
+            &args_owned,
+            &cache_clone,
+            &session_clone,
+            &index_clone,
+            &bloom_clone,
+            edit_mode,
+        );
+        let _ = tx.send(result);
+    });
+
+    let result = match rx.recv_timeout(timeout) {
+        Ok(result) => {
+            // Thread finished in time — join it to reclaim resources
+            let _ = handle.join();
+            result
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            // Thread is still running — we can't safely kill it, but we return
+            // an error to the client immediately. The thread will finish in the
+            // background and its result will be dropped.
+            //
+            // Note: we intentionally do NOT join here to avoid blocking the
+            // main loop. The thread will complete and exit on its own.
+            let abandoned = ABANDONED_THREADS.fetch_add(1, Ordering::Relaxed) + 1;
+            if abandoned >= ABANDONED_THREAD_WARN {
+                eprintln!(
+                    "tilth: warning: {abandoned} abandoned threads still running. \
+                     Consider reducing scope or increasing TILTH_TIMEOUT."
+                );
+            }
+            Err(format!(
+                "tool timed out after {}s — the operation took too long. \
+                 Try: reduce scope, use section instead of full, or set \
+                 TILTH_TIMEOUT=<seconds> to increase the limit.",
+                timeout.as_secs()
+            ))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            // Thread panicked — the channel was dropped without sending
+            Err("tool panicked during execution".into())
+        }
+    };
 
     match result {
         Ok(output) => JsonRpcResponse {

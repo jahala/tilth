@@ -16,6 +16,17 @@ use crate::types::{estimate_tokens, FileType, Lang, ViewMode};
 pub(crate) const TOKEN_THRESHOLD: u64 = 6_000;
 const FILE_SIZE_CAP: u64 = 500_000; // 500KB
 
+/// Max file size for `full=true` reads. Files above this threshold get a
+/// warning header + outline instead of raw content, preventing multi-megabyte
+/// responses that cause MCP client timeouts.
+/// Override with `TILTH_FULL_SIZE_CAP` env var (bytes). Default: 2MB.
+fn full_read_size_cap() -> u64 {
+    std::env::var("TILTH_FULL_SIZE_CAP")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(2_000_000)
+}
+
 /// Main entry point for read mode. Routes through the decision tree.
 pub fn read_file(
     path: &Path,
@@ -94,6 +105,28 @@ pub fn read_file(
     let tokens = estimate_tokens(byte_len);
     let content = String::from_utf8_lossy(buf);
     let line_count = memchr::memchr_iter(b'\n', buf).count() as u32 + 1;
+
+    // Guard: full=true on very large files. Return outline + warning instead of
+    // dumping megabytes that would blow up the MCP client's timeout/memory.
+    let cap = full_read_size_cap();
+    if full && byte_len > cap {
+        let file_type = detect_file_type(path);
+        let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        #[allow(clippy::cast_precision_loss)] // cap and file sizes fit in f64 mantissa for display
+        let cap_mb = cap as f64 / 1_000_000.0;
+        #[allow(clippy::cast_precision_loss)]
+        let file_mb = byte_len as f64 / 1_000_000.0;
+
+        let outline = cache.get_or_compute(path, mtime, || {
+            outline::generate(path, file_type, &content, buf, true)
+        });
+
+        let header = format::file_header(path, byte_len, line_count, ViewMode::Outline);
+        return Ok(format!(
+            "{header}\n\n> **full=true skipped**: file is {file_mb:.1}MB (cap: {cap_mb:.1}MB). \
+             Use `section` to read specific ranges, or set TILTH_FULL_SIZE_CAP={byte_len} to override.\n\n{outline}"
+        ));
+    }
 
     // Full mode or small file → return full content (skip smart view)
     if full || tokens <= TOKEN_THRESHOLD {
@@ -510,5 +543,38 @@ mod tests {
 
         // String without hashes
         assert_eq!(resolve_heading(input, "hello"), None);
+    }
+
+    #[test]
+    fn full_true_size_cap_returns_outline() {
+        use std::io::Write;
+
+        // Create a temp file larger than our small cap (100 bytes)
+        let path = std::env::temp_dir().join("tilth_test_large.rs");
+        let mut f = std::fs::File::create(&path).unwrap();
+        // Write enough to exceed the cap — 200 bytes of Rust code
+        for i in 0..20 {
+            writeln!(f, "pub fn func_{i}() {{ println!(\"hello\"); }}").unwrap();
+        }
+        drop(f);
+
+        // Set a tiny cap so the guard triggers
+        std::env::set_var("TILTH_FULL_SIZE_CAP", "100");
+
+        let cache = OutlineCache::new();
+        let result = read_file(&path, None, true, &cache, false).unwrap();
+
+        // Should contain the warning, not the full file content
+        assert!(
+            result.contains("full=true skipped"),
+            "expected size cap warning, got: {result}"
+        );
+        assert!(
+            result.contains("func_0"),
+            "expected outline content in output"
+        );
+
+        std::env::remove_var("TILTH_FULL_SIZE_CAP");
+        let _ = std::fs::remove_file(&path);
     }
 }
