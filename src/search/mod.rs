@@ -346,7 +346,13 @@ fn format_matches(
 
 /// Group consecutive non-definition matches by (path, enclosing outline entry).
 /// Dedup key for definition matches: (path, line, `def_range`, `def_name`, `impl_target`).
-type DefKey<'a> = (&'a Path, u32, Option<(u32, u32)>, Option<&'a str>, Option<&'a str>);
+type DefKey<'a> = (
+    &'a Path,
+    u32,
+    Option<(u32, u32)>,
+    Option<&'a str>,
+    Option<&'a str>,
+);
 
 /// Returns a Vec of groups, where each group is a slice of matches.
 /// Definitions and impl matches are always singleton groups.
