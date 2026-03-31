@@ -113,9 +113,10 @@ fn run_inner(
     expand: usize,
     cache: &OutlineCache,
 ) -> Result<String, TilthError> {
-    let use_expanded = expand > 0;
-
     let query_type = classify(query, scope);
+
+    let use_expanded = expand > 0
+        && !matches!(query_type, QueryType::FilePath(_) | QueryType::Glob(_));
 
     // Multi-symbol: comma-separated identifiers, 2..=5 items
     // Check before main dispatch. Only activate when all parts look like identifiers
@@ -161,8 +162,8 @@ fn run_inner(
     let output = match query_type {
         QueryType::FilePath(path) => {
             let mut out = read::read_file(&path, section, full, cache, false)?;
-            // Append related file hints on outline reads (no section, large file)
-            if section.is_none() && read::would_outline(&path) {
+            // Append related file hints on large files (outline mode only, not full reads)
+            if section.is_none() && !full && read::would_outline(&path) {
                 let related = read::imports::resolve_related_files(&path);
                 if !related.is_empty() {
                     let hints: Vec<String> = related
@@ -192,7 +193,11 @@ fn run_inner(
         QueryType::Concept(text) => {
             let is_multi_word = text.contains(' ');
 
-            if is_multi_word {
+            if is_multi_word && use_expanded {
+                search::search_content_expanded(
+                    &text, scope, cache, session.as_ref().unwrap(), expand, None,
+                )?
+            } else if is_multi_word {
                 multi_word_concept_search(&text, scope, cache)?
             } else if use_expanded {
                 search::search_symbol_expanded(

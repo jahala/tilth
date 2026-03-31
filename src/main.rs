@@ -45,7 +45,7 @@ struct Cli {
     edit: bool,
 
     /// Expand top N search matches with inline source (default: 2 when flag present).
-    #[arg(long, num_args = 0..=1, default_missing_value = "2")]
+    #[arg(long, num_args = 0..=1, default_missing_value = "2", require_equals = true)]
     expand: Option<usize>,
 
     /// Find all callers of a symbol.
@@ -57,7 +57,7 @@ struct Cli {
     deps: bool,
 
     /// Generate a structural codebase map.
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["callers", "deps", "expand", "section", "full"])]
     map: bool,
 
     /// Print shell completions for the given shell.
