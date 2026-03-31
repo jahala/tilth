@@ -221,6 +221,10 @@ fn run_inner(
             } else if is_multi_word {
                 multi_word_concept_search(&text, scope, cache)?
             } else if use_expanded {
+                // --expand: go straight to expanded symbol search, intentionally
+                // bypassing the definitions>0 / content fallback cascade in
+                // single_query_search. The expanded variant already provides
+                // richer results with inline source, making the cascade redundant.
                 search::search_symbol_expanded(
                     &text,
                     scope,
@@ -270,6 +274,7 @@ fn run_inner(
 
         QueryType::Fallthrough(text) => {
             if use_expanded {
+                // --expand: skip single_query_search cascade (same rationale as Concept above)
                 search::search_symbol_expanded(
                     &text,
                     scope,
