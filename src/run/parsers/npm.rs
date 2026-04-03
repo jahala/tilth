@@ -26,11 +26,13 @@ impl Parser for NpmParser {
             return DetectResult::Text;
         }
 
-        // npm diagnostics
+        // npm diagnostics (both lowercase "npm warn" and legacy uppercase "npm WARN")
         let npm_warn = memmem::Finder::new("npm warn");
+        let npm_warn_upper = memmem::Finder::new("npm WARN");
         let npm_error = memmem::Finder::new("npm error");
         let npm_err_bang = memmem::Finder::new("npm ERR!");
         if npm_warn.find(bytes).is_some()
+            || npm_warn_upper.find(bytes).is_some()
             || npm_error.find(bytes).is_some()
             || npm_err_bang.find(bytes).is_some()
         {
@@ -218,6 +220,16 @@ mod tests {
     fn detect_yarn() {
         let sample = "[YN0000]: Done in 3s\nsuccess Saved lockfile.\n";
         assert!(PARSER.detect(sample).matched());
+    }
+
+    // Bug 9 regression: older npm emits "npm WARN" (uppercase). detect() must match it.
+    #[test]
+    fn detect_npm_warn_uppercase() {
+        let sample = "npm WARN deprecated inflight@1.0.6: This module is not supported\n";
+        assert!(
+            PARSER.detect(sample).matched(),
+            "detect() must match uppercase 'npm WARN'"
+        );
     }
 
     #[test]

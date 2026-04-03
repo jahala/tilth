@@ -63,6 +63,8 @@ toml = "0.8"
 # MCP protocol (JSON-RPC over stdio)
 # (handled manually — no framework needed)
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [profile.release]
 opt-level = 3

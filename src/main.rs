@@ -2,7 +2,7 @@ use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process;
 
-use clap::{CommandFactory, Parser};
+use clap::{CommandFactory, Parser, ValueEnum};
 use clap_complete::Shell;
 
 /// tilth — Tree-sitter indexed lookups, smart code reading for AI agents.
@@ -53,6 +53,14 @@ struct Cli {
     completions: Option<Shell>,
 }
 
+/// Output format for the `run` subcommand.
+#[derive(Clone, ValueEnum)]
+enum RunFormat {
+    Markdown,
+    Plain,
+    Json,
+}
+
 #[derive(clap::Subcommand)]
 enum Command {
     /// Install tilth into an MCP host's config.
@@ -84,9 +92,9 @@ enum Command {
         #[arg(long, default_value_t = 120)]
         timeout: u64,
 
-        /// Output format: markdown, plain, json.
+        /// Output format.
         #[arg(long)]
-        format: Option<String>,
+        format: Option<RunFormat>,
     },
 }
 
@@ -216,7 +224,13 @@ fn handle_hook_rewrite() -> ! {
             .and_then(|p| p.to_str().map(String::from))
             .unwrap_or_else(|| "tilth".into());
 
-        let rewritten = format!("{tilth_bin} run -- {command}");
+        // Quote both paths: tilth_bin may contain spaces, and command may contain
+        // shell metacharacters (&&, ||, ;, pipes). Single-quoting passes the full
+        // compound command as one argument to tilth's trailing_var_arg, which then
+        // joins and passes it to sh -c.
+        let tilth_quoted = shell_quote_single(&tilth_bin);
+        let cmd_quoted = shell_quote_single(&command);
+        let rewritten = format!("{tilth_quoted} run -- {cmd_quoted}");
         json["command"] = serde_json::Value::String(rewritten);
     }
 
@@ -228,15 +242,12 @@ fn handle_hook_rewrite() -> ! {
 /// Check if a command should be routed through `tilth run` for compression.
 fn should_rewrite_for_hook(command: &str) -> bool {
     let cmd = command.trim();
+    let base = extract_base_command(cmd);
 
-    // Already wrapped
-    if cmd.starts_with("tilth") {
+    // Already wrapped — exact word boundary so "tilthx" doesn't match
+    if base == "tilth" {
         return false;
     }
-
-    // Extract the base command name (handle paths like /usr/bin/cargo)
-    let first_word = cmd.split_whitespace().next().unwrap_or("");
-    let base = first_word.rsplit('/').next().unwrap_or(first_word);
 
     matches!(
         base,
@@ -275,8 +286,48 @@ fn should_rewrite_for_hook(command: &str) -> bool {
     )
 }
 
+/// Extract the actual base command name from a shell command string, skipping:
+/// - `KEY=VALUE` environment variable assignments
+/// - Known wrapper commands: `sudo`, `env`, `time`, `nice`, `nohup`, `strace`, `ltrace`
+///
+/// Also strips path prefixes (e.g. `/usr/bin/cargo` → `cargo`).
+fn extract_base_command(cmd: &str) -> &str {
+    let mut words = cmd.split_whitespace();
+    loop {
+        let Some(word) = words.next() else {
+            return "";
+        };
+        let base = word.rsplit('/').next().unwrap_or(word);
+        // Skip KEY=VALUE env var assignments (contains '=' but doesn't start with it)
+        if base.contains('=') && !base.starts_with('=') {
+            continue;
+        }
+        // Skip known wrapper commands
+        if matches!(
+            base,
+            "sudo" | "env" | "time" | "nice" | "nohup" | "strace" | "ltrace"
+        ) {
+            continue;
+        }
+        return base;
+    }
+}
+
+/// Build the shell command string for `sh -c`.
+///
+/// When there is exactly one argument (e.g. a fully-formed compound command delivered
+/// by the hook path), pass it through verbatim — calling `shell_join` would re-quote
+/// it, causing `sh -c` to fail. For multiple arguments, join with quoting.
+fn build_command_string(command: Vec<String>) -> String {
+    if command.len() == 1 {
+        command.into_iter().next().unwrap()
+    } else {
+        shell_join(&command)
+    }
+}
+
 /// Execute a shell command, compress its output, and exit with the command's exit code.
-fn handle_run(command: Vec<String>, cwd: PathBuf, timeout: u64, format: Option<String>) -> ! {
+fn handle_run(command: Vec<String>, cwd: PathBuf, timeout: u64, format: Option<RunFormat>) -> ! {
     use tilth::run::{exec, process_structured, OutputFormat};
 
     let is_tty = io::stdout().is_terminal();
@@ -286,7 +337,7 @@ fn handle_run(command: Vec<String>, cwd: PathBuf, timeout: u64, format: Option<S
         process::exit(1);
     }
 
-    let cmd_str = shell_join(&command);
+    let cmd_str = build_command_string(command);
     let cwd = cwd.canonicalize().unwrap_or(cwd);
 
     let exec_result = match exec::execute(&cmd_str, &cwd, timeout) {
@@ -297,49 +348,52 @@ fn handle_run(command: Vec<String>, cwd: PathBuf, timeout: u64, format: Option<S
         }
     };
 
-    if exec_result.timed_out {
+    let exit_code = exec_result.exit_code;
+    let timed_out = exec_result.timed_out;
+
+    if timed_out {
         eprintln!("command timed out after {timeout}s");
-        let partial = match (exec_result.stdout.is_empty(), exec_result.stderr.is_empty()) {
-            (_, true) => exec_result.stdout,
-            (true, _) => exec_result.stderr,
-            _ => format!("{}{}", exec_result.stdout, exec_result.stderr),
-        };
+        let partial = exec_result.combined_output();
         if !partial.is_empty() {
             emit_output(&partial, is_tty);
         }
         process::exit(124);
     }
 
-    let combined = match (exec_result.stdout.is_empty(), exec_result.stderr.is_empty()) {
-        (_, true) => exec_result.stdout,
-        (true, _) => exec_result.stderr,
-        _ => format!("{}{}", exec_result.stdout, exec_result.stderr),
-    };
+    let combined = exec_result.combined_output();
 
-    let fmt = match format.as_deref() {
-        Some("json") => OutputFormat::Json,
-        Some("markdown") => OutputFormat::Markdown,
-        Some("plain") => OutputFormat::Plain,
+    let fmt = match format {
+        Some(RunFormat::Json) => OutputFormat::Json,
+        Some(RunFormat::Markdown) => OutputFormat::Markdown,
+        Some(RunFormat::Plain) => OutputFormat::Plain,
         None if is_tty => OutputFormat::Plain,
-        _ => OutputFormat::Markdown,
+        None => OutputFormat::Markdown,
     };
 
     let result = process_structured(&combined);
 
     let output = if result.passthrough {
-        combined.clone()
+        combined
     } else {
         result
             .format_checked(fmt, combined.len())
             .unwrap_or(combined)
     };
 
-    if exec_result.exit_code != 0 {
-        eprintln!("exit code: {}", exec_result.exit_code);
+    if exit_code != 0 {
+        eprintln!("exit code: {exit_code}");
     }
 
     emit_output(&output, is_tty);
-    process::exit(exec_result.exit_code);
+    process::exit(exit_code);
+}
+
+/// Wrap a string in single quotes for use in a shell command.
+///
+/// Single-quotes prevent all shell interpretation (metacharacters, variable expansion, etc.).
+/// Embedded single quotes are escaped using the `'\''` idiom.
+fn shell_quote_single(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// Join command arguments, quoting any that contain shell metacharacters.
@@ -381,7 +435,8 @@ fn emit_output(output: &str, is_tty: bool) {
         }
     }
 
-    println!("{output}");
+    print!("{output}");
+    let _ = io::stdout().flush();
 }
 
 fn terminal_height() -> usize {
@@ -412,4 +467,194 @@ fn configure_thread_pools() {
         .num_threads(num_threads)
         .build_global()
         .ok();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- should_rewrite_for_hook ---
+
+    #[test]
+    fn rewrite_simple_cargo() {
+        assert!(should_rewrite_for_hook("cargo test"));
+    }
+
+    #[test]
+    fn no_rewrite_already_wrapped() {
+        assert!(!should_rewrite_for_hook("tilth run -- cargo test"));
+    }
+
+    #[test]
+    fn no_rewrite_tilth_alone() {
+        assert!(!should_rewrite_for_hook("tilth"));
+    }
+
+    /// Bug #16: "tilthx" must NOT be treated as already-wrapped.
+    #[test]
+    fn rewrite_tilthx_not_matched_by_guard() {
+        // "tilthx" is not a known build command so should_rewrite returns false,
+        // but the guard must not incorrectly suppress the check — tilthx != tilth.
+        // Since tilthx is not in the allow-list either, the result is false.
+        // The important thing: it must not return false due to the "already wrapped" guard.
+        // We verify by checking a known command prefixed with "tilth" in the name:
+        // use a hypothetical "tilthbuild cargo test" — not a real command, so false is correct.
+        // More directly: a command whose first word is "tilthx" should reach the matches! block.
+        // It won't match any known command, so result is false — but NOT because of guard.
+        assert!(!should_rewrite_for_hook("tilthx cargo test"));
+    }
+
+    /// Bug #16 — the guard must not block "tilth_something" style names.
+    #[test]
+    fn rewrite_guard_exact_word_only() {
+        // "tilthy build" — base == "tilthy", not "tilth", so guard doesn't fire.
+        // Not in the match list → returns false (correct — no rewrite for unknown commands).
+        assert!(!should_rewrite_for_hook("tilthy build"));
+    }
+
+    /// Compound command (Bug #5) — cargo + shell operator
+    #[test]
+    fn rewrite_compound_command() {
+        assert!(should_rewrite_for_hook("cargo test && echo done"));
+    }
+
+    #[test]
+    fn rewrite_compound_pipe() {
+        assert!(should_rewrite_for_hook("cargo build 2>&1 | tee build.log"));
+    }
+
+    #[test]
+    fn no_rewrite_unknown_command() {
+        assert!(!should_rewrite_for_hook("echo hello"));
+    }
+
+    // --- shell_quote_single ---
+
+    #[test]
+    fn quote_simple_string() {
+        assert_eq!(shell_quote_single("hello"), "'hello'");
+    }
+
+    #[test]
+    fn quote_string_with_spaces() {
+        // Handles paths like /Users/John Doe/.cargo/bin/tilth
+        assert_eq!(
+            shell_quote_single("/Users/John Doe/.cargo/bin/tilth"),
+            "'/Users/John Doe/.cargo/bin/tilth'"
+        );
+    }
+
+    #[test]
+    fn quote_string_with_single_quote() {
+        assert_eq!(shell_quote_single("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn quote_compound_command() {
+        // A compound command passed as one arg
+        assert_eq!(
+            shell_quote_single("cargo test && echo done"),
+            "'cargo test && echo done'"
+        );
+    }
+
+    // --- handle_hook_rewrite integration (rewrite format) ---
+
+    /// Verify the rewritten command has the correct structure for Bug #5 and Bug #17.
+    #[test]
+    fn hook_rewrite_quotes_compound_command() {
+        // Simulate what handle_hook_rewrite does for a compound command
+        let command = "cargo test && echo done";
+        let tilth_bin = "/Users/John Doe/.cargo/bin/tilth";
+
+        let tilth_quoted = shell_quote_single(tilth_bin);
+        let cmd_quoted = shell_quote_single(command);
+        let rewritten = format!("{tilth_quoted} run -- {cmd_quoted}");
+
+        assert_eq!(
+            rewritten,
+            "'/Users/John Doe/.cargo/bin/tilth' run -- 'cargo test && echo done'"
+        );
+    }
+
+    #[test]
+    fn hook_rewrite_simple_command() {
+        let command = "cargo test";
+        let tilth_bin = "/home/user/.cargo/bin/tilth";
+
+        let tilth_quoted = shell_quote_single(tilth_bin);
+        let cmd_quoted = shell_quote_single(command);
+        let rewritten = format!("{tilth_quoted} run -- {cmd_quoted}");
+
+        assert_eq!(
+            rewritten,
+            "'/home/user/.cargo/bin/tilth' run -- 'cargo test'"
+        );
+    }
+
+    // --- build_command_string: single-arg passthrough ---
+    //
+    // When the hook rewrites a command, it produces something like:
+    //   tilth run -- 'cargo test && echo done'
+    // Clap parses this as a single trailing_var_arg element: ["cargo test && echo done"].
+    // build_command_string must pass it through verbatim — calling shell_join would
+    // re-quote it, causing sh -c to treat the whole thing as a literal binary name.
+    // shell_join itself is correct for multi-arg joining; the fix is in the caller.
+
+    #[test]
+    fn build_command_string_single_compound_arg_passthrough() {
+        // A compound command arriving as one element must come through verbatim.
+        let args = vec!["cargo test && echo done".to_string()];
+        assert_eq!(build_command_string(args), "cargo test && echo done");
+    }
+
+    #[test]
+    fn build_command_string_single_simple_arg_passthrough() {
+        // A simple two-word command passed as one element must come through verbatim.
+        let args = vec!["cargo test".to_string()];
+        assert_eq!(build_command_string(args), "cargo test");
+    }
+
+    #[test]
+    fn build_command_string_multi_arg_joins_with_quoting() {
+        // Multiple args (CLI invocation like `tilth run cargo test`) are shell-joined.
+        let args = vec!["cargo".to_string(), "test".to_string()];
+        assert_eq!(build_command_string(args), "cargo test");
+    }
+
+    #[test]
+    fn build_command_string_multi_arg_with_metachar_quoting() {
+        // An arg with metacharacters in a multi-arg context gets quoted by shell_join.
+        let args = vec!["echo".to_string(), "hello world".to_string()];
+        assert_eq!(build_command_string(args), "echo 'hello world'");
+    }
+
+    #[test]
+    fn rewrite_env_var_prefixed_command() {
+        // Bug: env var prefix causes first_word to be "RUST_BACKTRACE=1",
+        // base becomes "RUST_BACKTRACE=1", no match → returns false.
+        assert!(should_rewrite_for_hook("RUST_BACKTRACE=1 cargo test"));
+    }
+
+    #[test]
+    fn rewrite_sudo_prefixed_command() {
+        assert!(should_rewrite_for_hook("sudo cargo test"));
+    }
+
+    #[test]
+    fn rewrite_env_prefixed_command() {
+        assert!(should_rewrite_for_hook("env cargo test"));
+    }
+
+    // --- FIX N4: absolute-path commands ---
+
+    #[test]
+    fn rewrite_absolute_path_cargo() {
+        assert!(should_rewrite_for_hook("/usr/bin/cargo test"));
+    }
+
+    #[test]
+    fn rewrite_absolute_path_pytest() {
+        assert!(should_rewrite_for_hook("/usr/local/bin/pytest foo.py"));
+    }
 }

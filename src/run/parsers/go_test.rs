@@ -113,8 +113,13 @@ impl GoTestParser {
                 "pass" => {
                     if let Some(elapsed) = event.get("Elapsed").and_then(serde_json::Value::as_f64)
                     {
-                        if test_name.is_some() {
-                            duration_secs += elapsed;
+                        // Only count top-level tests (no '/' in name). Subtests have the form
+                        // "TestFoo/subtest" — their time is already included in the parent's
+                        // elapsed, so adding both would double-count.
+                        if let Some(name) = test_name {
+                            if !name.contains('/') {
+                                duration_secs += elapsed;
+                            }
                         }
                     }
                     if let Some(name) = test_name {
@@ -125,8 +130,11 @@ impl GoTestParser {
                 "fail" => {
                     if let Some(elapsed) = event.get("Elapsed").and_then(serde_json::Value::as_f64)
                     {
-                        if test_name.is_some() {
-                            duration_secs += elapsed;
+                        // Same rule: only top-level test durations to avoid double-counting.
+                        if let Some(name) = test_name {
+                            if !name.contains('/') {
+                                duration_secs += elapsed;
+                            }
                         }
                     }
                     if let Some(name) = test_name {
@@ -209,6 +217,11 @@ impl GoTestParser {
         let mut current_name: Option<String> = None;
         let mut current_lines: Vec<String> = Vec::new();
 
+        // Duration: prefer the package-level `ok`/`FAIL` line time.
+        // Accumulate top-level (non-subtest) durations as fallback.
+        let mut pkg_duration: Option<f64> = None;
+        let mut toplevel_duration: f64 = 0.0;
+
         for line in input.lines() {
             // === RUN   TestName — start accumulating for a new test.
             if let Some(rest) = line.strip_prefix("=== RUN") {
@@ -221,6 +234,12 @@ impl GoTestParser {
             // --- FAIL: TestName (0.00s) — emit diagnostic from accumulated lines.
             if let Some(rest) = line.strip_prefix("--- FAIL: ") {
                 let name = rest.split_whitespace().next().unwrap_or(rest).to_string();
+                // Only count top-level tests for fallback duration (no '/' means not a subtest).
+                if !name.contains('/') {
+                    if let Some(secs) = parse_test_duration(rest) {
+                        toplevel_duration += secs;
+                    }
+                }
                 // Use lines accumulated since `=== RUN` (the detail comes BEFORE this line).
                 let lines = std::mem::take(&mut current_lines);
                 diagnostics.push(build_text_diagnostic(name, &lines));
@@ -229,7 +248,14 @@ impl GoTestParser {
             }
 
             // --- PASS: TestName (0.00s) — discard accumulated lines, count pass.
-            if line.starts_with("--- PASS: ") {
+            if let Some(rest) = line.strip_prefix("--- PASS: ") {
+                let name = rest.split_whitespace().next().unwrap_or(rest).to_string();
+                // Only count top-level tests for fallback duration.
+                if !name.contains('/') {
+                    if let Some(secs) = parse_test_duration(rest) {
+                        toplevel_duration += secs;
+                    }
+                }
                 current_lines.clear();
                 current_name = None;
                 passed += 1;
@@ -244,8 +270,12 @@ impl GoTestParser {
                 continue;
             }
 
-            // FAIL\tpackage or ok\tpackage — package-level summary lines; close any open block.
+            // ok  \tpackage\t0.65s  or  FAIL\tpackage\t0.65s — package-level summary.
+            // This is the authoritative total duration; prefer it over per-test accumulation.
             if line.starts_with("ok  \t") || line.starts_with("FAIL\t") {
+                if let Some(secs) = parse_package_duration(line) {
+                    pkg_duration = Some(secs);
+                }
                 current_lines.clear();
                 current_name = None;
                 continue;
@@ -260,6 +290,13 @@ impl GoTestParser {
         // Failure count comes directly from the collected diagnostics.
         let failed = diagnostics.len() as u32;
 
+        // Prefer the package-level duration; fall back to sum of top-level tests.
+        let duration_secs = pkg_duration.or(if toplevel_duration > 0.0 {
+            Some(toplevel_duration)
+        } else {
+            None
+        });
+
         let summary = build_test_summary(passed, failed, skipped);
         let counts = Counts {
             passed,
@@ -273,7 +310,7 @@ impl GoTestParser {
             summary,
             diagnostics,
             counts,
-            duration_secs: None,
+            duration_secs,
             raw_lines,
             raw_bytes,
         }
@@ -283,6 +320,30 @@ impl GoTestParser {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Parse the duration from a `--- PASS:` / `--- FAIL:` rest string like `TestFoo (0.50s)`.
+///
+/// Returns seconds as `f64`, or `None` if no valid duration is found.
+fn parse_test_duration(rest: &str) -> Option<f64> {
+    // rest looks like: `TestFoo (0.50s)` or `TestFoo/sub (0.20s)`
+    let open = rest.rfind('(')?;
+    let close = rest[open..].find(')')? + open;
+    let inner = rest[open + 1..close].trim();
+    // Strip trailing 's'
+    let num_str = inner.strip_suffix('s')?;
+    num_str.parse::<f64>().ok()
+}
+
+/// Parse the duration from a package-level `ok` or `FAIL` line.
+///
+/// `ok  \tmypackage\t0.65s` → `Some(0.65)`
+/// `FAIL\tmypackage\t0.65s` → `Some(0.65)`
+fn parse_package_duration(line: &str) -> Option<f64> {
+    // The duration is the last whitespace-separated token ending in 's'.
+    let last = line.split_whitespace().last()?;
+    let num_str = last.strip_suffix('s')?;
+    num_str.parse::<f64>().ok()
+}
 
 fn build_text_diagnostic(name: String, lines: &[String]) -> Diagnostic {
     let combined = lines.join("\n");
@@ -490,5 +551,71 @@ mod tests {
         assert_eq!(out.counts.failed, 0);
         assert!(out.diagnostics.is_empty());
         assert!(out.summary.contains("2 passed"));
+    }
+
+    // -- Bug #8: duration double-counting -----------------------------------------
+
+    /// Package-level `ok` line must be used as the authoritative duration.
+    /// Subtest durations must NOT be summed in (that would double-count).
+    #[test]
+    fn parse_text_duration_uses_ok_line() {
+        // TestFoo (0.50s) includes subtest time; ok line gives 0.65s (total).
+        // Without the fix, summing all --- PASS lines gives 0.50+0.20+0.30+0.10 = 1.10s.
+        let input = concat!(
+            "=== RUN   TestFoo\n",
+            "=== RUN   TestFoo/subtest1\n",
+            "--- PASS: TestFoo/subtest1 (0.20s)\n",
+            "=== RUN   TestFoo/subtest2\n",
+            "--- PASS: TestFoo/subtest2 (0.30s)\n",
+            "--- PASS: TestFoo (0.50s)\n",
+            "=== RUN   TestBar\n",
+            "--- PASS: TestBar (0.10s)\n",
+            "ok  \tmypackage\t0.65s\n",
+        );
+        let out = PARSER.parse(input, DetectResult::Text);
+        // Should use the ok line's 0.65s, not the double-counted sum.
+        assert_eq!(out.duration_secs, Some(0.65));
+    }
+
+    /// When no `ok`/`FAIL` package line is present, only top-level (non-subtest)
+    /// durations should be summed — subtests must be excluded.
+    #[test]
+    fn parse_text_duration_toplevel_only_fallback() {
+        let input = concat!(
+            "=== RUN   TestFoo\n",
+            "=== RUN   TestFoo/sub\n",
+            "--- PASS: TestFoo/sub (0.30s)\n",
+            "--- PASS: TestFoo (0.50s)\n",
+            "=== RUN   TestBar\n",
+            "--- PASS: TestBar (0.10s)\n",
+        );
+        let out = PARSER.parse(input, DetectResult::Text);
+        // 0.50 + 0.10 = 0.60 (TestFoo/sub must not be included).
+        let dur = out.duration_secs.expect("duration should be present");
+        assert!((dur - 0.60).abs() < 1e-9, "expected 0.60, got {dur}");
+    }
+
+    /// JSON parse: subtest elapsed times must not be added to the total.
+    #[test]
+    fn parse_json_duration_no_subtest_double_count() {
+        let input = concat!(
+            // Top-level test: elapsed 0.50s
+            "{\"Action\":\"run\",\"Package\":\"ex/pkg\",\"Test\":\"TestFoo\"}\n",
+            // Subtest 1: elapsed 0.20s (already included in TestFoo's 0.50s)
+            "{\"Action\":\"run\",\"Package\":\"ex/pkg\",\"Test\":\"TestFoo/sub1\"}\n",
+            "{\"Action\":\"pass\",\"Package\":\"ex/pkg\",\"Test\":\"TestFoo/sub1\",\"Elapsed\":0.20}\n",
+            // Subtest 2: elapsed 0.30s
+            "{\"Action\":\"run\",\"Package\":\"ex/pkg\",\"Test\":\"TestFoo/sub2\"}\n",
+            "{\"Action\":\"pass\",\"Package\":\"ex/pkg\",\"Test\":\"TestFoo/sub2\",\"Elapsed\":0.30}\n",
+            // Parent test
+            "{\"Action\":\"pass\",\"Package\":\"ex/pkg\",\"Test\":\"TestFoo\",\"Elapsed\":0.50}\n",
+            // Another top-level test: elapsed 0.10s
+            "{\"Action\":\"run\",\"Package\":\"ex/pkg\",\"Test\":\"TestBar\"}\n",
+            "{\"Action\":\"pass\",\"Package\":\"ex/pkg\",\"Test\":\"TestBar\",\"Elapsed\":0.10}\n",
+        );
+        let out = PARSER.parse(input, DetectResult::NdJson);
+        // Should be 0.50 + 0.10 = 0.60, not 0.50 + 0.20 + 0.30 + 0.10 = 1.10.
+        let dur = out.duration_secs.expect("duration should be present");
+        assert!((dur - 0.60).abs() < 1e-9, "expected 0.60, got {dur}");
     }
 }

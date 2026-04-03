@@ -278,11 +278,17 @@ fn parse_text_line(line: &str) -> Option<Diagnostic> {
 
     let message_raw = after_severity.trim();
 
-    // Extract optional `[code]` at the end of the message
+    // Extract optional `[code]` at the end of the message.
+    // Try double-space prefix first ("  ["), then single-space (" [").
+    // The offset to skip past the opening bracket differs: "  [" → +3, " [" → +2.
     let (message, name) = if message_raw.ends_with(']') {
-        if let Some(bracket_start) = message_raw.rfind("  [").or_else(|| message_raw.rfind(" [")) {
+        if let Some(bracket_start) = message_raw.rfind("  [") {
             let msg = message_raw[..bracket_start].trim().to_string();
             let code = message_raw[bracket_start + 3..message_raw.len() - 1].to_string();
+            (msg, code)
+        } else if let Some(bracket_start) = message_raw.rfind(" [") {
+            let msg = message_raw[..bracket_start].trim().to_string();
+            let code = message_raw[bracket_start + 2..message_raw.len() - 1].to_string();
             (msg, code)
         } else {
             (message_raw.to_string(), severity_str.to_string())
@@ -384,6 +390,21 @@ mod tests {
 
         assert_eq!(out.counts.errors, 1);
         assert_eq!(out.summary, "1 error(s)");
+    }
+
+    // Bug 6 regression: single-space " [code]" prefix must use offset +2, not +3.
+    // Without the fix, the extracted code would be "assignment]" (off-by-one).
+    #[test]
+    fn parse_text_single_space_bracket_code() {
+        let input = "src/main.py:10: error: Incompatible types [assignment]\n";
+        let out = PARSER.parse(input, DetectResult::Text);
+        assert_eq!(out.diagnostics.len(), 1);
+        let diag = &out.diagnostics[0];
+        assert_eq!(
+            diag.name, "assignment",
+            "code must not include leading space or bracket"
+        );
+        assert_eq!(diag.message, "Incompatible types");
     }
 
     #[test]

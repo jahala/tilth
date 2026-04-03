@@ -522,41 +522,42 @@ fn tool_run(args: &Value) -> Result<String, String> {
     let timeout_secs = args
         .get("timeout")
         .and_then(serde_json::Value::as_u64)
-        .unwrap_or(crate::run::exec::default_timeout());
+        .unwrap_or(crate::run::exec::default_timeout())
+        .max(1);
 
     let cwd = args.get("cwd").and_then(|v| v.as_str()).unwrap_or(".");
-    let cwd_path = std::path::Path::new(cwd);
+    let cwd_path = std::path::PathBuf::from(cwd);
+    let cwd_path = cwd_path.canonicalize().unwrap_or(cwd_path);
 
     let exec_result =
-        crate::run::exec::execute(command, cwd_path, timeout_secs).map_err(|e| e.to_string())?;
+        crate::run::exec::execute(command, &cwd_path, timeout_secs).map_err(|e| e.to_string())?;
 
-    if exec_result.timed_out {
+    let exit_code = exec_result.exit_code;
+    let timed_out = exec_result.timed_out;
+
+    if timed_out {
         let mut output = format!("command timed out after {timeout_secs}s\n\n");
-        let partial = match (exec_result.stdout.is_empty(), exec_result.stderr.is_empty()) {
-            (_, true) => exec_result.stdout,
-            (true, _) => exec_result.stderr,
-            _ => format!("{}{}", exec_result.stdout, exec_result.stderr),
-        };
+        let partial = exec_result.combined_output();
         if !partial.is_empty() {
             output.push_str(&partial);
         }
         return Ok(output);
     }
 
-    let combined = match (exec_result.stdout.is_empty(), exec_result.stderr.is_empty()) {
-        (_, true) => exec_result.stdout,
-        (true, _) => exec_result.stderr,
-        _ => format!("{}{}", exec_result.stdout, exec_result.stderr),
-    };
+    let combined = exec_result.combined_output();
 
     let result = crate::run::process_structured(&combined);
-    let formatted = result
-        .format_checked(crate::run::OutputFormat::Markdown, combined.len())
-        .unwrap_or(combined);
+    let formatted = if result.passthrough {
+        combined
+    } else {
+        result
+            .format_checked(crate::run::OutputFormat::Markdown, combined.len())
+            .unwrap_or(combined)
+    };
 
     let mut output = String::with_capacity(formatted.len() + 32);
-    if exec_result.exit_code != 0 {
-        write!(output, "exit code: {}\n\n", exec_result.exit_code).unwrap();
+    if exit_code != 0 {
+        write!(output, "exit code: {exit_code}\n\n").unwrap();
     }
     output.push_str(&formatted);
 

@@ -145,6 +145,8 @@ impl CargoTestParser {
                 passed = extract_count(rest, "passed").unwrap_or(0);
                 failed = extract_count(rest, "failed").unwrap_or(0);
                 ignored = extract_count(rest, "ignored").unwrap_or(0);
+                // NOTE: Only the first `test result:` line is captured. Multi-binary workspace
+                // runs produce multiple summary lines; the JSON path handles those correctly.
                 break;
             }
         }
@@ -235,15 +237,25 @@ fn extract_failure_message(stdout: &str) -> String {
     }
 
     // Panic message: `thread 'test_name' panicked at 'message', file:line`
-    // or the newer format: `thread 'test_name' panicked at file:line:`
-    for line in stdout.lines() {
+    // or the newer format (Rust 1.73+): `thread 'test_name' panicked at file:line:`
+    // followed by the message on the next line.
+    let lines: Vec<&str> = stdout.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
         if trimmed.contains("panicked at") {
-            // Try to extract just the message portion.
             // Old format: panicked at 'message', src/...
-            // New format: panicked at src/...:  (message on next line)
-            if let Some(msg) = extract_panic_message(trimmed) {
+            if let Some(msg) = extract_panic_message_old(trimmed) {
                 return msg;
+            }
+            // New format (Rust 1.73+): panicked at src/file.rs:line:col:
+            // The message is on the next line.
+            if is_new_panic_format(trimmed) {
+                if let Some(next_line) = lines.get(i + 1) {
+                    let msg = next_line.trim();
+                    if !msg.is_empty() {
+                        return msg.to_string();
+                    }
+                }
             }
             return trimmed.to_string();
         }
@@ -258,19 +270,26 @@ fn extract_failure_message(stdout: &str) -> String {
         .to_string()
 }
 
-/// Extract the human message from a panic line.
+/// Extract the human message from a panic line using the old rustc format.
 ///
-/// Old rustc format: `thread 'name' panicked at 'the message', file:line:col`
-/// New rustc format: `thread 'name' panicked at file:line:col:` (message follows on next line)
-fn extract_panic_message(line: &str) -> Option<String> {
-    // Old format: panicked at 'message', ...
-    if let Some(after_at) = line.find("panicked at '") {
-        let after_quote = after_at + "panicked at '".len();
-        if let Some(close) = line[after_quote..].find('\'') {
-            return Some(line[after_quote..after_quote + close].to_string());
-        }
-    }
-    None
+/// Old format: `thread 'name' panicked at 'the message', file:line:col`
+fn extract_panic_message_old(line: &str) -> Option<String> {
+    let after_at = line.find("panicked at '")?;
+    let after_quote = after_at + "panicked at '".len();
+    let close = line[after_quote..].find('\'')?;
+    Some(line[after_quote..after_quote + close].to_string())
+}
+
+/// Returns true when the line matches the new Rust 1.73+ panic format:
+/// `thread 'name' panicked at file:line:col:`
+/// In this format the location appears inline and ends with `:`, and the
+/// message is on the following line (not quoted on this line).
+fn is_new_panic_format(line: &str) -> bool {
+    // New format does NOT have `panicked at '` (that's the old format).
+    // It ends with `:` after the location (e.g. `panicked at src/lib.rs:10:5:`).
+    line.contains("panicked at")
+        && !line.contains("panicked at '")
+        && line.trim_end().ends_with(':')
 }
 
 /// Parse the header of a stdout failure block.
@@ -393,6 +412,44 @@ mod tests {
         assert_eq!(out.counts.skipped, 0);
         assert!(out.summary.contains("2 passed"));
         assert!(out.summary.contains("1 failed"));
+    }
+
+    // -- Panic format (Bug #7) -----------------------------------------------
+
+    #[test]
+    fn extract_panic_message_new_format() {
+        // Rust 1.73+ format: location inline after "panicked at", message on next line.
+        let stdout = "thread 'my_mod::test_add' panicked at src/lib.rs:10:5:\nexpected true, got false\nnote: run with RUST_BACKTRACE=1\n";
+        let msg = extract_failure_message(stdout);
+        assert_eq!(msg, "expected true, got false");
+    }
+
+    #[test]
+    fn extract_panic_message_old_format_still_works() {
+        // Old format: message quoted inline.
+        let stdout =
+            "thread 'my_mod::test_add' panicked at 'assertion failed: 1 == 2', src/lib.rs:10:5\n";
+        let msg = extract_failure_message(stdout);
+        assert_eq!(msg, "assertion failed: 1 == 2");
+    }
+
+    #[test]
+    fn parse_json_failure_new_panic_format() {
+        // Simulates a failed test whose stdout uses the Rust 1.73+ panic format.
+        let stdout =
+            "thread 'a::test_bad' panicked at src/lib.rs:10:5:\nassertion failed: 2 + 2 == 5\n";
+        let event = format!(
+            "{{\"type\":\"test\",\"event\":\"failed\",\"name\":\"a::test_bad\",\"stdout\":{}}}\n",
+            serde_json::to_string(stdout).unwrap()
+        );
+        let input = format!(
+            "{{\"type\":\"suite\",\"event\":\"started\",\"test_count\":1}}\n{event}{{\"type\":\"suite\",\"event\":\"failed\",\"passed\":0,\"failed\":1,\"ignored\":0,\"exec_time\":0.01}}\n",
+        );
+        let out = PARSER.parse(&input, DetectResult::NdJson);
+        assert_eq!(out.counts.failed, 1);
+        let diag = &out.diagnostics[0];
+        // Should extract the next-line message, not the location string.
+        assert_eq!(diag.message, "assertion failed: 2 + 2 == 5");
     }
 
     #[test]

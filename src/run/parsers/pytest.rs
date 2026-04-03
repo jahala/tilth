@@ -114,12 +114,14 @@ impl PytestParser {
             }
         }
 
-        let summary_str = build_summary(passed, failed, skipped, errors);
+        // pytest "errors" (collection/fixture errors) are test-runner failures,
+        // not compilation errors. Fold them into `failed` per Counts convention.
+        let failed = failed + errors;
+        let summary_str = build_summary(passed, failed, skipped);
         let counts = Counts {
             passed,
             failed,
             skipped,
-            errors,
             ..Counts::default()
         };
 
@@ -247,15 +249,13 @@ impl PytestParser {
             finish_block(name, &failure_block_lines, &mut diagnostics);
         }
 
-        let summary_str = build_summary(passed, failed, skipped, 0);
+        let summary_str = build_summary(passed, failed, skipped);
+        // pytest is a test runner — leave `errors` at 0. All pytest "errors"
+        // (collection/fixture errors) are folded into `failed` via the banner parser.
         let counts = Counts {
             passed,
             failed,
             skipped,
-            errors: diagnostics
-                .iter()
-                .filter(|d| d.severity == Severity::Error)
-                .count() as u32,
             ..Counts::default()
         };
 
@@ -334,6 +334,10 @@ fn parse_summary_line(line: &str) -> Option<Diagnostic> {
 /// Parse the pytest final summary banner, returning (passed, failed, skipped, duration).
 ///
 /// Example: `====== 2 failed, 5 passed, 1 skipped in 0.42s ======`
+/// Example: `====== 1 failed, 2 passed, 1 error in 0.5s ======`
+///
+/// pytest "errors" (collection/fixture errors) are folded into `failed` per the
+/// `Counts` convention: test runners use `failed`, not `errors`.
 fn parse_summary_banner(line: &str) -> Option<(u32, u32, u32, Option<f64>)> {
     // Only process lines that look like summary banners — they must contain
     // at least one of these result keywords.
@@ -343,12 +347,14 @@ fn parse_summary_banner(line: &str) -> Option<(u32, u32, u32, Option<f64>)> {
 
     let passed = extract_count(line, "passed").unwrap_or(0);
     let failed = extract_count(line, "failed").unwrap_or(0);
+    // "error" in the banner means collection/fixture errors — fold into failed.
+    let errors = extract_count(line, "error").unwrap_or(0);
     let skipped = extract_count(line, "skipped")
         .or_else(|| extract_count(line, "deselected"))
         .unwrap_or(0);
     let duration = extract_duration(line);
 
-    Some((passed, failed, skipped, duration))
+    Some((passed, failed + errors, skipped, duration))
 }
 
 /// Extract the duration value from a string like `in 0.42s`.
@@ -418,7 +424,7 @@ fn parse_nodeid_location(_nodeid: &str) -> Option<Location> {
 }
 
 /// Build a human-readable summary, omitting zero categories except `passed`.
-fn build_summary(passed: u32, failed: u32, skipped: u32, errors: u32) -> String {
+fn build_summary(passed: u32, failed: u32, skipped: u32) -> String {
     let mut parts: Vec<String> = Vec::new();
     parts.push(format!("{passed} passed"));
     if failed > 0 {
@@ -426,9 +432,6 @@ fn build_summary(passed: u32, failed: u32, skipped: u32, errors: u32) -> String 
     }
     if skipped > 0 {
         parts.push(format!("{skipped} skipped"));
-    }
-    if errors > 0 {
-        parts.push(format!("{errors} errors"));
     }
     parts.join(", ")
 }
@@ -545,6 +548,34 @@ mod tests {
     // for node IDs that have no line info. Now it returns None, and the summary-line
     // parser gets no location (which is honest), while the block parser correctly
     // extracts the real line number from block content.
+    // Bug 12 regression: pytest "errors" (collection/fixture errors) must be folded
+    // into `failed`, not placed in `counts.errors`. Test runners leave `errors` at 0.
+    #[test]
+    fn parse_text_errors_fold_into_failed() {
+        // Banner with both `failed` and `error` counts.
+        let input = concat!(
+            "collected 3 items\n",
+            "\n",
+            "=========================== short test summary info ============================\n",
+            "FAILED tests/test_foo.py::test_one - AssertionError: 1 != 2\n",
+            "ERROR tests/test_bar.py::test_setup - fixture 'missing_fixture' not found\n",
+            "=================== 1 failed, 1 passed, 1 error in 0.15s ===================\n",
+        );
+        let out = PARSER.parse(input, DetectResult::Text);
+        // The banner has 1 failed + 1 error → both fold into failed = 2.
+        assert_eq!(
+            out.counts.failed, 2,
+            "pytest errors should fold into failed"
+        );
+        assert_eq!(out.counts.errors, 0, "test runner must leave errors at 0");
+        assert_eq!(out.counts.passed, 1);
+        assert!(
+            out.summary.contains("2 failed"),
+            "summary should reflect folded count; got: {}",
+            out.summary
+        );
+    }
+
     #[test]
     fn parse_nodeid_location_returns_none() {
         // Calling parse_nodeid_location directly should return None — not line 0.

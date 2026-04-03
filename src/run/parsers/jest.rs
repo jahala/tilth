@@ -91,28 +91,27 @@ impl JestParser {
 
         if let Some(test_results) = root.get("testResults").and_then(|v| v.as_array()) {
             for suite in test_results {
-                // Duration from perfStats or endTime - startTime.
-                if duration_secs.is_none() {
-                    if let Some(runtime) = suite
+                // Accumulate duration across all suites. Jest reports per-suite
+                // runtimes in perfStats.runtime (ms); sum them for total wall time.
+                if let Some(runtime) = suite
+                    .get("perfStats")
+                    .and_then(|ps| ps.get("runtime"))
+                    .and_then(serde_json::Value::as_f64)
+                {
+                    *duration_secs.get_or_insert(0.0) += runtime / 1000.0;
+                } else {
+                    let start = suite
                         .get("perfStats")
-                        .and_then(|ps| ps.get("runtime"))
-                        .and_then(serde_json::Value::as_f64)
-                    {
-                        duration_secs = Some(runtime / 1000.0);
-                    } else {
-                        let start = suite
-                            .get("perfStats")
-                            .and_then(|ps| ps.get("start"))
-                            .or_else(|| suite.get("startTime"))
-                            .and_then(serde_json::Value::as_f64);
-                        let end = suite
-                            .get("perfStats")
-                            .and_then(|ps| ps.get("end"))
-                            .or_else(|| suite.get("endTime"))
-                            .and_then(serde_json::Value::as_f64);
-                        if let (Some(s), Some(e)) = (start, end) {
-                            duration_secs = Some((e - s) / 1000.0);
-                        }
+                        .and_then(|ps| ps.get("start"))
+                        .or_else(|| suite.get("startTime"))
+                        .and_then(serde_json::Value::as_f64);
+                    let end = suite
+                        .get("perfStats")
+                        .and_then(|ps| ps.get("end"))
+                        .or_else(|| suite.get("endTime"))
+                        .and_then(serde_json::Value::as_f64);
+                    if let (Some(s), Some(e)) = (start, end) {
+                        *duration_secs.get_or_insert(0.0) += (e - s) / 1000.0;
                     }
                 }
 
@@ -186,8 +185,12 @@ impl JestParser {
         let mut failed: u32 = 0;
         let mut pending: u32 = 0;
         let mut diagnostics: Vec<Diagnostic> = Vec::new();
+        // Use the LAST `Time:` line — in multi-suite runs Jest prints per-suite times
+        // followed by the overall summary time at the end. We want the overall value.
+        let mut duration_secs: Option<f64> = None;
 
         // Summary line: `Tests:  3 passed, 1 failed, 4 total`
+        // Time line:    `Time:   1.234 s, estimated 2 s`  or  `Time: 0.5s`
         for line in input.lines() {
             if let Some(rest) = line.find("Tests:").map(|i| &line[i + 6..]) {
                 let rest = rest.trim();
@@ -197,7 +200,15 @@ impl JestParser {
                     .or_else(|| extract_count(rest, "pending"))
                     .or_else(|| extract_count(rest, "todo"))
                     .unwrap_or(0);
-                break;
+            }
+            if let Some(rest) = line.find("Time:").map(|i| &line[i + 5..]) {
+                // Take the first whitespace-separated token and strip a trailing 's' if present.
+                if let Some(tok) = rest.split_whitespace().next() {
+                    let num_str = tok.strip_suffix('s').unwrap_or(tok);
+                    if let Ok(secs) = num_str.parse::<f64>() {
+                        duration_secs = Some(secs);
+                    }
+                }
             }
         }
 
@@ -258,7 +269,7 @@ impl JestParser {
             summary,
             diagnostics,
             counts,
-            duration_secs: None,
+            duration_secs,
             raw_lines,
             raw_bytes,
         }
@@ -551,6 +562,38 @@ mod tests {
         assert_eq!(out.counts.skipped, 0);
         assert!(out.summary.contains("2 passed"));
         assert!(out.summary.contains("1 failed"));
+    }
+
+    // -- Bug #10: only first suite's duration used ----------------------------
+
+    /// In a multi-suite run Jest emits a `Time:` line per suite, then an overall
+    /// summary `Time:` at the end.  We must use the LAST one (the overall).
+    #[test]
+    fn parse_text_duration_uses_last_time_line() {
+        let input = concat!(
+            "PASS src/a.test.js\n",
+            "Time: 0.3s\n",
+            "PASS src/b.test.js\n",
+            "Time: 0.4s\n",
+            "\n",
+            "Tests:  4 passed, 4 total\n",
+            "Time: 0.9s\n",
+        );
+        let out = PARSER.parse(input, DetectResult::Text);
+        // Should be 0.9s (the last Time: line), not 0.3s (the first).
+        assert_eq!(out.duration_secs, Some(0.9));
+    }
+
+    /// Single-suite: the one `Time:` line should be captured.
+    #[test]
+    fn parse_text_duration_single_suite() {
+        let input = concat!(
+            "PASS src/add.test.js\n",
+            "Tests:  3 passed, 3 total\n",
+            "Time: 0.5s\n",
+        );
+        let out = PARSER.parse(input, DetectResult::Text);
+        assert_eq!(out.duration_secs, Some(0.5));
     }
 
     #[test]

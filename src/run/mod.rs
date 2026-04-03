@@ -7,38 +7,11 @@ pub mod types;
 
 pub use types::{CompressResult, Counts, InputStats, OutputFormat};
 
-use std::panic::AssertUnwindSafe;
-
 /// Process command output into a structured result: strip ANSI, detect tool, parse, group.
 ///
 /// Returns a `CompressResult` that can be formatted lazily via `format()` or `format_checked()`.
 #[must_use]
 pub fn process_structured(input: &str) -> CompressResult {
-    std::panic::catch_unwind(AssertUnwindSafe(|| process_structured_inner(input)))
-        .unwrap_or_else(|_| passthrough_result(input))
-}
-
-/// Process command output: strip ANSI, detect tool, parse, group, format.
-///
-/// Returns the original input unchanged if:
-/// - Input is empty
-/// - Input contains binary (null bytes)
-/// - Input is <=20 lines and unrecognised
-/// - Formatted output would be longer than the input (never-worse guarantee)
-/// - Any internal panic occurs
-#[allow(dead_code)]
-#[must_use]
-pub fn process(input: &str) -> String {
-    let result = process_structured(input);
-    if result.passthrough {
-        return input.to_string();
-    }
-    result
-        .format_checked(OutputFormat::Markdown, input.len())
-        .unwrap_or_else(|| input.to_string())
-}
-
-fn process_structured_inner(input: &str) -> CompressResult {
     if input.is_empty() {
         return passthrough_result(input);
     }
@@ -85,6 +58,75 @@ fn process_structured_inner(input: &str) -> CompressResult {
         },
         passthrough: false,
         cleaned: cleaned_for_generic,
+    }
+}
+
+/// Process command output: strip ANSI, detect tool, parse, group, format.
+///
+/// Returns the original input unchanged if:
+/// - Input is empty
+/// - Input contains binary (null bytes)
+/// - Input is <=20 lines and unrecognised
+/// - Formatted output would be longer than the input (never-worse guarantee)
+#[allow(dead_code)]
+#[must_use]
+pub fn process(input: &str) -> String {
+    let result = process_structured(input);
+    if result.passthrough {
+        return input.to_string();
+    }
+    result
+        .format_checked(OutputFormat::Markdown, input.len())
+        .unwrap_or_else(|| input.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_input_is_passthrough() {
+        let result = process_structured("");
+        assert!(result.passthrough);
+    }
+
+    #[test]
+    fn short_unknown_input_is_passthrough() {
+        let result = process_structured("hello world\n");
+        assert!(result.passthrough);
+    }
+
+    #[test]
+    fn binary_input_is_passthrough() {
+        let input = "hello\x00world";
+        let result = process_structured(input);
+        assert!(result.passthrough);
+    }
+
+    #[test]
+    fn process_returns_original_for_short_input() {
+        let input = "some short output\n";
+        let output = process(input);
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn passthrough_result_format_checked_returns_none() {
+        // Demonstrates that passthrough correctness in tool_run (mcp.rs) is accidental:
+        // format_checked on a passthrough result returns None because the formatted output
+        // is longer than the original, so the fallback kicks in. This works by accident.
+        let input = "short output\n";
+        let result = process_structured(input);
+        assert!(
+            result.passthrough,
+            "short unknown input should be passthrough"
+        );
+        // format_checked should return None for passthrough results
+        let formatted = result.format_checked(OutputFormat::Markdown, input.len());
+        assert!(
+            formatted.is_none(),
+            "passthrough format_checked should return None (accidental correctness)"
+        );
     }
 }
 

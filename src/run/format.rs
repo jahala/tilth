@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::fmt::Write as FmtWrite;
 
 use crate::run::types::{CompressResult, Counts, DiagnosticGroup, Severity};
@@ -34,11 +35,11 @@ pub fn format_markdown_with_raw(result: &CompressResult, cleaned: &str) -> Strin
         }
     }
 
-    // Skip head/tail when errors dominate the input — the groups are the content.
-    let error_line_count: usize = result.groups.iter().map(|g| g.total).sum();
+    // Skip head/tail when error groups dominate the input — the groups are the content.
+    // Each group contributes ~5 lines of formatted output; if that fills >80% of input, skip.
+    let estimated_error_lines = result.groups.len() * 5;
     #[allow(clippy::cast_precision_loss)] // ratio comparison — precision loss is acceptable
-    let error_ratio = error_line_count as f64 / result.input_stats.lines.max(1) as f64;
-    if error_ratio > 0.8 {
+    if estimated_error_lines as f64 / result.input_stats.lines.max(1) as f64 > 0.8 {
         return out;
     }
 
@@ -117,26 +118,50 @@ fn write_detail_markdown(out: &mut String, detail: &str) {
     }
 }
 
+struct HeadTail<'a> {
+    head: Vec<&'a str>,
+    tail: VecDeque<&'a str>,
+    total: usize,
+}
+
+fn collect_head_tail(text: &str) -> HeadTail<'_> {
+    let mut head: Vec<&str> = Vec::with_capacity(HEAD_TAIL_LINES);
+    let mut tail: VecDeque<&str> = VecDeque::with_capacity(HEAD_TAIL_LINES);
+    let mut total = 0usize;
+
+    for line in text.lines() {
+        if total < HEAD_TAIL_LINES {
+            head.push(line);
+        } else {
+            if tail.len() == HEAD_TAIL_LINES {
+                tail.pop_front();
+            }
+            tail.push_back(line);
+        }
+        total += 1;
+    }
+
+    HeadTail { head, tail, total }
+}
+
 fn write_head_tail_markdown(out: &mut String, cleaned: &str) {
-    let lines: Vec<&str> = cleaned.lines().collect();
-    let n = lines.len();
-    let head_count = HEAD_TAIL_LINES.min(n);
+    let HeadTail { head, tail, total } = collect_head_tail(cleaned);
+    let head_count = head.len();
 
     let _ = writeln!(out, "#\n# --- first {head_count} lines ---");
-    for line in &lines[..head_count] {
+    for line in &head {
         let _ = writeln!(out, "# {line}");
     }
 
-    if n > head_count * 2 {
-        let tail_start = n - HEAD_TAIL_LINES.min(n);
-        let tail_count = n - tail_start;
+    if total > head_count * 2 {
+        let tail_count = tail.len();
         let _ = writeln!(out, "# --- last {tail_count} lines ---");
-        for line in &lines[tail_start..] {
+        for line in &tail {
             let _ = writeln!(out, "# {line}");
         }
-    } else if n > head_count {
-        let _ = writeln!(out, "# --- last {} lines ---", n - head_count);
-        for line in &lines[head_count..] {
+    } else if total > head_count {
+        let _ = writeln!(out, "# --- last {} lines ---", total - head_count);
+        for line in &tail {
             let _ = writeln!(out, "# {line}");
         }
     }
@@ -171,10 +196,11 @@ pub fn format_plain_with_raw(result: &CompressResult, cleaned: &str) -> String {
         }
     }
 
-    let error_line_count: usize = result.groups.iter().map(|g| g.total).sum();
+    // Skip head/tail when error groups dominate the input — the groups are the content.
+    // Each group contributes ~5 lines of formatted output; if that fills >80% of input, skip.
+    let estimated_error_lines = result.groups.len() * 5;
     #[allow(clippy::cast_precision_loss)] // ratio comparison — precision loss is acceptable
-    let error_ratio = error_line_count as f64 / result.input_stats.lines.max(1) as f64;
-    if error_ratio > 0.8 {
+    if estimated_error_lines as f64 / result.input_stats.lines.max(1) as f64 > 0.8 {
         return out;
     }
 
@@ -253,25 +279,23 @@ fn write_detail_plain(out: &mut String, detail: &str) {
 }
 
 fn write_head_tail_plain(out: &mut String, cleaned: &str) {
-    let lines: Vec<&str> = cleaned.lines().collect();
-    let n = lines.len();
-    let head_count = HEAD_TAIL_LINES.min(n);
+    let HeadTail { head, tail, total } = collect_head_tail(cleaned);
+    let head_count = head.len();
 
     let _ = writeln!(out, "\n--- first {head_count} lines ---");
-    for line in &lines[..head_count] {
+    for line in &head {
         let _ = writeln!(out, "{line}");
     }
 
-    if n > head_count * 2 {
-        let tail_start = n - HEAD_TAIL_LINES.min(n);
-        let tail_count = n - tail_start;
+    if total > head_count * 2 {
+        let tail_count = tail.len();
         let _ = writeln!(out, "--- last {tail_count} lines ---");
-        for line in &lines[tail_start..] {
+        for line in &tail {
             let _ = writeln!(out, "{line}");
         }
-    } else if n > head_count {
-        let _ = writeln!(out, "--- last {} lines ---", n - head_count);
-        for line in &lines[head_count..] {
+    } else if total > head_count {
+        let _ = writeln!(out, "--- last {} lines ---", total - head_count);
+        for line in &tail {
             let _ = writeln!(out, "{line}");
         }
     }
@@ -297,6 +321,8 @@ struct JsonGroup<'a> {
     total: usize,
     locations: Vec<String>,
     message: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<&'a str>,
     cascading: bool,
 }
 
@@ -331,6 +357,7 @@ fn build_json_groups(result: &CompressResult) -> Vec<JsonGroup<'_>> {
                     .map(std::string::ToString::to_string)
                     .collect(),
                 message: &g.representative.message,
+                detail: g.representative.detail.as_deref(),
                 cascading: g.cascading,
             }
         })
@@ -345,7 +372,7 @@ pub fn format_json(result: &CompressResult) -> String {
         counts: &result.counts,
         groups: build_json_groups(result),
     };
-    serde_json::to_string(&output).unwrap_or_default()
+    serde_json::to_string(&output).expect("CompressResult JSON is always serializable")
 }
 
 pub fn format_json_with_raw(result: &CompressResult, cleaned: &str) -> String {
@@ -371,7 +398,7 @@ pub fn format_json_with_raw(result: &CompressResult, cleaned: &str) -> String {
         head,
         tail,
     };
-    serde_json::to_string(&output).unwrap_or_default()
+    serde_json::to_string(&output).expect("CompressResult JSON is always serializable")
 }
 
 // ---------------------------------------------------------------------------
@@ -455,5 +482,64 @@ mod tests {
         let out = format_json(&result);
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
         assert_eq!(parsed["tool"], "cargo test");
+    }
+
+    #[test]
+    fn json_format_includes_detail_field() {
+        let mut result = make_result("cargo test", "1 failed", 100);
+        let mut group = make_group(Severity::Error, "test_foo", 1);
+        group.representative.detail = Some("expected 1, got 2\nstack trace here".to_string());
+        result.groups = vec![group];
+
+        let out = format_json(&result);
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        let detail = parsed["groups"][0]["detail"]
+            .as_str()
+            .expect("detail field must be present");
+        assert!(detail.contains("expected 1, got 2"));
+    }
+
+    #[test]
+    fn json_format_omits_detail_when_none() {
+        let mut result = make_result("cargo test", "1 failed", 100);
+        result.groups = vec![make_group(Severity::Error, "test_foo", 1)];
+
+        let out = format_json(&result);
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        assert!(
+            parsed["groups"][0].get("detail").is_none(),
+            "detail field should be omitted when None"
+        );
+    }
+
+    #[test]
+    fn json_format_never_empty_string() {
+        let result = make_result("cargo test", "ok", 10);
+        let out = format_json(&result);
+        assert!(!out.is_empty(), "JSON output must never be empty");
+        // Must be valid JSON
+        serde_json::from_str::<serde_json::Value>(&out).expect("must be valid JSON");
+    }
+
+    #[test]
+    fn head_tail_not_suppressed_by_inflated_diagnostic_count() {
+        // 100-line input, 5 error groups with total=20 each (100 diagnostics total).
+        // The error_ratio should not suppress head/tail — only 5 distinct error patterns
+        // exist, and many lines are non-error content (build progress, etc.).
+        let mut result = make_result("cargo build", "5 errors", 100);
+        result.groups = (0..5)
+            .map(|i| {
+                let mut g = make_group(Severity::Error, &format!("E{i:03}"), 20);
+                g.total = 20;
+                g
+            })
+            .collect();
+
+        let cleaned: String = (0..100).map(|i| format!("line {i}\n")).collect();
+        let out = format_markdown_with_raw(&result, &cleaned);
+        assert!(
+            out.contains("first"),
+            "head/tail should NOT be suppressed when diagnostic count inflates the ratio"
+        );
     }
 }

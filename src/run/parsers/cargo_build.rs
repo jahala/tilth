@@ -412,15 +412,32 @@ fn is_decoration_line(line: &str) -> bool {
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-fn build_summary(errors: u32, warnings: u32, success: Option<bool>) -> String {
-    if errors == 0 && success != Some(false) {
-        if warnings == 0 {
-            "build succeeded".to_string()
-        } else {
-            format!("build succeeded, {warnings} warning(s)")
+/// `finished` indicates whether a `build-finished` JSON message was observed.
+/// Without it we cannot claim success — output may be truncated.
+fn build_summary(errors: u32, warnings: u32, finished: Option<bool>) -> String {
+    match finished {
+        Some(true) => {
+            // build-finished seen with success=true
+            if warnings == 0 {
+                "build succeeded".to_string()
+            } else {
+                format!("build succeeded, {warnings} warning(s)")
+            }
         }
-    } else {
-        format!("{errors} error(s), {warnings} warning(s)")
+        Some(false) => {
+            // build-finished seen with success=false
+            format!("{errors} error(s), {warnings} warning(s)")
+        }
+        None => {
+            // build-finished never seen — output may be truncated
+            if errors > 0 {
+                format!("{errors} error(s), {warnings} warning(s)")
+            } else if warnings > 0 {
+                format!("build status unknown (output may be truncated), {warnings} warning(s)")
+            } else {
+                "build status unknown (output may be truncated)".to_string()
+            }
+        }
     }
 }
 
@@ -494,6 +511,75 @@ mod tests {
             .unwrap()
             .contains("prefix it with an underscore"));
         assert_eq!(out.counts.warnings, 1);
+    }
+
+    // --- build_summary (Bug #13) ---
+
+    #[test]
+    fn build_summary_success_requires_finished_message() {
+        // No build-finished seen (None) + 0 errors must NOT claim success.
+        let s = build_summary(0, 0, None);
+        assert!(
+            s.contains("unknown") || s.contains("truncated"),
+            "expected unknown/truncated message, got: {s}"
+        );
+        assert!(
+            !s.contains("succeeded"),
+            "must not claim success without build-finished: {s}"
+        );
+    }
+
+    #[test]
+    fn build_summary_truncated_with_warnings() {
+        let s = build_summary(0, 3, None);
+        assert!(s.contains("3"), "should mention warning count: {s}");
+        assert!(
+            !s.contains("succeeded"),
+            "must not claim success without build-finished: {s}"
+        );
+    }
+
+    #[test]
+    fn build_summary_finished_success() {
+        let s = build_summary(0, 0, Some(true));
+        assert_eq!(s, "build succeeded");
+    }
+
+    #[test]
+    fn build_summary_finished_success_with_warnings() {
+        let s = build_summary(0, 2, Some(true));
+        assert!(s.contains("succeeded") && s.contains("2 warning(s)"));
+    }
+
+    #[test]
+    fn build_summary_finished_failure() {
+        let s = build_summary(3, 1, Some(false));
+        assert!(s.contains("3 error(s)"));
+    }
+
+    #[test]
+    fn parse_json_no_build_finished_reports_unknown() {
+        // Stream has a compiler message but no build-finished — simulate truncation.
+        let input = r#"{"reason":"compiler-message","package_id":"foo 0.1.0","manifest_path":"/foo/Cargo.toml","target":{"kind":["lib"],"crate_types":["lib"],"name":"foo","src_path":"/foo/src/lib.rs","edition":"2021"},"message":{"message":"unused import","code":{"code":"unused_imports","explanation":null},"level":"warning","spans":[{"file_name":"src/lib.rs","byte_start":0,"byte_end":1,"line_start":1,"line_end":1,"column_start":1,"column_end":2,"is_primary":true,"text":[],"label":null,"suggested_replacement":null,"suggestion_applicability":null,"expansion":null}],"children":[],"rendered":"warning: unused import\n"}}"#;
+
+        let out = PARSER.parse(input, DetectResult::NdJson);
+        assert!(
+            out.summary.contains("unknown") || out.summary.contains("truncated"),
+            "expected unknown/truncated summary without build-finished, got: {}",
+            out.summary
+        );
+        assert!(
+            !out.summary.contains("succeeded"),
+            "must not claim success without build-finished: {}",
+            out.summary
+        );
+    }
+
+    #[test]
+    fn parse_json_with_build_finished_success_reports_succeeded() {
+        let input = concat!("{\"reason\":\"build-finished\",\"success\":true}\n",);
+        let out = PARSER.parse(input, DetectResult::NdJson);
+        assert_eq!(out.summary, "build succeeded");
     }
 
     // --- Text path ---

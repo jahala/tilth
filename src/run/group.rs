@@ -76,23 +76,25 @@ pub fn group(diagnostics: &[Diagnostic]) -> Vec<DiagnosticGroup> {
     let warn_end_raw = groups.partition_point(|g| g.severity <= Severity::Warning);
 
     let error_end_capped = error_end.min(MAX_ERROR_GROUPS);
-    let warn_count = (warn_end_raw - error_end).min(MAX_WARNING_GROUPS);
 
     // Retain only within caps; collect remaining info groups too (uncapped for now).
     let info_start = warn_end_raw;
     let mut result: Vec<DiagnosticGroup> =
-        Vec::with_capacity(error_end_capped + warn_count + (groups.len() - info_start));
+        Vec::with_capacity(error_end_capped + MAX_WARNING_GROUPS + (groups.len() - info_start));
 
     result.extend(groups.drain(..error_end).take(MAX_ERROR_GROUPS));
-    let remaining = groups;
-    let mut remaining_iter = remaining.into_iter();
-    let warn_slice: Vec<_> = remaining_iter
-        .by_ref()
-        .take_while(|g| g.severity == Severity::Warning)
-        .take(MAX_WARNING_GROUPS)
-        .collect();
-    result.extend(warn_slice);
-    result.extend(remaining_iter); // info groups, uncapped
+    let mut warn_count = 0;
+    for g in groups {
+        if g.severity == Severity::Warning {
+            if warn_count < MAX_WARNING_GROUPS {
+                result.push(g);
+                warn_count += 1;
+            }
+            // skip excess warnings
+        } else {
+            result.push(g); // info groups, uncapped
+        }
+    }
 
     // --- Step 5: Cascade detection ---
     mark_cascading(&mut result);
@@ -106,7 +108,15 @@ pub fn group(diagnostics: &[Diagnostic]) -> Vec<DiagnosticGroup> {
 ///
 /// We extract an identifier by scanning the representative message for the first
 /// backtick-quoted or single-quoted token.
+///
+/// **Precondition**: `groups[0].severity == Severity::Error` (error groups are always first
+/// after sorting by severity).
 fn mark_cascading(groups: &mut [DiagnosticGroup]) {
+    debug_assert!(
+        !groups.is_empty() && groups[0].severity == Severity::Error,
+        "mark_cascading requires groups[0] to be an error (groups must be sorted by severity)"
+    );
+
     let error_count = groups
         .iter()
         .filter(|g| g.severity == Severity::Error)
@@ -223,5 +233,27 @@ mod tests {
     fn quoted_identifier_extraction() {
         let id = extract_quoted_identifier("cannot find value `foo` in this scope");
         assert_eq!(id.as_deref(), Some("foo"));
+    }
+
+    #[test]
+    fn info_groups_not_dropped_after_warnings() {
+        // Build enough warnings to hit the cap, plus an info group after them.
+        // The bug: take_while discards the first Info group when it stops iterating.
+        let mut diags: Vec<Diagnostic> = (0..MAX_WARNING_GROUPS)
+            .map(|i| make_diag(Severity::Warning, &format!("W{i}"), "warn"))
+            .collect();
+        diags.push(make_diag(Severity::Info, "I1", "info"));
+        diags.push(make_diag(Severity::Error, "E1", "err"));
+
+        let groups = group(&diags);
+
+        let info_count = groups
+            .iter()
+            .filter(|g| g.severity == Severity::Info)
+            .count();
+        assert_eq!(
+            info_count, 1,
+            "info group must not be dropped after warnings"
+        );
     }
 }
