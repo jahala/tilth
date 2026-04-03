@@ -65,6 +65,29 @@ enum Command {
         #[arg(long)]
         edit: bool,
     },
+    /// Hook for Claude Code PreToolUse — rewrites Bash commands through tilth run.
+    ///
+    /// Reads tool input JSON from stdin, rewrites compressible commands
+    /// (build/test/lint) to use `tilth run`, writes modified JSON to stdout.
+    HookRewrite,
+    /// Run a shell command with structured output compression.
+    Run {
+        /// The command to execute (passed to sh -c).
+        #[arg(trailing_var_arg = true)]
+        command: Vec<String>,
+
+        /// Working directory for the command.
+        #[arg(long, default_value = ".")]
+        cwd: PathBuf,
+
+        /// Timeout in seconds.
+        #[arg(long, default_value_t = 120)]
+        timeout: u64,
+
+        /// Output format: markdown, plain, json.
+        #[arg(long)]
+        format: Option<String>,
+    },
 }
 
 fn main() {
@@ -85,6 +108,17 @@ fn main() {
                     eprintln!("install error: {e}");
                     process::exit(1);
                 }
+            }
+            Command::HookRewrite => {
+                handle_hook_rewrite();
+            }
+            Command::Run {
+                command,
+                cwd,
+                timeout,
+                format,
+            } => {
+                handle_run(command, cwd, timeout, format);
             }
         }
         return;
@@ -151,6 +185,180 @@ fn main() {
             process::exit(e.exit_code());
         }
     }
+}
+
+/// Hook rewrite: reads Bash tool input from stdin, rewrites compressible commands to use tilth run.
+fn handle_hook_rewrite() -> ! {
+    use io::Read;
+
+    let mut input = String::new();
+    if io::stdin().read_to_string(&mut input).is_err() || input.is_empty() {
+        // Can't read stdin — pass through (exit 0 = no modification)
+        process::exit(0);
+    }
+
+    let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&input) else {
+        process::exit(0);
+    };
+
+    let Some(command) = json
+        .get("command")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+    else {
+        process::exit(0);
+    };
+
+    if should_rewrite_for_hook(&command) {
+        // Find tilth binary path for the rewrite
+        let tilth_bin = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.to_str().map(String::from))
+            .unwrap_or_else(|| "tilth".into());
+
+        let rewritten = format!("{tilth_bin} run -- {command}");
+        json["command"] = serde_json::Value::String(rewritten);
+    }
+
+    // Write modified (or unmodified) JSON to stdout
+    let _ = io::stdout().write_all(serde_json::to_string(&json).unwrap_or(input).as_bytes());
+    process::exit(0);
+}
+
+/// Check if a command should be routed through `tilth run` for compression.
+fn should_rewrite_for_hook(command: &str) -> bool {
+    let cmd = command.trim();
+
+    // Already wrapped
+    if cmd.starts_with("tilth") {
+        return false;
+    }
+
+    // Extract the base command name (handle paths like /usr/bin/cargo)
+    let first_word = cmd.split_whitespace().next().unwrap_or("");
+    let base = first_word.rsplit('/').next().unwrap_or(first_word);
+
+    matches!(
+        base,
+        "cargo"
+            | "rustc"
+            | "npm"
+            | "npx"
+            | "pnpm"
+            | "yarn"
+            | "bun"
+            | "pip"
+            | "pip3"
+            | "pytest"
+            | "python"
+            | "python3"
+            | "go"
+            | "tsc"
+            | "eslint"
+            | "ruff"
+            | "mypy"
+            | "flake8"
+            | "pylint"
+            | "make"
+            | "cmake"
+            | "gradle"
+            | "mvn"
+            | "jest"
+            | "vitest"
+            | "mocha"
+            | "dotnet"
+            | "msbuild"
+            | "gcc"
+            | "g++"
+            | "clang"
+            | "clang++"
+    )
+}
+
+/// Execute a shell command, compress its output, and exit with the command's exit code.
+fn handle_run(command: Vec<String>, cwd: PathBuf, timeout: u64, format: Option<String>) -> ! {
+    use tilth::run::{exec, process_structured, OutputFormat};
+
+    let is_tty = io::stdout().is_terminal();
+
+    if command.is_empty() {
+        eprintln!("error: no command given");
+        process::exit(1);
+    }
+
+    let cmd_str = shell_join(&command);
+    let cwd = cwd.canonicalize().unwrap_or(cwd);
+
+    let exec_result = match exec::execute(&cmd_str, &cwd, timeout) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("run error: {e}");
+            process::exit(1);
+        }
+    };
+
+    if exec_result.timed_out {
+        eprintln!("command timed out after {timeout}s");
+        let partial = match (exec_result.stdout.is_empty(), exec_result.stderr.is_empty()) {
+            (_, true) => exec_result.stdout,
+            (true, _) => exec_result.stderr,
+            _ => format!("{}{}", exec_result.stdout, exec_result.stderr),
+        };
+        if !partial.is_empty() {
+            emit_output(&partial, is_tty);
+        }
+        process::exit(124);
+    }
+
+    let combined = match (exec_result.stdout.is_empty(), exec_result.stderr.is_empty()) {
+        (_, true) => exec_result.stdout,
+        (true, _) => exec_result.stderr,
+        _ => format!("{}{}", exec_result.stdout, exec_result.stderr),
+    };
+
+    let fmt = match format.as_deref() {
+        Some("json") => OutputFormat::Json,
+        Some("markdown") => OutputFormat::Markdown,
+        Some("plain") => OutputFormat::Plain,
+        None if is_tty => OutputFormat::Plain,
+        _ => OutputFormat::Markdown,
+    };
+
+    let result = process_structured(&combined);
+
+    let output = if result.passthrough {
+        combined.clone()
+    } else {
+        result
+            .format_checked(fmt, combined.len())
+            .unwrap_or(combined)
+    };
+
+    if exec_result.exit_code != 0 {
+        eprintln!("exit code: {}", exec_result.exit_code);
+    }
+
+    emit_output(&output, is_tty);
+    process::exit(exec_result.exit_code);
+}
+
+/// Join command arguments, quoting any that contain shell metacharacters.
+fn shell_join(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| {
+            if arg.is_empty() {
+                "''".to_string()
+            } else if arg.contains(|c: char| {
+                c.is_ascii_whitespace() || "\"'\\$`!#&|;(){}[]<>?*~".contains(c)
+            }) {
+                // Single-quote the arg, escaping any embedded single quotes
+                format!("'{}'", arg.replace('\'', "'\\''"))
+            } else {
+                arg.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Write output to stdout. When TTY and output is long, pipe through $PAGER.

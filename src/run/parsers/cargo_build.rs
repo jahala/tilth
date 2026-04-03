@@ -1,7 +1,7 @@
 use memchr::memmem;
 use serde_json::Value;
 
-use crate::run::types::{Counts, Diagnostic, Location, ParsedOutput, Severity};
+use crate::run::types::{Counts, DetectResult, Diagnostic, Location, ParsedOutput, Severity};
 
 use super::Parser;
 
@@ -14,49 +14,44 @@ impl Parser for CargoBuildParser {
         "cargo-build"
     }
 
-    fn detect(&self, sample: &str) -> bool {
+    fn detect(&self, sample: &str) -> DetectResult {
         let bytes = sample.as_bytes();
 
         // JSON fingerprint: any line contains `"reason":"compiler-` or `"reason": "compiler-`
         let json_finder_compact = memmem::Finder::new(b"\"reason\":\"compiler-");
         let json_finder_spaced = memmem::Finder::new(b"\"reason\": \"compiler-");
         if json_finder_compact.find(bytes).is_some() || json_finder_spaced.find(bytes).is_some() {
-            return true;
+            return DetectResult::NdJson;
         }
 
         // Text fingerprint: `error[E` or `warning[` or `warning:` with ` --> ` arrow
         let arrow_finder = memmem::Finder::new(b" --> ");
         if arrow_finder.find(bytes).is_none() {
-            return false;
+            return DetectResult::NoMatch;
         }
         let error_code = memmem::Finder::new(b"error[E");
         let warning_bracket = memmem::Finder::new(b"warning[");
         let warning_colon = memmem::Finder::new(b"warning:");
-        error_code.find(bytes).is_some()
+        if error_code.find(bytes).is_some()
             || warning_bracket.find(bytes).is_some()
             || warning_colon.find(bytes).is_some()
+        {
+            return DetectResult::Text;
+        }
+
+        DetectResult::NoMatch
     }
 
-    fn parse(&self, input: &str) -> ParsedOutput {
+    fn parse(&self, input: &str, hint: DetectResult) -> ParsedOutput {
         let raw_bytes = input.len();
         let raw_lines = input.lines().count();
 
-        // Try JSON path first; fall back to text parsing.
-        if looks_like_json(input) {
+        if hint.is_json() {
             try_json(input, raw_lines, raw_bytes)
         } else {
             parse_text(input, raw_lines, raw_bytes)
         }
     }
-}
-
-/// Heuristic: treat as JSON if any of the first 5 non-empty lines starts with `{`.
-fn looks_like_json(input: &str) -> bool {
-    input
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .take(5)
-        .any(|l| l.trim_start().starts_with('{'))
 }
 
 // ---------------------------------------------------------------------------
@@ -80,9 +75,8 @@ fn try_json(input: &str, raw_lines: usize, raw_bytes: usize) -> ParsedOutput {
             Err(_) => continue,
         };
 
-        let reason = match value.get("reason").and_then(Value::as_str) {
-            Some(r) => r,
-            None => continue,
+        let Some(reason) = value.get("reason").and_then(Value::as_str) else {
+            continue;
         };
 
         match reason {
@@ -177,8 +171,7 @@ fn extract_json_diagnostic(msg: &Value) -> Option<Diagnostic> {
                 .filter(|c| {
                     c.get("level")
                         .and_then(Value::as_str)
-                        .map(|l| l == "help")
-                        .unwrap_or(false)
+                        .is_some_and(|l| l == "help")
                 })
                 .filter_map(|c| c.get("message").and_then(Value::as_str))
                 .collect::<Vec<_>>()
@@ -294,7 +287,6 @@ fn parse_text(input: &str, raw_lines: usize, raw_bytes: usize) -> ParsedOutput {
             if let Some(ref mut d) = current {
                 d.help_lines.push(help);
             }
-            continue;
         }
     }
 
@@ -445,25 +437,25 @@ mod tests {
     #[test]
     fn detect_json_fingerprint() {
         let sample = r#"{"reason":"compiler-message","package_id":"foo"}"#;
-        assert!(PARSER.detect(sample));
+        assert_eq!(PARSER.detect(sample), DetectResult::NdJson);
     }
 
     #[test]
     fn detect_json_fingerprint_spaced() {
         let sample = r#"{"reason": "compiler-message", "package_id": "foo"}"#;
-        assert!(PARSER.detect(sample));
+        assert_eq!(PARSER.detect(sample), DetectResult::NdJson);
     }
 
     #[test]
     fn detect_text_fingerprint() {
         let sample = "error[E0308]: mismatched types\n --> src/lib.rs:10:5\n";
-        assert!(PARSER.detect(sample));
+        assert_eq!(PARSER.detect(sample), DetectResult::Text);
     }
 
     #[test]
     fn detect_rejects_generic() {
         let sample = "some random\noutput\nwith no rust compiler markers\n";
-        assert!(!PARSER.detect(sample));
+        assert_eq!(PARSER.detect(sample), DetectResult::NoMatch);
     }
 
     // --- JSON path ---
@@ -472,7 +464,7 @@ mod tests {
     fn parse_json_compiler_message() {
         let input = r#"{"reason":"compiler-message","package_id":"foo 0.1.0","manifest_path":"/foo/Cargo.toml","target":{"kind":["lib"],"crate_types":["lib"],"name":"foo","src_path":"/foo/src/lib.rs","edition":"2021"},"message":{"message":"mismatched types","code":{"code":"E0308","explanation":"..."},"level":"error","spans":[{"file_name":"src/lib.rs","byte_start":100,"byte_end":110,"line_start":10,"line_end":10,"column_start":5,"column_end":15,"is_primary":true,"text":[],"label":null,"suggested_replacement":null,"suggestion_applicability":null,"expansion":null}],"children":[],"rendered":"error[E0308]: mismatched types\n"}}"#;
 
-        let out = PARSER.parse(input);
+        let out = PARSER.parse(input, DetectResult::NdJson);
         assert_eq!(out.diagnostics.len(), 1);
         let diag = &out.diagnostics[0];
         assert_eq!(diag.severity, Severity::Error);
@@ -491,7 +483,7 @@ mod tests {
     fn parse_json_with_help() {
         let input = r#"{"reason":"compiler-message","package_id":"foo 0.1.0","manifest_path":"/foo/Cargo.toml","target":{"kind":["lib"],"crate_types":["lib"],"name":"foo","src_path":"/foo/src/lib.rs","edition":"2021"},"message":{"message":"unused variable: `x`","code":{"code":"unused_variables","explanation":null},"level":"warning","spans":[{"file_name":"src/lib.rs","byte_start":50,"byte_end":51,"line_start":5,"line_end":5,"column_start":9,"column_end":10,"is_primary":true,"text":[],"label":null,"suggested_replacement":null,"suggestion_applicability":null,"expansion":null}],"children":[{"message":"if this is intentional, prefix it with an underscore: `_x`","code":null,"level":"help","spans":[],"children":[],"rendered":null}],"rendered":"warning: unused variable: `x`\n"}}"#;
 
-        let out = PARSER.parse(input);
+        let out = PARSER.parse(input, DetectResult::NdJson);
         assert_eq!(out.diagnostics.len(), 1);
         let diag = &out.diagnostics[0];
         assert_eq!(diag.severity, Severity::Warning);
@@ -509,7 +501,7 @@ mod tests {
     #[test]
     fn parse_text_error_with_location() {
         let input = "error[E0308]: mismatched types\n --> src/lib.rs:42:5\n  |\n42 |     let x: i32 = \"hello\";\n  |                  ^^^^^^^ expected `i32`, found `&str`\n";
-        let out = PARSER.parse(input);
+        let out = PARSER.parse(input, DetectResult::Text);
         assert_eq!(out.diagnostics.len(), 1);
         let diag = &out.diagnostics[0];
         assert_eq!(diag.severity, Severity::Error);
@@ -526,7 +518,7 @@ mod tests {
     #[test]
     fn parse_text_warning() {
         let input = "warning[unused_variables]: unused variable: `x`\n --> src/main.rs:7:9\n  |\n7 |     let x = 5;\n  |         ^ help: if this is intentional, prefix it with an underscore: `_x`\n  |\n";
-        let out = PARSER.parse(input);
+        let out = PARSER.parse(input, DetectResult::Text);
         assert_eq!(out.diagnostics.len(), 1);
         let diag = &out.diagnostics[0];
         assert_eq!(diag.severity, Severity::Warning);
@@ -537,7 +529,7 @@ mod tests {
     #[test]
     fn parse_text_clippy_warning() {
         let input = "warning: redundant pattern matching\n --> src/lib.rs:15:5\n";
-        let out = PARSER.parse(input);
+        let out = PARSER.parse(input, DetectResult::Text);
         assert_eq!(out.diagnostics.len(), 1);
         let diag = &out.diagnostics[0];
         assert_eq!(diag.severity, Severity::Warning);

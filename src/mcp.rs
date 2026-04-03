@@ -513,9 +513,6 @@ fn tool_edit(
     }
 }
 
-const DEFAULT_RUN_TIMEOUT_SECS: u64 = 120;
-const MAX_OUTPUT_BYTES: u64 = 10 * 1024 * 1024; // 10 MB
-
 fn tool_run(args: &Value) -> Result<String, String> {
     let command = args
         .get("command")
@@ -525,80 +522,45 @@ fn tool_run(args: &Value) -> Result<String, String> {
     let timeout_secs = args
         .get("timeout")
         .and_then(serde_json::Value::as_u64)
-        .unwrap_or(DEFAULT_RUN_TIMEOUT_SECS);
+        .unwrap_or(crate::run::exec::default_timeout());
 
     let cwd = args.get("cwd").and_then(|v| v.as_str()).unwrap_or(".");
     let cwd_path = std::path::Path::new(cwd);
-    if !cwd_path.is_dir() {
-        return Err(format!("cwd is not a valid directory: {cwd}"));
-    }
 
-    let mut child = std::process::Command::new("sh")
-        .args(["-c", command])
-        .current_dir(cwd_path)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("failed to spawn command: {e}"))?;
+    let exec_result =
+        crate::run::exec::execute(command, cwd_path, timeout_secs).map_err(|e| e.to_string())?;
 
-    // Read stdout/stderr in background threads to avoid pipe deadlock.
-    // Bounded reads prevent OOM from runaway commands.
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
-    let stdout_handle = std::thread::spawn(move || read_bounded(stdout));
-    let stderr_handle = std::thread::spawn(move || read_bounded(stderr));
-
-    // Wait for exit on a dedicated thread so we don't block the MCP I/O loop.
-    let child_pid = child.id();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(child.wait());
-    });
-
-    let status = match rx.recv_timeout(std::time::Duration::from_secs(timeout_secs)) {
-        Ok(Ok(status)) => status,
-        Ok(Err(e)) => return Err(format!("failed to wait on command: {e}")),
-        Err(_) => {
-            // Kill the child process. The wait thread will unblock and clean up.
-            let _ = std::process::Command::new("kill")
-                .args(["-9", &child_pid.to_string()])
-                .status();
-            return Err(format!("command timed out after {timeout_secs}s"));
+    if exec_result.timed_out {
+        let mut output = format!("command timed out after {timeout_secs}s\n\n");
+        let partial = match (exec_result.stdout.is_empty(), exec_result.stderr.is_empty()) {
+            (_, true) => exec_result.stdout,
+            (true, _) => exec_result.stderr,
+            _ => format!("{}{}", exec_result.stdout, exec_result.stderr),
+        };
+        if !partial.is_empty() {
+            output.push_str(&partial);
         }
-    };
-    let stdout_str = stdout_handle
-        .join()
-        .map_err(|_| "stdout reader thread panicked".to_string())?
-        .map_err(|e| format!("failed to read stdout: {e}"))?;
-    let stderr_str = stderr_handle
-        .join()
-        .map_err(|_| "stderr reader thread panicked".to_string())?
-        .map_err(|e| format!("failed to read stderr: {e}"))?;
-
-    let combined = match (stdout_str.is_empty(), stderr_str.is_empty()) {
-        (_, true) => stdout_str,
-        (true, _) => stderr_str,
-        _ => format!("{stdout_str}{stderr_str}"),
-    };
-
-    let exit_code = status.code().unwrap_or(-1);
-    let processed = crate::run::process(&combined);
-
-    let mut result_text = String::with_capacity(processed.len() + 32);
-    if exit_code != 0 {
-        write!(result_text, "exit code: {exit_code}\n\n").unwrap();
+        return Ok(output);
     }
-    result_text.push_str(&processed);
 
-    Ok(result_text)
-}
+    let combined = match (exec_result.stdout.is_empty(), exec_result.stderr.is_empty()) {
+        (_, true) => exec_result.stdout,
+        (true, _) => exec_result.stderr,
+        _ => format!("{}{}", exec_result.stdout, exec_result.stderr),
+    };
 
-/// Read up to `MAX_OUTPUT_BYTES` from a reader into a String.
-fn read_bounded(reader: impl std::io::Read) -> std::io::Result<String> {
-    use std::io::Read;
-    let mut buf = String::new();
-    reader.take(MAX_OUTPUT_BYTES).read_to_string(&mut buf)?;
-    Ok(buf)
+    let result = crate::run::process_structured(&combined);
+    let formatted = result
+        .format_checked(crate::run::OutputFormat::Markdown, combined.len())
+        .unwrap_or(combined);
+
+    let mut output = String::with_capacity(formatted.len() + 32);
+    if exec_result.exit_code != 0 {
+        write!(output, "exit code: {}\n\n", exec_result.exit_code).unwrap();
+    }
+    output.push_str(&formatted);
+
+    Ok(output)
 }
 
 /// Falls back to cwd when scope is invalid, with a warning message.

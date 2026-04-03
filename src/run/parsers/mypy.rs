@@ -2,7 +2,8 @@ use memchr::memmem;
 use serde_json::Value;
 
 use crate::run::types::{
-    build_lint_summary, parse_found_count, Counts, Diagnostic, Location, ParsedOutput, Severity,
+    build_lint_summary, parse_found_count, Counts, DetectResult, Diagnostic, Location,
+    ParsedOutput, Severity,
 };
 
 use super::Parser;
@@ -16,7 +17,7 @@ impl Parser for MypyParser {
         "mypy"
     }
 
-    fn detect(&self, sample: &str) -> bool {
+    fn detect(&self, sample: &str) -> DetectResult {
         let bytes = sample.as_bytes();
 
         // JSON fingerprint (mypy --output=json NDJSON): lines with "severity" + "message" + .py
@@ -27,34 +28,30 @@ impl Parser for MypyParser {
             && message_finder.find(bytes).is_some()
             && py_finder.find(bytes).is_some()
         {
-            return true;
+            return DetectResult::NdJson;
         }
 
         // Text fingerprint: `path.py:N: error:` or `path.py:N: warning:`
         let error_finder = memmem::Finder::new(b".py:");
         if error_finder.find(bytes).is_none() {
-            return false;
+            return DetectResult::NoMatch;
         }
-        sample.lines().any(looks_like_mypy_text_line)
+        if sample.lines().any(looks_like_mypy_text_line) {
+            DetectResult::Text
+        } else {
+            DetectResult::NoMatch
+        }
     }
 
-    fn parse(&self, input: &str) -> ParsedOutput {
+    fn parse(&self, input: &str, hint: DetectResult) -> ParsedOutput {
         let raw_bytes = input.len();
         let raw_lines = input.lines().count();
 
-        // Detect JSON vs text: look for NDJSON objects with "severity" key
-        let trimmed = input.trim_start();
-        if trimmed.starts_with('{') {
-            let severity_finder = memmem::Finder::new(b"\"severity\"");
-            let message_finder = memmem::Finder::new(b"\"message\"");
-            if severity_finder.find(trimmed.as_bytes()).is_some()
-                && message_finder.find(trimmed.as_bytes()).is_some()
-            {
-                return parse_json(input, raw_lines, raw_bytes);
-            }
+        if hint.is_json() {
+            parse_json(input, raw_lines, raw_bytes)
+        } else {
+            parse_text(input, raw_lines, raw_bytes)
         }
-
-        parse_text(input, raw_lines, raw_bytes)
     }
 }
 
@@ -170,10 +167,10 @@ fn extract_json_diagnostic(value: &Value) -> Option<Diagnostic> {
         .and_then(Value::as_u64)
         .map(|c| c as u32);
 
-    let location = if !file.is_empty() {
-        Some(Location { file, line, column })
-    } else {
+    let location = if file.is_empty() {
         None
+    } else {
+        Some(Location { file, line, column })
     };
 
     Some(Diagnostic {
@@ -320,13 +317,13 @@ mod tests {
     #[test]
     fn detect_text() {
         let sample = "src/main.py:42: error: Incompatible types in assignment  [assignment]\n";
-        assert!(PARSER.detect(sample));
+        assert!(PARSER.detect(sample).matched());
     }
 
     #[test]
     fn detect_rejects() {
         let sample = "some random\noutput with no mypy markers\n";
-        assert!(!PARSER.detect(sample));
+        assert!(!PARSER.detect(sample).matched());
     }
 
     // --- JSON path ---
@@ -339,7 +336,7 @@ mod tests {
             r#"{"file": "src/main.py", "line": 43, "column": 1, "severity": "note", "message": "Expected \"int\", got \"str\"", "code": null}"#,
             "\n",
         );
-        let out = PARSER.parse(input);
+        let out = PARSER.parse(input, DetectResult::NdJson);
         assert_eq!(out.diagnostics.len(), 2);
 
         let first = &out.diagnostics[0];
@@ -369,7 +366,7 @@ mod tests {
             "src/main.py:42: error: Incompatible types in assignment  [assignment]\n",
             "src/main.py:43: note: Expected \"int\", got \"str\"\n",
         );
-        let out = PARSER.parse(input);
+        let out = PARSER.parse(input, DetectResult::Text);
         assert_eq!(out.diagnostics.len(), 2);
 
         let first = &out.diagnostics[0];
@@ -394,8 +391,32 @@ mod tests {
         // When mypy emits only a summary line (e.g., with --no-error-summary off),
         // we should still capture the count.
         let input = "Found 3 errors in 2 files (checked 10 source files)\n";
-        let out = PARSER.parse(input);
+        let out = PARSER.parse(input, DetectResult::Text);
         assert_eq!(out.counts.errors, 3);
         assert_eq!(out.summary, "3 error(s)");
+    }
+
+    // Bug 5 regression: ruff's weak fingerprint was before mypy in PARSERS, so
+    // mypy JSON output could be claimed by ruff if ruff matched first.
+    // With the strengthened ruff fingerprint (Bug 3 fix), mypy JSON must NOT be
+    // detected as ruff — mypy NDJSON uses "severity"/"message"/"file", not "filename"/"row".
+    #[test]
+    fn mypy_json_not_claimed_by_ruff() {
+        let mypy_json = concat!(
+            r#"{"file": "src/main.py", "line": 42, "column": 5, "severity": "error", "message": "Incompatible types in assignment", "code": "assignment"}"#,
+            "\n",
+        );
+        // ruff.detect() should NOT match mypy's NDJSON format.
+        let ruff_result = crate::run::parsers::ruff::PARSER.detect(mypy_json);
+        assert!(
+            !ruff_result.matched(),
+            "ruff should not claim mypy NDJSON output (mypy uses 'file'/'severity', not 'filename'/'location'/'row')"
+        );
+        // mypy.detect() should match.
+        let mypy_result = PARSER.detect(mypy_json);
+        assert!(
+            mypy_result.matched(),
+            "mypy should detect its own NDJSON output"
+        );
     }
 }

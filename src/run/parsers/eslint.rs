@@ -1,7 +1,7 @@
 use memchr::memmem;
 use serde_json::Value;
 
-use crate::run::types::{Counts, Diagnostic, Location, ParsedOutput, Severity};
+use crate::run::types::{Counts, DetectResult, Diagnostic, Location, ParsedOutput, Severity};
 
 use super::Parser;
 
@@ -14,7 +14,7 @@ impl Parser for EslintParser {
         "eslint"
     }
 
-    fn detect(&self, sample: &str) -> bool {
+    fn detect(&self, sample: &str) -> DetectResult {
         let bytes = sample.as_bytes();
 
         // JSON fingerprint: array containing objects with "filePath" and "messages".
@@ -24,19 +24,23 @@ impl Parser for EslintParser {
             && file_path_finder.find(bytes).is_some()
             && messages_finder.find(bytes).is_some()
         {
-            return true;
+            return DetectResult::SingleJson;
         }
 
         // Text fingerprint: indented lines with `error` or `warning` and a rule containing `/`
         // or a well-known bare rule name pattern.
-        sample.lines().any(looks_like_eslint_text_line)
+        if sample.lines().any(looks_like_eslint_text_line) {
+            DetectResult::Text
+        } else {
+            DetectResult::NoMatch
+        }
     }
 
-    fn parse(&self, input: &str) -> ParsedOutput {
+    fn parse(&self, input: &str, hint: DetectResult) -> ParsedOutput {
         let raw_bytes = input.len();
         let raw_lines = input.lines().count();
 
-        if input.trim_start().starts_with('[') {
+        if hint.is_json() {
             parse_json(input, raw_lines, raw_bytes)
         } else {
             parse_text(input, raw_lines, raw_bytes)
@@ -53,6 +57,7 @@ impl Parser for EslintParser {
 /// ESLint text lines are indented and have the form:
 ///   `  10:5  error  'x' is defined but never used  no-unused-vars`
 ///   `  15:3  warning  Missing semicolon  semi`
+#[allow(clippy::doc_markdown)] // "ESLint" is a tool name, not a code item
 fn looks_like_eslint_text_line(line: &str) -> bool {
     let trimmed = line.trim_start();
     // Must be indented (original line starts with whitespace).
@@ -64,13 +69,7 @@ fn looks_like_eslint_text_line(line: &str) -> bool {
         return false;
     };
     let loc = loc.trim();
-    if !loc.contains(':')
-        || !loc
-            .chars()
-            .next()
-            .map(|c| c.is_ascii_digit())
-            .unwrap_or(false)
-    {
+    if !loc.contains(':') || !loc.chars().next().is_some_and(|c| c.is_ascii_digit()) {
         return false;
     }
     let rest = rest.trim_start();
@@ -232,7 +231,7 @@ fn parse_text(input: &str, raw_lines: usize, raw_bytes: usize) -> ParsedOutput {
     }
 }
 
-/// Parse a single indented ESLint text diagnostic line.
+/// Parse a single indented `ESLint` text diagnostic line.
 ///
 /// Expected format: `  10:5  error  'x' is defined but never used  no-unused-vars`
 fn parse_text_line(line: &str, file: &str) -> Option<Diagnostic> {
@@ -273,14 +272,14 @@ fn parse_text_line(line: &str, file: &str) -> Option<Diagnostic> {
         (fields[2].to_string(), "unknown".to_string())
     };
 
-    let location = if !file.is_empty() {
+    let location = if file.is_empty() {
+        None
+    } else {
         Some(Location {
             file: file.to_string(),
             line: line_num,
             column: Some(column),
         })
-    } else {
-        None
     };
 
     Some(Diagnostic {
@@ -308,7 +307,7 @@ fn build_summary(errors: u32, warnings: u32) -> String {
     if errors == 0 && warnings == 0 {
         "no issues found".to_string()
     } else {
-        format!("{} error(s), {} warning(s)", errors, warnings)
+        format!("{errors} error(s), {warnings} warning(s)")
     }
 }
 
@@ -337,19 +336,19 @@ mod tests {
     #[test]
     fn detect_json() {
         let sample = r#"[{"filePath":"/src/app.js","messages":[]}]"#;
-        assert!(PARSER.detect(sample));
+        assert!(PARSER.detect(sample).matched());
     }
 
     #[test]
     fn detect_text() {
         let sample = "/src/app.js\n  10:5  error  'x' is defined but never used  no-unused-vars\n";
-        assert!(PARSER.detect(sample));
+        assert!(PARSER.detect(sample).matched());
     }
 
     #[test]
     fn detect_rejects() {
         let sample = "some random\noutput with no eslint markers\n";
-        assert!(!PARSER.detect(sample));
+        assert!(!PARSER.detect(sample).matched());
     }
 
     // --- JSON path ---
@@ -375,7 +374,7 @@ mod tests {
     }
   ]
 }]"#;
-        let out = PARSER.parse(input);
+        let out = PARSER.parse(input, DetectResult::SingleJson);
         assert_eq!(out.diagnostics.len(), 2);
 
         let first = &out.diagnostics[0];
@@ -402,7 +401,7 @@ mod tests {
     #[test]
     fn parse_text() {
         let input = "/path/to/file.js\n  10:5  error  'x' is defined but never used  no-unused-vars\n  15:3  warning  Unexpected any  @typescript-eslint/no-explicit-any\n";
-        let out = PARSER.parse(input);
+        let out = PARSER.parse(input, DetectResult::Text);
         assert_eq!(out.diagnostics.len(), 2);
 
         let first = &out.diagnostics[0];

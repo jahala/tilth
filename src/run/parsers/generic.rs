@@ -1,6 +1,6 @@
 use memchr::memmem;
 
-use crate::run::types::{Counts, Diagnostic, Location, ParsedOutput, Severity};
+use crate::run::types::{Counts, DetectResult, Diagnostic, Location, ParsedOutput, Severity};
 
 use super::Parser;
 
@@ -45,11 +45,11 @@ impl Parser for GenericParser {
     }
 
     /// The generic parser is the implicit fallback; it never claims a match.
-    fn detect(&self, _sample: &str) -> bool {
-        false
+    fn detect(&self, _sample: &str) -> DetectResult {
+        DetectResult::NoMatch
     }
 
-    fn parse(&self, input: &str) -> ParsedOutput {
+    fn parse(&self, input: &str, _hint: DetectResult) -> ParsedOutput {
         let raw_bytes = input.len();
         let lines: Vec<&str> = input.lines().collect();
         let raw_lines = lines.len();
@@ -78,7 +78,7 @@ impl Parser for GenericParser {
             // ASCII-lowercase into reusable buffer (all keywords are ASCII).
             let line_bytes = line.as_bytes();
             lower_buf.clear();
-            lower_buf.extend(line_bytes.iter().map(|b| b.to_ascii_lowercase()));
+            lower_buf.extend(line_bytes.iter().map(u8::to_ascii_lowercase));
 
             if finders.matches(&lower_buf) {
                 error_count += 1;
@@ -207,7 +207,7 @@ mod tests {
     #[test]
     fn short_input_passthrough() {
         let input = "line 1\nline 2\nline 3";
-        let out = PARSER.parse(input);
+        let out = PARSER.parse(input, DetectResult::Text);
         assert_eq!(out.raw_lines, 3);
         assert!(out.diagnostics.is_empty());
     }
@@ -223,7 +223,7 @@ mod tests {
             }
         }
         let input = lines.join("\n");
-        let out = PARSER.parse(&input);
+        let out = PARSER.parse(&input, DetectResult::Text);
         assert!(!out.diagnostics.is_empty());
         assert_eq!(out.counts.errors, out.diagnostics.len() as u32);
     }
@@ -248,7 +248,7 @@ mod tests {
 
     #[test]
     fn detect_always_false() {
-        assert!(!PARSER.detect("anything"));
+        assert!(!PARSER.detect("anything").matched());
     }
 
     #[test]
@@ -285,7 +285,7 @@ mod tests {
             ));
         }
         let input = lines.join("\n");
-        let out = PARSER.parse(&input);
+        let out = PARSER.parse(&input, DetectResult::Text);
         // All 30 should have the same name (normalized message)
         let first_name = &out.diagnostics[0].name;
         assert!(out.diagnostics.iter().all(|d| &d.name == first_name));

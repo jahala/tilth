@@ -1,7 +1,8 @@
 use memchr::memmem;
 
 use crate::run::types::{
-    extract_count, truncate_detail, Counts, Diagnostic, Location, ParsedOutput, Severity,
+    extract_count, truncate_detail, Counts, DetectResult, Diagnostic, Location, ParsedOutput,
+    Severity,
 };
 
 use super::Parser;
@@ -19,13 +20,13 @@ impl Parser for PytestParser {
     ///
     /// Accepts the short test summary section header, or the pytest summary
     /// banner line (`=====` with `passed`/`failed`).
-    fn detect(&self, sample: &str) -> bool {
+    fn detect(&self, sample: &str) -> DetectResult {
         let bytes = sample.as_bytes();
 
         // Unambiguous: pytest's short test summary info section header.
         let short_summary = memmem::Finder::new("short test summary info");
         if short_summary.find(bytes).is_some() {
-            return true;
+            return DetectResult::Text;
         }
 
         // Banner line fingerprint: `=====` AND (`passed` OR `failed`).
@@ -33,36 +34,47 @@ impl Parser for PytestParser {
         if equals.find(bytes).is_some() {
             let passed = memmem::Finder::new("passed");
             let failed = memmem::Finder::new("failed");
-            return passed.find(bytes).is_some() || failed.find(bytes).is_some();
+            if passed.find(bytes).is_some() || failed.find(bytes).is_some() {
+                return DetectResult::Text;
+            }
         }
 
-        false
+        DetectResult::NoMatch
     }
 
-    fn parse(&self, input: &str) -> ParsedOutput {
-        // JSON is only available with the pytest-json-report plugin — very rare.
-        // Attempt it opportunistically; fall through to text parsing otherwise.
-        let trimmed = input.trim_start();
-        if trimmed.starts_with('{') {
-            if let Some(parsed) = self.try_json(input) {
+    fn parse(&self, input: &str, hint: DetectResult) -> ParsedOutput {
+        if hint.is_json() {
+            if let Some(parsed) = PytestParser::try_json(input) {
                 return parsed;
             }
         }
-        self.parse_text(input)
+        PytestParser::parse_text(input)
     }
 }
 
 impl PytestParser {
     /// Opportunistic JSON parse for pytest-json-report output.
-    fn try_json(&self, input: &str) -> Option<ParsedOutput> {
+    fn try_json(input: &str) -> Option<ParsedOutput> {
         let value: serde_json::Value = serde_json::from_str(input).ok()?;
         let summary = value.get("summary")?;
 
-        let passed = summary.get("passed").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-        let failed = summary.get("failed").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-        let skipped = summary.get("skipped").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-        let errors = summary.get("error").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-        let duration_secs = value.get("duration").and_then(|v| v.as_f64());
+        let passed = summary
+            .get("passed")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as u32;
+        let failed = summary
+            .get("failed")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as u32;
+        let skipped = summary
+            .get("skipped")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as u32;
+        let errors = summary
+            .get("error")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as u32;
+        let duration_secs = value.get("duration").and_then(serde_json::Value::as_f64);
 
         let mut diagnostics: Vec<Diagnostic> = Vec::new();
         if let Some(tests) = value.get("tests").and_then(|v| v.as_array()) {
@@ -122,7 +134,7 @@ impl PytestParser {
         })
     }
 
-    fn parse_text(&self, input: &str) -> ParsedOutput {
+    fn parse_text(input: &str) -> ParsedOutput {
         let raw_bytes = input.len();
         let raw_lines = input.lines().count();
         let lines: Vec<&str> = input.lines().collect();
@@ -386,28 +398,23 @@ fn extract_error_message(block: &str) -> String {
     // Fallback: first non-empty, non-separator line.
     block
         .lines()
-        .map(|l| l.trim())
+        .map(str::trim)
         .find(|l| !l.is_empty() && !l.starts_with('>') && !l.starts_with('-'))
         .unwrap_or("test failed")
         .to_string()
 }
 
-/// Parse a pytest node id like `tests/test_foo.py::test_bar` into a Location.
-fn parse_nodeid_location(nodeid: &str) -> Option<Location> {
-    // Strip the `::test_name` suffix, leaving just the file path.
-    let file = if let Some(pos) = nodeid.find("::") {
-        &nodeid[..pos]
-    } else {
-        nodeid
-    };
-    if file.is_empty() || !file.ends_with(".py") {
-        return None;
-    }
-    Some(Location {
-        file: file.to_string(),
-        line: 0,
-        column: None,
-    })
+/// Extract the file path from a pytest node id like `tests/test_foo.py::test_bar`.
+///
+/// Returns `None` — node IDs contain no line number information. Callers that
+/// need a location should use `Location::scan_text` on the failure block content
+/// instead. This function intentionally returns `None` rather than creating a
+/// `Location { line: 0 }` which would be misleading.
+fn parse_nodeid_location(_nodeid: &str) -> Option<Location> {
+    // Node IDs have the form `path/to/file.py::ClassName::test_method`.
+    // They do NOT carry line numbers. We return None so callers fall back to
+    // Location::scan_text on block content (which has real line info).
+    None
 }
 
 /// Build a human-readable summary, omitting zero categories except `passed`.
@@ -439,19 +446,19 @@ mod tests {
     #[test]
     fn detect_summary_with_equals() {
         let sample = "collected 3 items\n\n============================== 2 passed, 1 failed in 0.12s ==============================";
-        assert!(PARSER.detect(sample));
+        assert!(PARSER.detect(sample).matched());
     }
 
     #[test]
     fn detect_short_test_summary() {
         let sample = "=========================== short test summary info ============================\nFAILED tests/test_foo.py::test_bar - AssertionError: 1 != 2";
-        assert!(PARSER.detect(sample));
+        assert!(PARSER.detect(sample).matched());
     }
 
     #[test]
     fn detect_rejects_generic() {
         let sample = "Building project...\nCompiling foo\nDone in 1.2s";
-        assert!(!PARSER.detect(sample));
+        assert!(!PARSER.detect(sample).matched());
     }
 
     // -- Text parse ----------------------------------------------------------
@@ -465,7 +472,7 @@ mod tests {
             "\n",
             "============================== 5 passed in 0.23s ==============================\n",
         );
-        let out = PARSER.parse(input);
+        let out = PARSER.parse(input, DetectResult::Text);
         assert_eq!(out.tool, "pytest");
         assert_eq!(out.counts.passed, 5);
         assert_eq!(out.counts.failed, 0);
@@ -486,7 +493,7 @@ mod tests {
             "FAILED tests/test_foo.py::test_mul - AssertionError: 3 != 4\n",
             "========================= 2 failed, 1 passed in 0.05s =========================\n",
         );
-        let out = PARSER.parse(input);
+        let out = PARSER.parse(input, DetectResult::Text);
         assert_eq!(out.counts.passed, 1);
         assert_eq!(out.counts.failed, 2);
         assert_eq!(out.diagnostics.len(), 2);
@@ -513,7 +520,7 @@ mod tests {
             "FAILED tests/test_foo.py::test_add - AssertionError: assert 3 == 4\n",
             "============================== 1 failed in 0.07s ==============================\n",
         );
-        let out = PARSER.parse(input);
+        let out = PARSER.parse(input, DetectResult::Text);
         assert_eq!(out.counts.failed, 1);
         // The block-based diagnostic is preferred over the summary line.
         assert_eq!(out.diagnostics.len(), 1);
@@ -532,5 +539,45 @@ mod tests {
             .expect("location should be extracted");
         assert_eq!(loc.file, "tests/test_foo.py");
         assert_eq!(loc.line, 10);
+    }
+
+    // Bug 4 regression: parse_nodeid_location used to return Location { line: 0 }
+    // for node IDs that have no line info. Now it returns None, and the summary-line
+    // parser gets no location (which is honest), while the block parser correctly
+    // extracts the real line number from block content.
+    #[test]
+    fn parse_nodeid_location_returns_none() {
+        // Calling parse_nodeid_location directly should return None — not line 0.
+        assert!(
+            parse_nodeid_location("tests/test_foo.py::TestClass::test_method").is_none(),
+            "node ID with no line number should return None, not Location {{ line: 0 }}"
+        );
+        assert!(
+            parse_nodeid_location("tests/test_foo.py::test_method").is_none(),
+            "simple node ID should also return None"
+        );
+    }
+
+    #[test]
+    fn parse_summary_line_has_no_line_number() {
+        // A FAILED summary line without a block produces a diagnostic with no location
+        // (since node IDs have no line info and there is no block content to scan).
+        let input = concat!(
+            "=========================== short test summary info ============================\n",
+            "FAILED tests/test_foo.py::test_bar - AssertionError: assert 1 == 2\n",
+            "============================== 1 failed in 0.01s ==============================\n",
+        );
+        let out = PARSER.parse(input, DetectResult::Text);
+        assert_eq!(out.diagnostics.len(), 1);
+        let diag = &out.diagnostics[0];
+        // location is None (no block content) — NOT Some(Location { line: 0 })
+        if let Some(loc) = &diag.location {
+            assert_ne!(
+                loc.line, 0,
+                "location line should not be 0; use None instead"
+            );
+        }
+        // name is the full node id
+        assert_eq!(diag.name, "tests/test_foo.py::test_bar");
     }
 }

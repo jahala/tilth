@@ -1,7 +1,102 @@
 use std::fmt;
 
+use crate::run::format;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetectResult {
+    NoMatch,
+    NdJson,
+    SingleJson,
+    Text,
+}
+
+impl DetectResult {
+    #[must_use]
+    pub fn matched(self) -> bool {
+        self != DetectResult::NoMatch
+    }
+
+    #[must_use]
+    pub fn is_json(self) -> bool {
+        matches!(self, DetectResult::NdJson | DetectResult::SingleJson)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputFormat {
+    Markdown,
+    Plain,
+    Json,
+}
+
+pub struct CompressResult {
+    pub tool: &'static str,
+    pub summary: String,
+    pub groups: Vec<DiagnosticGroup>,
+    pub counts: Counts,
+    pub duration_secs: Option<f64>,
+    pub input_stats: InputStats,
+    pub passthrough: bool,
+    /// Cleaned text for generic head/tail formatting. Only populated for unknown tools.
+    pub(crate) cleaned: Option<String>,
+}
+
+impl CompressResult {
+    #[must_use]
+    pub fn format(&self, fmt: OutputFormat) -> String {
+        match fmt {
+            OutputFormat::Markdown => match &self.cleaned {
+                Some(cleaned) => format::format_markdown_with_raw(self, cleaned),
+                None => format::format_markdown(self),
+            },
+            OutputFormat::Plain => match &self.cleaned {
+                Some(cleaned) => format::format_plain_with_raw(self, cleaned),
+                None => format::format_plain(self),
+            },
+            OutputFormat::Json => match &self.cleaned {
+                Some(cleaned) => format::format_json_with_raw(self, cleaned),
+                None => format::format_json(self),
+            },
+        }
+    }
+
+    #[must_use]
+    pub fn format_checked(&self, fmt: OutputFormat, original_len: usize) -> Option<String> {
+        let formatted = self.format(fmt);
+        if formatted.len() >= original_len {
+            None
+        } else {
+            Some(formatted)
+        }
+    }
+
+    #[must_use]
+    pub fn has_errors(&self) -> bool {
+        self.counts.errors > 0 || self.counts.failed > 0
+    }
+
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        self.counts.errors == 0 && self.counts.failed == 0 && self.counts.warnings == 0
+    }
+}
+
+pub struct InputStats {
+    pub lines: usize,
+    pub bytes: usize,
+}
+
+pub struct DiagnosticGroup {
+    pub severity: Severity,
+    pub signature: String,
+    pub locations: Vec<Location>,
+    pub total: usize,
+    pub representative: Diagnostic,
+    pub cascading: bool,
+}
+
 #[allow(dead_code)] // fields read in format.rs + tests, clippy can't trace pub(crate) API
-pub struct ParsedOutput {
+pub(crate) struct ParsedOutput {
     pub tool: &'static str,
     pub summary: String,
     pub diagnostics: Vec<Diagnostic>,
@@ -20,7 +115,7 @@ pub struct ParsedOutput {
 ///
 /// Test runners use `failed` for test failures and leave `errors` at 0.
 /// Linters/compilers use `errors`/`warnings` and leave test fields at 0.
-#[derive(Default)]
+#[derive(Default, serde::Serialize)]
 #[allow(dead_code)] // fields read in tests, clippy can't trace pub(crate) API
 pub struct Counts {
     pub passed: u32,
@@ -36,15 +131,6 @@ pub struct Diagnostic {
     pub name: String,
     pub message: String,
     pub detail: Option<String>,
-}
-
-pub struct DiagnosticGroup {
-    pub severity: Severity,
-    pub signature: String,
-    pub locations: Vec<Location>,
-    pub total: usize,
-    pub representative: Diagnostic,
-    pub cascading: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
@@ -86,6 +172,7 @@ impl Location {
     /// This is the shared location extractor used by multiple parsers. It looks for
     /// `file.ext:line` or `file.ext:line:col` patterns, walking backwards from the
     /// colon to find the path start (delimited by whitespace or quote chars).
+    #[must_use]
     pub fn scan_line(line: &str) -> Option<Location> {
         let bytes = line.as_bytes();
         let len = bytes.len();
@@ -107,15 +194,12 @@ impl Location {
                 continue;
             }
 
-            let line_num: u32 = match std::str::from_utf8(&bytes[num_start..num_end])
+            let Some(line_num) = std::str::from_utf8(&bytes[num_start..num_end])
                 .ok()
-                .and_then(|s| s.parse().ok())
-            {
-                Some(n) => n,
-                None => {
-                    i += 1;
-                    continue;
-                }
+                .and_then(|s| s.parse::<u32>().ok())
+            else {
+                i += 1;
+                continue;
             };
 
             // Optional column after another colon.
@@ -140,8 +224,7 @@ impl Location {
             let path_start = bytes[..path_end]
                 .iter()
                 .rposition(|&b| b == b' ' || b == b'\t' || b == b'\'' || b == b'"' || b == b'(')
-                .map(|pos| pos + 1)
-                .unwrap_or(0);
+                .map_or(0, |pos| pos + 1);
 
             let path_bytes = &bytes[path_start..path_end];
             let looks_like_path = path_bytes.iter().any(|&b| b == b'.' || b == b'/');
@@ -164,6 +247,7 @@ impl Location {
     }
 
     /// Scan multi-line text for the first location match.
+    #[must_use]
     pub fn scan_text(text: &str) -> Option<Location> {
         for line in text.lines() {
             if let Some(loc) = Location::scan_line(line.trim()) {
@@ -179,6 +263,7 @@ pub const MAX_DETAIL_BYTES: usize = 2048;
 /// Truncate a string to [`MAX_DETAIL_BYTES`], respecting UTF-8 char boundaries.
 ///
 /// Returns `None` if the input is empty/whitespace-only.
+#[must_use]
 pub fn truncate_detail(s: &str) -> Option<String> {
     let trimmed = s.trim();
     if trimmed.is_empty() {
@@ -200,13 +285,14 @@ pub fn truncate_detail(s: &str) -> Option<String> {
 ///
 /// Searches `haystack` for `label`, then walks backwards from the match position
 /// to collect consecutive digits, producing the count.
+#[must_use]
 pub fn extract_count(haystack: &str, label: &str) -> Option<u32> {
     let pos = haystack.find(label)?;
     let before = haystack[..pos].trim_end();
     let digits: String = before
         .chars()
         .rev()
-        .take_while(|c| c.is_ascii_digit())
+        .take_while(char::is_ascii_digit)
         .collect::<String>()
         .chars()
         .rev()
@@ -215,6 +301,7 @@ pub fn extract_count(haystack: &str, label: &str) -> Option<u32> {
 }
 
 /// Build a human-readable test summary, omitting zero categories except `passed`.
+#[must_use]
 pub fn build_test_summary(passed: u32, failed: u32, skipped: u32) -> String {
     let mut parts: Vec<String> = Vec::new();
     parts.push(format!("{passed} passed"));
@@ -227,7 +314,8 @@ pub fn build_test_summary(passed: u32, failed: u32, skipped: u32) -> String {
     parts.join(", ")
 }
 
-/// Parse "Found N ..." lines (used by tsc and mypy).
+/// Parse "Found N ..." lines (used by `tsc` and `mypy`).
+#[must_use]
 pub fn parse_found_count(line: &str) -> Option<u32> {
     let rest = line.trim().strip_prefix("Found ")?;
     let space = rest.find(' ')?;
@@ -235,6 +323,7 @@ pub fn parse_found_count(line: &str) -> Option<u32> {
 }
 
 /// Build summary for linter/compiler output.
+#[must_use]
 pub fn build_lint_summary(errors: u32, warnings: u32) -> String {
     match (errors, warnings) {
         (0, 0) => "no issues".to_string(),

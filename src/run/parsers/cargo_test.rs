@@ -1,8 +1,8 @@
 use memchr::memmem;
 
 use crate::run::types::{
-    build_test_summary, extract_count, truncate_detail, Counts, Diagnostic, Location, ParsedOutput,
-    Severity,
+    build_test_summary, extract_count, truncate_detail, Counts, DetectResult, Diagnostic, Location,
+    ParsedOutput, Severity,
 };
 
 use super::Parser;
@@ -19,35 +19,38 @@ impl Parser for CargoTestParser {
     /// Detect cargo test output via byte scanning — no regex.
     ///
     /// Accepts JSON format (`"type":"test"`) or text format (`test result:` + `passed`).
-    fn detect(&self, sample: &str) -> bool {
+    fn detect(&self, sample: &str) -> DetectResult {
         let bytes = sample.as_bytes();
 
         // JSON fingerprint: any line with `"type":"test"` or `"type": "test"`
         let type_test_compact = memmem::Finder::new(r#""type":"test""#);
         let type_test_spaced = memmem::Finder::new(r#""type": "test""#);
         if type_test_compact.find(bytes).is_some() || type_test_spaced.find(bytes).is_some() {
-            return true;
+            return DetectResult::NdJson;
         }
 
         // Text fingerprint: `test result:` AND `passed` both appear in the sample
         let test_result = memmem::Finder::new("test result:");
         let passed = memmem::Finder::new("passed");
-        test_result.find(bytes).is_some() && passed.find(bytes).is_some()
+        if test_result.find(bytes).is_some() && passed.find(bytes).is_some() {
+            return DetectResult::Text;
+        }
+
+        DetectResult::NoMatch
     }
 
-    fn parse(&self, input: &str) -> ParsedOutput {
-        let trimmed = input.trim_start();
-        if trimmed.starts_with('{') || input.lines().any(|l| l.trim_start().starts_with('{')) {
-            if let Some(parsed) = self.try_json(input) {
+    fn parse(&self, input: &str, hint: DetectResult) -> ParsedOutput {
+        if hint == DetectResult::NdJson {
+            if let Some(parsed) = CargoTestParser::try_json(input) {
                 return parsed;
             }
         }
-        self.parse_text(input)
+        CargoTestParser::parse_text(input)
     }
 }
 
 impl CargoTestParser {
-    fn try_json(&self, input: &str) -> Option<ParsedOutput> {
+    fn try_json(input: &str) -> Option<ParsedOutput> {
         let raw_bytes = input.len();
         let raw_lines = input.lines().count();
 
@@ -92,8 +95,10 @@ impl CargoTestParser {
                 ("test", "ignored") => {
                     ignored += 1;
                 }
-                ("suite", "ok") | ("suite", "failed") => {
-                    if let Some(exec_time) = event.get("exec_time").and_then(|v| v.as_f64()) {
+                ("suite", "ok" | "failed") => {
+                    if let Some(exec_time) =
+                        event.get("exec_time").and_then(serde_json::Value::as_f64)
+                    {
                         duration_secs = Some(exec_time);
                     }
                 }
@@ -120,7 +125,7 @@ impl CargoTestParser {
         })
     }
 
-    fn parse_text(&self, input: &str) -> ParsedOutput {
+    fn parse_text(input: &str) -> ParsedOutput {
         let raw_bytes = input.len();
         let raw_lines = input.lines().count();
 
@@ -135,7 +140,7 @@ impl CargoTestParser {
             if let Some(rest) = line.find("test result:").map(|i| &line[i + 12..]) {
                 let rest = rest.trim();
                 // Strip leading "ok." or "FAILED." status word
-                let rest = rest.find('.').map(|i| rest[i + 1..].trim()).unwrap_or(rest);
+                let rest = rest.find('.').map_or(rest, |i| rest[i + 1..].trim());
 
                 passed = extract_count(rest, "passed").unwrap_or(0);
                 failed = extract_count(rest, "failed").unwrap_or(0);
@@ -213,7 +218,7 @@ fn parse_ndjson(input: &str) -> Vec<serde_json::Value> {
 /// Extract the most useful failure message from a test's stdout.
 ///
 /// Priority order:
-/// 1. `assertion` lines (assert_eq!, assert!, assert_ne! output)
+/// 1. `assertion` lines (`assert_eq!`, `assert!`, `assert_ne!` output)
 /// 2. `thread '...' panicked at` lines
 /// 3. First non-empty line as fallback
 fn extract_failure_message(stdout: &str) -> String {
@@ -247,7 +252,7 @@ fn extract_failure_message(stdout: &str) -> String {
     // Fallback: first non-empty line
     stdout
         .lines()
-        .map(|l| l.trim())
+        .map(str::trim)
         .find(|l| !l.is_empty())
         .unwrap_or("test failed")
         .to_string()
@@ -306,25 +311,26 @@ mod tests {
     #[test]
     fn detect_json_fingerprint() {
         let sample = r#"{"type":"test","event":"ok","name":"foo::bar"}"#;
-        assert!(PARSER.detect(sample));
+        assert!(PARSER.detect(sample).matched());
+        assert_eq!(PARSER.detect(sample), DetectResult::NdJson);
     }
 
     #[test]
     fn detect_json_fingerprint_spaced() {
         let sample = r#"{"type": "test", "event": "ok", "name": "foo::bar"}"#;
-        assert!(PARSER.detect(sample));
+        assert!(PARSER.detect(sample).matched());
     }
 
     #[test]
     fn detect_text_fingerprint() {
         let sample = "running 5 tests\ntest result: ok. 5 passed; 0 failed; 0 ignored";
-        assert!(PARSER.detect(sample));
+        assert_eq!(PARSER.detect(sample), DetectResult::Text);
     }
 
     #[test]
     fn detect_rejects_generic() {
         let sample = "Building project...\nCompiling foo v0.1.0\nFinished in 1.2s";
-        assert!(!PARSER.detect(sample));
+        assert_eq!(PARSER.detect(sample), DetectResult::NoMatch);
     }
 
     // -- JSON parse ----------------------------------------------------------
@@ -338,7 +344,7 @@ mod tests {
             "{\"type\":\"test\",\"event\":\"ok\",\"name\":\"a::test_three\"}\n",
             "{\"type\":\"suite\",\"event\":\"ok\",\"passed\":3,\"failed\":0,\"ignored\":0,\"exec_time\":0.05}\n",
         );
-        let out = PARSER.parse(input);
+        let out = PARSER.parse(input, DetectResult::NdJson);
         assert_eq!(out.tool, "cargo-test");
         assert_eq!(out.counts.passed, 3);
         assert_eq!(out.counts.failed, 0);
@@ -360,7 +366,7 @@ mod tests {
         let input = format!(
             "{{\"type\":\"suite\",\"event\":\"started\",\"test_count\":1}}\n{event}{{\"type\":\"suite\",\"event\":\"failed\",\"passed\":0,\"failed\":1,\"ignored\":0,\"exec_time\":0.01}}\n",
         );
-        let out = PARSER.parse(&input);
+        let out = PARSER.parse(&input, DetectResult::NdJson);
         assert_eq!(out.counts.failed, 1);
         assert_eq!(out.counts.passed, 0);
         assert_eq!(out.diagnostics.len(), 1);
@@ -381,7 +387,7 @@ mod tests {
     #[test]
     fn parse_text_summary() {
         let input = "running 3 tests\ntest foo ... ok\ntest bar ... ok\ntest baz ... FAILED\n\ntest result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
-        let out = PARSER.parse(input);
+        let out = PARSER.parse(input, DetectResult::Text);
         assert_eq!(out.counts.passed, 2);
         assert_eq!(out.counts.failed, 1);
         assert_eq!(out.counts.skipped, 0);
@@ -404,7 +410,7 @@ mod tests {
             "\n",
             "test result: FAILED. 0 passed; 1 failed; 0 ignored\n",
         );
-        let out = PARSER.parse(input);
+        let out = PARSER.parse(input, DetectResult::Text);
         assert_eq!(out.diagnostics.len(), 1);
         let diag = &out.diagnostics[0];
         assert_eq!(diag.name, "my_mod::test_add");

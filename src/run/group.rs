@@ -10,7 +10,7 @@ const MAX_LOCATIONS_PER_GROUP: usize = 3;
 ///
 /// See module-level doc for the full algorithm:
 /// 1. Signature extraction (by `diagnostic.name`)
-/// 2. HashMap grouping
+/// 2. `HashMap` grouping
 /// 3. Ranking: errors first, then by frequency descending
 /// 4. Capping: max groups and max locations per group
 /// 5. Cascade detection: if one error's identifier appears in >50% of others
@@ -117,9 +117,8 @@ fn mark_cascading(groups: &mut [DiagnosticGroup]) {
     }
 
     // Extract identifier from first error group's representative message.
-    let root_id = match extract_quoted_identifier(&groups[0].representative.message) {
-        Some(id) => id,
-        None => return,
+    let Some(root_id) = extract_quoted_identifier(&groups[0].representative.message) else {
+        return;
     };
 
     // For every subsequent error group, check if the root_id appears in its signature

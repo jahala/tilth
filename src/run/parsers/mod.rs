@@ -6,20 +6,23 @@ pub mod go_test;
 pub mod golangci_lint;
 pub mod jest;
 pub mod mypy;
+pub mod npm;
+pub mod pip;
 pub mod pytest;
 pub mod ruff;
 pub mod tsc;
 
-use crate::run::types::ParsedOutput;
+use crate::run::types::{DetectResult, ParsedOutput};
 
 /// A tool-specific parser that can detect its own input and produce structured output.
 pub trait Parser: Send + Sync {
     fn name(&self) -> &'static str;
 
-    /// Returns true if `sample` (first ~200 lines) looks like output from this tool.
-    fn detect(&self, sample: &str) -> bool;
+    /// Returns a `DetectResult` indicating whether `sample` (first ~200 lines)
+    /// looks like output from this tool, and if so, what format it's in.
+    fn detect(&self, sample: &str) -> DetectResult;
 
-    fn parse(&self, input: &str) -> ParsedOutput;
+    fn parse(&self, input: &str, hint: DetectResult) -> ParsedOutput;
 }
 
 /// Static registry — ordered by detection priority.
@@ -38,6 +41,8 @@ static PARSERS: &[&dyn Parser] = &[
     // Text-only parsers — no distinctive JSON fingerprint.
     &pytest::PARSER,
     &tsc::PARSER,
+    &npm::PARSER,
+    &pip::PARSER,
 ];
 
 /// Truncate input to the first `n` lines without allocation.
@@ -55,12 +60,39 @@ fn truncate_to_n_lines(input: &str, n: usize) -> &str {
 }
 
 /// Detect the appropriate parser by scanning the first ~200 lines of content.
-pub fn detect_from_content(input: &str) -> &'static dyn Parser {
+pub fn detect_from_content(input: &str) -> (&'static dyn Parser, DetectResult) {
     let sample = truncate_to_n_lines(input, 200);
     for p in PARSERS {
-        if p.detect(sample) {
-            return *p;
+        let result = p.detect(sample);
+        if result.matched() {
+            return (*p, result);
         }
     }
-    &generic::PARSER
+    (&generic::PARSER, DetectResult::Text)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Bug 5 regression: ruff's weak fingerprint was before mypy in PARSERS.
+    // Verify that mypy JSON is correctly detected as mypy (not ruff) when
+    // detect_from_content walks the PARSERS array in order.
+    #[test]
+    fn detect_mypy_json_not_claimed_by_ruff() {
+        let mypy_json = concat!(
+            r#"{"file": "src/main.py", "line": 42, "column": 5, "severity": "error", "message": "Incompatible types in assignment", "code": "assignment"}"#,
+            "\n",
+        );
+        let (parser, _result) = detect_from_content(mypy_json);
+        assert_eq!(
+            parser.name(),
+            "mypy",
+            "mypy NDJSON should be detected as mypy, not ruff (ruff is before mypy in PARSERS)"
+        );
+    }
 }

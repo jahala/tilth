@@ -1,7 +1,7 @@
 use memchr::memmem;
 use serde_json::Value;
 
-use crate::run::types::{Counts, Diagnostic, Location, ParsedOutput, Severity};
+use crate::run::types::{Counts, DetectResult, Diagnostic, Location, ParsedOutput, Severity};
 
 use super::Parser;
 
@@ -14,30 +14,44 @@ impl Parser for RuffParser {
         "ruff"
     }
 
-    fn detect(&self, sample: &str) -> bool {
+    fn detect(&self, sample: &str) -> DetectResult {
         let bytes = sample.as_bytes();
 
-        // JSON fingerprint: array (or NDJSON lines) with "code" and "filename".
+        // JSON fingerprint: ruff JSON always has "code", "filename", AND "location"/"row".
+        // Checking only "code"+"filename" is too weak — e.g. GitHub API errors match.
+        // Adding "location" + "row" makes this specific to ruff's schema.
         let code_finder = memmem::Finder::new(b"\"code\"");
         let filename_finder = memmem::Finder::new(b"\"filename\"");
-        if code_finder.find(bytes).is_some() && filename_finder.find(bytes).is_some() {
+        let location_finder = memmem::Finder::new(b"\"location\"");
+        let row_finder = memmem::Finder::new(b"\"row\"");
+        if code_finder.find(bytes).is_some()
+            && filename_finder.find(bytes).is_some()
+            && location_finder.find(bytes).is_some()
+            && row_finder.find(bytes).is_some()
+        {
             // Accept both `[` (JSON array) and NDJSON (each line is a `{`).
             let trimmed = sample.trim_start();
-            if trimmed.starts_with('[') || trimmed.starts_with('{') {
-                return true;
+            if trimmed.starts_with('[') {
+                return DetectResult::SingleJson;
+            }
+            if trimmed.starts_with('{') {
+                return DetectResult::NdJson;
             }
         }
 
         // Text fingerprint: `path.py:N:M: CODE message` where CODE is letter(s) + digits.
-        sample.lines().any(looks_like_ruff_text_line)
+        if sample.lines().any(looks_like_ruff_text_line) {
+            return DetectResult::Text;
+        }
+
+        DetectResult::NoMatch
     }
 
-    fn parse(&self, input: &str) -> ParsedOutput {
+    fn parse(&self, input: &str, hint: DetectResult) -> ParsedOutput {
         let raw_bytes = input.len();
         let raw_lines = input.lines().count();
 
-        let trimmed = input.trim_start();
-        if trimmed.starts_with('[') || trimmed.starts_with('{') {
+        if hint.is_json() {
             parse_json(input, raw_lines, raw_bytes)
         } else {
             parse_text(input, raw_lines, raw_bytes)
@@ -51,7 +65,7 @@ impl Parser for RuffParser {
 
 /// Returns true if `line` looks like a Ruff text-format diagnostic line.
 ///
-/// Format: `path/to/file.py:5:1: F401 [*] \`os\` imported but unused`
+/// Format: `path/to/file.py:5:1: F401 [*] 'os' imported but unused`
 /// The rule code is letter(s) followed by digits, e.g. `E501`, `F401`, `UP006`, `I001`.
 fn looks_like_ruff_text_line(line: &str) -> bool {
     // Quick reject: must contain `: ` with a code-looking token after a `col:` prefix.
@@ -83,13 +97,13 @@ fn is_ruff_code(s: &str) -> bool {
     if s.is_empty() {
         return false;
     }
-    let letters: usize = s.chars().take_while(|c| c.is_ascii_alphabetic()).count();
+    let letters: usize = s.chars().take_while(char::is_ascii_alphabetic).count();
     if letters == 0 {
         return false;
     }
     let digits: usize = s[letters..]
         .chars()
-        .take_while(|c| c.is_ascii_digit())
+        .take_while(char::is_ascii_digit)
         .count();
     if digits == 0 {
         return false;
@@ -215,7 +229,7 @@ fn parse_text(input: &str, raw_lines: usize, raw_bytes: usize) -> ParsedOutput {
 
 /// Parse a single Ruff text diagnostic line.
 ///
-/// Format: `src/main.py:5:1: F401 [*] \`os\` imported but unused`
+/// Format: `src/main.py:5:1: F401 [*] 'os' imported but unused`
 ///
 /// The `[*]` fix-availability marker is optional; it is stripped from the message.
 fn parse_text_line(line: &str) -> Option<Diagnostic> {
@@ -276,7 +290,7 @@ fn build_summary(count: u32) -> String {
     if count == 0 {
         "no issues found".to_string()
     } else {
-        format!("{} issue(s)", count)
+        format!("{count} issue(s)")
     }
 }
 
@@ -293,19 +307,42 @@ mod tests {
     #[test]
     fn detect_json() {
         let sample = r#"[{"code":"F401","filename":"src/main.py","message":"unused","location":{"row":5,"column":1},"url":""}]"#;
-        assert!(PARSER.detect(sample));
+        assert!(PARSER.detect(sample).matched());
     }
 
     #[test]
     fn detect_text() {
         let sample = "src/main.py:5:1: F401 `os` imported but unused\n";
-        assert!(PARSER.detect(sample));
+        assert!(PARSER.detect(sample).matched());
     }
 
     #[test]
     fn detect_rejects() {
         let sample = "some random\noutput with no ruff markers\n";
-        assert!(!PARSER.detect(sample));
+        assert!(!PARSER.detect(sample).matched());
+    }
+
+    // Bug 3 regression: ruff JSON fingerprint was too weak — only checked "code"+"filename".
+    // A response like {"code": 404, "filename": "..."} would false-match.
+    #[test]
+    fn detect_rejects_generic_json_with_code_and_filename() {
+        // Has "code" and "filename" but no "location"/"row" — NOT ruff output.
+        let sample = r#"{"code": 404, "filename": "not_found.py", "message": "File not found"}"#;
+        assert!(
+            !PARSER.detect(sample).matched(),
+            "should not match generic JSON that has code+filename but no location/row"
+        );
+    }
+
+    #[test]
+    fn detect_rejects_github_api_style_json() {
+        // GitHub API error that happens to have "code" and "filename" but no location.
+        let sample =
+            r#"[{"code":"not_found","filename":"src/foo.py","resource":"File","field":"path"}]"#;
+        assert!(
+            !PARSER.detect(sample).matched(),
+            "should not match GitHub API JSON lacking location/row"
+        );
     }
 
     // --- JSON path ---
@@ -330,7 +367,7 @@ mod tests {
     "url": "https://docs.astral.sh/ruff/rules/line-too-long"
   }
 ]"#;
-        let out = PARSER.parse(input);
+        let out = PARSER.parse(input, DetectResult::SingleJson);
         assert_eq!(out.diagnostics.len(), 2);
 
         let first = &out.diagnostics[0];
@@ -359,7 +396,7 @@ mod tests {
     #[test]
     fn parse_text() {
         let input = "src/main.py:5:1: F401 [*] `os` imported but unused\nsrc/utils.py:12:89: E501 Line too long (120 > 88)\n";
-        let out = PARSER.parse(input);
+        let out = PARSER.parse(input, DetectResult::Text);
         assert_eq!(out.diagnostics.len(), 2);
 
         let first = &out.diagnostics[0];

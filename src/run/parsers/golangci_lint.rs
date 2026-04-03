@@ -1,7 +1,7 @@
 use memchr::memmem;
 use serde_json::Value;
 
-use crate::run::types::{Counts, Diagnostic, Location, ParsedOutput, Severity};
+use crate::run::types::{Counts, DetectResult, Diagnostic, Location, ParsedOutput, Severity};
 
 use super::Parser;
 
@@ -14,37 +14,41 @@ impl Parser for GolangciLintParser {
         "golangci-lint"
     }
 
-    fn detect(&self, sample: &str) -> bool {
+    fn detect(&self, sample: &str) -> DetectResult {
         let bytes = sample.as_bytes();
 
         // JSON fingerprint (single-object): `"Issues"` and `"Severity"` both present.
         let issues_finder = memmem::Finder::new(b"\"Issues\"");
         let severity_finder = memmem::Finder::new(b"\"Severity\"");
         if issues_finder.find(bytes).is_some() && severity_finder.find(bytes).is_some() {
-            return true;
+            return DetectResult::SingleJson;
         }
 
         // JSON fingerprint (per-line): lines with `"FromLinter"` and `"Text"`.
         let from_linter_finder = memmem::Finder::new(b"\"FromLinter\"");
         let text_finder = memmem::Finder::new(b"\"Text\"");
         if from_linter_finder.find(bytes).is_some() && text_finder.find(bytes).is_some() {
-            return true;
+            return DetectResult::NdJson;
         }
 
         // Text fingerprint: `.go:N:M: linterName: message` — look for `.go:` with a digit after.
         let go_finder = memmem::Finder::new(b".go:");
         if go_finder.find(bytes).is_none() {
-            return false;
+            return DetectResult::NoMatch;
         }
         // Confirm at least one line looks like a real golangci-lint text line.
-        sample.lines().any(looks_like_lint_line)
+        if sample.lines().any(looks_like_lint_line) {
+            DetectResult::Text
+        } else {
+            DetectResult::NoMatch
+        }
     }
 
-    fn parse(&self, input: &str) -> ParsedOutput {
+    fn parse(&self, input: &str, hint: DetectResult) -> ParsedOutput {
         let raw_bytes = input.len();
         let raw_lines = input.lines().count();
 
-        if looks_like_json(input) {
+        if hint.is_json() {
             try_json(input, raw_lines, raw_bytes)
         } else {
             parse_text(input, raw_lines, raw_bytes)
@@ -55,14 +59,6 @@ impl Parser for GolangciLintParser {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Check for golangci-lint JSON fingerprints (`"FromLinter"` or `"Issues"` keys).
-fn looks_like_json(input: &str) -> bool {
-    let bytes = input.as_bytes();
-    let from_linter = memchr::memmem::Finder::new(b"\"FromLinter\"");
-    let issues_key = memchr::memmem::Finder::new(b"\"Issues\"");
-    from_linter.find(bytes).is_some() || issues_key.find(bytes).is_some()
-}
 
 /// Returns true if `line` matches `path.go:N:M: linterName: message` (with or without column).
 fn looks_like_lint_line(line: &str) -> bool {
@@ -290,7 +286,7 @@ fn build_summary(issue_count: usize, linter_count: usize) -> String {
     if issue_count == 0 {
         "no issues found".to_string()
     } else {
-        format!("{} issue(s) from {} linter(s)", issue_count, linter_count)
+        format!("{issue_count} issue(s) from {linter_count} linter(s)")
     }
 }
 
@@ -307,19 +303,19 @@ mod tests {
     #[test]
     fn detect_json_fingerprint() {
         let sample = r#"{ "Issues": [], "Severity": "warning" }"#;
-        assert!(PARSER.detect(sample));
+        assert!(PARSER.detect(sample).matched());
     }
 
     #[test]
     fn detect_text_fingerprint() {
         let sample = "pkg/foo/bar.go:42:5: govet: printf: wrong type\npkg/foo/bar.go:10:1: errcheck: unchecked error\n";
-        assert!(PARSER.detect(sample));
+        assert!(PARSER.detect(sample).matched());
     }
 
     #[test]
     fn detect_rejects_generic() {
         let sample = "some random\noutput\nwith no golang lint markers\n";
-        assert!(!PARSER.detect(sample));
+        assert!(!PARSER.detect(sample).matched());
     }
 
     // --- JSON path ---
@@ -342,7 +338,7 @@ mod tests {
     }
   ]
 }"#;
-        let out = PARSER.parse(input);
+        let out = PARSER.parse(input, DetectResult::SingleJson);
         assert_eq!(out.diagnostics.len(), 2);
 
         let govet = &out.diagnostics[0];
@@ -366,7 +362,7 @@ mod tests {
     #[test]
     fn parse_json_no_issues() {
         let input = r#"{ "Issues": [] }"#;
-        let out = PARSER.parse(input);
+        let out = PARSER.parse(input, DetectResult::Text);
         assert_eq!(out.diagnostics.len(), 0);
         assert_eq!(out.summary, "no issues found");
     }
@@ -376,7 +372,7 @@ mod tests {
     #[test]
     fn parse_text_lint_lines() {
         let input = "main.go:42:5: govet: printf: wrong type\ncmd/root.go:17:2: errcheck: unchecked error\n";
-        let out = PARSER.parse(input);
+        let out = PARSER.parse(input, DetectResult::Text);
         assert_eq!(out.diagnostics.len(), 2);
 
         let first = &out.diagnostics[0];
@@ -398,7 +394,7 @@ mod tests {
     fn parse_text_groups_by_linter() {
         let input =
             "a.go:1:1: govet: msg one\nb.go:2:3: govet: msg two\nc.go:5:1: errcheck: msg three\n";
-        let out = PARSER.parse(input);
+        let out = PARSER.parse(input, DetectResult::Text);
         assert_eq!(out.diagnostics.len(), 3);
         // Two govet issues, one errcheck — 2 distinct linters.
         assert_eq!(out.summary, "3 issue(s) from 2 linter(s)");

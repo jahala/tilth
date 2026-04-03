@@ -3,7 +3,8 @@ use serde_json::Value;
 
 use crate::run::ansi;
 use crate::run::types::{
-    extract_count, truncate_detail, Counts, Diagnostic, Location, ParsedOutput, Severity,
+    extract_count, truncate_detail, Counts, DetectResult, Diagnostic, Location, ParsedOutput,
+    Severity,
 };
 
 use super::Parser;
@@ -21,20 +22,20 @@ impl Parser for JestParser {
     ///
     /// Accepts JSON format (`"numPassedTests"` or `"numFailedTests"`) or text
     /// format (`Tests:` + `passed`/`failed`, or Vitest markers `✓`/`×` + `Tests`).
-    fn detect(&self, sample: &str) -> bool {
+    fn detect(&self, sample: &str) -> DetectResult {
         let bytes = sample.as_bytes();
 
         // JSON fingerprint: Jest and Vitest both emit these keys.
         let num_passed = memmem::Finder::new(r#""numPassedTests""#);
         let num_failed = memmem::Finder::new(r#""numFailedTests""#);
         if num_passed.find(bytes).is_some() || num_failed.find(bytes).is_some() {
-            return true;
+            return DetectResult::SingleJson;
         }
 
         // Text fingerprint: summary line must contain "Tests:" AND a status word.
         let tests_label = memmem::Finder::new("Tests:");
         if tests_label.find(bytes).is_none() {
-            return false;
+            return DetectResult::NoMatch;
         }
 
         let passed_finder = memmem::Finder::new("passed");
@@ -43,25 +44,29 @@ impl Parser for JestParser {
         let vitest_pass = memmem::Finder::new("✓");
         let vitest_fail = memmem::Finder::new("×");
 
-        passed_finder.find(bytes).is_some()
+        if passed_finder.find(bytes).is_some()
             || failed_finder.find(bytes).is_some()
             || vitest_pass.find(bytes).is_some()
             || vitest_fail.find(bytes).is_some()
+        {
+            DetectResult::Text
+        } else {
+            DetectResult::NoMatch
+        }
     }
 
-    fn parse(&self, input: &str) -> ParsedOutput {
-        let trimmed = input.trim_start();
-        if trimmed.starts_with('{') {
-            if let Some(parsed) = self.try_json(input) {
+    fn parse(&self, input: &str, hint: DetectResult) -> ParsedOutput {
+        if hint.is_json() {
+            if let Some(parsed) = JestParser::try_json(input) {
                 return parsed;
             }
         }
-        self.parse_text(input)
+        JestParser::parse_text(input)
     }
 }
 
 impl JestParser {
-    fn try_json(&self, input: &str) -> Option<ParsedOutput> {
+    fn try_json(input: &str) -> Option<ParsedOutput> {
         let raw_bytes = input.len();
         let raw_lines = input.lines().count();
 
@@ -70,15 +75,15 @@ impl JestParser {
 
         let passed = root
             .get("numPassedTests")
-            .and_then(|v| v.as_u64())
+            .and_then(serde_json::Value::as_u64)
             .unwrap_or(0) as u32;
         let failed = root
             .get("numFailedTests")
-            .and_then(|v| v.as_u64())
+            .and_then(serde_json::Value::as_u64)
             .unwrap_or(0) as u32;
         let pending = root
             .get("numPendingTests")
-            .and_then(|v| v.as_u64())
+            .and_then(serde_json::Value::as_u64)
             .unwrap_or(0) as u32;
 
         let mut diagnostics: Vec<Diagnostic> = Vec::new();
@@ -91,7 +96,7 @@ impl JestParser {
                     if let Some(runtime) = suite
                         .get("perfStats")
                         .and_then(|ps| ps.get("runtime"))
-                        .and_then(|v| v.as_f64())
+                        .and_then(serde_json::Value::as_f64)
                     {
                         duration_secs = Some(runtime / 1000.0);
                     } else {
@@ -99,12 +104,12 @@ impl JestParser {
                             .get("perfStats")
                             .and_then(|ps| ps.get("start"))
                             .or_else(|| suite.get("startTime"))
-                            .and_then(|v| v.as_f64());
+                            .and_then(serde_json::Value::as_f64);
                         let end = suite
                             .get("perfStats")
                             .and_then(|ps| ps.get("end"))
                             .or_else(|| suite.get("endTime"))
-                            .and_then(|v| v.as_f64());
+                            .and_then(serde_json::Value::as_f64);
                         if let (Some(s), Some(e)) = (start, end) {
                             duration_secs = Some((e - s) / 1000.0);
                         }
@@ -129,8 +134,8 @@ impl JestParser {
 
                     let failure_messages: Vec<&str> = assertion
                         .get("failureMessages")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+                        .and_then(serde_json::Value::as_array)
+                        .map(|arr| arr.iter().filter_map(serde_json::Value::as_str).collect())
                         .unwrap_or_default();
 
                     let first_message = failure_messages.first().copied().unwrap_or("");
@@ -173,7 +178,7 @@ impl JestParser {
         })
     }
 
-    fn parse_text(&self, input: &str) -> ParsedOutput {
+    fn parse_text(input: &str) -> ParsedOutput {
         let raw_bytes = input.len();
         let raw_lines = input.lines().count();
 
@@ -281,7 +286,10 @@ fn build_summary(passed: u32, failed: u32, pending: u32) -> String {
 ///
 /// Prefers `fullName`; falls back to `ancestorTitles` joined with ` > ` + `title`.
 fn build_test_name(assertion: &Value) -> String {
-    if let Some(full) = assertion.get("fullName").and_then(|v| v.as_str()) {
+    if let Some(full) = assertion
+        .get("fullName")
+        .and_then(serde_json::Value::as_str)
+    {
         if !full.is_empty() {
             return full.to_string();
         }
@@ -289,8 +297,8 @@ fn build_test_name(assertion: &Value) -> String {
 
     let ancestors: Vec<&str> = assertion
         .get("ancestorTitles")
-        .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| arr.iter().filter_map(serde_json::Value::as_str).collect())
         .unwrap_or_default();
 
     let title = assertion
@@ -328,7 +336,7 @@ fn extract_jest_message(text: &str) -> String {
     // Fallback: first non-empty line that isn't a stack frame.
     clean
         .lines()
-        .map(|l| l.trim())
+        .map(str::trim)
         .find(|l| !l.is_empty() && !l.starts_with("at ") && !l.starts_with("●"))
         .unwrap_or("test failed")
         .to_string()
@@ -446,19 +454,19 @@ mod tests {
     #[test]
     fn detect_json_fingerprint() {
         let sample = r#"{"numPassedTests":3,"numFailedTests":0,"testResults":[]}"#;
-        assert!(PARSER.detect(sample));
+        assert!(PARSER.detect(sample).matched());
     }
 
     #[test]
     fn detect_text_fingerprint() {
         let sample = "PASS src/add.test.js\nTests:  3 passed, 3 total\nTime: 0.5s";
-        assert!(PARSER.detect(sample));
+        assert!(PARSER.detect(sample).matched());
     }
 
     #[test]
     fn detect_rejects_generic() {
         let sample = "Building project...\nCompiling foo v0.1.0\nFinished in 1.2s";
-        assert!(!PARSER.detect(sample));
+        assert!(!PARSER.detect(sample).matched());
     }
 
     // -- JSON parse ----------------------------------------------------------
@@ -478,7 +486,7 @@ mod tests {
                 ]
             }]
         }"#;
-        let out = PARSER.parse(input);
+        let out = PARSER.parse(input, DetectResult::SingleJson);
         assert_eq!(out.tool, "jest");
         assert_eq!(out.counts.passed, 3);
         assert_eq!(out.counts.failed, 0);
@@ -511,7 +519,7 @@ mod tests {
                 ]
             }]
         }"#;
-        let out = PARSER.parse(input);
+        let out = PARSER.parse(input, DetectResult::SingleJson);
         assert_eq!(out.counts.failed, 1);
         assert_eq!(out.counts.passed, 1);
         assert_eq!(out.diagnostics.len(), 1);
@@ -537,7 +545,7 @@ mod tests {
             "Snapshots: 0 total\n",
             "Time: 1.2s\n",
         );
-        let out = PARSER.parse(input);
+        let out = PARSER.parse(input, DetectResult::Text);
         assert_eq!(out.counts.passed, 2);
         assert_eq!(out.counts.failed, 1);
         assert_eq!(out.counts.skipped, 0);
@@ -561,7 +569,7 @@ mod tests {
             "\n",
             "Tests:  0 passed, 1 failed, 1 total\n",
         );
-        let out = PARSER.parse(input);
+        let out = PARSER.parse(input, DetectResult::Text);
         assert_eq!(out.diagnostics.len(), 1);
         let diag = &out.diagnostics[0];
         assert_eq!(diag.name, "subtract › returns correct value");

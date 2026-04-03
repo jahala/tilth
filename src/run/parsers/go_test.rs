@@ -4,7 +4,8 @@ use memchr::memmem;
 use serde_json::Value;
 
 use crate::run::types::{
-    build_test_summary, truncate_detail, Counts, Diagnostic, Location, ParsedOutput, Severity,
+    build_test_summary, truncate_detail, Counts, DetectResult, Diagnostic, Location, ParsedOutput,
+    Severity,
 };
 
 use super::Parser;
@@ -22,30 +23,33 @@ impl Parser for GoTestParser {
     ///
     /// Accepts JSON format (`"Action":"` + `"Package":"`) or text format
     /// (`--- FAIL:` or `--- PASS:`).
-    fn detect(&self, sample: &str) -> bool {
+    fn detect(&self, sample: &str) -> DetectResult {
         let bytes = sample.as_bytes();
 
         // JSON fingerprint: both "Action":" and "Package":" must appear.
         let action = memmem::Finder::new(r#""Action":""#);
         let package = memmem::Finder::new(r#""Package":""#);
         if action.find(bytes).is_some() && package.find(bytes).is_some() {
-            return true;
+            return DetectResult::NdJson;
         }
 
         // Text fingerprint: at least one of the canonical test result markers.
         let fail_marker = memmem::Finder::new("--- FAIL:");
         let pass_marker = memmem::Finder::new("--- PASS:");
-        fail_marker.find(bytes).is_some() || pass_marker.find(bytes).is_some()
+        if fail_marker.find(bytes).is_some() || pass_marker.find(bytes).is_some() {
+            return DetectResult::Text;
+        }
+
+        DetectResult::NoMatch
     }
 
-    fn parse(&self, input: &str) -> ParsedOutput {
-        // Try JSON (NDJSON) first — any line starting with `{` signals JSON mode.
-        if input.lines().any(|l| l.trim_start().starts_with('{')) {
-            if let Some(parsed) = self.try_json(input) {
+    fn parse(&self, input: &str, hint: DetectResult) -> ParsedOutput {
+        if hint.is_json() {
+            if let Some(parsed) = GoTestParser::try_json(input) {
                 return parsed;
             }
         }
-        self.parse_text(input)
+        GoTestParser::parse_text(input)
     }
 }
 
@@ -55,7 +59,7 @@ impl GoTestParser {
     /// Each line is an independent JSON object (event). We drive a per-test
     /// state machine keyed by `(Package, Test)` to accumulate output lines,
     /// then produce a `Diagnostic` on failure.
-    fn try_json(&self, input: &str) -> Option<ParsedOutput> {
+    fn try_json(input: &str) -> Option<ParsedOutput> {
         let raw_bytes = input.len();
         let raw_lines = input.lines().count();
 
@@ -107,7 +111,8 @@ impl GoTestParser {
                     }
                 }
                 "pass" => {
-                    if let Some(elapsed) = event.get("Elapsed").and_then(|v| v.as_f64()) {
+                    if let Some(elapsed) = event.get("Elapsed").and_then(serde_json::Value::as_f64)
+                    {
                         if test_name.is_some() {
                             duration_secs += elapsed;
                         }
@@ -118,7 +123,8 @@ impl GoTestParser {
                     }
                 }
                 "fail" => {
-                    if let Some(elapsed) = event.get("Elapsed").and_then(|v| v.as_f64()) {
+                    if let Some(elapsed) = event.get("Elapsed").and_then(serde_json::Value::as_f64)
+                    {
                         if test_name.is_some() {
                             duration_secs += elapsed;
                         }
@@ -134,7 +140,7 @@ impl GoTestParser {
                         let diag_name = if pkg.is_empty() {
                             name.to_string()
                         } else {
-                            format!("{}::{}", pkg, name)
+                            format!("{pkg}::{name}")
                         };
                         diagnostics.push(Diagnostic {
                             severity: Severity::Error,
@@ -180,7 +186,18 @@ impl GoTestParser {
     }
 
     /// Parse plain `go test` text output (without `-json`).
-    fn parse_text(&self, input: &str) -> ParsedOutput {
+    ///
+    /// Go test output structure:
+    /// ```text
+    /// === RUN   TestFoo
+    ///     foo_test.go:15: expected 4, got 3   -- detail comes BEFORE the result line
+    /// --- FAIL: TestFoo (0.00s)
+    /// ```
+    ///
+    /// Lines are accumulated per-test (keyed by `=== RUN` name). On `--- FAIL:` we
+    /// flush the accumulated lines as a diagnostic. On `--- PASS:` / `--- SKIP:`
+    /// we discard them.
+    fn parse_text(input: &str) -> ParsedOutput {
         let raw_bytes = input.len();
         let raw_lines = input.lines().count();
 
@@ -188,65 +205,56 @@ impl GoTestParser {
         let mut skipped: u32 = 0;
         let mut diagnostics: Vec<Diagnostic> = Vec::new();
 
-        // Current failure block being accumulated.
-        let mut failure_name: Option<String> = None;
-        let mut failure_lines: Vec<String> = Vec::new();
+        // Lines accumulated since the last `=== RUN`, keyed by test name.
+        let mut current_name: Option<String> = None;
+        let mut current_lines: Vec<String> = Vec::new();
 
         for line in input.lines() {
-            // --- FAIL: TestName (0.00s)
-            if let Some(rest) = line.strip_prefix("--- FAIL: ") {
-                // Flush any previous block first.
-                if let Some(name) = failure_name.take() {
-                    diagnostics.push(build_text_diagnostic(name, &failure_lines));
-                    failure_lines.clear();
-                }
-                // Parse "TestName (0.00s)" — take everything before the first space.
-                let name = rest.split_whitespace().next().unwrap_or(rest).to_string();
-                failure_name = Some(name);
+            // === RUN   TestName — start accumulating for a new test.
+            if let Some(rest) = line.strip_prefix("=== RUN") {
+                let name = rest.trim().to_string();
+                current_name = if name.is_empty() { None } else { Some(name) };
+                current_lines.clear();
                 continue;
             }
 
-            // --- PASS: TestName (0.00s)
+            // --- FAIL: TestName (0.00s) — emit diagnostic from accumulated lines.
+            if let Some(rest) = line.strip_prefix("--- FAIL: ") {
+                let name = rest.split_whitespace().next().unwrap_or(rest).to_string();
+                // Use lines accumulated since `=== RUN` (the detail comes BEFORE this line).
+                let lines = std::mem::take(&mut current_lines);
+                diagnostics.push(build_text_diagnostic(name, &lines));
+                current_name = None;
+                continue;
+            }
+
+            // --- PASS: TestName (0.00s) — discard accumulated lines, count pass.
             if line.starts_with("--- PASS: ") {
-                if let Some(name) = failure_name.take() {
-                    diagnostics.push(build_text_diagnostic(name, &failure_lines));
-                    failure_lines.clear();
-                }
+                current_lines.clear();
+                current_name = None;
                 passed += 1;
                 continue;
             }
 
-            // --- SKIP: TestName (0.00s)
+            // --- SKIP: TestName (0.00s) — discard accumulated lines, count skip.
             if line.starts_with("--- SKIP: ") {
-                if let Some(name) = failure_name.take() {
-                    diagnostics.push(build_text_diagnostic(name, &failure_lines));
-                    failure_lines.clear();
-                }
+                current_lines.clear();
+                current_name = None;
                 skipped += 1;
                 continue;
             }
 
-            // FAIL\tpackage\t0.00s — package-level failure; already counted via --- FAIL lines.
-            // ok  \tpackage\t0.00s — package passed; count sub-tests already tallied above.
+            // FAIL\tpackage or ok\tpackage — package-level summary lines; close any open block.
             if line.starts_with("ok  \t") || line.starts_with("FAIL\t") {
-                if let Some(name) = failure_name.take() {
-                    diagnostics.push(build_text_diagnostic(name, &failure_lines));
-                    failure_lines.clear();
-                }
-                // The package-level "ok" lines don't add to passed individually since
-                // individual --- PASS lines already do; just ensure we close any open block.
+                current_lines.clear();
+                current_name = None;
                 continue;
             }
 
-            // Indented detail line belonging to the current failure block.
-            if failure_name.is_some() {
-                failure_lines.push(line.to_string());
+            // Any other line while a test is running: accumulate as detail.
+            if current_name.is_some() {
+                current_lines.push(line.to_string());
             }
-        }
-
-        // Flush any trailing failure block.
-        if let Some(name) = failure_name.take() {
-            diagnostics.push(build_text_diagnostic(name, &failure_lines));
         }
 
         // Failure count comes directly from the collected diagnostics.
@@ -317,7 +325,7 @@ fn extract_failure_message(output: &str) -> String {
     // Fallback: first non-empty line.
     output
         .lines()
-        .map(|l| l.trim())
+        .map(str::trim)
         .find(|l| !l.is_empty())
         .unwrap_or("test failed")
         .to_string()
@@ -355,8 +363,7 @@ fn extract_test_log_message(line: &str) -> Option<String> {
         let path_start = bytes[..path_end]
             .iter()
             .rposition(|&b| b == b' ' || b == b'\t')
-            .map(|p| p + 1)
-            .unwrap_or(0);
+            .map_or(0, |p| p + 1);
         let path_bytes = &bytes[path_start..path_end];
         let looks_like_file = path_bytes.contains(&b'.');
         if !looks_like_file {
@@ -386,19 +393,19 @@ mod tests {
     #[test]
     fn detect_json_fingerprint() {
         let sample = r#"{"Time":"2024-01-01T00:00:00Z","Action":"run","Package":"example.com/pkg","Test":"TestFoo"}"#;
-        assert!(PARSER.detect(sample));
+        assert!(PARSER.detect(sample).matched());
     }
 
     #[test]
     fn detect_text_fingerprint() {
-        let sample = "=== RUN   TestFoo\n--- FAIL: TestFoo (0.00s)\n    foo_test.go:10: expected 1 got 2\nFAIL\n";
-        assert!(PARSER.detect(sample));
+        let sample = "=== RUN   TestFoo\n    foo_test.go:10: expected 1 got 2\n--- FAIL: TestFoo (0.00s)\nFAIL\n";
+        assert!(PARSER.detect(sample).matched());
     }
 
     #[test]
     fn detect_rejects_generic() {
         let sample = "Building foo...\nDone.\nAll steps completed.\n";
-        assert!(!PARSER.detect(sample));
+        assert!(!PARSER.detect(sample).matched());
     }
 
     // -- JSON parse ----------------------------------------------------------
@@ -412,7 +419,7 @@ mod tests {
             "{\"Time\":\"2024-01-01T00:00:00Z\",\"Action\":\"run\",\"Package\":\"ex/pkg\",\"Test\":\"TestB\"}\n",
             "{\"Time\":\"2024-01-01T00:00:00Z\",\"Action\":\"pass\",\"Package\":\"ex/pkg\",\"Test\":\"TestB\",\"Elapsed\":0.02}\n",
         );
-        let out = PARSER.parse(input);
+        let out = PARSER.parse(input, DetectResult::NdJson);
         assert_eq!(out.tool, "go-test");
         assert_eq!(out.counts.passed, 2);
         assert_eq!(out.counts.failed, 0);
@@ -429,7 +436,7 @@ mod tests {
             "{\"Time\":\"2024-01-01T00:00:00Z\",\"Action\":\"output\",\"Package\":\"ex/pkg\",\"Test\":\"TestBad\",\"Output\":\"    foo_test.go:42: got 1 want 2\\n\"}\n",
             "{\"Time\":\"2024-01-01T00:00:00Z\",\"Action\":\"fail\",\"Package\":\"ex/pkg\",\"Test\":\"TestBad\",\"Elapsed\":0.05}\n",
         );
-        let out = PARSER.parse(input);
+        let out = PARSER.parse(input, DetectResult::NdJson);
         assert_eq!(out.counts.failed, 1);
         assert_eq!(out.counts.passed, 0);
         assert_eq!(out.diagnostics.len(), 1);
@@ -444,22 +451,29 @@ mod tests {
 
     // -- Text parse ----------------------------------------------------------
 
+    // Bug 2 regression: detail lines come BEFORE `--- FAIL:` in real Go output.
+    // The old parser accumulated lines AFTER `--- FAIL:`, so it always got empty detail.
     #[test]
-    fn parse_text_failure() {
+    fn parse_text_failure_detail_before_fail_line() {
         let input = concat!(
             "=== RUN   TestAdd\n",
-            "--- FAIL: TestAdd (0.00s)\n",
             "    math_test.go:15: expected 4, got 3\n",
+            "--- FAIL: TestAdd (0.00s)\n",
             "FAIL\n",
         );
-        let out = PARSER.parse(input);
+        let out = PARSER.parse(input, DetectResult::Text);
         assert_eq!(out.diagnostics.len(), 1);
         let diag = &out.diagnostics[0];
         assert_eq!(diag.name, "TestAdd");
         assert_eq!(diag.severity, Severity::Error);
+        // Location must be extracted from the detail line (before --- FAIL).
         let loc = diag.location.as_ref().expect("location should be present");
         assert_eq!(loc.file, "math_test.go");
         assert_eq!(loc.line, 15);
+        assert!(
+            diag.message.contains("expected 4, got 3"),
+            "message should come from the detail line"
+        );
     }
 
     #[test]
@@ -471,7 +485,7 @@ mod tests {
             "--- PASS: TestTwo (0.00s)\n",
             "ok  \texample.com/mypkg\t0.015s\n",
         );
-        let out = PARSER.parse(input);
+        let out = PARSER.parse(input, DetectResult::Text);
         assert_eq!(out.counts.passed, 2);
         assert_eq!(out.counts.failed, 0);
         assert!(out.diagnostics.is_empty());
