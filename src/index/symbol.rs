@@ -73,6 +73,7 @@ impl SymbolIndex {
         // because rayon gives us better work-stealing than ignore's parallel walker
         // for CPU-bound tree-sitter parsing.
         let files: Vec<PathBuf> = WalkBuilder::new(scope)
+            .follow_links(true)
             .hidden(false)
             .git_ignore(false)
             .git_global(false)
