@@ -300,7 +300,9 @@ fn get_old_content(path: &Path, old_path: Option<&Path>, source: &DiffSource) ->
             if let Some((left, _)) = r.split_once("..") {
                 git_show(&format!("{left}:{path_str}"))
             } else {
-                git_show(&format!("{r}^:{path_str}"))
+                // `git diff HEAD~1` compares HEAD~1 (old) against HEAD (new).
+                // So old content is at the ref itself.
+                git_show(&format!("{r}:{path_str}"))
             }
         }
         DiffSource::Files(a, _) => std::fs::read_to_string(a).unwrap_or_default(),
@@ -318,7 +320,9 @@ fn get_new_content(path: &Path, source: &DiffSource) -> String {
             if let Some((_, right)) = r.split_once("..") {
                 git_show(&format!("{right}:{path_str}"))
             } else {
-                git_show(&format!("{r}:{path_str}"))
+                // `git diff HEAD~1` compares HEAD~1 against HEAD.
+                // New content is HEAD (current commit).
+                git_show(&format!("HEAD:{path_str}"))
             }
         }
         DiffSource::Files(_, b) => std::fs::read_to_string(b).unwrap_or_default(),
