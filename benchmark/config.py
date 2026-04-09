@@ -41,7 +41,7 @@ FIXTURES_DIR = BENCHMARK_DIR / "fixtures"
 SYNTHETIC_REPO = FIXTURES_DIR / "repo"
 RESULTS_DIR = BENCHMARK_DIR / "results"
 TILTH_MCP_CONFIG = FIXTURES_DIR / "tilth_mcp.json"
-REPOS_DIR = FIXTURES_DIR / "repos"
+REPOS_DIR = Path("/tmp/tilth_bench/repos")
 
 
 @dataclass

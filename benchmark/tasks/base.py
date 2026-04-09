@@ -57,7 +57,12 @@ class Task(ABC):
         return []
 
     def apply_mutations(self, repo_path: str) -> None:
-        """Apply all mutations to the repo. Raises if original text not found."""
+        """Apply all mutations to the repo and commit them.
+
+        Committing makes the benchmark realistic — real bugs are committed code.
+        The agent can discover them via git log/diff, and after fixing, git diff
+        shows a real diff (no 'matches HEAD' confusion).
+        """
         for m in self.mutations:
             fp = Path(repo_path) / m.file_path
             content = fp.read_text()
@@ -68,6 +73,24 @@ class Task(ABC):
                 )
             content = content.replace(m.original, m.mutated, 1)
             fp.write_text(content)
+
+        mutated_files = [m.file_path for m in self.mutations]
+        git_env = {
+            "GIT_AUTHOR_NAME": "dev",
+            "GIT_AUTHOR_EMAIL": "dev@test.com",
+            "GIT_COMMITTER_NAME": "dev",
+            "GIT_COMMITTER_EMAIL": "dev@test.com",
+        }
+        import os
+        env = {**os.environ, **git_env}
+        subprocess.run(
+            ["git", "add"] + mutated_files,
+            cwd=repo_path, check=True, capture_output=True, env=env,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "refactor: simplify edge case handling"],
+            cwd=repo_path, check=True, capture_output=True, env=env,
+        )
 
     def check_correctness(self, result_text: str, repo_path: str) -> tuple[bool, str]:
         """Validate result against ground truth."""
