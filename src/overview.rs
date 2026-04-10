@@ -94,6 +94,21 @@ fn fingerprint_inner(root: &Path) -> String {
                     .collect();
             }
         }
+        // Filter out well-known non-source directories
+        let non_source = [
+            "test", "tests", "__tests__", "spec", "specs",
+            "doc", "docs", "docs_src", "documentation",
+            "example", "examples", "sample", "samples",
+            "script", "scripts", "tools", "fixtures",
+            "benchmark", "benchmarks", "bench",
+            ".github", ".vscode", ".idea",
+            "vendor", "node_modules", "target", "dist", "build",
+        ];
+        mods.retain(|(name, _)| {
+            let lower = name.to_lowercase();
+            // Check if ANY path component is a non-source dir
+            !lower.split('/').any(|part| non_source.contains(&part))
+        });
         // Sort by file count descending, truncate to 10, extract names
         mods.sort_by(|a, b| b.1.cmp(&a.1));
         mods.truncate(10);
@@ -809,7 +824,7 @@ fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opti
 
     // Sort by import count descending, take top 5
     let mut sorted: Vec<(std::path::PathBuf, usize)> = path_counts.into_iter().collect();
-    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    sorted.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     sorted.truncate(5);
 
     if sorted[0].1 < 2 {
@@ -857,10 +872,10 @@ fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opti
                 }
             }
 
-            // Pick the most frequently imported symbol
+            // Pick the most frequently imported symbol (break ties alphabetically for determinism)
             let top_sym = symbol_counts
                 .into_iter()
-                .max_by_key(|(_, c)| *c)
+                .max_by(|(a_sym, a_c), (b_sym, b_c)| a_c.cmp(b_c).then(b_sym.cmp(a_sym)))
                 .map(|(sym, _)| sym);
 
             if let Some(sym) = top_sym {
