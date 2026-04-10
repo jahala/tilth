@@ -9,6 +9,7 @@ use std::process::Command;
 use std::time::Instant;
 
 use crate::lang::detect_file_type;
+use crate::read::imports::is_import_line;
 use crate::search::SKIP_DIRS;
 use crate::types::{FileType, Lang};
 
@@ -51,19 +52,19 @@ fn fingerprint_inner(root: &Path) -> String {
     // Modules: dirs with >=2 files of the primary language, with common prefix stripped.
     // Keys in module_lang_counts may be "dir" or "dir/subdir" (for deeply nested projects).
     let modules: Vec<String> = {
-        let mut mods: Vec<String> = walk
+        // Collect dirs with >=2 primary-language files, sorted by file count descending
+        let mut mods: Vec<(String, usize)> = walk
             .module_lang_counts
             .iter()
-            .filter(|(_, lang_map)| {
-                primary_lang
+            .filter_map(|(name, lang_map)| {
+                let count = primary_lang
                     .and_then(|l| lang_map.get(&l))
                     .copied()
-                    .unwrap_or(0)
-                    >= 2
+                    .unwrap_or(0);
+                if count >= 2 { Some((name.clone(), count)) } else { None }
             })
-            .map(|(name, _)| name.clone())
             .collect();
-        mods.sort_unstable();
+        mods.sort_by(|a, b| b.1.cmp(&a.1)); // most files first
 
         // If all modules (or at least most) share a common top-level prefix
         // (e.g., all are "src/..."), strip it so we display short names
@@ -75,43 +76,42 @@ fn fingerprint_inner(root: &Path) -> String {
                 let prefix_bare = prefix.trim_end_matches('/');
                 mods = mods
                     .into_iter()
-                    .filter_map(|m| {
-                        if m == prefix_bare {
+                    .filter_map(|(name, count)| {
+                        if name == prefix_bare {
                             // Drop the bare prefix itself (it's the container, not a module)
                             None
-                        } else if let Some(stripped) = m.strip_prefix(&prefix) {
+                        } else if let Some(stripped) = name.strip_prefix(&prefix) {
                             let s = stripped.trim_start_matches('/');
                             if s.is_empty() {
                                 None
                             } else {
-                                Some(s.to_string())
+                                Some((s.to_string(), count))
                             }
                         } else {
-                            Some(m)
+                            Some((name, count))
                         }
                     })
                     .collect();
-                mods.sort_unstable();
             }
         }
-        mods
+        // Sort by file count descending, truncate to 10, extract names
+        mods.sort_by(|a, b| b.1.cmp(&a.1));
+        mods.truncate(10);
+        mods.into_iter().map(|(name, _)| name).collect()
     };
 
     // Header line
-    let module_count = modules.len();
+    let dir_count = modules.len();
     lines.push(format!(
-        "[tilth] {lang_name} project — {total_files} source files across {module_count} modules"
+        "[tilth] {lang_name} project — {total_files} source files, {dir_count} directories"
     ));
 
-    // Entry point
-    if let Some(entry) = &walk.entry_point {
-        lines.push(format!("  entry: {entry}"));
-    }
-
-    // Modules
+    // Directories (cap at 10, sorted by file count descending)
     if !modules.is_empty() {
-        let display: Vec<String> = modules.iter().map(|m| format!("{m}/")).collect();
-        lines.push(format!("  modules: {}", display.join(" ")));
+        let mut dirs = modules;
+        dirs.truncate(10);
+        let display: Vec<String> = dirs.iter().map(|m| format!("{m}/")).collect();
+        lines.push(format!("  dirs: {}", display.join(" ")));
     }
 
     // Manifest — name, version, deps
@@ -171,17 +171,17 @@ fn fingerprint_inner(root: &Path) -> String {
 
 /// If all module names (which may be "a/b" style) share the same first path
 /// component, return that component followed by "/". Otherwise return "".
-fn common_dir_prefix(names: &[String]) -> String {
-    if names.is_empty() {
+fn common_dir_prefix(mods: &[(String, usize)]) -> String {
+    if mods.is_empty() {
         return String::new();
     }
     // Extract the first path component from each name
-    let first_components: Vec<&str> = names
+    let first_components: Vec<&str> = mods
         .iter()
-        .map(|n| n.split('/').next().unwrap_or(n))
+        .map(|(n, _)| n.split('/').next().unwrap_or(n))
         .collect();
     let first = first_components[0];
-    if first_components.iter().all(|c| *c == first) && names.iter().any(|n| n.contains('/')) {
+    if first_components.iter().all(|c| *c == first) && mods.iter().any(|(n, _)| n.contains('/')) {
         // All share the same first component and at least some have a subdir
         format!("{first}/")
     } else {
@@ -223,7 +223,6 @@ struct WalkResult {
     lang_counts: HashMap<Lang, usize>,
     /// Top-level dirs → per-language file counts
     module_lang_counts: HashMap<String, HashMap<Lang, usize>>,
-    entry_point: Option<String>,
     /// Code files found: (path relative to root, size in bytes)
     code_files: Vec<(String, u64)>,
     /// Whether specific test dirs exist
@@ -236,16 +235,11 @@ struct WalkResult {
 fn walk_files(root: &Path) -> WalkResult {
     let mut lang_counts: HashMap<Lang, usize> = HashMap::new();
     let mut module_lang_counts: HashMap<String, HashMap<Lang, usize>> = HashMap::new();
-    let mut entry_point: Option<String> = None;
     let mut code_files: Vec<(String, u64)> = Vec::new();
     let mut has_tests_dir = false;
     let mut has_test_dir = false;
     let mut has_dunder_tests = false;
     let mut has_spec_dir = false;
-
-    let entry_points = [
-        "main.rs", "lib.rs", "index.ts", "index.js", "app.py", "main.py", "main.go",
-    ];
 
     // Walk depth 0 (root itself)
     walk_dir(
@@ -255,24 +249,16 @@ fn walk_files(root: &Path) -> WalkResult {
         2,
         &mut lang_counts,
         &mut module_lang_counts,
-        &mut entry_point,
         &mut code_files,
         &mut has_tests_dir,
         &mut has_test_dir,
         &mut has_dunder_tests,
         &mut has_spec_dir,
-        &entry_points,
     );
-
-    // Check for cmd/ directory (Go pattern)
-    if entry_point.is_none() && root.join("cmd").is_dir() {
-        entry_point = Some("cmd/".to_string());
-    }
 
     WalkResult {
         lang_counts,
         module_lang_counts,
-        entry_point,
         code_files,
         has_tests_dir,
         has_test_dir,
@@ -289,13 +275,11 @@ fn walk_dir(
     max_depth: usize,
     lang_counts: &mut HashMap<Lang, usize>,
     module_lang_counts: &mut HashMap<String, HashMap<Lang, usize>>,
-    entry_point: &mut Option<String>,
     code_files: &mut Vec<(String, u64)>,
     has_tests_dir: &mut bool,
     has_test_dir: &mut bool,
     has_dunder_tests: &mut bool,
     has_spec_dir: &mut bool,
-    entry_points: &[&str],
 ) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
@@ -333,13 +317,11 @@ fn walk_dir(
                     max_depth,
                     lang_counts,
                     module_lang_counts,
-                    entry_point,
                     code_files,
                     has_tests_dir,
                     has_test_dir,
                     has_dunder_tests,
                     has_spec_dir,
-                    entry_points,
                 );
             }
         } else if ft.is_file() {
@@ -351,7 +333,7 @@ fn walk_dir(
                 if let Ok(rel) = path.strip_prefix(root) {
                     let rel_str = rel.to_string_lossy().to_string();
 
-                    code_files.push((rel_str.clone(), size));
+                    code_files.push((rel_str, size));
 
                     // Track module — use up to 2 path components as the key,
                     // but only for files nested at least one level deep.
@@ -381,10 +363,6 @@ fn walk_dir(
                         }
                     }
 
-                    // Check entry points
-                    if entry_point.is_none() && entry_points.contains(&name) {
-                        *entry_point = Some(rel_str);
-                    }
                 }
             }
 
@@ -628,7 +606,16 @@ fn extract_toml_string_value(line: &str, key: &str) -> Option<String> {
     if !rest.starts_with('=') {
         return None;
     }
-    let val = rest[1..].trim().trim_matches('"');
+    let after_eq = rest[1..].trim();
+    // Extract value between quotes: "value" or 'value'
+    let val = if let Some(rest) = after_eq.strip_prefix('"') {
+        rest.split('"').next().unwrap_or("")
+    } else if let Some(rest) = after_eq.strip_prefix('\'') {
+        rest.split('\'').next().unwrap_or("")
+    } else {
+        // Bare value — take up to whitespace or comment
+        after_eq.split_whitespace().next().unwrap_or("")
+    };
     if val.is_empty() {
         return None;
     }
@@ -776,7 +763,7 @@ fn test_style(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opt
 // ---------------------------------------------------------------------------
 
 fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Option<String> {
-    let _lang = primary_lang?; // require a detected language
+    let lang = primary_lang?; // require a detected language
     let start = Instant::now();
 
     // Sort by size (smallest first) and take first 100
@@ -787,6 +774,9 @@ fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opti
     // Use resolve_related_files to get real file paths for imports.
     // Count how many files import each target path.
     let mut path_counts: HashMap<std::path::PathBuf, usize> = HashMap::new();
+    // Also collect all import source lines for symbol extraction later
+    let mut all_import_sources: Vec<String> = Vec::new();
+
     for (rel_path, _) in &files {
         if start.elapsed().as_millis() > 100 {
             break;
@@ -800,6 +790,16 @@ fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opti
         let resolved = crate::read::imports::resolve_related_files_with_content(&full, &content);
         for target_path in resolved {
             *path_counts.entry(target_path).or_insert(0) += 1;
+        }
+
+        // Collect import source strings for symbol extraction
+        for line in content.lines() {
+            if is_import_line(line, lang) {
+                let source = crate::lang::outline::extract_import_source(line);
+                if !source.is_empty() && !crate::read::imports::is_external(&source, lang) {
+                    all_import_sources.push(source);
+                }
+            }
         }
     }
 
@@ -816,12 +816,58 @@ fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opti
         return None;
     }
 
+    // For each hot file, find the most commonly imported symbol by scanning
+    // import sources that reference this file's module name.
     let parts: Vec<String> = sorted
         .iter()
         .filter(|(_, count)| *count >= 2)
         .map(|(path, count)| {
             let rel = path.strip_prefix(root).unwrap_or(path);
-            format!("{} ×{count}", rel.display())
+            let rel_str = rel.display().to_string();
+
+            // Derive the module name from the file path
+            // src/types.rs → "types", src/lang/mod.rs → "lang", src/error.rs → "error"
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            let module_name = if stem == "mod" || stem == "index" || stem == "__init__" {
+                path.parent()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(stem)
+            } else {
+                stem
+            };
+
+            // Count symbols imported from this module across all import sources
+            let mut symbol_counts: HashMap<String, usize> = HashMap::new();
+            for source in &all_import_sources {
+                // Match imports that reference this module
+                // e.g., for module "types": "crate::types::OutlineEntry" matches
+                let segments: Vec<&str> = source.split("::").collect();
+                if let Some(mod_pos) = segments.iter().position(|s| *s == module_name) {
+                    // Everything after the module name is a symbol path
+                    for &sym in segments.iter().skip(mod_pos + 1) {
+                        if !sym.is_empty()
+                            && !sym.contains('*')
+                            && !sym.contains('{')
+                            && sym != "self"
+                        {
+                            *symbol_counts.entry(sym.to_string()).or_insert(0) += 1;
+                        }
+                    }
+                }
+            }
+
+            // Pick the most frequently imported symbol
+            let top_sym = symbol_counts
+                .into_iter()
+                .max_by_key(|(_, c)| *c)
+                .map(|(sym, _)| sym);
+
+            if let Some(sym) = top_sym {
+                format!("{rel_str}({sym}) ×{count}")
+            } else {
+                format!("{rel_str} ×{count}")
+            }
         })
         .collect();
 
@@ -849,10 +895,6 @@ mod tests {
         assert!(
             output.contains("Rust"),
             "should detect Rust as primary language"
-        );
-        assert!(
-            output.contains("main.rs") || output.contains("lib.rs"),
-            "should detect entry point"
         );
         assert!(output.contains("Cargo.toml"), "should detect manifest");
         assert!(output.contains("tilth"), "should find project name");
