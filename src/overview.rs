@@ -9,7 +9,6 @@ use std::process::Command;
 use std::time::Instant;
 
 use crate::lang::detect_file_type;
-use crate::read::imports::is_import_line;
 use crate::search::SKIP_DIRS;
 use crate::types::{FileType, Lang};
 
@@ -776,7 +775,7 @@ fn test_style(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opt
 // ---------------------------------------------------------------------------
 
 fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Option<String> {
-    let lang = primary_lang?;
+    let _lang = primary_lang?; // require a detected language
     let start = Instant::now();
 
     // Sort by size (smallest first) and take first 100
@@ -784,12 +783,9 @@ fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opti
     files.sort_by_key(|(_, size)| *size);
     files.truncate(100);
 
-    // Track (module_name, symbol_name) → count
-    // module_name is the file/module being imported from
-    // symbol_name is the specific symbol imported (if any)
-    let mut module_counts: HashMap<String, usize> = HashMap::new();
-    let mut module_top_symbol: HashMap<String, HashMap<String, usize>> = HashMap::new();
-
+    // Use resolve_related_files to get real file paths for imports.
+    // Count how many files import each target path.
+    let mut path_counts: HashMap<std::path::PathBuf, usize> = HashMap::new();
     for (rel_path, _) in &files {
         if start.elapsed().as_millis() > 100 {
             break;
@@ -799,59 +795,19 @@ fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opti
             continue;
         };
 
-        for line in content.lines() {
-            if !is_import_line(line, lang) {
-                continue;
-            }
-            let source = crate::lang::outline::extract_import_source(line);
-            if source.is_empty() || crate::read::imports::is_external(&source, lang) {
-                continue;
-            }
-            // Split into module (file) and symbol parts
-            // "crate::types::OutlineEntry" → module="types", symbol="OutlineEntry"
-            // "crate::lang::detect_file_type" → module="lang", symbol="detect_file_type"
-            // "./utils" → module="utils", symbol=""
-            let segments: Vec<&str> = source.split("::").collect();
-            let (module, symbol) = if segments.len() >= 2 {
-                // Skip "crate", "self", "super" prefixes
-                let meaningful: Vec<&str> = segments
-                    .iter()
-                    .filter(|s| !["crate", "self", "super"].contains(s))
-                    .copied()
-                    .collect();
-                if meaningful.len() >= 2 {
-                    (meaningful[0].to_string(), meaningful.last().unwrap().to_string())
-                } else if meaningful.len() == 1 {
-                    (meaningful[0].to_string(), String::new())
-                } else {
-                    continue;
-                }
-            } else {
-                let name = source.rsplit('/').next().unwrap_or(&source);
-                (name.to_string(), String::new())
-            };
-
-            if module.is_empty() || module.contains('*') {
-                continue;
-            }
-
-            *module_counts.entry(module.clone()).or_insert(0) += 1;
-            if !symbol.is_empty() && !symbol.contains('*') {
-                *module_top_symbol
-                    .entry(module)
-                    .or_default()
-                    .entry(symbol)
-                    .or_insert(0) += 1;
-            }
+        // Resolve imports to actual file paths using the proven import resolver
+        let resolved = crate::read::imports::resolve_related_files_with_content(&full, &content);
+        for target_path in resolved {
+            *path_counts.entry(target_path).or_insert(0) += 1;
         }
     }
 
-    if module_counts.is_empty() {
+    if path_counts.is_empty() {
         return None;
     }
 
-    // Sort modules by import count descending, take top 5
-    let mut sorted: Vec<(String, usize)> = module_counts.into_iter().collect();
+    // Sort by import count descending, take top 5
+    let mut sorted: Vec<(std::path::PathBuf, usize)> = path_counts.into_iter().collect();
     sorted.sort_by(|a, b| b.1.cmp(&a.1));
     sorted.truncate(5);
 
@@ -862,17 +818,9 @@ fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opti
     let parts: Vec<String> = sorted
         .iter()
         .filter(|(_, count)| *count >= 2)
-        .map(|(module, count)| {
-            // Find the most-imported symbol from this module
-            let top_sym = module_top_symbol
-                .get(module)
-                .and_then(|syms| syms.iter().max_by_key(|(_, c)| *c))
-                .map(|(sym, _)| sym.as_str());
-            if let Some(sym) = top_sym {
-                format!("{module}.rs({sym}) ×{count}")
-            } else {
-                format!("{module}.rs ×{count}")
-            }
+        .map(|(path, count)| {
+            let rel = path.strip_prefix(root).unwrap_or(path);
+            format!("{} ×{count}", rel.display())
         })
         .collect();
 
