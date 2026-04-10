@@ -187,8 +187,12 @@ fn handle_request(
 ) -> JsonRpcResponse {
     match req.method.as_str() {
         "initialize" => {
-            let cwd = std::env::current_dir().unwrap_or_default();
-            let overview = crate::overview::fingerprint(&cwd);
+            let overview = if std::env::var("TILTH_NO_OVERVIEW").is_ok() {
+                String::new()
+            } else {
+                let cwd = std::env::current_dir().unwrap_or_default();
+                crate::overview::fingerprint(&cwd)
+            };
             let instructions = if edit_mode {
                 if overview.is_empty() {
                     format!("{SERVER_INSTRUCTIONS}{EDIT_MODE_EXTRA}")

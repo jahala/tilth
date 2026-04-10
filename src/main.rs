@@ -44,6 +44,10 @@ struct Cli {
     #[arg(long)]
     edit: bool,
 
+    /// Disable project fingerprint in MCP init.
+    #[arg(long)]
+    no_overview: bool,
+
     /// Expand top N search matches with inline source (default: 2 when flag present).
     #[arg(long, num_args = 0..=1, default_missing_value = "2", require_equals = true)]
     expand: Option<usize>,
@@ -247,6 +251,9 @@ fn main() {
 
     // MCP mode: JSON-RPC server
     if cli.mcp {
+        if cli.no_overview {
+            std::env::set_var("TILTH_NO_OVERVIEW", "1");
+        }
         if let Err(e) = tilth::mcp::run(cli.edit) {
             eprintln!("mcp error: {e}");
             process::exit(1);
