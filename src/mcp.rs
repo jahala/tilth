@@ -72,7 +72,7 @@ tilth_deps: Blast-radius check — what imports this file and what it imports.\n
   Use ONLY before renaming, removing, or changing an export's signature.\n\
 \n\
 tilth_diff: Structural diff — shows what changed at function level. Replaces Bash(git diff).\n\
-  Usage: tilth_diff() for uncommitted overview. tilth_diff(source: \"HEAD~1\") for last commit.\n\
+  Usage: tilth_diff(source: \"HEAD~1\") for last commit. No args = uncommitted changes.\n\
   scope: \"file.rs\" or \"file.rs:fn_name\". log: \"HEAD~5..HEAD\" for per-commit summaries.\n\
   search: filter to lines matching a term. blast: true to show callers of changed signatures.\n\
   Output: [+] added, [-] deleted, [~] body changed, [~:sig] signature changed.\n\
@@ -94,7 +94,8 @@ DO NOT re-read files already shown in expanded search results.";
 const EDIT_MODE_EXTRA: &str = "\n\
 \n\
 tilth_edit: Edit files using hash-anchored lines. Replaces the host Edit tool.\n\
-  tilth_read → copy anchors (<line>:<hash>) → pass to tilth_edit.\n\
+  tilth_read → copy anchors (<line>:<hash>) (BOTH line and hash required) → pass to tilth_edit.\n\
+  tilth_search does NOT provide hashes — you MUST tilth_read the file or section first.\n\
   Single line: {\"start\": \"<line>:<hash>\", \"content\": \"<new code>\"}\n\
   Range: {\"start\": \"<line>:<hash>\", \"end\": \"<line>:<hash>\", \"content\": \"...\"}\n\
   Delete: {\"start\": \"<line>:<hash>\", \"content\": \"\"}\n\
@@ -186,10 +187,18 @@ fn handle_request(
 ) -> JsonRpcResponse {
     match req.method.as_str() {
         "initialize" => {
+            let cwd = std::env::current_dir().unwrap_or_default();
+            let overview = crate::overview::fingerprint(&cwd);
             let instructions = if edit_mode {
-                format!("{SERVER_INSTRUCTIONS}{EDIT_MODE_EXTRA}")
-            } else {
+                if overview.is_empty() {
+                    format!("{SERVER_INSTRUCTIONS}{EDIT_MODE_EXTRA}")
+                } else {
+                    format!("{overview}\n\n{SERVER_INSTRUCTIONS}{EDIT_MODE_EXTRA}")
+                }
+            } else if overview.is_empty() {
                 SERVER_INSTRUCTIONS.to_string()
+            } else {
+                format!("{overview}\n\n{SERVER_INSTRUCTIONS}")
             };
             JsonRpcResponse {
                 jsonrpc: "2.0",

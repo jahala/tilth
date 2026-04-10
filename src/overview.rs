@@ -15,6 +15,7 @@ use crate::types::{FileType, Lang};
 /// Compute a project fingerprint for MCP initialization.
 /// Must be fast (<250ms) — runs synchronously in the initialize handler.
 /// Returns empty string on any failure (no error propagation).
+#[must_use]
 pub fn fingerprint(root: &Path) -> String {
     let start = Instant::now();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fingerprint_inner(root)));

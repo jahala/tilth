@@ -131,6 +131,8 @@ enum Command {
         #[arg(long, default_value_t = 10000)]
         budget: u64,
     },
+    /// Show the project fingerprint (what MCP init would inject).
+    Overview,
     /// Hook for Claude Code PreToolUse — rewrites Bash commands through tilth run.
     ///
     /// Reads tool input JSON from stdin, rewrites compressible commands
@@ -174,6 +176,15 @@ fn main() {
                     eprintln!("install error: {e}");
                     process::exit(1);
                 }
+            }
+            Command::Overview => {
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let output = tilth::overview::fingerprint(&cwd);
+                if output.is_empty() {
+                    eprintln!("No project fingerprint could be generated.");
+                    process::exit(1);
+                }
+                println!("{output}");
             }
             Command::Diff {
                 source,
