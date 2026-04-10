@@ -784,7 +784,11 @@ fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opti
     files.sort_by_key(|(_, size)| *size);
     files.truncate(100);
 
-    let mut import_counts: HashMap<String, usize> = HashMap::new();
+    // Track (module_name, symbol_name) → count
+    // module_name is the file/module being imported from
+    // symbol_name is the specific symbol imported (if any)
+    let mut module_counts: HashMap<String, usize> = HashMap::new();
+    let mut module_top_symbol: HashMap<String, HashMap<String, usize>> = HashMap::new();
 
     for (rel_path, _) in &files {
         if start.elapsed().as_millis() > 100 {
@@ -803,28 +807,54 @@ fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opti
             if source.is_empty() || crate::read::imports::is_external(&source, lang) {
                 continue;
             }
-            // Extract the filename from the import path
-            let file_name = source
-                .rsplit("::")
-                .next()
-                .or_else(|| source.rsplit('/').next())
-                .unwrap_or(&source);
-            if !file_name.is_empty() && !file_name.contains('*') {
-                *import_counts.entry(file_name.to_string()).or_insert(0) += 1;
+            // Split into module (file) and symbol parts
+            // "crate::types::OutlineEntry" → module="types", symbol="OutlineEntry"
+            // "crate::lang::detect_file_type" → module="lang", symbol="detect_file_type"
+            // "./utils" → module="utils", symbol=""
+            let segments: Vec<&str> = source.split("::").collect();
+            let (module, symbol) = if segments.len() >= 2 {
+                // Skip "crate", "self", "super" prefixes
+                let meaningful: Vec<&str> = segments
+                    .iter()
+                    .filter(|s| !["crate", "self", "super"].contains(s))
+                    .copied()
+                    .collect();
+                if meaningful.len() >= 2 {
+                    (meaningful[0].to_string(), meaningful.last().unwrap().to_string())
+                } else if meaningful.len() == 1 {
+                    (meaningful[0].to_string(), String::new())
+                } else {
+                    continue;
+                }
+            } else {
+                let name = source.rsplit('/').next().unwrap_or(&source);
+                (name.to_string(), String::new())
+            };
+
+            if module.is_empty() || module.contains('*') {
+                continue;
+            }
+
+            *module_counts.entry(module.clone()).or_insert(0) += 1;
+            if !symbol.is_empty() && !symbol.contains('*') {
+                *module_top_symbol
+                    .entry(module)
+                    .or_default()
+                    .entry(symbol)
+                    .or_insert(0) += 1;
             }
         }
     }
 
-    if import_counts.is_empty() {
+    if module_counts.is_empty() {
         return None;
     }
 
-    // Sort by count descending, take top 5
-    let mut sorted: Vec<(String, usize)> = import_counts.into_iter().collect();
+    // Sort modules by import count descending, take top 5
+    let mut sorted: Vec<(String, usize)> = module_counts.into_iter().collect();
     sorted.sort_by(|a, b| b.1.cmp(&a.1));
     sorted.truncate(5);
 
-    // Filter out low counts
     if sorted[0].1 < 2 {
         return None;
     }
@@ -832,7 +862,18 @@ fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opti
     let parts: Vec<String> = sorted
         .iter()
         .filter(|(_, count)| *count >= 2)
-        .map(|(name, count)| format!("{name} ({count} deps)"))
+        .map(|(module, count)| {
+            // Find the most-imported symbol from this module
+            let top_sym = module_top_symbol
+                .get(module)
+                .and_then(|syms| syms.iter().max_by_key(|(_, c)| *c))
+                .map(|(sym, _)| sym.as_str());
+            if let Some(sym) = top_sym {
+                format!("{module}.rs({sym}) ×{count}")
+            } else {
+                format!("{module}.rs ×{count}")
+            }
+        })
         .collect();
 
     if parts.is_empty() {
