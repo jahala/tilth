@@ -78,10 +78,17 @@ tilth_diff: Structural diff — shows what changed at function level. Replaces B
   Output: [+] added, [-] deleted, [~] body changed, [~:sig] signature changed.\n\
   DO NOT use Bash(git diff) or Bash(git log --patch). Use tilth_diff instead.\n\
 \n\
+tilth_run: Run a shell command with structured output parsing. Replaces Bash for build/test/lint.\n\
+  Automatically detects and compresses verbose output (cargo, go test, pytest, jest, eslint, etc.).\n\
+  Test failures are grouped, error counts summarized, noise removed.\n\
+  Output: exit code (if non-zero) + compressed diagnostics.\n\
+  Use tilth_run instead of Bash for any command whose output you need to understand.\n\
+\n\
 To search code, use tilth_search instead of Grep or Bash(grep/rg).\n\
 To read files, use tilth_read instead of Read or Bash(cat).\n\
 To find files, use tilth_files instead of Glob or Bash(find/ls).\n\
 To check what changed, use tilth_diff instead of Bash(git diff/git log).\n\
+To run commands, use tilth_run instead of Bash for build/test/lint commands.\n\
 DO NOT re-read files already shown in expanded search results.";
 
 const EDIT_MODE_EXTRA: &str = "\n\
@@ -256,6 +263,7 @@ pub(crate) fn dispatch_tool(
         "tilth_map" => Err("tilth_map is disabled — use tilth_search instead".into()),
         "tilth_session" => tool_session(args, session),
         "tilth_edit" if edit_mode => tool_edit(args, session, cache, bloom),
+        "tilth_run" => tool_run(args),
         _ => Err(format!("unknown tool: {tool}")),
     }
 }
@@ -593,6 +601,57 @@ fn tool_edit(
     }
 }
 
+fn tool_run(args: &Value) -> Result<String, String> {
+    let command = args
+        .get("command")
+        .and_then(|v| v.as_str())
+        .ok_or("missing required parameter: command")?;
+
+    let timeout_secs = args
+        .get("timeout")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(crate::run::exec::default_timeout())
+        .max(1);
+
+    let cwd = args.get("cwd").and_then(|v| v.as_str()).unwrap_or(".");
+    let cwd_path = std::path::PathBuf::from(cwd);
+    let cwd_path = cwd_path.canonicalize().unwrap_or(cwd_path);
+
+    let exec_result =
+        crate::run::exec::execute(command, &cwd_path, timeout_secs).map_err(|e| e.to_string())?;
+
+    let exit_code = exec_result.exit_code;
+    let timed_out = exec_result.timed_out;
+
+    if timed_out {
+        let mut output = format!("command timed out after {timeout_secs}s\n\n");
+        let partial = exec_result.combined_output();
+        if !partial.is_empty() {
+            output.push_str(&partial);
+        }
+        return Ok(output);
+    }
+
+    let combined = exec_result.combined_output();
+
+    let result = crate::run::process_structured(&combined);
+    let formatted = if result.passthrough {
+        combined
+    } else {
+        result
+            .format_checked(crate::run::OutputFormat::Markdown, combined.len())
+            .unwrap_or(combined)
+    };
+
+    let mut output = String::with_capacity(formatted.len() + 32);
+    if exit_code != 0 {
+        write!(output, "exit code: {exit_code}\n\n").unwrap();
+    }
+    output.push_str(&formatted);
+
+    Ok(output)
+}
+
 /// Falls back to cwd when scope is invalid, with a warning message.
 fn resolve_scope(args: &Value) -> (PathBuf, Option<String>) {
     let raw_str = args.get("scope").and_then(|v| v.as_str()).unwrap_or(".");
@@ -852,6 +911,28 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     "budget": {
                         "type": "number",
                         "description": "Max tokens. Truncates 'Used by' first."
+                    }
+                }
+            }
+        }),
+        serde_json::json!({
+            "name": "tilth_run",
+            "description": "Run a shell command and return structured output. Replaces Bash for build, test, and lint commands. Output is automatically parsed and compressed — test failures are grouped by type, error counts are summarized, and verbose output is reduced to actionable diagnostics. Supports cargo, go, pytest, jest, eslint, ruff, mypy, tsc, and more. Use this instead of Bash for any command whose output you need to understand.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["command"],
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "Shell command to execute (passed to sh -c)."
+                    },
+                    "cwd": {
+                        "type": "string",
+                        "description": "Working directory for the command. Default: current directory."
+                    },
+                    "timeout": {
+                        "type": "number",
+                        "description": "Timeout in seconds (default: 120)."
                     }
                 }
             }

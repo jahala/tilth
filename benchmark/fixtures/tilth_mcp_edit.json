@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "tilth": {
+      "command": "/opt/homebrew/bin/tilth",
+      "args": ["--mcp", "--edit"]
+    }
+  }
+}

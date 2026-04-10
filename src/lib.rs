@@ -26,6 +26,7 @@ pub(crate) mod lang;
 pub mod map;
 pub mod mcp;
 pub(crate) mod read;
+pub mod run;
 pub(crate) mod search;
 pub(crate) mod session;
 pub(crate) mod types;
