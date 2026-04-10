@@ -25,6 +25,8 @@ pub mod install;
 pub(crate) mod lang;
 pub mod map;
 pub mod mcp;
+#[allow(dead_code)] // TODO: remove once wired into MCP initialize handler
+pub(crate) mod overview;
 pub(crate) mod read;
 pub mod run;
 pub(crate) mod search;
