@@ -28,6 +28,20 @@ pub(crate) mod search;
 pub(crate) mod session;
 pub(crate) mod types;
 
+/// Apply pagination (limit + offset) to a SearchResult in-place.
+fn paginate(result: &mut types::SearchResult, limit: Option<usize>, offset: usize) {
+    if offset > 0 && offset < result.matches.len() {
+        result.matches = result.matches.split_off(offset);
+    } else if offset >= result.matches.len() && !result.matches.is_empty() {
+        result.matches.clear();
+    }
+    if let Some(n) = limit {
+        result.matches.truncate(n);
+    }
+    result.has_more = result.total_found > offset + result.matches.len();
+    result.offset = offset;
+}
+
 use std::path::Path;
 
 use cache::OutlineCache;
@@ -216,7 +230,7 @@ fn run_inner(
             let bloom = index::bloom::BloomFilterCache::new();
             let expand = if expand > 0 { expand } else { 2 };
             let output = search::search_multi_symbol_expanded(
-                &parts, scope, cache, &session, &sym_index, &bloom, expand, None,
+                &parts, scope, cache, &session, &sym_index, &bloom, expand, None, limit, offset,
             )?;
             return match budget_tokens {
                 Some(b) => Ok(budget::apply(&output, b)),
@@ -269,8 +283,8 @@ fn run_query_expanded(
     scope: &Path,
     cache: &OutlineCache,
     ctx: &ExpandedCtx,
-    _limit: Option<usize>,
-    _offset: usize,
+    limit: Option<usize>,
+    offset: usize,
 ) -> Result<String, TilthError> {
     match query_type {
         QueryType::Symbol(name) => search::search_symbol_expanded(
@@ -282,14 +296,12 @@ fn run_query_expanded(
             &ctx.bloom,
             ctx.expand,
             None,
+            limit,
+            offset,
         ),
         QueryType::Concept(text) if text.contains(' ') => {
-            search::search_content_expanded(text, scope, cache, &ctx.session, ctx.expand, None)
+            search::search_content_expanded(text, scope, cache, &ctx.session, ctx.expand, None, limit, offset)
         }
-        // Single-word Concept and Fallthrough share the same expanded path:
-        // both go straight to symbol_expanded, intentionally bypassing the
-        // definitions>0 / content fallback cascade in single_query_search.
-        // The expanded variant already provides richer results with inline source.
         QueryType::Concept(text) | QueryType::Fallthrough(text) => search::search_symbol_expanded(
             text,
             scope,
@@ -299,14 +311,15 @@ fn run_query_expanded(
             &ctx.bloom,
             ctx.expand,
             None,
+            limit,
+            offset,
         ),
         QueryType::Content(text) => {
-            search::search_content_expanded(text, scope, cache, &ctx.session, ctx.expand, None)
+            search::search_content_expanded(text, scope, cache, &ctx.session, ctx.expand, None, limit, offset)
         }
         QueryType::Regex(pattern) => {
-            search::search_regex_expanded(pattern, scope, cache, &ctx.session, ctx.expand, None)
+            search::search_regex_expanded(pattern, scope, cache, &ctx.session, ctx.expand, None, limit, offset)
         }
-        // FilePath/Glob never reach here (gated by use_expanded)
         QueryType::FilePath(_) | QueryType::Glob(_) => {
             unreachable!("non-search query type in expanded path")
         }
@@ -314,30 +327,26 @@ fn run_query_expanded(
 }
 
 /// Dispatch search queries in basic mode (no expansion).
-/// Only called for search query types — FilePath/Glob are handled before this.
 fn run_query_basic(
     query_type: &QueryType,
     scope: &Path,
     cache: &OutlineCache,
-    _limit: Option<usize>,
-    _offset: usize,
+    limit: Option<usize>,
+    offset: usize,
 ) -> Result<String, TilthError> {
     match query_type {
-        QueryType::Symbol(name) => search::search_symbol(name, scope, cache),
+        QueryType::Symbol(name) => search::search_symbol(name, scope, cache, limit, offset),
         QueryType::Concept(text) if text.contains(' ') => {
-            multi_word_concept_search(text, scope, cache)
+            multi_word_concept_search(text, scope, cache, limit, offset)
         }
         QueryType::Concept(text) => {
-            // Single-word concept: prefer definitions, then content, then any match.
-            single_query_search(text, scope, cache, true)
+            single_query_search(text, scope, cache, true, limit, offset)
         }
-        QueryType::Content(text) => search::search_content(text, scope, cache),
-        QueryType::Regex(pattern) => search::search_regex(pattern, scope, cache),
+        QueryType::Content(text) => search::search_content(text, scope, cache, limit, offset),
+        QueryType::Regex(pattern) => search::search_regex(pattern, scope, cache, limit, offset),
         QueryType::Fallthrough(text) => {
-            // Accept any symbol match immediately (no definitions preference).
-            single_query_search(text, scope, cache, false)
+            single_query_search(text, scope, cache, false, limit, offset)
         }
-        // FilePath/Glob never reach here
         QueryType::FilePath(_) | QueryType::Glob(_) => {
             unreachable!("non-search query type in basic path")
         }
@@ -354,8 +363,11 @@ fn single_query_search(
     scope: &Path,
     cache: &cache::OutlineCache,
     prefer_definitions: bool,
+    limit: Option<usize>,
+    offset: usize,
 ) -> Result<String, error::TilthError> {
-    let sym_result = search::search_symbol_raw(text, scope)?;
+    let mut sym_result = search::search_symbol_raw(text, scope)?;
+    paginate(&mut sym_result, limit, offset);
     let accept_sym = if prefer_definitions {
         sym_result.definitions > 0
     } else {
@@ -366,7 +378,8 @@ fn single_query_search(
         return search::format_raw_result(&sym_result, cache);
     }
 
-    let content_result = search::search_content_raw(text, scope)?;
+    let mut content_result = search::search_content_raw(text, scope)?;
+    paginate(&mut content_result, limit, offset);
     if content_result.total_found > 0 {
         return search::format_raw_result(&content_result, cache);
     }
@@ -387,9 +400,11 @@ fn multi_word_concept_search(
     text: &str,
     scope: &Path,
     cache: &cache::OutlineCache,
+    limit: Option<usize>,
+    offset: usize,
 ) -> Result<String, error::TilthError> {
-    // Try exact phrase match first
     let mut content_result = search::search_content_raw(text, scope)?;
+    paginate(&mut content_result, limit, offset);
     content_result.query = text.to_string();
     if content_result.total_found > 0 {
         return search::format_raw_result(&content_result, cache);
@@ -415,6 +430,7 @@ fn multi_word_concept_search(
     };
 
     let mut relaxed_result = search::search_regex_raw(&relaxed, scope)?;
+    paginate(&mut relaxed_result, limit, offset);
     relaxed_result.query = text.to_string();
     if relaxed_result.total_found > 0 {
         return search::format_raw_result(&relaxed_result, cache);

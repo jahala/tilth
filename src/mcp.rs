@@ -373,7 +373,7 @@ fn tool_search(
                 1 => {
                     session.record_search(queries[0]);
                     crate::search::search_symbol_expanded(
-                        queries[0], &scope, cache, session, index, bloom, expand, context,
+                        queries[0], &scope, cache, session, index, bloom, expand, context, None, 0,
                     )
                 }
                 2..=5 => {
@@ -381,7 +381,7 @@ fn tool_search(
                         session.record_search(q);
                     }
                     crate::search::search_multi_symbol_expanded(
-                        &queries, &scope, cache, session, index, bloom, expand, context,
+                        &queries, &scope, cache, session, index, bloom, expand, context, None, 0,
                     )
                 }
                 _ => {
@@ -394,7 +394,7 @@ fn tool_search(
         }
         "content" => {
             session.record_search(query);
-            crate::search::search_content_expanded(query, &scope, cache, session, expand, context)
+            crate::search::search_content_expanded(query, &scope, cache, session, expand, context, None, 0)
         }
         "regex" => {
             session.record_search(query);

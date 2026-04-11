@@ -153,8 +153,10 @@ pub fn search_symbol(
     query: &str,
     scope: &Path,
     cache: &OutlineCache,
+    limit: Option<usize>,
+    offset: usize,
 ) -> Result<String, TilthError> {
-    let result = symbol::search(query, scope, None, None, 0)?;
+    let result = symbol::search(query, scope, None, limit, offset)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
     format_search_result(&result, cache, None, &bloom, 0)
 }
@@ -168,12 +170,11 @@ pub fn search_symbol_expanded(
     bloom: &crate::index::bloom::BloomFilterCache,
     expand: usize,
     context: Option<&Path>,
+    limit: Option<usize>,
+    offset: usize,
 ) -> Result<String, TilthError> {
-    // Index is available but not yet used for search fast-path.
-    // Build will be triggered when the lookup path is wired in.
     let _ = index;
-
-    let result = symbol::search(query, scope, context, None, 0)?;
+    let result = symbol::search(query, scope, context, limit, offset)?;
     format_search_result(&result, cache, Some(session), bloom, expand)
 }
 
@@ -186,11 +187,11 @@ pub fn search_multi_symbol_expanded(
     bloom: &crate::index::bloom::BloomFilterCache,
     expand: usize,
     context: Option<&Path>,
+    limit: Option<usize>,
+    offset: usize,
 ) -> Result<String, TilthError> {
-    let _ = index; // Available but not yet used for search fast-path
+    let _ = index;
 
-    // Shared expand budget: at least 1 slot per query, or explicit expand if higher.
-    // expand=0 means no expansion at all.
     let mut expand_remaining = if expand == 0 {
         0
     } else {
@@ -200,7 +201,7 @@ pub fn search_multi_symbol_expanded(
     let mut sections = Vec::with_capacity(queries.len());
 
     for query in queries {
-        let result = symbol::search(query, scope, context, None, 0)?;
+        let result = symbol::search(query, scope, context, limit, offset)?;
         let mut out = format::search_header(
             &result.query,
             &result.scope,
@@ -235,9 +236,11 @@ pub fn search_content(
     query: &str,
     scope: &Path,
     cache: &OutlineCache,
+    limit: Option<usize>,
+    offset: usize,
 ) -> Result<String, TilthError> {
     let (pattern, is_regex) = parse_pattern(query);
-    let result = content::search(pattern, scope, is_regex, None, None, 0)?;
+    let result = content::search(pattern, scope, is_regex, None, limit, offset)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
     format_search_result(&result, cache, None, &bloom, 0)
 }
@@ -246,8 +249,10 @@ pub fn search_regex(
     pattern: &str,
     scope: &Path,
     cache: &OutlineCache,
+    limit: Option<usize>,
+    offset: usize,
 ) -> Result<String, TilthError> {
-    let result = content::search(pattern, scope, true, None, None, 0)?;
+    let result = content::search(pattern, scope, true, None, limit, offset)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
     format_search_result(&result, cache, None, &bloom, 0)
 }
@@ -259,14 +264,16 @@ pub fn search_content_expanded(
     session: &Session,
     expand: usize,
     context: Option<&Path>,
+    limit: Option<usize>,
+    offset: usize,
 ) -> Result<String, TilthError> {
     let (pattern, is_regex) = parse_pattern(query);
-    let result = content::search(pattern, scope, is_regex, context, None, 0)?;
+    let result = content::search(pattern, scope, is_regex, context, limit, offset)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
     format_search_result(&result, cache, Some(session), &bloom, expand)
 }
 
-/// Expanded regex search — takes raw pattern, no slash wrapping needed.
+/// Expanded regex search -- takes raw pattern, no slash wrapping needed.
 pub fn search_regex_expanded(
     pattern: &str,
     scope: &Path,
@@ -274,8 +281,10 @@ pub fn search_regex_expanded(
     session: &Session,
     expand: usize,
     context: Option<&Path>,
+    limit: Option<usize>,
+    offset: usize,
 ) -> Result<String, TilthError> {
-    let result = content::search(pattern, scope, true, context, None, 0)?;
+    let result = content::search(pattern, scope, true, context, limit, offset)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
     format_search_result(&result, cache, Some(session), &bloom, expand)
 }
