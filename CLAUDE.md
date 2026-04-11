@@ -15,6 +15,12 @@ src/
     outline.rs         Tree-sitter outline extraction: outline_language(), walk_top_level(), get_outline_entries().
     treesitter.rs      Shared AST constants: DEFINITION_KINDS, extract_definition_name(), definition_weight().
     detection.rs       Generated file detection (lockfiles, .min.js) and binary detection.
+  diff/
+    mod.rs             Structural diff types, source resolution, orchestrator pipeline (diff()).
+    parse.rs           Unified diff parser: git diff output → Vec<FileDiff>.
+    matching.rs        Three-phase symbol matching: identity → structural hash → fuzzy similarity.
+    overlay.rs         Per-file structural overlay: outline old/new, match symbols, attribute hunks.
+    format.rs          Progressive-disclosure formatters: overview, file detail, function detail, log, conflicts.
   read/
     mod.rs             File reading with smart view (full vs outline based on token count).
     outline/

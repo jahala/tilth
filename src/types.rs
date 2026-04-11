@@ -130,7 +130,7 @@ pub struct OutlineEntry {
     pub doc: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OutlineKind {
     Import,
     Function,

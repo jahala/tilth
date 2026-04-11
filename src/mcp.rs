@@ -71,9 +71,17 @@ tilth_files: Find files by glob pattern. Replaces find, ls, pwd, and the host Gl
 tilth_deps: Blast-radius check — what imports this file and what it imports.\n\
   Use ONLY before renaming, removing, or changing an export's signature.\n\
 \n\
+tilth_diff: Structural diff — shows what changed at function level. Replaces Bash(git diff).\n\
+  Usage: tilth_diff() for uncommitted overview. tilth_diff(source: \"HEAD~1\") for last commit.\n\
+  scope: \"file.rs\" or \"file.rs:fn_name\". log: \"HEAD~5..HEAD\" for per-commit summaries.\n\
+  search: filter to lines matching a term. blast: true to show callers of changed signatures.\n\
+  Output: [+] added, [-] deleted, [~] body changed, [~:sig] signature changed.\n\
+  DO NOT use Bash(git diff) or Bash(git log --patch). Use tilth_diff instead.\n\
+\n\
 To search code, use tilth_search instead of Grep or Bash(grep/rg).\n\
 To read files, use tilth_read instead of Read or Bash(cat).\n\
 To find files, use tilth_files instead of Glob or Bash(find/ls).\n\
+To check what changed, use tilth_diff instead of Bash(git diff/git log).\n\
 DO NOT re-read files already shown in expanded search results.";
 
 const EDIT_MODE_EXTRA: &str = "\n\
@@ -244,6 +252,7 @@ pub(crate) fn dispatch_tool(
         "tilth_search" => tool_search(args, cache, session, index, bloom),
         "tilth_files" => tool_files(args, cache),
         "tilth_deps" => tool_deps(args, cache, bloom),
+        "tilth_diff" => tool_diff(args),
         "tilth_map" => Err("tilth_map is disabled — use tilth_search instead".into()),
         "tilth_session" => tool_session(args, session),
         "tilth_edit" if edit_mode => tool_edit(args, session, cache, bloom),
@@ -465,6 +474,22 @@ fn tool_deps(
         budget,
     ));
     Ok(output)
+}
+
+fn tool_diff(args: &Value) -> Result<String, String> {
+    let source = args.get("source").and_then(|v| v.as_str());
+    let scope = args.get("scope").and_then(|v| v.as_str());
+    let a = args.get("a").and_then(|v| v.as_str());
+    let b = args.get("b").and_then(|v| v.as_str());
+    let patch = args.get("patch").and_then(|v| v.as_str());
+    let log = args.get("log").and_then(|v| v.as_str());
+    let search = args.get("search").and_then(|v| v.as_str());
+    let blast = args.get("blast").and_then(Value::as_bool).unwrap_or(false);
+    let expand = args.get("expand").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let budget = args.get("budget").and_then(Value::as_u64);
+
+    let diff_source = crate::diff::resolve_source(source, a, b, patch, log)?;
+    crate::diff::diff(&diff_source, scope, search, blast, expand, budget)
 }
 
 fn tool_session(args: &Value, session: &Session) -> Result<String, String> {
@@ -837,6 +862,57 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         //     "name": "tilth_map",
         //     ...
         // }),
+        serde_json::json!({
+            "name": "tilth_diff",
+            "description": "Structural diff showing function-level changes. Replaces git diff. Call with no args for uncommitted changes overview.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "description": "Diff source: 'uncommitted' (default), 'staged', or a git ref (e.g. 'HEAD~1', 'main..feat'). Ignored when a, b, patch, or log is set."
+                    },
+                    "scope": {
+                        "type": "string",
+                        "description": "Restrict diff output to a specific file or directory path."
+                    },
+                    "a": {
+                        "type": "string",
+                        "description": "First file for a file-to-file diff. Must be used together with b."
+                    },
+                    "b": {
+                        "type": "string",
+                        "description": "Second file for a file-to-file diff. Must be used together with a."
+                    },
+                    "patch": {
+                        "type": "string",
+                        "description": "Path to a .patch file to parse instead of running git diff."
+                    },
+                    "log": {
+                        "type": "string",
+                        "description": "Git log range (e.g. 'HEAD~5..HEAD') — shows per-commit structural summaries."
+                    },
+                    "search": {
+                        "type": "string",
+                        "description": "Filter output to symbols or files matching this substring (case-insensitive)."
+                    },
+                    "blast": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Show blast-radius warnings for signature-changed symbols."
+                    },
+                    "expand": {
+                        "type": "number",
+                        "default": 0,
+                        "description": "Number of changed symbols to expand with full source context."
+                    },
+                    "budget": {
+                        "type": "number",
+                        "description": "Max tokens in response."
+                    }
+                }
+            }
+        }),
     ];
 
     if edit_mode {

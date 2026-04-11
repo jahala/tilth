@@ -81,6 +81,48 @@ enum Command {
         #[arg(long)]
         edit: bool,
     },
+    /// Show structural diff with function-level change summaries.
+    Diff {
+        /// Diff source: uncommitted (default), staged, or a git ref (e.g. HEAD~1, main..feat).
+        #[arg(default_value = "uncommitted")]
+        source: String,
+
+        /// Restrict diff to a specific file or directory.
+        #[arg(long)]
+        scope: Option<String>,
+
+        /// First file for file-to-file diff (requires --b).
+        #[arg(long)]
+        a: Option<PathBuf>,
+
+        /// Second file for file-to-file diff (requires --a).
+        #[arg(long)]
+        b: Option<PathBuf>,
+
+        /// Path to a .patch file to parse.
+        #[arg(long)]
+        patch: Option<PathBuf>,
+
+        /// Git log range for per-commit summaries (e.g. HEAD~5..HEAD).
+        #[arg(long)]
+        log: Option<String>,
+
+        /// Filter output to symbols or files matching this substring.
+        #[arg(long)]
+        search: Option<String>,
+
+        /// Show blast-radius warnings for signature-changed symbols.
+        #[arg(long)]
+        blast: bool,
+
+        /// Expand top N changed symbols with full source context.
+        #[arg(long, default_value_t = 0)]
+        expand: usize,
+
+        /// Max tokens in response.
+        #[arg(long, default_value_t = 10000)]
+        budget: u64,
+    },
 }
 
 fn main() {
@@ -100,6 +142,50 @@ fn main() {
                 if let Err(e) = tilth::install::run(host, edit) {
                     eprintln!("install error: {e}");
                     process::exit(1);
+                }
+            }
+            Command::Diff {
+                source,
+                scope,
+                a,
+                b,
+                patch,
+                log,
+                search,
+                blast,
+                expand,
+                budget,
+            } => {
+                let a_str = a.as_ref().map(|p| p.to_string_lossy().into_owned());
+                let b_str = b.as_ref().map(|p| p.to_string_lossy().into_owned());
+                let patch_str = patch.as_ref().map(|p| p.to_string_lossy().into_owned());
+                let diff_source = match tilth::diff::resolve_source(
+                    Some(&source),
+                    a_str.as_deref(),
+                    b_str.as_deref(),
+                    patch_str.as_deref(),
+                    log.as_deref(),
+                ) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("diff error: {e}");
+                        process::exit(1);
+                    }
+                };
+                let budget_opt = if budget == 0 { None } else { Some(budget) };
+                match tilth::diff::diff(
+                    &diff_source,
+                    scope.as_deref(),
+                    search.as_deref(),
+                    blast,
+                    expand,
+                    budget_opt,
+                ) {
+                    Ok(output) => emit_output(&output, io::stdout().is_terminal()),
+                    Err(e) => {
+                        eprintln!("diff error: {e}");
+                        process::exit(1);
+                    }
                 }
             }
         }
