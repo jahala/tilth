@@ -487,7 +487,7 @@ fn tool_search(
     let output = match kind {
         "symbol" => {
             let queries: Vec<&str> = query
-                .split(',')
+                .split([',', ' '])
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .collect();
