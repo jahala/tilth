@@ -11,6 +11,7 @@ Comma-separated symbols for multi-symbol lookup (max 5).
 kind: "symbol" (default) | "content" (strings/comments) | "callers" (call sites)
 expand (default 2): inline full source for top matches.
 context: path to file being edited — boosts nearby results.
+glob: file pattern filter — "*.rs" (whitelist), "!*.test.ts" (exclude), "*.{go,rs}" (multi).
 Output per match:
 ## <path>:<start>-<end> [definition|usage|impl]
 <outline context>

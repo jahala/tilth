@@ -100,7 +100,8 @@ pub(crate) fn package_root(path: &Path) -> Option<&Path> {
 
 /// Build a parallel directory walker that searches ALL files except known junk directories.
 /// Does NOT respect .gitignore — ensures gitignored but locally-relevant files are found.
-pub(crate) fn walker(scope: &Path) -> ignore::WalkParallel {
+/// When `glob` is Some, applies a file-pattern override (whitelist or negation).
+pub(crate) fn walker(scope: &Path, glob: Option<&str>) -> Result<ignore::WalkParallel, TilthError> {
     let threads = std::env::var("TILTH_THREADS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -108,7 +109,8 @@ pub(crate) fn walker(scope: &Path) -> ignore::WalkParallel {
             std::thread::available_parallelism().map_or(4, |n| (n.get() / 2).clamp(2, 6))
         });
 
-    WalkBuilder::new(scope)
+    let mut builder = WalkBuilder::new(scope);
+    builder
         .hidden(false)
         .git_ignore(false)
         .git_global(false)
@@ -123,8 +125,25 @@ pub(crate) fn walker(scope: &Path) -> ignore::WalkParallel {
                 }
             }
             true
-        })
-        .build_parallel()
+        });
+
+    if let Some(pattern) = glob {
+        if !pattern.is_empty() {
+            let mut overrides = ignore::overrides::OverrideBuilder::new(scope);
+            overrides
+                .add(pattern)
+                .map_err(|e| TilthError::InvalidQuery {
+                    query: pattern.to_string(),
+                    reason: format!("invalid glob: {e}"),
+                })?;
+            builder.overrides(overrides.build().map_err(|e| TilthError::InvalidQuery {
+                query: pattern.to_string(),
+                reason: format!("invalid glob: {e}"),
+            })?);
+        }
+    }
+
+    Ok(builder.build_parallel())
 }
 
 /// Parse `/pattern/` regex syntax. Returns (pattern, `is_regex`).
@@ -153,8 +172,9 @@ pub fn search_symbol(
     query: &str,
     scope: &Path,
     cache: &OutlineCache,
+    glob: Option<&str>,
 ) -> Result<String, TilthError> {
-    let result = symbol::search(query, scope, None)?;
+    let result = symbol::search(query, scope, None, glob)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
     format_search_result(&result, cache, None, &bloom, 0)
 }
@@ -168,12 +188,13 @@ pub fn search_symbol_expanded(
     bloom: &crate::index::bloom::BloomFilterCache,
     expand: usize,
     context: Option<&Path>,
+    glob: Option<&str>,
 ) -> Result<String, TilthError> {
     // Index is available but not yet used for search fast-path.
     // Build will be triggered when the lookup path is wired in.
     let _ = index;
 
-    let result = symbol::search(query, scope, context)?;
+    let result = symbol::search(query, scope, context, glob)?;
     format_search_result(&result, cache, Some(session), bloom, expand)
 }
 
@@ -186,6 +207,7 @@ pub fn search_multi_symbol_expanded(
     bloom: &crate::index::bloom::BloomFilterCache,
     expand: usize,
     context: Option<&Path>,
+    glob: Option<&str>,
 ) -> Result<String, TilthError> {
     let _ = index; // Available but not yet used for search fast-path
 
@@ -200,7 +222,7 @@ pub fn search_multi_symbol_expanded(
     let mut sections = Vec::with_capacity(queries.len());
 
     for query in queries {
-        let result = symbol::search(query, scope, context)?;
+        let result = symbol::search(query, scope, context, glob)?;
         let mut out = format::search_header(
             &result.query,
             &result.scope,
@@ -235,9 +257,10 @@ pub fn search_content(
     query: &str,
     scope: &Path,
     cache: &OutlineCache,
+    glob: Option<&str>,
 ) -> Result<String, TilthError> {
     let (pattern, is_regex) = parse_pattern(query);
-    let result = content::search(pattern, scope, is_regex, None)?;
+    let result = content::search(pattern, scope, is_regex, None, glob)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
     format_search_result(&result, cache, None, &bloom, 0)
 }
@@ -246,8 +269,9 @@ pub fn search_regex(
     pattern: &str,
     scope: &Path,
     cache: &OutlineCache,
+    glob: Option<&str>,
 ) -> Result<String, TilthError> {
-    let result = content::search(pattern, scope, true, None)?;
+    let result = content::search(pattern, scope, true, None, glob)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
     format_search_result(&result, cache, None, &bloom, 0)
 }
@@ -259,9 +283,10 @@ pub fn search_content_expanded(
     session: &Session,
     expand: usize,
     context: Option<&Path>,
+    glob: Option<&str>,
 ) -> Result<String, TilthError> {
     let (pattern, is_regex) = parse_pattern(query);
-    let result = content::search(pattern, scope, is_regex, context)?;
+    let result = content::search(pattern, scope, is_regex, context, glob)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
     format_search_result(&result, cache, Some(session), &bloom, expand)
 }
@@ -274,26 +299,39 @@ pub fn search_regex_expanded(
     session: &Session,
     expand: usize,
     context: Option<&Path>,
+    glob: Option<&str>,
 ) -> Result<String, TilthError> {
-    let result = content::search(pattern, scope, true, context)?;
+    let result = content::search(pattern, scope, true, context, glob)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
     format_search_result(&result, cache, Some(session), &bloom, expand)
 }
 
 /// Raw symbol search — returns structured result for programmatic inspection.
-pub fn search_symbol_raw(query: &str, scope: &Path) -> Result<SearchResult, TilthError> {
-    symbol::search(query, scope, None)
+pub fn search_symbol_raw(
+    query: &str,
+    scope: &Path,
+    glob: Option<&str>,
+) -> Result<SearchResult, TilthError> {
+    symbol::search(query, scope, None, glob)
 }
 
 /// Raw content search — returns structured result for programmatic inspection.
-pub fn search_content_raw(query: &str, scope: &Path) -> Result<SearchResult, TilthError> {
+pub fn search_content_raw(
+    query: &str,
+    scope: &Path,
+    glob: Option<&str>,
+) -> Result<SearchResult, TilthError> {
     let (pattern, is_regex) = parse_pattern(query);
-    content::search(pattern, scope, is_regex, None)
+    content::search(pattern, scope, is_regex, None, glob)
 }
 
 /// Raw regex search — returns structured result for programmatic inspection.
-pub fn search_regex_raw(pattern: &str, scope: &Path) -> Result<SearchResult, TilthError> {
-    content::search(pattern, scope, true, None)
+pub fn search_regex_raw(
+    pattern: &str,
+    scope: &Path,
+    glob: Option<&str>,
+) -> Result<SearchResult, TilthError> {
+    content::search(pattern, scope, true, None, glob)
 }
 
 /// Format a raw search result (symbol or content — both use the same pipeline).
@@ -1209,4 +1247,232 @@ fn format_glob_result(result: &glob::GlobResult, scope: &Path) -> Result<String,
     }
 
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+
+    /// Collect all file paths from a walker into a sorted Vec.
+    fn walk_paths(scope: &Path, glob: Option<&str>) -> Vec<PathBuf> {
+        let w = walker(scope, glob).expect("walker failed");
+        let paths: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+        w.run(|| {
+            let paths = &paths;
+            Box::new(move |entry| {
+                if let Ok(e) = entry {
+                    if e.file_type().is_some_and(|ft| ft.is_file()) {
+                        paths.lock().unwrap().push(e.into_path());
+                    }
+                }
+                ignore::WalkState::Continue
+            })
+        });
+        let mut v = paths.into_inner().unwrap();
+        v.sort();
+        v
+    }
+
+    fn extensions(paths: &[PathBuf]) -> HashSet<String> {
+        paths
+            .iter()
+            .filter_map(|p| p.extension())
+            .map(|e| e.to_string_lossy().to_string())
+            .collect()
+    }
+
+    // ── walker unit tests ──
+
+    #[test]
+    fn walker_none_returns_all_file_types() {
+        let scope = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let all = walk_paths(&scope, None);
+        let exts = extensions(&all);
+        assert!(exts.contains("rs"), "expected .rs files, got {exts:?}");
+        assert!(!all.is_empty());
+    }
+
+    #[test]
+    fn walker_whitelist_filters_to_matching_extension() {
+        let scope = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let filtered = walk_paths(&scope, Some("*.rs"));
+        assert!(!filtered.is_empty(), "whitelist should find .rs files");
+        for p in &filtered {
+            assert_eq!(
+                p.extension().and_then(|e| e.to_str()),
+                Some("rs"),
+                "non-.rs file leaked through whitelist: {}",
+                p.display()
+            );
+        }
+    }
+
+    #[test]
+    fn walker_negation_excludes_matching_extension() {
+        let scope = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let without_rs = walk_paths(&scope, Some("!*.rs"));
+        for p in &without_rs {
+            assert_ne!(
+                p.extension().and_then(|e| e.to_str()),
+                Some("rs"),
+                ".rs file leaked through negation: {}",
+                p.display()
+            );
+        }
+    }
+
+    #[test]
+    fn walker_empty_string_equals_none() {
+        let scope = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let all = walk_paths(&scope, None);
+        let empty = walk_paths(&scope, Some(""));
+        assert_eq!(all.len(), empty.len(), "empty glob should behave like None");
+    }
+
+    #[test]
+    fn walker_invalid_glob_returns_error() {
+        let scope = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let result = walker(&scope, Some("[unclosed"));
+        match result {
+            Err(TilthError::InvalidQuery { query, reason }) => {
+                assert_eq!(query, "[unclosed");
+                assert!(
+                    reason.contains("invalid glob"),
+                    "reason should mention 'invalid glob': {reason}"
+                );
+            }
+            Err(other) => panic!("expected InvalidQuery, got {other}"),
+            Ok(_) => panic!("expected Err for invalid glob, got Ok"),
+        }
+    }
+
+    #[test]
+    fn walker_brace_expansion_matches_multiple_extensions() {
+        let scope = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let filtered = walk_paths(&scope, Some("*.{rs,toml}"));
+        let exts = extensions(&filtered);
+        assert!(
+            exts.contains("rs"),
+            "brace expansion should include .rs: {exts:?}"
+        );
+        assert!(
+            exts.contains("toml"),
+            "brace expansion should include .toml: {exts:?}"
+        );
+        for ext in &exts {
+            assert!(
+                ext == "rs" || ext == "toml",
+                "unexpected extension leaked: {ext}"
+            );
+        }
+    }
+
+    #[test]
+    fn walker_whitelist_fewer_than_unfiltered() {
+        // Use project root (not src/) — project root has .toml, .md, .lock etc.
+        // alongside .rs files, so *.rs is guaranteed to be a strict subset.
+        let scope = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let all = walk_paths(&scope, None);
+        let rs_only = walk_paths(&scope, Some("*.rs"));
+        assert!(
+            rs_only.len() < all.len(),
+            "whitelist ({}) should find fewer files than unfiltered ({})",
+            rs_only.len(),
+            all.len()
+        );
+    }
+
+    #[test]
+    fn walker_path_pattern_restricts_directory() {
+        let scope = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let filtered = walk_paths(&scope, Some("src/**/*.rs"));
+        assert!(!filtered.is_empty(), "path pattern should find files");
+        let src_dir = scope.join("src");
+        for p in &filtered {
+            assert!(
+                p.starts_with(&src_dir),
+                "file outside src/ leaked: {}",
+                p.display()
+            );
+        }
+    }
+
+    // ── end-to-end through search functions ──
+
+    #[test]
+    fn content_search_glob_restricts_results() {
+        let scope = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let all = content::search("TilthError", &scope, false, None, None).expect("search failed");
+        let rs_only = content::search("TilthError", &scope, false, None, Some("*.rs"))
+            .expect("search with glob failed");
+        let toml_only = content::search("TilthError", &scope, false, None, Some("*.toml"))
+            .expect("search with toml glob failed");
+
+        assert!(all.total_found > 0, "unfiltered should find TilthError");
+        assert!(rs_only.total_found > 0, "*.rs should find TilthError");
+        assert_eq!(
+            toml_only.total_found, 0,
+            "*.toml should not find TilthError in Rust source"
+        );
+        for m in &rs_only.matches {
+            assert_eq!(
+                m.path.extension().and_then(|e| e.to_str()),
+                Some("rs"),
+                "non-.rs match leaked: {}",
+                m.path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn symbol_search_glob_restricts_results() {
+        let scope = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let rs_result =
+            symbol::search("walker", &scope, None, Some("*.rs")).expect("symbol search failed");
+        let toml_result = symbol::search("walker", &scope, None, Some("*.toml"))
+            .expect("symbol search with toml failed");
+
+        assert!(rs_result.total_found > 0, "*.rs should find 'walker'");
+        assert_eq!(
+            toml_result.total_found, 0,
+            "*.toml should not find 'walker'"
+        );
+        for m in &rs_result.matches {
+            assert_eq!(
+                m.path.extension().and_then(|e| e.to_str()),
+                Some("rs"),
+                "non-.rs match in symbol search: {}",
+                m.path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn callers_search_glob_restricts_results() {
+        let scope = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let rs_callers =
+            callers::find_callers("walker", &scope, &bloom, Some("*.rs")).expect("callers failed");
+        let toml_callers = callers::find_callers("walker", &scope, &bloom, Some("*.toml"))
+            .expect("callers toml failed");
+
+        assert!(
+            !rs_callers.is_empty(),
+            "*.rs should find callers of 'walker'"
+        );
+        assert!(
+            toml_callers.is_empty(),
+            "*.toml should not find callers of 'walker'"
+        );
+        for c in &rs_callers {
+            assert_eq!(
+                c.path.extension().and_then(|e| e.to_str()),
+                Some("rs"),
+                "non-.rs caller leaked: {}",
+                c.path.display()
+            );
+        }
+    }
 }

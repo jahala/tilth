@@ -46,6 +46,7 @@ tilth_search: Search code — finds definitions, usages, and text. Replaces grep
   kind: \"symbol\" (default) | \"content\" (strings/comments) | \"callers\" (call sites)\n\
   expand (default 2): inline full source for top matches.\n\
   context: path to file being edited — boosts nearby results.\n\
+  glob: file pattern filter — \"*.rs\" (whitelist), \"!*.test.ts\" (exclude).\n\
   Output per match:\n\
     ## <path>:<start>-<end> [definition|usage|impl]\n\
     <outline context>\n\
@@ -359,6 +360,7 @@ fn tool_search(
         .and_then(|v| v.as_str())
         .map(PathBuf::from);
     let context = context_path.as_deref();
+    let glob = args.get("glob").and_then(|v| v.as_str());
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
 
     let output = match kind {
@@ -373,7 +375,7 @@ fn tool_search(
                 1 => {
                     session.record_search(queries[0]);
                     crate::search::search_symbol_expanded(
-                        queries[0], &scope, cache, session, index, bloom, expand, context,
+                        queries[0], &scope, cache, session, index, bloom, expand, context, glob,
                     )
                 }
                 2..=5 => {
@@ -381,7 +383,7 @@ fn tool_search(
                         session.record_search(q);
                     }
                     crate::search::search_multi_symbol_expanded(
-                        &queries, &scope, cache, session, index, bloom, expand, context,
+                        &queries, &scope, cache, session, index, bloom, expand, context, glob,
                     )
                 }
                 _ => {
@@ -394,18 +396,20 @@ fn tool_search(
         }
         "content" => {
             session.record_search(query);
-            crate::search::search_content_expanded(query, &scope, cache, session, expand, context)
+            crate::search::search_content_expanded(
+                query, &scope, cache, session, expand, context, glob,
+            )
         }
         "regex" => {
             session.record_search(query);
-            let result = crate::search::content::search(query, &scope, true, context)
+            let result = crate::search::content::search(query, &scope, true, context, glob)
                 .map_err(|e| e.to_string())?;
             crate::search::format_raw_result(&result, cache)
         }
         "callers" => {
             session.record_search(query);
             crate::search::callers::search_callers_expanded(
-                query, &scope, cache, session, bloom, expand, context,
+                query, &scope, cache, session, bloom, expand, context, glob,
             )
         }
         _ => {
@@ -744,6 +748,10 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     "budget": {
                         "type": "number",
                         "description": "Max tokens in response."
+                    },
+                    "glob": {
+                        "type": "string",
+                        "description": "File pattern filter. Whitelist: \"*.rs\" (only Rust files). Exclude: \"!*.test.ts\" (skip test files). Brace expansion: \"*.{go,rs}\" (Go and Rust). Path patterns: \"src/**/*.ts\"."
                     }
                 }
             }

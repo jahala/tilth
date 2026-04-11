@@ -31,6 +31,7 @@ pub fn search(
     query: &str,
     scope: &Path,
     context: Option<&Path>,
+    glob: Option<&str>,
 ) -> Result<SearchResult, TilthError> {
     // Compile regex once, share across both arms
     let word_pattern = format!(r"\b{}\b", regex_syntax::escape(query));
@@ -40,8 +41,8 @@ pub fn search(
     })?;
 
     let (defs, usages) = rayon::join(
-        || find_definitions(query, scope),
-        || find_usages(query, &matcher, scope),
+        || find_definitions(query, scope, glob),
+        || find_usages(query, &matcher, scope, glob),
     );
 
     let defs = defs?;
@@ -85,14 +86,18 @@ pub fn search(
 /// Single-read design: reads each file once, checks for symbol via
 /// `memchr::memmem` (SIMD), then reuses the buffer for tree-sitter parsing.
 /// Early termination: quits the parallel walker once enough defs are found.
-fn find_definitions(query: &str, scope: &Path) -> Result<Vec<Match>, TilthError> {
+fn find_definitions(
+    query: &str,
+    scope: &Path,
+    glob: Option<&str>,
+) -> Result<Vec<Match>, TilthError> {
     let matches: Mutex<Vec<Match>> = Mutex::new(Vec::new());
     // Relaxed is correct: walker.run() joins all threads before we read the final value.
     // Early-quit checks are approximate by design — one extra iteration is harmless.
     let found_count = AtomicUsize::new(0);
     let needle = query.as_bytes();
 
-    let walker = super::walker(scope);
+    let walker = super::walker(scope, glob)?;
 
     walker.run(|| {
         let matches = &matches;
@@ -359,12 +364,13 @@ fn find_usages(
     query: &str,
     matcher: &RegexMatcher,
     scope: &Path,
+    glob: Option<&str>,
 ) -> Result<Vec<Match>, TilthError> {
     let matches: Mutex<Vec<Match>> = Mutex::new(Vec::new());
     // Relaxed: same reasoning as find_definitions — approximate early-quit, joined before read
     let found_count = AtomicUsize::new(0);
 
-    let walker = super::walker(scope);
+    let walker = super::walker(scope, glob)?;
 
     walker.run(|| {
         let matches = &matches;

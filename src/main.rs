@@ -48,6 +48,10 @@ struct Cli {
     #[arg(long, num_args = 0..=1, default_missing_value = "2", require_equals = true)]
     expand: Option<usize>,
 
+    /// File pattern filter (e.g. "*.rs", "!*.test.ts", "*.{go,rs}").
+    #[arg(long)]
+    glob: Option<String>,
+
     /// Find all callers of a symbol.
     #[arg(long, conflicts_with_all = ["deps", "map", "edit"])]
     callers: bool,
@@ -139,7 +143,14 @@ fn main() {
 
     // Callers mode
     if cli.callers {
-        let result = tilth::run_callers(&query, &scope, expand, cli.budget, &cache);
+        let result = tilth::run_callers(
+            &query,
+            &scope,
+            expand,
+            cli.budget,
+            cli.glob.as_deref(),
+            &cache,
+        );
         emit_result(result, &query, cli.json, is_tty);
         return;
     }
@@ -174,12 +185,27 @@ fn main() {
             cli.budget,
             full,
             expand,
+            cli.glob.as_deref(),
             &cache,
         )
     } else if full {
-        tilth::run_full(&query, &scope, cli.section.as_deref(), cli.budget, &cache)
+        tilth::run_full(
+            &query,
+            &scope,
+            cli.section.as_deref(),
+            cli.budget,
+            cli.glob.as_deref(),
+            &cache,
+        )
     } else {
-        tilth::run(&query, &scope, cli.section.as_deref(), cli.budget, &cache)
+        tilth::run(
+            &query,
+            &scope,
+            cli.section.as_deref(),
+            cli.budget,
+            cli.glob.as_deref(),
+            &cache,
+        )
     };
 
     emit_result(result, &query, cli.json, is_tty);
