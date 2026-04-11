@@ -111,6 +111,7 @@ pub(crate) fn walker(scope: &Path, glob: Option<&str>) -> Result<ignore::WalkPar
 
     let mut builder = WalkBuilder::new(scope);
     builder
+        .follow_links(true)
         .hidden(false)
         .git_ignore(false)
         .git_global(false)
@@ -793,6 +794,7 @@ fn find_basename_fallback(scope: &Path, query_lower: &str) -> Option<PathBuf> {
     let mut best_priority: u8 = 0;
 
     let walker = ignore::WalkBuilder::new(scope)
+        .follow_links(true)
         .hidden(true)
         .git_ignore(true)
         .max_depth(Some(6))
@@ -1474,5 +1476,101 @@ mod tests {
                 c.path.display()
             );
         }
+    }
+
+    #[test]
+    fn walker_follows_symlinked_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real_dir = tmp.path().join("real");
+        std::fs::create_dir(&real_dir).unwrap();
+        std::fs::write(real_dir.join("hello.rs"), "fn main() {}").unwrap();
+
+        let link_dir = tmp.path().join("linked");
+        std::fs::create_dir(&link_dir).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(real_dir.join("hello.rs"), link_dir.join("hello.rs")).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(real_dir.join("hello.rs"), link_dir.join("hello.rs"))
+            .unwrap();
+
+        let paths = walk_paths(tmp.path(), None);
+        let names: Vec<&str> = paths
+            .iter()
+            .filter_map(|p| p.file_name()?.to_str())
+            .collect();
+        assert_eq!(
+            names.iter().filter(|n| **n == "hello.rs").count(),
+            2,
+            "expected hello.rs from both real and symlinked dirs, got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn walker_follows_symlinked_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real_dir = tmp.path().join("real_pkg");
+        std::fs::create_dir(&real_dir).unwrap();
+        std::fs::write(real_dir.join("lib.rs"), "pub fn add() {}").unwrap();
+        std::fs::write(real_dir.join("util.rs"), "pub fn helper() {}").unwrap();
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_dir, tmp.path().join("deps_link")).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&real_dir, tmp.path().join("deps_link")).unwrap();
+
+        let paths = walk_paths(tmp.path(), None);
+        let link_files: Vec<_> = paths
+            .iter()
+            .filter(|p| p.starts_with(tmp.path().join("deps_link")))
+            .collect();
+        assert_eq!(
+            link_files.len(),
+            2,
+            "expected 2 files via symlinked directory, got: {link_files:?}"
+        );
+    }
+
+    #[test]
+    fn walker_survives_symlink_cycle() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("real.rs"), "fn main() {}").unwrap();
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(tmp.path(), tmp.path().join("loop")).unwrap();
+
+        let paths = walk_paths(tmp.path(), None);
+        let names: Vec<&str> = paths
+            .iter()
+            .filter_map(|p| p.file_name()?.to_str())
+            .collect();
+        assert!(
+            names.contains(&"real.rs"),
+            "should find real.rs despite cycle: {names:?}"
+        );
+    }
+
+    #[test]
+    fn content_search_finds_symbol_through_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real_dir = tmp.path().join("real");
+        std::fs::create_dir(&real_dir).unwrap();
+        std::fs::write(
+            real_dir.join("api.rs"),
+            "pub fn unique_symlink_test_symbol() {}",
+        )
+        .unwrap();
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_dir, tmp.path().join("linked")).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&real_dir, tmp.path().join("linked")).unwrap();
+
+        let result =
+            content::search("unique_symlink_test_symbol", tmp.path(), false, None, None).unwrap();
+        assert!(
+            result.total_found >= 2,
+            "expected symbol found via both real and symlinked paths, got {}",
+            result.total_found
+        );
     }
 }

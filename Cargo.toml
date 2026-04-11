@@ -64,6 +64,9 @@ toml = "0.8"
 # (handled manually — no framework needed)
 
 
+[dev-dependencies]
+tempfile = "3"
+
 [profile.release]
 opt-level = 3
 lto = "fat"
