@@ -61,7 +61,11 @@ fn fingerprint_inner(root: &Path) -> String {
                     .and_then(|l| lang_map.get(&l))
                     .copied()
                     .unwrap_or(0);
-                if count >= 2 { Some((name.clone(), count)) } else { None }
+                if count >= 2 {
+                    Some((name.clone(), count))
+                } else {
+                    None
+                }
             })
             .collect();
         mods.sort_by(|a, b| b.1.cmp(&a.1)); // most files first
@@ -96,13 +100,34 @@ fn fingerprint_inner(root: &Path) -> String {
         }
         // Filter out well-known non-source directories
         let non_source = [
-            "test", "tests", "__tests__", "spec", "specs",
-            "doc", "docs", "docs_src", "documentation",
-            "example", "examples", "sample", "samples",
-            "script", "scripts", "tools", "fixtures",
-            "benchmark", "benchmarks", "bench",
-            ".github", ".vscode", ".idea",
-            "vendor", "node_modules", "target", "dist", "build",
+            "test",
+            "tests",
+            "__tests__",
+            "spec",
+            "specs",
+            "doc",
+            "docs",
+            "docs_src",
+            "documentation",
+            "example",
+            "examples",
+            "sample",
+            "samples",
+            "script",
+            "scripts",
+            "tools",
+            "fixtures",
+            "benchmark",
+            "benchmarks",
+            "bench",
+            ".github",
+            ".vscode",
+            ".idea",
+            "vendor",
+            "node_modules",
+            "target",
+            "dist",
+            "build",
         ];
         mods.retain(|(name, _)| {
             let lower = name.to_lowercase();
@@ -377,7 +402,6 @@ fn walk_dir(
                             }
                         }
                     }
-
                 }
             }
 

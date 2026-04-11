@@ -254,7 +254,17 @@ fn main() {
         if cli.no_overview {
             std::env::set_var("TILTH_NO_OVERVIEW", "1");
         }
-        if let Err(e) = tilth::mcp::run(cli.edit) {
+        // Pass --scope to MCP if it's not the default "."
+        let mcp_scope = if cli.scope.as_os_str() == "." {
+            None
+        } else {
+            Some(
+                cli.scope
+                    .canonicalize()
+                    .unwrap_or_else(|_| cli.scope.clone()),
+            )
+        };
+        if let Err(e) = tilth::mcp::run(cli.edit, mcp_scope.as_deref()) {
             eprintln!("mcp error: {e}");
             process::exit(1);
         }

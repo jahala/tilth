@@ -1,6 +1,6 @@
 use std::fmt::Write as _;
 use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -107,7 +107,25 @@ DO NOT use the host Edit tool. Use tilth_edit for all edits.";
 
 /// MCP server over stdio. When `edit_mode` is true, exposes `tilth_edit` and
 /// switches `tilth_read` to hashline output format.
-pub fn run(edit_mode: bool) -> io::Result<()> {
+///
+/// `scope` overrides the default search root. When provided, tilth chdir's to it
+/// at startup so all tools, git commands, and searches use the correct project root.
+/// This fixes MCP hosts that launch tilth with cwd=/ (e.g., Codex).
+pub fn run(edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
+    // Resolve the project root and chdir to it.
+    // Priority: explicit --scope > package_root(cwd) > cwd (unchanged)
+    if let Some(s) = scope {
+        if s.is_dir() {
+            let _ = std::env::set_current_dir(s);
+        }
+    } else {
+        // No explicit scope — try to find a project root from cwd.
+        let cwd = std::env::current_dir().unwrap_or_default();
+        if let Some(root) = crate::lang::package_root(&cwd) {
+            let _ = std::env::set_current_dir(root);
+        }
+    }
+
     let cache = Arc::new(OutlineCache::new());
     let session = Arc::new(Session::new());
     let symbol_index = Arc::new(SymbolIndex::new());
