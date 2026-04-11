@@ -42,7 +42,7 @@ DO NOT use Read if content is already shown in expanded search results.\n\
 DO NOT use Grep, Read, or Glob. Always use the better tools tilth_search (grep), tilth_read (read), tilth_files (glob).\n\
 \n\
 tilth_search: Search code — finds definitions, usages, and text. Replaces grep/rg for all code search.\n\
-  Comma-separated symbols for multi-symbol lookup (max 5).\n\
+  For multi-symbol lookup, separate each with a comma \"symbol1,symbol2\" (max 5).\n\
   kind: \"symbol\" (default) | \"content\" (strings/comments) | \"callers\" (call sites)\n\
   expand (default 2): inline full source for top matches.\n\
   context: path to file being edited — boosts nearby results.\n\
