@@ -112,14 +112,15 @@ DO NOT use the host Edit tool. Use tilth_edit for all edits.";
 /// at startup so all tools, git commands, and searches use the correct project root.
 /// This fixes MCP hosts that launch tilth with cwd=/ (e.g., Codex).
 pub fn run(edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
+    let scope_is_explicit = scope.is_some();
+
     // Resolve the project root and chdir to it.
-    // Priority: explicit --scope > package_root(cwd) > cwd (unchanged)
+    // Priority: explicit --scope > MCP roots (handled later) > package_root(cwd) > cwd
     if let Some(s) = scope {
         if s.is_dir() {
             let _ = std::env::set_current_dir(s);
         }
     } else {
-        // No explicit scope — try to find a project root from cwd.
         let cwd = std::env::current_dir().unwrap_or_default();
         if let Some(root) = crate::lang::package_root(&cwd) {
             let _ = std::env::set_current_dir(root);
@@ -134,24 +135,59 @@ pub fn run(edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
 
+    // Track pending roots/list request (for MCP roots protocol)
+    let mut pending_roots_id: Option<Value> = None;
+
     for line in stdin.lock().lines() {
         let line = line?;
         if line.is_empty() {
             continue;
         }
 
-        let req: JsonRpcRequest = match serde_json::from_str(&line) {
-            Ok(r) => r,
+        // Parse as generic JSON first — could be a request, notification, or response
+        let msg: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
             Err(e) => {
                 write_error(&mut stdout, None, -32700, &format!("parse error: {e}"))?;
                 continue;
             }
         };
 
+        // Check if this is a response to our roots/list request
+        if let Some(ref roots_id) = pending_roots_id {
+            if msg.get("id") == Some(roots_id) && msg.get("result").is_some() {
+                pending_roots_id = None;
+                // Only apply roots if --scope was NOT explicitly provided
+                if !scope_is_explicit {
+                    if let Some(root_path) = extract_root_from_response(&msg) {
+                        let _ = std::env::set_current_dir(&root_path);
+                    }
+                }
+                continue;
+            }
+        }
+
+        // Must have "method" to be a request or notification
+        let method = match msg.get("method").and_then(Value::as_str) {
+            Some(m) => m.to_string(),
+            None => continue, // Not a request — skip (could be an unexpected response)
+        };
+
         // Notifications have no id — silently drop them per JSON-RPC spec
-        if req.id.is_none() {
+        let id = msg.get("id").cloned();
+        if id.is_none() {
             continue;
         }
+
+        // Parse params
+        let params = msg.get("params").cloned().unwrap_or(Value::Null);
+
+        let req = JsonRpcRequest {
+            _jsonrpc: "2.0".to_string(),
+            id,
+            method: method.clone(),
+            params,
+        };
 
         let response = handle_request(
             &req,
@@ -164,9 +200,46 @@ pub fn run(edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
         serde_json::to_writer(&mut stdout, &response)?;
         stdout.write_all(b"\n")?;
         stdout.flush()?;
+
+        // After initialize response: send roots/list if client supports it
+        // and we don't already have an explicit --scope
+        if method == "initialize" && !scope_is_explicit && pending_roots_id.is_none() {
+            let client_caps = req.params.get("capabilities").unwrap_or(&Value::Null);
+            if client_caps.get("roots").is_some() {
+                let roots_id = Value::String("tilth_roots_1".to_string());
+                let roots_req = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": roots_id,
+                    "method": "roots/list"
+                });
+                serde_json::to_writer(&mut stdout, &roots_req)?;
+                stdout.write_all(b"\n")?;
+                stdout.flush()?;
+                pending_roots_id = Some(roots_id);
+            }
+        }
     }
 
     Ok(())
+}
+
+/// Extract the first root directory path from a roots/list response.
+/// Parses `file://` URIs and returns the path, or None if no valid roots.
+fn extract_root_from_response(msg: &Value) -> Option<PathBuf> {
+    let roots = msg.get("result")?.get("roots")?.as_array()?;
+    for root in roots {
+        let uri = root.get("uri")?.as_str()?;
+        // Parse file:// URI to path
+        let path = if let Some(p) = uri.strip_prefix("file://") {
+            PathBuf::from(p)
+        } else {
+            PathBuf::from(uri)
+        };
+        if path.is_dir() {
+            return Some(path);
+        }
+    }
+    None
 }
 
 #[derive(Deserialize)]
