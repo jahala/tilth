@@ -16,9 +16,9 @@ use crate::read::outline::code::outline_language;
 use crate::session::Session;
 use crate::types::FileType;
 
-const MAX_MATCHES: usize = 10;
+const MAX_MATCHES: usize = 25;
 /// Stop walking once we have this many raw matches. Generous headroom for dedup + ranking.
-const EARLY_QUIT_THRESHOLD: usize = 30;
+const EARLY_QUIT_THRESHOLD: usize = 80;
 /// Max unique caller functions to trace for 2nd hop. Above this = wide fan-out, skip.
 const IMPACT_FANOUT_THRESHOLD: usize = 10;
 /// Max 2nd-hop results to display.
@@ -478,7 +478,9 @@ pub fn search_callers_expanded(
     bloom: &crate::index::bloom::BloomFilterCache,
     expand: usize,
     context: Option<&Path>,
+    limit: Option<usize>,
 ) -> Result<String, TilthError> {
+    let max_matches = limit.unwrap_or(MAX_MATCHES);
     let callers = find_callers(target, scope, bloom)?;
 
     if callers.is_empty() {
@@ -504,7 +506,7 @@ pub fn search_callers_expanded(
         .map(|c| c.calling_function.clone())
         .collect();
 
-    sorted_callers.truncate(MAX_MATCHES);
+    sorted_callers.truncate(max_matches);
 
     // Format the output
     let mut output = format!(

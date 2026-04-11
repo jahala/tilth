@@ -1,0 +1,17 @@
+{
+  "nextId": 2,
+  "tasks": [
+    {
+      "id": "1",
+      "subject": "Produce CLI parity implementation plan",
+      "description": "Analyze all code paths and produce a comprehensive implementation plan for porting MCP-only features to CLI mode",
+      "status": "completed",
+      "activeForm": "Producing implementation plan",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1774962308894,
+      "updatedAt": 1774962705703
+    }
+  ]
+}

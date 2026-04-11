@@ -1,0 +1,48 @@
+{
+  "nextId": 14,
+  "tasks": [
+    {
+      "id": "11",
+      "subject": "F6.1: Add type/constructor reference queries to callee_query_str",
+      "description": "Add tree-sitter queries for constructor calls, extends/implements, type annotations, struct literals to callee_query_str for all supported languages. Keep existing @callee capture name.",
+      "status": "completed",
+      "activeForm": "Adding type reference queries",
+      "metadata": {},
+      "blocks": [
+        "13"
+      ],
+      "blockedBy": [],
+      "createdAt": 1775917401017,
+      "updatedAt": 1775917674921
+    },
+    {
+      "id": "12",
+      "subject": "F6.2: Raise caller caps + add --limit flag",
+      "description": "Raise MAX_MATCHES and EARLY_QUIT_THRESHOLD. Add --limit N flag to CLI.",
+      "status": "completed",
+      "activeForm": "Raising caller caps",
+      "metadata": {},
+      "blocks": [
+        "13"
+      ],
+      "blockedBy": [],
+      "createdAt": 1775917401017,
+      "updatedAt": 1775917866266
+    },
+    {
+      "id": "13",
+      "subject": "F6.3: Build, test, assess noise",
+      "description": "Build release, test on ghidra (ProgramDB callers) and CLIProxyAPIPlus to assess noise vs coverage improvement.",
+      "status": "in_progress",
+      "activeForm": "Testing callers on real repos",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [
+        "11",
+        "12"
+      ],
+      "createdAt": 1775917401017,
+      "updatedAt": 1775917866267
+    }
+  ]
+}

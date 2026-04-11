@@ -1,0 +1,17 @@
+{
+  "nextId": 2,
+  "tasks": [
+    {
+      "id": "1",
+      "subject": "Write complete CLI parity implementation plan document",
+      "description": "Write a thorough markdown document covering all 5 MCP features to port to CLI mode, with architecture analysis, dependency analysis, feature-by-feature plan with code sketches, CLI UX design, execution order, and risks.",
+      "status": "in_progress",
+      "activeForm": "Writing implementation plan document",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1774963425461,
+      "updatedAt": 1774963430369
+    }
+  ]
+}

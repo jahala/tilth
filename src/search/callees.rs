@@ -35,22 +35,40 @@ pub(crate) fn callee_query_str(lang: Lang) -> Option<&'static str> {
             "(call_expression function: (field_expression field: (field_identifier) @callee))\n",
             "(call_expression function: (scoped_identifier name: (identifier) @callee))\n",
             "(macro_invocation macro: (identifier) @callee)\n",
+            // Type references: struct literals, generics
+            "(struct_expression name: (type_identifier) @callee)\n",
+            "(type_arguments (type_identifier) @callee)\n",
         )),
         Lang::Go => Some(concat!(
             "(call_expression function: (identifier) @callee)\n",
             "(call_expression function: (selector_expression field: (field_identifier) @callee))\n",
+            // Type references: composite literals (ProgramDB{...})
+            "(composite_literal type: (type_identifier) @callee)\n",
+            "(composite_literal type: (qualified_type name: (type_identifier) @callee))\n",
         )),
         Lang::Python => Some(concat!(
             "(call function: (identifier) @callee)\n",
             "(call function: (attribute attribute: (identifier) @callee))\n",
+            // class Foo(Base) — superclass
+            "(class_definition superclasses: (argument_list (identifier) @callee))\n",
         )),
         Lang::JavaScript | Lang::TypeScript | Lang::Tsx => Some(concat!(
             "(call_expression function: (identifier) @callee)\n",
             "(call_expression function: (member_expression property: (property_identifier) @callee))\n",
+            // new Foo()
+            "(new_expression constructor: (identifier) @callee)\n",
+            // extends / implements
+            "(extends_clause value: (identifier) @callee)\n",
         )),
-        Lang::Java => Some(
+        Lang::Java => Some(concat!(
             "(method_invocation name: (identifier) @callee)\n",
-        ),
+            // new ProgramDB()
+            "(object_creation_expression type: (type_identifier) @callee)\n",
+            // extends ProgramDB
+            "(superclass (type_identifier) @callee)\n",
+            // implements X, Y
+            "(super_interfaces (type_list (type_identifier) @callee))\n",
+        )),
         Lang::Scala => Some(concat!(
             "(call_expression function: (identifier) @callee)\n",
             "(call_expression function: (field_expression field: (identifier) @callee))\n",
@@ -70,10 +88,19 @@ pub(crate) fn callee_query_str(lang: Lang) -> Option<&'static str> {
             "(member_call_expression name: (name) @callee)\n",
             "(nullsafe_member_call_expression name: (name) @callee)\n",
             "(scoped_call_expression name: (name) @callee)\n",
+            // new Foo()
+            "(object_creation_expression (name) @callee)\n",
+            "(object_creation_expression (qualified_name) @callee)\n",
         )),
         Lang::CSharp => Some(concat!(
             "(invocation_expression function: (identifier) @callee)\n",
             "(invocation_expression function: (member_access_expression name: (identifier) @callee))\n",
+            // new ProgramDB()
+            "(object_creation_expression (identifier) @callee)\n",
+            // : BaseService, IDisposable
+            "(base_list (identifier) @callee)\n",
+            // <ProgramDB>
+            "(type_argument_list (identifier) @callee)\n",
         )),
         Lang::Swift => Some(concat!(
             "(call_expression (simple_identifier) @callee)\n",

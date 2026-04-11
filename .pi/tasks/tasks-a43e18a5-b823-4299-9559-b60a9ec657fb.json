@@ -1,0 +1,65 @@
+{
+  "nextId": 6,
+  "tasks": [
+    {
+      "id": "1",
+      "subject": "Verify fix #1: --expand <query> no longer parses query as numeric arg",
+      "description": "Test: `tilth --expand handleRequest --scope src` should work (not fail with \"invalid digit\"). Also test `--expand=5 handleRequest`, `--expand handleRequest`, and bare `--expand` with query after.",
+      "status": "completed",
+      "activeForm": "Testing --expand arg parsing",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1774967769723,
+      "updatedAt": 1774967791641
+    },
+    {
+      "id": "2",
+      "subject": "Verify fix #2: Multi-word concepts with --expand produce expanded output",
+      "description": "Test: `tilth \"error handling\" --expand --scope src` should produce expanded inline source, not raw format. Compare output with and without --expand.",
+      "status": "completed",
+      "activeForm": "Testing multi-word expand",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1774967769723,
+      "updatedAt": 1774967804338
+    },
+    {
+      "id": "3",
+      "subject": "Verify fix #3: --map conflicts with --expand, --section, --full",
+      "description": "Test: `tilth --map --expand 5 --scope src` should be rejected by clap. Also test `--map --callers`, `--map --deps`, `--map --section 1-5`.",
+      "status": "completed",
+      "activeForm": "Testing --map conflicts",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1774967769724,
+      "updatedAt": 1774967819851
+    },
+    {
+      "id": "4",
+      "subject": "Verify fix #4: Related file hints gated on !full or comment updated",
+      "description": "Test: Read a large file with `--full` and check if related hints are still appended. Read without --full and verify hints appear on outline. Check the comment text.",
+      "status": "completed",
+      "activeForm": "Testing related hints",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1774967769724,
+      "updatedAt": 1774967859560
+    },
+    {
+      "id": "5",
+      "subject": "Verify fix #5: --expand with file path doesn't allocate unused Session/SymbolIndex",
+      "description": "Read src/lib.rs and verify use_expanded excludes FilePath/Glob query types so no unnecessary allocation happens.",
+      "status": "completed",
+      "activeForm": "Checking allocation guard",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1774967769724,
+      "updatedAt": 1774967887894
+    }
+  ]
+}

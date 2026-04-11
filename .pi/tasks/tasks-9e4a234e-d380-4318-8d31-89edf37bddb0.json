@@ -1,0 +1,205 @@
+{
+  "nextId": 14,
+  "tasks": [
+    {
+      "id": "1",
+      "subject": "Trace MCP expanded search implementation",
+      "description": "Read src/mcp.rs tool_search, find search_symbol_expanded/search_content_expanded signatures, check Session/Index dependencies",
+      "status": "completed",
+      "activeForm": "Tracing expanded search",
+      "metadata": {
+        "agentType": "Explore",
+        "agentId": "e004133b-d419-4e2",
+        "result": "I now have all the information needed. Here is the complete trace:\n\n---\n\n## MCP Expanded Search Implementation Trace\n\n### Entry Point: `tool_search` in MCP\n\n**File:** `/Users/bean/Documents/Develope/Ultra-lab/tilth/src/mcp.rs`  \n**Lines:** 336-421\n\n```rust\nfn tool_search(\n    args: &Value,\n    cache: &OutlineCache,\n    session: &Session,\n    index: &Arc<SymbolIndex>,\n    bloom: &Arc<BloomFilterCache>,\n) -> Result<String, String>\n```\n\nAll parameters are required references -- none are `Option`. This function parses JSON args to extract:\n- `query: &str` (required)\n- `kind: &str` (default `\"symbol\"`)\n- `expand: usize` (default `2`)\n- `context: Option<&Path>` (optional, from JSON `\"context\"` field)\n- `budget: Option<u64>` (optional, from JSON `\"budget\"` field)\n\nDispatches to 4 search kinds:\n\n---\n\n### 1. `search_symbol_expanded`\n\n**File:** `/Users/bean/Documents/Develope/Ultra-lab/tilth/src/search/mod.rs`  \n**Lines:** 162-178\n\n```rust\npub fn search_symbol_expanded(\n    query: &str,                                      // required\n    scope: &Path,                                     // required\n    cache: &OutlineCache,                             // required\n    session: &Session,                                // required\n    index: &crate::index::SymbolIndex,                // required (but unused — `let _ = index;`)\n    bloom: &crate::index::bloom::BloomFilterCache,    // required\n    expand: usize,                                    // required (controls how many matches get expanded)\n    context: Option<&Path>,                           // Option — can be None\n) -> Result<String, TilthError>\n```\n\n**Key detail:** `index` is accepted but explicitly ignored (`let _ = index;` on line 174). The comment says \"Index is available but not yet used for search fast-path.\"\n\nDelegates to `symbol::search(query, scope, context)` then `format_search_result(result, cache, Some(session), bloom, expand)`.\n\n---\n\n### 2. `search_multi_symbol_expanded`\n\n**File:** `/Users/bean/Documents/Develope/Ultra-lab/tilth/src/search/mod.rs`  \n**Lines:** 180-232\n\n```rust\npub fn search_multi_symbol_expanded(\n    queries: &[&str],                                 // required (comma-split, 2..=5 items)\n    scope: &Path,                                     // required\n    cache: &OutlineCache,                             // required\n    session: &Session,                                // required\n    index: &crate::index::SymbolIndex,                // required (but unused — `let _ = index;`)\n    bloom: &crate::index::bloom::BloomFilterCache,    // required\n    expand: usize,                                    // required\n    context: Option<&Path>,                           // Option — can be None\n) -> Result<String, TilthError>\n```\n\nSame pattern: `index` ignored. Calls `format_matches` directly per query with shared expand budget.\n\n---\n\n### 3. `search_content_expanded`\n\n**File:** `/Users/bean/Documents/Develope/Ultra-lab/tilth/src/search/mod.rs`  \n**Lines:** 255-267\n\n```rust\npub fn search_content_expanded(\n    query: &str,                                      // required\n    scope: &Path,                                     // required\n    cache: &OutlineCache,                             // required\n    session: &Session,                                // required\n    expand: usize,                                    // required\n    context: Option<&Path>,                           // Option — can be None\n) -> Result<String, TilthError>\n```\n\n**Notable:** Does NOT take `index` or `bloom` as parameters. Creates its own `BloomFilterCache::new()` internally (line 265). Passes `Some(session)` to `format_search_result`.\n\n---\n\n### 4. `search_callers_expanded`\n\n**File:** `/Users/bean/Documents/Develope/Ultra-lab/tilth/src/search/callers.rs`  \n**Lines:** 473-630\n\n```rust\npub fn search_callers_expanded(\n    target: &str,                                     // required\n    scope: &Path,                                     // required\n    _cache: &OutlineCache,                            // required (but prefixed `_cache` — unused)\n    _session: &Session,                               // required (but prefixed `_session` — unused)\n    bloom: &crate::index::bloom::BloomFilterCache,    // required\n    expand: usize,                                    // required\n    context: Option<&Path>,                           // Option — can be None\n) -> Result<String, TilthError>\n```\n\n**Notable:** Both `cache` and `session` are prefixed with `_` — accepted but unused.\n\n---\n\n### Dependency Types: Construction Requirements\n\n#### `Session` (`src/session.rs:9-15`)\n- `Session::new() -> Self` — no arguments, no dependencies\n- Implements `Default` (delegates to `new()`)\n- Stateful: tracks reads, searches, symbols, dir_hits, expanded entries via `AtomicUsize`/`Mutex<HashMap>`\n- **Can be trivially constructed** with `Session::new()`\n\n#### `SymbolIndex` (`src/index/symbol.rs:39-44`)\n- `SymbolIndex::new() -> Self` — no arguments, creates empty index\n- Implements `Default` (delegates to `new()`)\n- **Can be trivially constructed** with `SymbolIndex::new()` (starts empty)\n- **Currently unused** by all expanded search functions (`let _ = index;`)\n\n#### `BloomFilterCache` (`src/index/bloom.rs:138-140`)\n- `BloomFilterCache::new() -> Self` — no arguments, creates empty cache\n- Implements `Default` (delegates to `new()`)\n- **Can be trivially constructed** with `BloomFilterCache::new()`\n- `search_content_expanded` already creates a fresh one internally\n- Actually used by `search_callers_expanded` (passed to `find_callers`) and by `format_matches`/`format_single_match` in the expansion flow\n\n---\n\n### Call Chain Summary\n\n```\nMCP handle_tool_call (mcp.rs:579)\n  → dispatch_tool (mcp.rs:231)     takes &Arc<SymbolIndex>, &Arc<BloomFilterCache>\n    → tool_search (mcp.rs:336)     takes &Arc<SymbolIndex>, &Arc<BloomFilterCache"
+      },
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1774963820756,
+      "updatedAt": 1774964026092,
+      "owner": "e004133b-d419-4e2"
+    },
+    {
+      "id": "2",
+      "subject": "Trace MCP callers search implementation",
+      "description": "Read src/search/callers.rs, find search_callers_expanded signature, check what params are required vs optional, Session/Bloom dependency",
+      "status": "completed",
+      "activeForm": "Tracing callers search",
+      "metadata": {
+        "agentType": "Explore",
+        "agentId": "28f9555d-4dc6-48d",
+        "result": "Now I have the complete picture. Here is my thorough report:\n\n---\n\n## Callers Search Implementation Trace\n\n### 1. Primary Entry Point: `search_callers_expanded`\n\n**File:** `/Users/bean/Documents/Develope/Ultra-lab/tilth/src/search/callers.rs`\n**Lines:** 473-630\n\n```rust\npub fn search_callers_expanded(\n    target: &str,                                    // required\n    scope: &Path,                                    // required\n    _cache: &OutlineCache,                           // required ref, but UNUSED (underscore prefix)\n    _session: &Session,                              // required ref, but UNUSED (underscore prefix)\n    bloom: &crate::index::bloom::BloomFilterCache,   // required\n    expand: usize,                                   // required (number of results to expand inline)\n    context: Option<&Path>,                          // OPTIONAL — boosts ranking for context file\n) -> Result<String, TilthError>\n```\n\n**Parameter analysis:**\n\n| Parameter | Type | Required/Optional | Actually Used? |\n|-----------|------|-------------------|----------------|\n| `target` | `&str` | Required | Yes — passed to `find_callers()` |\n| `scope` | `&Path` | Required | Yes — passed to `find_callers()`, used in output formatting |\n| `_cache` | `&OutlineCache` | Required (by signature) | **No** — prefixed with `_`, never referenced in body |\n| `_session` | `&Session` | Required (by signature) | **No** — prefixed with `_`, never referenced in body |\n| `bloom` | `&BloomFilterCache` | Required | Yes — passed to `find_callers()` and `find_callers_batch()` |\n| `expand` | `usize` | Required | Yes — controls how many caller bodies are shown inline |\n| `context` | `Option<&Path>` | Optional (can be `None`) | Yes — passed to `rank_callers()` for sort boost |\n\n### 2. Core Search Function: `find_callers`\n\n**File:** `/Users/bean/Documents/Develope/Ultra-lab/tilth/src/search/callers.rs`\n**Lines:** 44-129\n\n```rust\npub fn find_callers(\n    target: &str,\n    scope: &Path,\n    bloom: &crate::index::bloom::BloomFilterCache,\n) -> Result<Vec<CallerMatch>, TilthError>\n```\n\nAll three parameters are required. `bloom` is used as a pre-filter (Bloom filter check before expensive tree-sitter parsing). This walks the filesystem in parallel using `ignore::WalkParallel`.\n\n### 3. Batch Variant: `find_callers_batch`\n\n**File:** `/Users/bean/Documents/Develope/Ultra-lab/tilth/src/search/callers.rs`\n**Lines:** 224-315\n\n```rust\npub(crate) fn find_callers_batch(\n    targets: &HashSet<String>,\n    scope: &Path,\n    bloom: &crate::index::bloom::BloomFilterCache,\n) -> Result<Vec<(String, CallerMatch)>, TilthError>\n```\n\nUsed internally by `search_callers_expanded` for 2nd-hop impact analysis (line 565), and also used by `blast.rs` and `deps.rs`.\n\n### 4. Dependency Types — Construction Requirements\n\n**`BloomFilterCache`** (`src/index/bloom.rs:138-140`):\n- Has `Default` impl and `BloomFilterCache::new()` — trivially constructible with no arguments\n- Just wraps a `DashMap<PathBuf, (BloomFilter, SystemTime)>`\n- Can be created on the fly: `BloomFilterCache::new()`\n\n**`OutlineCache`** (`src/cache.rs:18-20`):\n- Has `Default` impl and `OutlineCache::new()` — trivially constructible with no arguments\n- Just wraps a `DashMap<(PathBuf, SystemTime), CacheEntry>`\n- Can be created on the fly: `OutlineCache::new()`\n\n**`Session`** (`src/session.rs:9-15`):\n- Has `Default` impl and `Session::new()` — trivially constructible with no arguments\n- Tracks MCP activity (read counts, search counts, expanded statuses)\n- Can be created on the fly: `Session::new()`\n\n### 5. Call Site (MCP only)\n\n**File:** `/Users/bean/Documents/Develope/Ultra-lab/tilth/src/mcp.rs`\n**Lines:** 404-409\n\n```rust\n\"callers\" => {\n    session.record_search(query);\n    crate::search::callers::search_callers_expanded(\n        query, &scope, cache, session, bloom, expand, context,\n    )\n}\n```\n\nThere is **no CLI invocation** anywhere. The function is only called from `mcp.rs:tool_search`.\n\n### 6. Key Findings for CLI Porting\n\n1. **`_cache` and `_session` are unused** in the function body (underscore-prefixed). They are passed through the signature for API consistency with other `search_*_expanded` functions but have zero effect. For CLI usage, `OutlineCache::new()` and `Session::new()` can be passed as throwaway values.\n\n2. **`BloomFilterCache` is genuinely required** — it is the performance-critical pre-filter used by both `find_callers()` and the 2nd-hop `find_callers_batch()`. However, it is trivially constructible via `BloomFilterCache::new()` (empty cache that populates lazily).\n\n3. **`context` is the only `Option` parameter** — can be `None` with degraded ranking (no context-file boost).\n\n4. **`expand` defaults to `2`** at the MCP layer (this is the standard default set in the MCP tool parameter definition).\n\n5. The function is self-contained: it calls `find_callers()` -> formats output -> optionally does 2nd-hop via `find_callers_batch()` -> returns a formatted `String`. No side effects on Session or Cache.\n\n6. **Return type** is `Result<String, TilthError>` — returns pre-formatted markdown output ready for display."
+      },
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1774963820757,
+      "updatedAt": 1774963999592,
+      "owner": "28f9555d-4dc6-48d"
+    },
+    {
+      "id": "3",
+      "subject": "Trace MCP deps implementation",
+      "description": "Read src/search/deps.rs, find analyze_deps and format_deps signatures, check dependencies on BloomFilterCache or Session",
+      "status": "completed",
+      "activeForm": "Tracing deps",
+      "metadata": {
+        "agentType": "Explore",
+        "agentId": "18e2cf99-bab6-408",
+        "result": "I now have all the information needed. Here is the complete report.\n\n---\n\n## Deps Implementation Trace — Full Report\n\n### File: `/Users/bean/Documents/Develope/Ultra-lab/tilth/src/search/deps.rs` (580 lines)\n\n---\n\n### `analyze_deps` — lines 56-237\n\n```rust\npub fn analyze_deps(\n    path: &Path,                                    // required\n    scope: &Path,                                   // required\n    cache: &OutlineCache,                           // required (but unused — `let _ = cache;` on line 99)\n    bloom: &crate::index::bloom::BloomFilterCache,  // required\n) -> Result<DepsResult, TilthError>\n```\n\n**Parameters:**\n| Param | Type | Required/Optional | Notes |\n|-------|------|-------------------|-------|\n| `path` | `&Path` | Required | File to analyze |\n| `scope` | `&Path` | Required | Project root for reverse-dep walking |\n| `cache` | `&OutlineCache` | Required (but **unused**) | Explicitly discarded: `let _ = cache;` at line 99. Passed through to `resolve_callees` which also ignores it (`_cache` parameter). Available for \"future caching\" per comment. |\n| `bloom` | `&crate::index::bloom::BloomFilterCache` | **Required** | Used in two places: (1) `resolve_callees()` at line 122 for forward-dep callee resolution, (2) `find_callers_batch()` at line 178 for reverse-dep scanning. Cannot be defaulted or omitted. |\n\n**No `Option` parameters.** All four params are plain references, all required at the type level.\n\n**Return:** `Result<DepsResult, TilthError>`\n\n---\n\n### `format_deps` — lines 246-328\n\n```rust\npub fn format_deps(\n    result: &DepsResult,     // required\n    scope: &Path,            // required\n    budget: Option<usize>,   // optional — None means no truncation\n) -> String\n```\n\n**Parameters:**\n| Param | Type | Required/Optional | Notes |\n|-------|------|-------------------|-------|\n| `result` | `&DepsResult` | Required | Output of `analyze_deps` |\n| `scope` | `&Path` | Required | Used to make paths relative for display |\n| `budget` | `Option<usize>` | **Optional** | `None` = full output, `Some(n)` = apply token-budget truncation |\n\n**Return:** `String` (formatted deps output with token count appended)\n\n---\n\n### Dependency chain on `BloomFilterCache`\n\n`BloomFilterCache` is defined at `/Users/bean/Documents/Develope/Ultra-lab/tilth/src/index/bloom.rs:138-140`:\n```rust\npub struct BloomFilterCache {\n    filters: DashMap<PathBuf, (BloomFilter, SystemTime)>,\n}\n```\n\nIt has a trivial constructor: `BloomFilterCache::new()` returns an empty cache. It is a probabilistic skip-filter: `contains(path, mtime, content, symbol) -> bool` — returns `true` if a symbol might appear in a file, `false` if definitely absent. Used to avoid parsing files that cannot contain a given symbol.\n\n**Call chain in `analyze_deps`:**\n1. Line 122: `resolve_callees(&callee_names, path, &content, cache, bloom)` — bloom used internally to skip files during callee resolution\n2. Line 178: `find_callers_batch(&symbols_set, scope, bloom)` — bloom used to skip files during reverse-dep walk (`/Users/bean/Documents/Develope/Ultra-lab/tilth/src/search/callers.rs:224-315`)\n\n**`BloomFilterCache` is required and cannot be `None`.** However, it is trivially constructable via `BloomFilterCache::new()` — an empty cache that will build filters on first access.\n\n---\n\n### Session and SymbolIndex: NOT used by deps\n\n- **`Session`** — zero references in `src/search/deps.rs`. Not imported, not passed, not needed.\n- **`SymbolIndex`** — zero references in `src/search/deps.rs`. Not imported, not passed, not needed.\n\nAt the MCP dispatch level (`src/mcp.rs:244`), `tool_deps` receives only `cache` and `bloom`, not `session` or `index`:\n```rust\n\"tilth_deps\" => tool_deps(args, cache, bloom),\n```\n\n---\n\n### Summary for CLI porting\n\nTo call `analyze_deps` from CLI mode, you need:\n1. **`OutlineCache`** — trivially created via `OutlineCache::new()`, though currently unused inside `analyze_deps` (passed through to `resolve_callees` which also ignores it)\n2. **`BloomFilterCache`** — trivially created via `BloomFilterCache::new()`, but **actively used** for performance filtering in both forward and reverse dependency phases\n3. **No `Session`** needed\n4. **No `SymbolIndex`** needed\n5. `format_deps` accepts `Option<usize>` budget — pass `None` for full output or a CLI-provided value"
+      },
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1774963820757,
+      "updatedAt": 1774964011804,
+      "owner": "18e2cf99-bab6-408"
+    },
+    {
+      "id": "4",
+      "subject": "Trace multi-symbol search and related file hints",
+      "description": "Read src/search/mod.rs for search_multi_symbol_expanded. Read src/read/ for related file hints logic (resolve_related_files or similar). Check signatures and dependencies.",
+      "status": "completed",
+      "activeForm": "Tracing multi-symbol &amp; related hints",
+      "metadata": {
+        "agentType": "Explore",
+        "agentId": "e66a4632-61af-441",
+        "result": "I now have all the information needed. Here is the complete report.\n\n---\n\n## Report: Multi-Symbol Search & Related File Hints — Signatures and Dependencies\n\n### 1. `search_multi_symbol_expanded`\n\n**File:** `/Users/bean/Documents/Develope/Ultra-lab/tilth/src/search/mod.rs` lines 180–232\n\n```rust\npub fn search_multi_symbol_expanded(\n    queries: &[&str],\n    scope: &Path,\n    cache: &OutlineCache,\n    session: &Session,\n    index: &crate::index::SymbolIndex,\n    bloom: &crate::index::bloom::BloomFilterCache,\n    expand: usize,\n    context: Option<&Path>,\n) -> Result<String, TilthError>\n```\n\n**Parameters:**\n\n| Parameter | Type | Optional? | Notes |\n|-----------|------|-----------|-------|\n| `queries` | `&[&str]` | Required | Comma-split query list (2–5 items enforced by caller) |\n| `scope` | `&Path` | Required | Directory to search within |\n| `cache` | `&OutlineCache` | Required | Outline cache for formatting |\n| `session` | `&Session` | Required | **But**: internally passed as `Some(session)` to `format_matches`, which accepts `Option<&Session>`. Used for `is_expanded`/`record_expand` dedup. |\n| `index` | `&SymbolIndex` | Required | **Currently unused** — line 190: `let _ = index;` |\n| `bloom` | `&BloomFilterCache` | Required | Used by `format_matches` → `expand_match` for callee resolution |\n| `expand` | `usize` | Required | Shared expand budget across all queries; 0 = no expansion |\n| `context` | `Option<&Path>` | **Option** | Boosts nearby results in ranking |\n\n**Key internal flow:** Iterates `queries`, calls `symbol::search()` for each, formats with shared `expand_remaining` and `expanded_files` state across queries (cross-query dedup).\n\n### 2. `search_symbol_expanded` (single-symbol variant)\n\n**File:** `/Users/bean/Documents/Develope/Ultra-lab/tilth/src/search/mod.rs` lines 162–178\n\n```rust\npub fn search_symbol_expanded(\n    query: &str,\n    scope: &Path,\n    cache: &OutlineCache,\n    session: &Session,\n    index: &crate::index::SymbolIndex,\n    bloom: &crate::index::bloom::BloomFilterCache,\n    expand: usize,\n    context: Option<&Path>,\n) -> Result<String, TilthError>\n```\n\nIdentical parameter set except `query: &str` (single) instead of `queries: &[&str]`. Delegates to `format_search_result` instead of the manual loop. `index` is also unused (line 174: `let _ = index;`).\n\n### 3. `format_matches` (internal)\n\n**File:** `/Users/bean/Documents/Develope/Ultra-lab/tilth/src/search/mod.rs` lines 306–345\n\n```rust\nfn format_matches(\n    matches: &[Match],\n    scope: &Path,\n    cache: &OutlineCache,\n    session: Option<&Session>,   // <-- Option here\n    bloom: &BloomFilterCache,\n    expand_remaining: &mut usize,\n    expanded_files: &mut HashSet<PathBuf>,\n    out: &mut String,\n)\n```\n\nNote: `session` is `Option<&Session>` in this internal function. It could be `None`, which would skip expand dedup tracking.\n\n### 4. Related File Hints\n\n#### `resolve_related_files`\n\n**File:** `/Users/bean/Documents/Develope/Ultra-lab/tilth/src/read/imports.rs` lines 14–19\n\n```rust\npub fn resolve_related_files(file_path: &Path) -> Vec<PathBuf>\n```\n\n- **No dependencies on Session, SymbolIndex, BloomFilterCache, or OutlineCache.**\n- Reads the file from disk itself (`fs::read_to_string`), then delegates to `resolve_related_files_with_content`.\n\n#### `resolve_related_files_with_content`\n\n**File:** `/Users/bean/Documents/Develope/Ultra-lab/tilth/src/read/imports.rs` lines 22–50\n\n```rust\npub fn resolve_related_files_with_content(file_path: &Path, content: &str) -> Vec<PathBuf>\n```\n\n- Takes pre-read content to avoid redundant I/O.\n- **No dependencies on any server state** — purely file-path-based import resolution.\n- Also used by `search/callees.rs:292` and `search/deps.rs:137`.\n- Supports: Rust, TypeScript/TSX/JavaScript, Python, C/C++. Other languages return empty.\n- Capped at `MAX_SUGGESTIONS = 8` results.\n\n#### MCP call site for related hints\n\n**File:** `/Users/bean/Documents/Develope/Ultra-lab/tilth/src/mcp.rs` lines 319–331\n\nThe hint is appended only when:\n1. `section.is_none()` (not a section read)\n2. `crate::read::would_outline(&path)` returns `true` (file is large enough to be outlined, i.e., tokens > `TOKEN_THRESHOLD`)\n\nOutput format: `\\n\\n> Related: path1, path2, ...`\n\n#### `would_outline`\n\n**File:** `/Users/bean/Documents/Develope/Ultra-lab/tilth/src/read/mod.rs` lines 161–165\n\n```rust\npub fn would_outline(path: &Path) -> bool\n```\n\nReturns true when the file is not a directory and its estimated token count exceeds `TOKEN_THRESHOLD`.\n\n### 5. Defaultability of Stateful Dependencies\n\n| Type | `Default` impl? | `new()` | Can be cheaply constructed? |\n|------|-----------------|---------|---------------------------|\n| `Session` | Yes (`session.rs:128-131`, delegates to `new()`) | `"
+      },
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1774963820758,
+      "updatedAt": 1774964033494,
+      "owner": "e66a4632-61af-441"
+    },
+    {
+      "id": "5",
+      "subject": "Analyze CLI entry points and classify logic",
+      "description": "Read src/lib.rs (run_inner, classify), src/main.rs (clap args), src/classify.rs, src/types.rs. Map out current CLI dispatch flow and identify where new features plug in.",
+      "status": "pending",
+      "activeForm": "Analyzing CLI entry points",
+      "metadata": {
+        "agentType": "Explore",
+        "agentId": "13879122-3963-44d",
+        "lastError": "aborted"
+      },
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1774963820759,
+      "updatedAt": 1774964236023,
+      "owner": "13879122-3963-44d"
+    },
+    {
+      "id": "6",
+      "subject": "Port expanded search to CLI",
+      "description": "Add --expand flag to clap. Modify run_inner to call search_symbol_expanded/search_content_expanded with trivial defaults when expand > 0. Default expand=2 when flag present without value, 0 when absent.",
+      "status": "completed",
+      "activeForm": "Implementing expanded search",
+      "metadata": {},
+      "blocks": [
+        "7",
+        "11"
+      ],
+      "blockedBy": [],
+      "createdAt": 1774964571055,
+      "updatedAt": 1774964694114
+    },
+    {
+      "id": "7",
+      "subject": "Port multi-symbol search to CLI",
+      "description": "Detect comma in query for Symbol-classified queries. Split and call search_multi_symbol_expanded. Reuse expand infra from task 1.",
+      "status": "completed",
+      "activeForm": "Implementing multi-symbol search",
+      "metadata": {},
+      "blocks": [
+        "11"
+      ],
+      "blockedBy": [
+        "6"
+      ],
+      "createdAt": 1774964571056,
+      "updatedAt": 1774964775055
+    },
+    {
+      "id": "8",
+      "subject": "Port callers search to CLI",
+      "description": "Add --callers flag. When set, skip classify and call search_callers_expanded directly with BloomFilterCache::new().",
+      "status": "completed",
+      "activeForm": "Implementing callers search",
+      "metadata": {},
+      "blocks": [
+        "11"
+      ],
+      "blockedBy": [],
+      "createdAt": 1774964571057,
+      "updatedAt": 1774964872989
+    },
+    {
+      "id": "9",
+      "subject": "Port deps to CLI",
+      "description": "Add --deps flag. Treat query as file path, call analyze_deps + format_deps with BloomFilterCache::new().",
+      "status": "completed",
+      "activeForm": "Implementing deps",
+      "metadata": {},
+      "blocks": [
+        "11"
+      ],
+      "blockedBy": [],
+      "createdAt": 1774964571059,
+      "updatedAt": 1774964872990
+    },
+    {
+      "id": "10",
+      "subject": "Port related file hints to CLI",
+      "description": "After read_file for FilePath queries, check section.is_none() && would_outline(&path), if true append resolve_related_files hints. No new flags needed.",
+      "status": "completed",
+      "activeForm": "Implementing related hints",
+      "metadata": {},
+      "blocks": [
+        "11"
+      ],
+      "blockedBy": [],
+      "createdAt": 1774964571060,
+      "updatedAt": 1774964922585
+    },
+    {
+      "id": "11",
+      "subject": "Test and verify all ported features",
+      "description": "Build, run cargo test, try each new CLI flag manually. Ensure no regressions.",
+      "status": "completed",
+      "activeForm": "Testing CLI parity",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [
+        "6",
+        "7",
+        "8",
+        "9",
+        "10"
+      ],
+      "createdAt": 1774964571061,
+      "updatedAt": 1774965041986
+    },
+    {
+      "id": "12",
+      "subject": "Fix review findings #3-#7",
+      "description": "Fix 5 review issues: JSON bypass, deps path resolution, unconditional alloc, regex slash round-trip, mutual exclusion",
+      "status": "completed",
+      "activeForm": "Fixing review findings",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1774966623572,
+      "updatedAt": 1774966948093
+    },
+    {
+      "id": "13",
+      "subject": "Refactor run_inner into basic/expanded dispatch",
+      "description": "Refactor run_inner: extract ExpandedCtx, split FilePath/Glob early return, extract run_query_basic and run_query_expanded, keep multi-symbol in run_inner. Preserve all behavior.",
+      "status": "completed",
+      "activeForm": "Refactoring run_inner",
+      "metadata": {},
+      "blocks": [],
+      "blockedBy": [],
+      "createdAt": 1774977243382,
+      "updatedAt": 1774977881232
+    }
+  ]
+}

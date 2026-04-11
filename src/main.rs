@@ -64,6 +64,10 @@ struct Cli {
     #[arg(long, conflicts_with_all = ["map", "full", "expand", "section", "edit"])]
     files: bool,
 
+    /// Max results for callers search (default: 25).
+    #[arg(long, value_name = "N")]
+    limit: Option<usize>,
+
     /// Print shell completions for the given shell.
     #[arg(long, value_name = "SHELL")]
     completions: Option<Shell>,
@@ -143,7 +147,7 @@ fn main() {
 
     // Callers mode
     if cli.callers {
-        let result = tilth::run_callers(&query, &scope, expand, cli.budget, &cache);
+        let result = tilth::run_callers(&query, &scope, expand, cli.budget, cli.limit, &cache);
         emit_result(result, &query, cli.json, is_tty);
         return;
     }
