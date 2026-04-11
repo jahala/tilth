@@ -1161,3 +1161,169 @@ fn write_error(w: &mut impl Write, id: Option<Value>, code: i32, msg: &str) -> i
     w.write_all(b"\n")?;
     w.flush()
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- extract_root_from_response -------------------------------------------
+
+    #[test]
+    fn extract_root_valid_file_uri() {
+        // Claude Code sends: {"result":{"roots":[{"uri":"file:///Users/x/project"}]}}
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = format!("file://{}", tmp.path().display());
+        let msg = serde_json::json!({
+            "result": { "roots": [{ "uri": uri }] }
+        });
+        let path = extract_root_from_response(&msg);
+        assert_eq!(path, Some(tmp.path().to_path_buf()));
+    }
+
+    #[test]
+    fn extract_root_empty_roots() {
+        // Codex sends: {"result":{"roots":[]}}
+        let msg = serde_json::json!({
+            "result": { "roots": [] }
+        });
+        assert_eq!(extract_root_from_response(&msg), None);
+    }
+
+    #[test]
+    fn extract_root_nonexistent_path() {
+        let msg = serde_json::json!({
+            "result": { "roots": [{ "uri": "file:///nonexistent/path/that/does/not/exist" }] }
+        });
+        assert_eq!(extract_root_from_response(&msg), None);
+    }
+
+    #[test]
+    fn extract_root_no_result() {
+        let msg = serde_json::json!({"error": {"code": -1, "message": "nope"}});
+        assert_eq!(extract_root_from_response(&msg), None);
+    }
+
+    #[test]
+    fn extract_root_multiple_roots_takes_first_valid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = format!("file://{}", tmp.path().display());
+        let msg = serde_json::json!({
+            "result": { "roots": [
+                { "uri": "file:///nonexistent" },
+                { "uri": uri },
+            ]}
+        });
+        // First root is invalid, second is valid — should return second
+        let path = extract_root_from_response(&msg);
+        assert_eq!(path, Some(tmp.path().to_path_buf()));
+    }
+
+    // -- resolve_scope --------------------------------------------------------
+
+    #[test]
+    fn resolve_scope_explicit_arg() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = serde_json::json!({ "scope": tmp.path().to_str().unwrap() });
+        let (scope, warning) = resolve_scope(&args);
+        assert_eq!(scope, tmp.path().canonicalize().unwrap());
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn resolve_scope_no_arg_uses_cwd() {
+        let args = serde_json::json!({});
+        let (scope, warning) = resolve_scope(&args);
+        // With no arg, defaults to "." which is cwd
+        let cwd = std::env::current_dir().unwrap();
+        // The function returns "." when resolved == cwd
+        assert!(scope == PathBuf::from(".") || scope == cwd);
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn resolve_scope_invalid_dir_warns() {
+        let args = serde_json::json!({ "scope": "/nonexistent/directory/zzz" });
+        let (scope, warning) = resolve_scope(&args);
+        assert_eq!(scope, PathBuf::from("."));
+        assert!(warning.is_some());
+        assert!(warning.unwrap().contains("not a valid directory"));
+    }
+
+    // -- Issue #37 reproduction: cwd=/ with --scope fixes it ------------------
+
+    #[test]
+    fn scope_flag_overrides_bad_cwd() {
+        // Reproduce issue #37: MCP host launches tilth with cwd=/
+        // The --scope flag should override this.
+        let project = tempfile::tempdir().unwrap();
+        let project_path = project.path();
+
+        // Create a manifest so package_root can find it
+        std::fs::write(
+            project_path.join("Cargo.toml"),
+            "[package]\nname = \"test\"",
+        )
+        .unwrap();
+        std::fs::create_dir(project_path.join("src")).unwrap();
+        std::fs::write(project_path.join("src/main.rs"), "fn main() {}").unwrap();
+
+        // Save current cwd
+        let orig_cwd = std::env::current_dir().unwrap();
+
+        // Simulate Codex: cwd=/
+        std::env::set_current_dir("/").unwrap();
+
+        // Without --scope: resolve_scope returns "." which is /
+        let args = serde_json::json!({});
+        let (scope, _) = resolve_scope(&args);
+        assert_eq!(
+            scope,
+            PathBuf::from("."),
+            "Without --scope, should return . (which is /)"
+        );
+
+        // With --scope pointing to project: set_current_dir should fix everything
+        let _ = std::env::set_current_dir(project_path);
+        let args = serde_json::json!({});
+        let (scope, _) = resolve_scope(&args);
+        assert_eq!(
+            scope,
+            PathBuf::from("."),
+            "After chdir to project, . should resolve correctly"
+        );
+
+        // Verify tilth_files would search in the project, not /
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(cwd, project_path.canonicalize().unwrap());
+
+        // Restore
+        std::env::set_current_dir(orig_cwd).unwrap();
+    }
+
+    // -- package_root fallback from subdirectory ------------------------------
+
+    #[test]
+    fn package_root_finds_project_from_subdirectory() {
+        let project = tempfile::tempdir().unwrap();
+        let project_path = project.path();
+        std::fs::write(
+            project_path.join("Cargo.toml"),
+            "[package]\nname = \"test\"",
+        )
+        .unwrap();
+        let subdir = project_path.join("src").join("deep").join("nested");
+        std::fs::create_dir_all(&subdir).unwrap();
+
+        // package_root from the nested subdir should find the project root
+        let root = crate::lang::package_root(&subdir);
+        assert!(root.is_some(), "package_root should find the project");
+        // Compare canonicalized paths to handle macOS /var -> /private/var symlinks
+        let root_canon = root.unwrap().canonicalize().unwrap();
+        let expected_canon = project_path.canonicalize().unwrap();
+        assert_eq!(root_canon, expected_canon);
+    }
+}
