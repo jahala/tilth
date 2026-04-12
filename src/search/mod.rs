@@ -1468,6 +1468,7 @@ mod tests {
             .iter()
             .filter_map(|p| p.file_name()?.to_str())
             .collect();
+        // Should find hello.rs twice: once in real/, once via the symlink in linked/
         assert_eq!(
             names.iter().filter(|n| **n == "hello.rs").count(),
             2,
@@ -1483,6 +1484,7 @@ mod tests {
         std::fs::write(real_dir.join("lib.rs"), "pub fn add() {}").unwrap();
         std::fs::write(real_dir.join("util.rs"), "pub fn helper() {}").unwrap();
 
+        // Symlink the entire directory
         #[cfg(unix)]
         std::os::unix::fs::symlink(&real_dir, tmp.path().join("deps_link")).unwrap();
         #[cfg(windows)]
@@ -1505,6 +1507,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("real.rs"), "fn main() {}").unwrap();
 
+        // Create a symlink cycle: loop -> .
         #[cfg(unix)]
         std::os::unix::fs::symlink(tmp.path(), tmp.path().join("loop")).unwrap();
 
@@ -1531,6 +1534,7 @@ mod tests {
         )
         .unwrap();
 
+        // Symlink the directory into the search scope
         #[cfg(unix)]
         std::os::unix::fs::symlink(&real_dir, tmp.path().join("linked")).unwrap();
         #[cfg(windows)]

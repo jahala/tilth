@@ -44,6 +44,10 @@ struct Cli {
     #[arg(long)]
     edit: bool,
 
+    /// Disable project fingerprint in MCP init.
+    #[arg(long)]
+    no_overview: bool,
+
     /// Expand top N search matches with inline source (default: 2 when flag present).
     #[arg(long, num_args = 0..=1, default_missing_value = "2", require_equals = true)]
     expand: Option<usize>,
@@ -123,6 +127,8 @@ enum Command {
         #[arg(long, default_value_t = 10000)]
         budget: u64,
     },
+    /// Show the project fingerprint (what MCP init would inject).
+    Overview,
 }
 
 fn main() {
@@ -143,6 +149,15 @@ fn main() {
                     eprintln!("install error: {e}");
                     process::exit(1);
                 }
+            }
+            Command::Overview => {
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let output = tilth::overview::fingerprint(&cwd);
+                if output.is_empty() {
+                    eprintln!("No project fingerprint could be generated.");
+                    process::exit(1);
+                }
+                println!("{output}");
             }
             Command::Diff {
                 source,
@@ -194,7 +209,20 @@ fn main() {
 
     // MCP mode: JSON-RPC server
     if cli.mcp {
-        if let Err(e) = tilth::mcp::run(cli.edit) {
+        if cli.no_overview {
+            std::env::set_var("TILTH_NO_OVERVIEW", "1");
+        }
+        // Pass --scope to MCP if it's not the default "."
+        let mcp_scope = if cli.scope.as_os_str() == "." {
+            None
+        } else {
+            Some(
+                cli.scope
+                    .canonicalize()
+                    .unwrap_or_else(|_| cli.scope.clone()),
+            )
+        };
+        if let Err(e) = tilth::mcp::run(cli.edit, mcp_scope.as_deref()) {
             eprintln!("mcp error: {e}");
             process::exit(1);
         }
@@ -346,7 +374,8 @@ fn emit_output(output: &str, is_tty: bool) {
         }
     }
 
-    println!("{output}");
+    print!("{output}");
+    let _ = io::stdout().flush();
 }
 
 fn terminal_height() -> usize {

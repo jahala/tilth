@@ -1,6 +1,6 @@
 use std::fmt::Write as _;
 use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -42,7 +42,7 @@ DO NOT use Read if content is already shown in expanded search results.\n\
 DO NOT use Grep, Read, or Glob. Always use the better tools tilth_search (grep), tilth_read (read), tilth_files (glob).\n\
 \n\
 tilth_search: Search code — finds definitions, usages, and text. Replaces grep/rg for all code search.\n\
-  Comma-separated symbols for multi-symbol lookup (max 5).\n\
+  For multi-symbol lookup, separate each with a comma \"symbol1,symbol2\" (max 5).\n\
   kind: \"symbol\" (default) | \"content\" (strings/comments) | \"callers\" (call sites)\n\
   expand (default 2): inline full source for top matches.\n\
   context: path to file being edited — boosts nearby results.\n\
@@ -72,7 +72,7 @@ tilth_deps: Blast-radius check — what imports this file and what it imports.\n
   Use ONLY before renaming, removing, or changing an export's signature.\n\
 \n\
 tilth_diff: Structural diff — shows what changed at function level. Replaces Bash(git diff).\n\
-  Usage: tilth_diff() for uncommitted overview. tilth_diff(source: \"HEAD~1\") for last commit.\n\
+  Usage: tilth_diff(source: \"HEAD~1\") for last commit. No args = uncommitted changes.\n\
   scope: \"file.rs\" or \"file.rs:fn_name\". log: \"HEAD~5..HEAD\" for per-commit summaries.\n\
   search: filter to lines matching a term. blast: true to show callers of changed signatures.\n\
   Output: [+] added, [-] deleted, [~] body changed, [~:sig] signature changed.\n\
@@ -87,7 +87,8 @@ DO NOT re-read files already shown in expanded search results.";
 const EDIT_MODE_EXTRA: &str = "\n\
 \n\
 tilth_edit: Edit files using hash-anchored lines. Replaces the host Edit tool.\n\
-  tilth_read → copy anchors (<line>:<hash>) → pass to tilth_edit.\n\
+  tilth_read → copy anchors (<line>:<hash>) (BOTH line and hash required) → pass to tilth_edit.\n\
+  tilth_search does NOT provide hashes — you MUST tilth_read the file or section first.\n\
   Single line: {\"start\": \"<line>:<hash>\", \"content\": \"<new code>\"}\n\
   Range: {\"start\": \"<line>:<hash>\", \"end\": \"<line>:<hash>\", \"content\": \"...\"}\n\
   Delete: {\"start\": \"<line>:<hash>\", \"content\": \"\"}\n\
@@ -99,7 +100,26 @@ DO NOT use the host Edit tool. Use tilth_edit for all edits.";
 
 /// MCP server over stdio. When `edit_mode` is true, exposes `tilth_edit` and
 /// switches `tilth_read` to hashline output format.
-pub fn run(edit_mode: bool) -> io::Result<()> {
+///
+/// `scope` overrides the default search root. When provided, tilth chdir's to it
+/// at startup so all tools, git commands, and searches use the correct project root.
+/// This fixes MCP hosts that launch tilth with cwd=/ (e.g., Codex).
+pub fn run(edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
+    let scope_is_explicit = scope.is_some();
+
+    // Resolve the project root and chdir to it.
+    // Priority: explicit --scope > MCP roots (handled later) > package_root(cwd) > cwd
+    if let Some(s) = scope {
+        if s.is_dir() {
+            let _ = std::env::set_current_dir(s);
+        }
+    } else {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        if let Some(root) = crate::lang::package_root(&cwd) {
+            let _ = std::env::set_current_dir(root);
+        }
+    }
+
     let cache = Arc::new(OutlineCache::new());
     let session = Arc::new(Session::new());
     let symbol_index = Arc::new(SymbolIndex::new());
@@ -108,24 +128,59 @@ pub fn run(edit_mode: bool) -> io::Result<()> {
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
 
+    // Track pending roots/list request (for MCP roots protocol)
+    let mut pending_roots_id: Option<Value> = None;
+
     for line in stdin.lock().lines() {
         let line = line?;
         if line.is_empty() {
             continue;
         }
 
-        let req: JsonRpcRequest = match serde_json::from_str(&line) {
-            Ok(r) => r,
+        // Parse as generic JSON first — could be a request, notification, or response
+        let msg: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
             Err(e) => {
                 write_error(&mut stdout, None, -32700, &format!("parse error: {e}"))?;
                 continue;
             }
         };
 
-        // Notifications have no id — silently drop them per JSON-RPC spec
-        if req.id.is_none() {
+        // Check if this is a response to our roots/list request
+        if let Some(ref roots_id) = pending_roots_id {
+            if msg.get("id") == Some(roots_id) && msg.get("result").is_some() {
+                pending_roots_id = None;
+                // Only apply roots if --scope was NOT explicitly provided
+                if !scope_is_explicit {
+                    if let Some(root_path) = extract_root_from_response(&msg) {
+                        let _ = std::env::set_current_dir(&root_path);
+                    }
+                }
+                continue;
+            }
+        }
+
+        // Must have "method" to be a request or notification
+        let method = match msg.get("method").and_then(Value::as_str) {
+            Some(m) => m.to_string(),
+            None => continue, // Not a request — skip (could be an unexpected response)
+        };
+
+        let id = msg.get("id").cloned();
+        if id.is_none() {
+            // Notifications have no id — silently drop them per JSON-RPC spec
             continue;
         }
+
+        // Parse params
+        let params = msg.get("params").cloned().unwrap_or(Value::Null);
+
+        let req = JsonRpcRequest {
+            _jsonrpc: "2.0".to_string(),
+            id,
+            method: method.clone(),
+            params,
+        };
 
         let response = handle_request(
             &req,
@@ -138,9 +193,46 @@ pub fn run(edit_mode: bool) -> io::Result<()> {
         serde_json::to_writer(&mut stdout, &response)?;
         stdout.write_all(b"\n")?;
         stdout.flush()?;
+
+        // After initialize response: send roots/list if client supports it
+        // and we don't already have an explicit --scope
+        if method == "initialize" && !scope_is_explicit && pending_roots_id.is_none() {
+            let client_caps = req.params.get("capabilities").unwrap_or(&Value::Null);
+            if client_caps.get("roots").is_some() {
+                let roots_id = Value::String("tilth_roots_1".to_string());
+                let roots_req = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": roots_id,
+                    "method": "roots/list"
+                });
+                serde_json::to_writer(&mut stdout, &roots_req)?;
+                stdout.write_all(b"\n")?;
+                stdout.flush()?;
+                pending_roots_id = Some(roots_id);
+            }
+        }
     }
 
     Ok(())
+}
+
+/// Extract the first root directory path from a roots/list response.
+/// Parses `file://` URIs and returns the path, or None if no valid roots.
+fn extract_root_from_response(msg: &Value) -> Option<PathBuf> {
+    let roots = msg.get("result")?.get("roots")?.as_array()?;
+    for root in roots {
+        let uri = root.get("uri")?.as_str()?;
+        // Parse file:// URI to path
+        let path = if let Some(p) = uri.strip_prefix("file://") {
+            PathBuf::from(p)
+        } else {
+            PathBuf::from(uri)
+        };
+        if path.is_dir() {
+            return Some(path);
+        }
+    }
+    None
 }
 
 #[derive(Deserialize)]
@@ -179,10 +271,22 @@ fn handle_request(
 ) -> JsonRpcResponse {
     match req.method.as_str() {
         "initialize" => {
-            let instructions = if edit_mode {
-                format!("{SERVER_INSTRUCTIONS}{EDIT_MODE_EXTRA}")
+            let overview = if std::env::var("TILTH_NO_OVERVIEW").is_ok() {
+                String::new()
             } else {
+                let cwd = std::env::current_dir().unwrap_or_default();
+                crate::overview::fingerprint(&cwd)
+            };
+            let instructions = if edit_mode {
+                if overview.is_empty() {
+                    format!("{SERVER_INSTRUCTIONS}{EDIT_MODE_EXTRA}")
+                } else {
+                    format!("{overview}\n\n{SERVER_INSTRUCTIONS}{EDIT_MODE_EXTRA}")
+                }
+            } else if overview.is_empty() {
                 SERVER_INSTRUCTIONS.to_string()
+            } else {
+                format!("{overview}\n\n{SERVER_INSTRUCTIONS}")
             };
             JsonRpcResponse {
                 jsonrpc: "2.0",
@@ -975,4 +1079,170 @@ fn write_error(w: &mut impl Write, id: Option<Value>, code: i32, msg: &str) -> i
     serde_json::to_writer(&mut *w, &resp)?;
     w.write_all(b"\n")?;
     w.flush()
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- extract_root_from_response -------------------------------------------
+
+    #[test]
+    fn extract_root_valid_file_uri() {
+        // Claude Code sends: {"result":{"roots":[{"uri":"file:///Users/x/project"}]}}
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = format!("file://{}", tmp.path().display());
+        let msg = serde_json::json!({
+            "result": { "roots": [{ "uri": uri }] }
+        });
+        let path = extract_root_from_response(&msg);
+        assert_eq!(path, Some(tmp.path().to_path_buf()));
+    }
+
+    #[test]
+    fn extract_root_empty_roots() {
+        // Codex sends: {"result":{"roots":[]}}
+        let msg = serde_json::json!({
+            "result": { "roots": [] }
+        });
+        assert_eq!(extract_root_from_response(&msg), None);
+    }
+
+    #[test]
+    fn extract_root_nonexistent_path() {
+        let msg = serde_json::json!({
+            "result": { "roots": [{ "uri": "file:///nonexistent/path/that/does/not/exist" }] }
+        });
+        assert_eq!(extract_root_from_response(&msg), None);
+    }
+
+    #[test]
+    fn extract_root_no_result() {
+        let msg = serde_json::json!({"error": {"code": -1, "message": "nope"}});
+        assert_eq!(extract_root_from_response(&msg), None);
+    }
+
+    #[test]
+    fn extract_root_multiple_roots_takes_first_valid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = format!("file://{}", tmp.path().display());
+        let msg = serde_json::json!({
+            "result": { "roots": [
+                { "uri": "file:///nonexistent" },
+                { "uri": uri },
+            ]}
+        });
+        // First root is invalid, second is valid — should return second
+        let path = extract_root_from_response(&msg);
+        assert_eq!(path, Some(tmp.path().to_path_buf()));
+    }
+
+    // -- resolve_scope --------------------------------------------------------
+
+    #[test]
+    fn resolve_scope_explicit_arg() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = serde_json::json!({ "scope": tmp.path().to_str().unwrap() });
+        let (scope, warning) = resolve_scope(&args);
+        assert_eq!(scope, tmp.path().canonicalize().unwrap());
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn resolve_scope_no_arg_uses_cwd() {
+        let args = serde_json::json!({});
+        let (scope, warning) = resolve_scope(&args);
+        // With no arg, defaults to "." which is cwd
+        let cwd = std::env::current_dir().unwrap();
+        // The function returns "." when resolved == cwd
+        assert!(scope == PathBuf::from(".") || scope == cwd);
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn resolve_scope_invalid_dir_warns() {
+        let args = serde_json::json!({ "scope": "/nonexistent/directory/zzz" });
+        let (scope, warning) = resolve_scope(&args);
+        assert_eq!(scope, PathBuf::from("."));
+        assert!(warning.is_some());
+        assert!(warning.unwrap().contains("not a valid directory"));
+    }
+
+    // -- Issue #37 reproduction: cwd=/ with --scope fixes it ------------------
+
+    #[test]
+    fn scope_flag_overrides_bad_cwd() {
+        // Reproduce issue #37: MCP host launches tilth with cwd=/
+        // The --scope flag should override this.
+        let project = tempfile::tempdir().unwrap();
+        let project_path = project.path();
+
+        // Create a manifest so package_root can find it
+        std::fs::write(
+            project_path.join("Cargo.toml"),
+            "[package]\nname = \"test\"",
+        )
+        .unwrap();
+        std::fs::create_dir(project_path.join("src")).unwrap();
+        std::fs::write(project_path.join("src/main.rs"), "fn main() {}").unwrap();
+
+        // Save current cwd
+        let orig_cwd = std::env::current_dir().unwrap();
+
+        // Simulate Codex: cwd=/
+        std::env::set_current_dir("/").unwrap();
+
+        // Without --scope: resolve_scope returns "." which is /
+        let args = serde_json::json!({});
+        let (scope, _) = resolve_scope(&args);
+        assert_eq!(
+            scope,
+            PathBuf::from("."),
+            "Without --scope, should return . (which is /)"
+        );
+
+        // With --scope pointing to project: set_current_dir should fix everything
+        let _ = std::env::set_current_dir(project_path);
+        let args = serde_json::json!({});
+        let (scope, _) = resolve_scope(&args);
+        assert_eq!(
+            scope,
+            PathBuf::from("."),
+            "After chdir to project, . should resolve correctly"
+        );
+
+        // Verify tilth_files would search in the project, not /
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(cwd, project_path.canonicalize().unwrap());
+
+        // Restore
+        std::env::set_current_dir(orig_cwd).unwrap();
+    }
+
+    // -- package_root fallback from subdirectory ------------------------------
+
+    #[test]
+    fn package_root_finds_project_from_subdirectory() {
+        let project = tempfile::tempdir().unwrap();
+        let project_path = project.path();
+        std::fs::write(
+            project_path.join("Cargo.toml"),
+            "[package]\nname = \"test\"",
+        )
+        .unwrap();
+        let subdir = project_path.join("src").join("deep").join("nested");
+        std::fs::create_dir_all(&subdir).unwrap();
+
+        // package_root from the nested subdir should find the project root
+        let root = crate::lang::package_root(&subdir);
+        assert!(root.is_some(), "package_root should find the project");
+        // Compare canonicalized paths to handle macOS /var -> /private/var symlinks
+        let root_canon = root.unwrap().canonicalize().unwrap();
+        let expected_canon = project_path.canonicalize().unwrap();
+        assert_eq!(root_canon, expected_canon);
+    }
 }

@@ -20,7 +20,7 @@ pub enum QueryType {
 /// Programming language, carried through the type system so downstream
 /// code never re-detects. Adding a language means adding an arm here
 /// and the compiler tells you everywhere else.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Lang {
     Rust,
     TypeScript,
