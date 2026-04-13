@@ -51,7 +51,18 @@ $ tilth handleAuth --scope src/
 
 Tree-sitter finds where symbols are **defined** — not just where strings appear. Each match shows its surrounding file structure so you know what you're looking at without a second read.
 
-Expanded definitions include a **callee footer** (`── calls ──`) showing resolved callees with file, line range, and signature — the agent can follow call chains without separate searches for each callee.
+Expanded definitions include a **callee footer** (`-- calls --`) showing resolved callees with file, line range, and signature -- the agent can follow call chains without separate searches for each callee.
+
+### Expanded search
+
+By default, CLI search shows compact results. Use `--expand` to inline source for the top matches:
+
+```bash
+$ tilth handleAuth --scope src/ --expand       # expand top 2 (default)
+$ tilth handleAuth --scope src/ --expand=5     # expand top 5
+```
+
+In MCP mode, `expand` defaults to 2 and is always active.
 
 ### Multi-symbol search
 
@@ -68,12 +79,36 @@ Each symbol gets its own result block with definitions and expansions. The expan
 Find all call sites of a symbol using structural tree-sitter matching (not text search):
 
 ```bash
-$ tilth isTrustedProxy --kind callers --scope .
+$ tilth isTrustedProxy --callers --scope .
 # Callers of "isTrustedProxy" — 5 call sites
 
 ## context.go:1011 [caller: ClientIP]
 → trusted = c.engine.isTrustedProxy(remoteIP)
 ```
+
+In MCP mode, use `kind: "callers"` instead of the `--callers` flag.
+
+### Blast-radius deps
+
+See what a file imports and what depends on it -- useful before renaming or changing exports:
+
+```bash
+$ tilth src/auth.ts --deps
+# deps: src/auth.ts
+
+## Imports (3)
+  jsonwebtoken  (external)
+  @/config      src/config.ts
+  express       (external)
+
+## Dependents (4)
+  src/routes/api.ts      uses: handleAuth, AuthManager
+  src/middleware/cors.ts  uses: validateToken
+  src/app.ts             uses: AuthManager
+  test/auth.test.ts      uses: handleAuth, AuthManager
+```
+
+In MCP mode, use `tilth_deps` instead of the `--deps` flag.
 
 ### Session dedup
 
@@ -159,7 +194,7 @@ Add `--edit` to enable hash-anchored file editing (see [Edit mode](#edit-mode)):
 tilth install claude-code --edit
 ```
 
-Or call it from bash — see [AGENTS.md](./AGENTS.md) for the agent prompt.
+Or call it from bash -- see [AGENTS.md](./AGENTS.md) for the MCP agent prompt and [skills/SKILL.md](./skills/SKILL.md) for the CLI skill prompt.
 
 ### Smaller models
 
@@ -216,6 +251,10 @@ tilth <path> --section 45-89      # exact line range
 tilth <path> --section "## Foo"   # markdown heading
 tilth <path> --full               # force full content
 tilth <symbol> --scope <dir>      # definitions + usages
+tilth <symbol> --scope <dir> --expand    # inline source for top 2 matches
+tilth <symbol> --scope <dir> --expand=5  # inline source for top 5
+tilth <symbol> --callers --scope <dir>   # find all call sites
+tilth <file> --deps               # blast-radius dependencies
 tilth "TODO: fix" --scope <dir>   # content search
 tilth "/<regex>/" --scope <dir>   # regex search
 tilth "*.test.ts" --scope <dir>   # glob files
