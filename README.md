@@ -79,6 +79,20 @@ $ tilth isTrustedProxy --kind callers --scope .
 
 In MCP mode, previously expanded definitions show `[shown earlier]` instead of the full body on subsequent searches. Saves tokens when the agent revisits symbols it already saw.
 
+## Structural diff
+
+```bash
+$ tilth diff HEAD~1
+# Diff: HEAD~1 — 3 files, 2 modified, 1 added (~350 tokens)
+
+## src/auth.rs (3 symbols)
+  [~:sig]  fn handleAuth(req) → (req, ctx)    L42
+  [~]      fn validate_session                 L88
+  [+]      fn refresh_token                    L120
+```
+
+Function-level change detection. Drill in with `--scope`, summarize history with `--log`, detect merge conflicts automatically. Replaces `git diff` for AI agents.
+
 ## Benchmarks
 
 Code navigation tasks across 4 real-world repos (Express, FastAPI, Gin, ripgrep). Baseline = Claude Code built-in tools. tilth = built-in tools + tilth MCP server. We report **cost per correct answer** (`total_spend / correct_answers`) — the expected cost under retry. See [benchmark/](benchmark/) for full methodology.
@@ -205,6 +219,7 @@ tilth <symbol> --scope <dir>      # definitions + usages
 tilth "TODO: fix" --scope <dir>   # content search
 tilth "/<regex>/" --scope <dir>   # regex search
 tilth "*.test.ts" --scope <dir>   # glob files
+tilth diff HEAD~1                     # structural diff (function-level)
 tilth --map --scope <dir>         # codebase skeleton (CLI only)
 ```
 
@@ -227,7 +242,7 @@ Search, content search, and glob use early termination — time is roughly const
 
 ## What's inside
 
-Rust. ~8,000 lines. No runtime dependencies.
+Rust. ~20,000 lines. No runtime dependencies.
 
 - **tree-sitter** — AST parsing for 14 languages (Rust, TypeScript, TSX, JavaScript, Python, Go, Java, Scala, C, C++, Ruby, PHP, C#, Swift). Used for definition detection, callee extraction, callers query, and structural outlines.
 - **ripgrep internals** (`grep-regex`, `grep-searcher`) — fast content search
