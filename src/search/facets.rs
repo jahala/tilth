@@ -88,7 +88,7 @@ fn is_same_package(path: &Path, primary_pkg: Option<&PathBuf>) -> bool {
         .is_some_and(|p| p == pkg_root.as_path())
 }
 
-/// Re-export from parent module.
+/// Re-export from lang module.
 fn package_root(path: &Path) -> Option<&Path> {
-    super::package_root(path)
+    crate::lang::package_root(path)
 }

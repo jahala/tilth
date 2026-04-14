@@ -66,7 +66,8 @@ class RipgrepSearchDispatchTask(Task):
         return (
             "Explain how ripgrep dispatches between single-line and multi-line search. "
             "Trace the code path from the Searcher to the actual matching logic. "
-            "What structs are involved and how do the generic type parameters flow?"
+            "What structs are involved, which files contain them, and how do the "
+            "generic type parameters flow?"
         )
 
     @property

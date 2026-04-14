@@ -3,8 +3,8 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use crate::edit::Edit;
-use crate::read::detect_file_type;
-use crate::search::callees::get_outline_entries;
+use crate::lang::detect_file_type;
+use crate::lang::outline::get_outline_entries;
 use crate::search::callers::{find_callers_batch, CallerMatch};
 use crate::types::{is_test_file, FileType, OutlineEntry, OutlineKind};
 
@@ -82,7 +82,7 @@ pub(crate) fn blast_radius(
 
     let symbol_names: HashSet<String> = touched.iter().map(|t| t.name.clone()).collect();
 
-    let callers = find_callers_batch(&symbol_names, scope, bloom).ok()?;
+    let callers = find_callers_batch(&symbol_names, scope, bloom, None).ok()?;
 
     let canonical = path.canonicalize().ok()?;
     let callers: Vec<(String, CallerMatch)> = callers

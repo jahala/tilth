@@ -8,10 +8,11 @@ pub(crate) const DEFINITION_KINDS: &[&str] = &[
     "function_item",
     "method_definition",
     "method_declaration",
-    // Classes & structs
+    // Classes, structs & Kotlin objects
     "class_declaration",
     "class_definition",
     "struct_item",
+    "object_declaration",
     // Interfaces & types (TS)
     "interface_declaration",
     "trait_declaration",
@@ -20,12 +21,13 @@ pub(crate) const DEFINITION_KINDS: &[&str] = &[
     // Enums
     "enum_item",
     "enum_declaration",
-    // Variables & constants
+    // Variables, constants & properties (Kotlin, C#, Swift)
     "lexical_declaration",
     "variable_declaration",
     "const_item",
     "const_declaration",
     "static_item",
+    "property_declaration",
     // Rust-specific
     "trait_item",
     "impl_item",
@@ -147,9 +149,9 @@ pub(crate) fn definition_weight(kind: &str) -> u16 {
         | "type_item"
         | "type_declaration"
         | "decorated_definition" => 100,
-        "impl_item" => 90,
+        "impl_item" | "object_declaration" => 90,
         "const_item" | "const_declaration" | "static_item" => 80,
-        "mod_item" | "namespace_definition" => 70,
+        "mod_item" | "namespace_definition" | "property_declaration" => 70,
         "lexical_declaration" | "variable_declaration" => 40,
         "export_statement" => 30,
         _ => 50,

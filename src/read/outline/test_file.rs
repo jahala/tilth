@@ -4,7 +4,7 @@ use crate::types::Lang;
 /// Returns a structured test outline with suite nesting, or None if
 /// no test structure was found.
 pub fn outline(content: &str, lang: Lang, max_lines: usize) -> Option<String> {
-    let language = super::code::outline_language(lang)?;
+    let language = crate::lang::outline::outline_language(lang)?;
 
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&language).ok()?;

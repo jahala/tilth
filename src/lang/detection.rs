@@ -1,3 +1,10 @@
+/// Any null byte in the first 512 bytes → binary.
+/// Uses memchr for the scan — single SIMD pass, no branching.
+pub fn is_binary(buf: &[u8]) -> bool {
+    let window = &buf[..buf.len().min(512)];
+    memchr::memchr(0, window).is_some()
+}
+
 /// Check filename against known generated/lock files.
 pub fn is_generated_by_name(name: &str) -> bool {
     matches!(

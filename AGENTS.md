@@ -11,6 +11,7 @@ Comma-separated symbols for multi-symbol lookup (max 5).
 kind: "symbol" (default) | "content" (strings/comments) | "callers" (call sites)
 expand (default 2): inline full source for top matches.
 context: path to file being edited — boosts nearby results.
+glob: file pattern filter — "*.rs" (whitelist), "!*.test.ts" (exclude), "*.{go,rs}" (multi).
 Output per match:
 ## <path>:<start>-<end> [definition|usage|impl]
 <outline context>
@@ -47,5 +48,6 @@ Range: {"start": "<line>:<hash>", "end": "<line>:<hash>", "content": "..."}
 Delete: {"start": "<line>:<hash>", "content": ""}
 Hash mismatch → file changed, re-read and retry.
 Large files: tilth_read shows outline — use section to get hashlined content.
+Pass diff: true to see a compact before/after diff in the response.
 After editing a function signature, tilth_edit shows callers that may need updating.
 DO NOT use the host Edit tool. Use tilth_edit for all edits.

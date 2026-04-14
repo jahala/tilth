@@ -5,7 +5,7 @@ use std::sync::{LazyLock, Mutex};
 use streaming_iterator::StreamingIterator;
 
 use crate::cache::OutlineCache;
-use crate::read::outline::code::outline_language;
+use crate::lang::outline::{get_outline_entries, outline_language};
 use crate::types::{Lang, OutlineEntry};
 
 /// A resolved callee: a function/method called from within an expanded definition.
@@ -79,35 +79,49 @@ pub(crate) fn callee_query_str(lang: Lang) -> Option<&'static str> {
             "(call_expression (simple_identifier) @callee)\n",
             "(call_expression (navigation_expression suffix: (navigation_suffix suffix: (simple_identifier) @callee)))\n",
         )),
+        Lang::Kotlin => Some(concat!(
+            "(call_expression (identifier) @callee)\n",
+            "(call_expression (navigation_expression (identifier) @callee .))\n",
+        )),
         _ => None,
     }
 }
 
 /// Global cache of compiled tree-sitter queries for callee extraction.
-/// Keyed by language name (a `&'static str` returned by `Language::name()`).
+///
+/// Keyed by `(symbol_count, field_count)` — a pair that uniquely identifies
+/// each grammar in practice. We avoid keying by `Language::name()` because
+/// older grammars (ABI < 15) do not register a name and would return `None`,
+/// silently disabling the cache and callee extraction entirely.
+///
 /// `Query` is `Send + Sync` in tree-sitter 0.25, so a global `Mutex`-guarded
 /// map is safe and avoids recompiling the same query on every call.
-static QUERY_CACHE: LazyLock<Mutex<HashMap<&'static str, tree_sitter::Query>>> =
+static QUERY_CACHE: LazyLock<Mutex<HashMap<(usize, usize), tree_sitter::Query>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Stable cache key for a tree-sitter language. Uses `(symbol_count,
+/// field_count)` which is unique for every grammar shipped with tilth.
+fn lang_cache_key(ts_lang: &tree_sitter::Language) -> (usize, usize) {
+    (ts_lang.node_kind_count(), ts_lang.field_count())
+}
+
 /// Look up or compile the callee query for `ts_lang`, then invoke `f` with a
-/// reference to the cached `Query`.  Returns `None` if compilation fails or
-/// the language has no registered name.
+/// reference to the cached `Query`.  Returns `None` if compilation fails.
 pub(super) fn with_callee_query<R>(
     ts_lang: &tree_sitter::Language,
     query_str: &str,
     f: impl FnOnce(&tree_sitter::Query) -> R,
 ) -> Option<R> {
-    let lang_name = ts_lang.name()?;
+    let key = lang_cache_key(ts_lang);
     let mut cache = QUERY_CACHE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !cache.contains_key(lang_name) {
+    if let std::collections::hash_map::Entry::Vacant(e) = cache.entry(key) {
         let query = tree_sitter::Query::new(ts_lang, query_str).ok()?;
-        cache.insert(lang_name, query);
+        e.insert(query);
     }
     // Safety: we just inserted if absent, so the key is always present here.
-    Some(f(cache.get(lang_name).expect("just inserted")))
+    Some(f(cache.get(&key).expect("just inserted")))
 }
 
 /// Extract names of functions/methods called within a given line range.
@@ -182,25 +196,6 @@ pub fn extract_callee_names(
     names
 }
 
-/// Get structured outline entries for file content.
-pub fn get_outline_entries(content: &str, lang: Lang) -> Vec<OutlineEntry> {
-    let Some(ts_lang) = outline_language(lang) else {
-        return Vec::new();
-    };
-
-    let mut parser = tree_sitter::Parser::new();
-    if parser.set_language(&ts_lang).is_err() {
-        return Vec::new();
-    }
-
-    let Some(tree) = parser.parse(content, None) else {
-        return Vec::new();
-    };
-
-    let lines: Vec<&str> = content.lines().collect();
-    crate::read::outline::code::walk_top_level(tree.root_node(), &lines, lang)
-}
-
 /// Match callee names against outline entries, moving resolved names out of `remaining`.
 fn resolve_from_entries(
     entries: &[OutlineEntry],
@@ -256,7 +251,7 @@ pub fn resolve_callees(
         return Vec::new();
     }
 
-    let file_type = crate::read::detect_file_type(source_path);
+    let file_type = crate::lang::detect_file_type(source_path);
     let crate::types::FileType::Code(lang) = file_type else {
         return Vec::new();
     };
@@ -306,7 +301,7 @@ pub fn resolve_callees(
             continue;
         }
 
-        let import_type = crate::read::detect_file_type(&import_path);
+        let import_type = crate::lang::detect_file_type(&import_path);
         let crate::types::FileType::Code(import_lang) = import_type else {
             continue;
         };
@@ -444,7 +439,7 @@ fn resolve_second_hop(
     visited: &mut HashSet<(PathBuf, u32)>,
     budget: &mut usize,
 ) -> Vec<ResolvedCallee> {
-    let file_type = crate::read::detect_file_type(&parent.file);
+    let file_type = crate::lang::detect_file_type(&parent.file);
     let crate::types::FileType::Code(lang) = file_type else {
         return Vec::new();
     };
@@ -493,6 +488,74 @@ fn resolve_second_hop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grammar_cache_keys_unique() {
+        // Verify that (node_kind_count, field_count) is unique across all shipped grammars.
+        // A collision would cause one language to serve another's cached query.
+        let grammars: Vec<(&str, tree_sitter::Language)> = vec![
+            ("rust", tree_sitter_rust::LANGUAGE.into()),
+            (
+                "typescript",
+                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            ),
+            ("tsx", tree_sitter_typescript::LANGUAGE_TSX.into()),
+            ("javascript", tree_sitter_javascript::LANGUAGE.into()),
+            ("python", tree_sitter_python::LANGUAGE.into()),
+            ("go", tree_sitter_go::LANGUAGE.into()),
+            ("java", tree_sitter_java::LANGUAGE.into()),
+            ("c", tree_sitter_c::LANGUAGE.into()),
+            ("cpp", tree_sitter_cpp::LANGUAGE.into()),
+            ("ruby", tree_sitter_ruby::LANGUAGE.into()),
+            ("php", tree_sitter_php::LANGUAGE_PHP.into()),
+            ("scala", tree_sitter_scala::LANGUAGE.into()),
+            ("csharp", tree_sitter_c_sharp::LANGUAGE.into()),
+            ("swift", tree_sitter_swift::LANGUAGE.into()),
+            ("kotlin", tree_sitter_kotlin_ng::LANGUAGE.into()),
+        ];
+        let mut seen = std::collections::HashMap::new();
+        for (name, lang) in &grammars {
+            let key = lang_cache_key(lang);
+            if let Some(prev) = seen.insert(key, name) {
+                panic!("cache key collision: {prev} and {name} both produce {key:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn kotlin_callee_query_compiles() {
+        let lang: tree_sitter::Language = tree_sitter_kotlin_ng::LANGUAGE.into();
+        let query_str = callee_query_str(crate::types::Lang::Kotlin).unwrap();
+        tree_sitter::Query::new(&lang, query_str).expect("kotlin callee query should compile");
+    }
+
+    #[test]
+    fn extract_kotlin_callee_names() {
+        let kotlin = r#"fun example() {
+    println("hello")
+    val x = listOf(1, 2, 3)
+    x.forEach { it.toString() }
+}
+"#;
+        let names = extract_callee_names(kotlin, crate::types::Lang::Kotlin, None);
+
+        assert!(
+            names.contains(&"println".to_string()),
+            "expected println, got: {names:?}"
+        );
+        assert!(
+            names.contains(&"listOf".to_string()),
+            "expected listOf, got: {names:?}"
+        );
+        assert!(
+            names.contains(&"forEach".to_string()),
+            "expected forEach, got: {names:?}"
+        );
+        assert!(
+            names.contains(&"toString".to_string()),
+            "expected toString, got: {names:?}"
+        );
+    }
 
     #[test]
     fn extract_php_callee_names() {

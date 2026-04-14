@@ -7,12 +7,12 @@ use std::sync::{Arc, Mutex};
 
 use streaming_iterator::StreamingIterator;
 
-use super::treesitter::{extract_definition_name, DEFINITION_KINDS};
+use crate::lang::treesitter::{extract_definition_name, DEFINITION_KINDS};
 
 use crate::cache::OutlineCache;
 use crate::error::TilthError;
-use crate::read::detect_file_type;
-use crate::read::outline::code::outline_language;
+use crate::lang::detect_file_type;
+use crate::lang::outline::outline_language;
 use crate::session::Session;
 use crate::types::FileType;
 
@@ -45,12 +45,13 @@ pub fn find_callers(
     target: &str,
     scope: &Path,
     bloom: &crate::index::bloom::BloomFilterCache,
+    glob: Option<&str>,
 ) -> Result<Vec<CallerMatch>, TilthError> {
     let matches: Mutex<Vec<CallerMatch>> = Mutex::new(Vec::new());
     let found_count = AtomicUsize::new(0);
     let needle = target.as_bytes();
 
-    let walker = super::walker(scope);
+    let walker = super::walker(scope, glob)?;
 
     walker.run(|| {
         let matches = &matches;
@@ -225,11 +226,12 @@ pub(crate) fn find_callers_batch(
     targets: &HashSet<String>,
     scope: &Path,
     bloom: &crate::index::bloom::BloomFilterCache,
+    glob: Option<&str>,
 ) -> Result<Vec<(String, CallerMatch)>, TilthError> {
     let matches: Mutex<Vec<(String, CallerMatch)>> = Mutex::new(Vec::new());
     let found_count = AtomicUsize::new(0);
 
-    let walker = super::walker(scope);
+    let walker = super::walker(scope, glob)?;
 
     walker.run(|| {
         let matches = &matches;
@@ -478,8 +480,9 @@ pub fn search_callers_expanded(
     bloom: &crate::index::bloom::BloomFilterCache,
     expand: usize,
     context: Option<&Path>,
+    glob: Option<&str>,
 ) -> Result<String, TilthError> {
-    let callers = find_callers(target, scope, bloom)?;
+    let callers = find_callers(target, scope, bloom, glob)?;
 
     if callers.is_empty() {
         return Ok(format!(
@@ -562,7 +565,7 @@ pub fn search_callers_expanded(
     // Use all_caller_names (pre-truncation) for the fan-out threshold check,
     // but search for callers of the full set to capture transitive impact.
     if !all_caller_names.is_empty() && all_caller_names.len() <= IMPACT_FANOUT_THRESHOLD {
-        if let Ok(hop2) = find_callers_batch(&all_caller_names, scope, bloom) {
+        if let Ok(hop2) = find_callers_batch(&all_caller_names, scope, bloom, glob) {
             // Filter out hop-1 matches (same file+line = same call site)
             let hop1_locations: HashSet<(PathBuf, u32)> = sorted_callers
                 .iter()

@@ -107,3 +107,11 @@ pub(crate) fn parse_anchor(s: &str) -> Option<(usize, u16)> {
     let hash = u16::from_str_radix(hash_str.trim(), 16).ok()?;
     Some((line, hash))
 }
+
+/// Path relative to scope for cleaner output. Falls back to full path.
+pub(crate) fn rel(path: &Path, scope: &Path) -> String {
+    path.strip_prefix(scope)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}

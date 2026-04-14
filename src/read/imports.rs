@@ -4,7 +4,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::read::detect_file_type;
+use crate::lang::detect_file_type;
 use crate::types::{FileType, Lang};
 
 const MAX_SUGGESTIONS: usize = 8;
@@ -36,7 +36,7 @@ pub fn resolve_related_files_with_content(file_path: &Path, content: &str) -> Ve
         if !is_import_line(line, lang) {
             continue;
         }
-        let source = super::outline::code::extract_import_source(line);
+        let source = crate::lang::outline::extract_import_source(line);
         if source.is_empty() || is_external(&source, lang) {
             continue;
         }

@@ -52,6 +52,10 @@ from .express_edit_tasks import (
     ExpressEditCookiePrefixTask,
     ExpressEditSendHtmlTypeTask,
 )
+from .express_diff_tasks import ExpressDiffMultiMutationTask
+from .fastapi_diff_tasks import FastAPIDiffWhichCommitTask
+from .ripgrep_diff_tasks import RipgrepDiffMisdirectedErrorTask
+from .gin_diff_tasks import GinDiffComprehensionTask
 
 TASKS = {
     # Synthetic repo tasks
@@ -97,4 +101,9 @@ TASKS = {
     "express_edit_json_type": ExpressEditJsonContentTypeTask(),
     "express_edit_cookie_prefix": ExpressEditCookiePrefixTask(),
     "express_edit_send_type": ExpressEditSendHtmlTypeTask(),
+    # diff-specific benchmark tasks
+    "express_diff_multi_mutation": ExpressDiffMultiMutationTask(),
+    "fastapi_diff_which_commit": FastAPIDiffWhichCommitTask(),
+    "rg_diff_misdirected_error": RipgrepDiffMisdirectedErrorTask(),
+    "gin_diff_comprehension": GinDiffComprehensionTask(),
 }

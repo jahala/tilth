@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use ignore::WalkBuilder;
 
 use crate::cache::OutlineCache;
-use crate::read::{detect_file_type, outline};
+use crate::lang::detect_file_type;
+use crate::read::outline;
 use crate::types::{estimate_tokens, FileType};
 
 /// Generate a structural codebase map.
@@ -16,6 +17,7 @@ pub fn generate(scope: &Path, depth: usize, budget: Option<u64>, cache: &Outline
     let mut tree: BTreeMap<PathBuf, Vec<FileEntry>> = BTreeMap::new();
 
     let walker = WalkBuilder::new(scope)
+        .follow_links(true)
         .hidden(false)
         .git_ignore(false)
         .git_global(false)
@@ -76,11 +78,21 @@ pub fn generate(scope: &Path, depth: usize, budget: Option<u64>, cache: &Outline
             _ => None,
         };
 
-        tree.entry(parent).or_default().push(FileEntry {
+        tree.entry(parent.clone()).or_default().push(FileEntry {
             name,
             symbols,
             tokens,
         });
+
+        // Ensure all ancestor directories exist in the tree so format_tree can find them.
+        let mut ancestor = parent.parent();
+        while let Some(a) = ancestor {
+            tree.entry(a.to_path_buf()).or_default();
+            if a == Path::new("") {
+                break;
+            }
+            ancestor = a.parent();
+        }
     }
 
     let mut out = format!("# Map: {} (depth {})\n", scope.display(), depth);

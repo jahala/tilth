@@ -11,9 +11,9 @@ use std::time::SystemTime;
 
 use dashmap::DashMap;
 
-use crate::read::detect_file_type;
-use crate::read::outline::code::outline_language;
-use crate::search::treesitter::{extract_definition_name, DEFINITION_KINDS};
+use crate::lang::detect_file_type;
+use crate::lang::outline::outline_language;
+use crate::lang::treesitter::{extract_definition_name, DEFINITION_KINDS};
 use crate::types::FileType;
 
 /// Maximum file size to index (500 KB). Matches the limit in symbol search.
@@ -73,6 +73,7 @@ impl SymbolIndex {
         // because rayon gives us better work-stealing than ignore's parallel walker
         // for CPU-bound tree-sitter parsing.
         let files: Vec<PathBuf> = WalkBuilder::new(scope)
+            .follow_links(true)
             .hidden(false)
             .git_ignore(false)
             .git_global(false)
@@ -291,11 +292,11 @@ fn walk_definitions(
         // For impl blocks in Rust, also index the trait name and type name
         // so lookups for "MyTrait" find `impl MyTrait for Foo`.
         if kind == "impl_item" {
-            if let Some(trait_name) = crate::search::treesitter::extract_impl_trait(node, lines) {
+            if let Some(trait_name) = crate::lang::treesitter::extract_impl_trait(node, lines) {
                 let line = node.start_position().row as u32 + 1;
                 symbols.push((Arc::from(trait_name.as_str()), line, true));
             }
-            if let Some(type_name) = crate::search::treesitter::extract_impl_type(node, lines) {
+            if let Some(type_name) = crate::lang::treesitter::extract_impl_type(node, lines) {
                 let line = node.start_position().row as u32 + 1;
                 symbols.push((Arc::from(type_name.as_str()), line, true));
             }
@@ -303,7 +304,7 @@ fn walk_definitions(
 
         // For classes implementing interfaces, index the interface names too
         if kind == "class_declaration" || kind == "class_definition" {
-            let interfaces = crate::search::treesitter::extract_implemented_interfaces(node, lines);
+            let interfaces = crate::lang::treesitter::extract_implemented_interfaces(node, lines);
             for iface in interfaces {
                 let line = node.start_position().row as u32 + 1;
                 symbols.push((Arc::from(iface.as_str()), line, true));
