@@ -36,7 +36,7 @@ pub fn resolve_related_files_with_content(file_path: &Path, content: &str) -> Ve
         if !is_import_line(line, lang) {
             continue;
         }
-        let source = crate::lang::outline::extract_import_source(line);
+        let source = crate::lang::outline::extract_import_source(line, Some(lang));
         if source.is_empty() || is_external(&source, lang) {
             continue;
         }

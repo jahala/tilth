@@ -637,8 +637,22 @@ fn elixir_extract_doc(node: tree_sitter::Node, lines: &[&str]) -> Option<String>
 /// Extract the source module name from an import statement text.
 /// Handles: `use std::fs;` → `std::fs`, `import X from "react"` → `react`,
 /// `from collections import X` → `collections`
-pub(crate) fn extract_import_source(text: &str) -> String {
+///
+/// The `lang` parameter is needed to disambiguate `use` (Rust path vs Elixir module)
+/// and `import` (JS/TS `from` syntax vs Elixir/Python/Go bare module name).
+pub(crate) fn extract_import_source(text: &str, lang: Option<crate::types::Lang>) -> String {
     let trimmed = text.trim().trim_end_matches(';');
+
+    // Elixir: `use GenServer`, `import Kernel`, `alias Foo.Bar`, `require Logger`
+    // Must be checked before the Rust `use` and JS `import` branches.
+    if lang == Some(crate::types::Lang::Elixir) {
+        for prefix in &["use ", "import ", "alias ", "require "] {
+            if let Some(rest) = trimmed.strip_prefix(prefix) {
+                return rest.split(',').next().unwrap_or(rest).trim().to_string();
+            }
+        }
+        return trimmed.to_string();
+    }
 
     // Rust: `use foo::bar` → `foo::bar`
     if let Some(rest) = trimmed.strip_prefix("use ") {
@@ -679,13 +693,6 @@ pub(crate) fn extract_import_source(text: &str) -> String {
     // C/C++: #include "file.h" or #include <header>
     if let Some(rest) = trimmed.strip_prefix("#include") {
         return rest.trim().to_string(); // preserves quotes/angles for external detection
-    }
-
-    // Elixir: `alias Foo.Bar`, `use GenServer`, `require Logger`
-    for prefix in &["alias ", "require "] {
-        if let Some(rest) = trimmed.strip_prefix(prefix) {
-            return rest.split(',').next().unwrap_or(rest).trim().to_string();
-        }
     }
 
     // Go: `import "source"` — already handled above via "import"

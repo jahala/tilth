@@ -52,7 +52,7 @@ fn format_entries(
             _ => {
                 // Flush any accumulated imports
                 if !import_groups.is_empty() {
-                    out.push(format_imports(&import_groups, import_group_start));
+                    out.push(format_imports(&import_groups, import_group_start, lang));
                     import_groups.clear();
                 }
             }
@@ -87,7 +87,7 @@ fn format_entries(
 
     // Flush trailing imports
     if !import_groups.is_empty() {
-        out.push(format_imports(&import_groups, import_group_start));
+        out.push(format_imports(&import_groups, import_group_start, lang));
     }
 
     out.join("\n")
@@ -95,7 +95,7 @@ fn format_entries(
 
 /// Format a collapsed import summary grouped by source with counts.
 /// Spec format: `imports: react(4), express(2), @/lib(3)`
-fn format_imports(imports: &[&str], start: u32) -> String {
+fn format_imports(imports: &[&str], start: u32, lang: Lang) -> String {
     let count = imports.len();
 
     // Extract source modules and count occurrences
@@ -103,7 +103,7 @@ fn format_imports(imports: &[&str], start: u32) -> String {
     let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
     for imp in imports {
-        let source = extract_import_source(imp);
+        let source = extract_import_source(imp, Some(lang));
         *seen.entry(source.clone()).or_insert(0) += 1;
         if !sources.contains(&source) {
             sources.push(source);

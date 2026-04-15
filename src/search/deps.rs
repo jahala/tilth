@@ -159,7 +159,7 @@ pub fn analyze_deps(
         if !is_import_line(line, lang) {
             continue;
         }
-        let source = extract_import_source(line);
+        let source = extract_import_source(line, Some(lang));
         if source.is_empty() {
             continue;
         }

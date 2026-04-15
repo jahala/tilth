@@ -831,7 +831,7 @@ fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opti
         // Collect import source strings for symbol extraction
         for line in content.lines() {
             if is_import_line(line, lang) {
-                let source = crate::lang::outline::extract_import_source(line);
+                let source = crate::lang::outline::extract_import_source(line, Some(lang));
                 if !source.is_empty() && !crate::read::imports::is_external(&source, lang) {
                     all_import_sources.push(source);
                 }
