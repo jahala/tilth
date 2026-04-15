@@ -150,7 +150,7 @@ fn find_definitions(
             let ts_language = lang.and_then(outline_language);
 
             let mut file_defs = if let Some(ref ts_lang) = ts_language {
-                find_defs_treesitter(path, query, ts_lang, &content, file_lines, mtime)
+                find_defs_treesitter(path, query, ts_lang, lang, &content, file_lines, mtime)
             } else {
                 Vec::new()
             };
@@ -183,6 +183,7 @@ fn find_defs_treesitter(
     path: &Path,
     query: &str,
     ts_lang: &tree_sitter::Language,
+    lang: Option<crate::types::Lang>,
     content: &str,
     file_lines: u32,
     mtime: SystemTime,
@@ -200,7 +201,9 @@ fn find_defs_treesitter(
     let root = tree.root_node();
     let mut defs = Vec::new();
 
-    walk_for_definitions(root, query, path, &lines, file_lines, mtime, &mut defs, 0);
+    walk_for_definitions(
+        root, query, path, &lines, file_lines, mtime, &mut defs, lang, 0,
+    );
 
     defs
 }
@@ -214,6 +217,7 @@ fn walk_for_definitions(
     file_lines: u32,
     mtime: SystemTime,
     defs: &mut Vec<Match>,
+    lang: Option<crate::types::Lang>,
     depth: usize,
 ) {
     if depth > 3 {
@@ -307,7 +311,7 @@ fn walk_for_definitions(
                 });
             }
         }
-    } else if is_elixir_definition(node, lines) {
+    } else if lang == Some(crate::types::Lang::Elixir) && is_elixir_definition(node, lines) {
         // Elixir: definitions are `call` nodes — check separately
         if let Some(name) = extract_elixir_definition_name(node, lines) {
             if name == query {
@@ -347,6 +351,7 @@ fn walk_for_definitions(
             file_lines,
             mtime,
             defs,
+            lang,
             depth + 1,
         );
     }
@@ -534,6 +539,7 @@ pub(crate) fn dispatch_tool(tool: &str) -> Result<String, String> {
             std::path::Path::new("test.rs"),
             "hello",
             &ts_lang,
+            Some(crate::types::Lang::Rust),
             code,
             15,
             SystemTime::now(),
@@ -546,6 +552,7 @@ pub(crate) fn dispatch_tool(tool: &str) -> Result<String, String> {
             std::path::Path::new("test.rs"),
             "Foo",
             &ts_lang,
+            Some(crate::types::Lang::Rust),
             code,
             15,
             SystemTime::now(),
@@ -556,6 +563,7 @@ pub(crate) fn dispatch_tool(tool: &str) -> Result<String, String> {
             std::path::Path::new("test.rs"),
             "dispatch_tool",
             &ts_lang,
+            Some(crate::types::Lang::Rust),
             code,
             15,
             SystemTime::now(),
@@ -571,6 +579,7 @@ pub(crate) fn dispatch_tool(tool: &str) -> Result<String, String> {
             std::path::Path::new("test.ex"),
             name,
             &ts_lang,
+            Some(crate::types::Lang::Elixir),
             code,
             lines,
             SystemTime::now(),

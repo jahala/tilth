@@ -260,7 +260,7 @@ fn extract_symbols(path: &Path, content: &str) -> Vec<(Arc<str>, u32, bool)> {
     let lines: Vec<&str> = content.lines().collect();
     let mut symbols = Vec::new();
 
-    walk_definitions(tree.root_node(), &lines, &mut symbols, 0);
+    walk_definitions(tree.root_node(), &lines, &mut symbols, lang, 0);
 
     symbols
 }
@@ -275,6 +275,7 @@ fn walk_definitions(
     node: tree_sitter::Node,
     lines: &[&str],
     symbols: &mut Vec<(Arc<str>, u32, bool)>,
+    lang: crate::types::Lang,
     depth: usize,
 ) {
     if depth > 3 {
@@ -310,7 +311,9 @@ fn walk_definitions(
                 symbols.push((Arc::from(iface.as_str()), line, true));
             }
         }
-    } else if crate::lang::treesitter::is_elixir_definition(node, lines) {
+    } else if lang == crate::types::Lang::Elixir
+        && crate::lang::treesitter::is_elixir_definition(node, lines)
+    {
         // Elixir: all definitions are `call` nodes — handle separately
         if let Some(name) = crate::lang::treesitter::extract_elixir_definition_name(node, lines) {
             let line = node.start_position().row as u32 + 1;
@@ -321,7 +324,7 @@ fn walk_definitions(
     // Recurse into children for nested definitions (impl blocks, class bodies, modules)
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        walk_definitions(child, lines, symbols, depth + 1);
+        walk_definitions(child, lines, symbols, lang, depth + 1);
     }
 }
 
