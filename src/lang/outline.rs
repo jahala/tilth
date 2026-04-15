@@ -660,8 +660,12 @@ fn elixir_extract_doc_string(node: tree_sitter::Node, lines: &[&str]) -> Option<
     let end_row = node.end_position().row;
 
     if start_row == end_row {
-        // Single-line: `"text"` — strip delimiters
-        let text = node_text(node, lines);
+        // Single-line: `"text"` or `~s"text"` — strip delimiters and sigil prefix
+        let mut text = node_text(node, lines);
+        // Strip sigil prefix (~s, ~S, etc.) if present
+        if text.starts_with('~') && text.len() >= 2 {
+            text = text[2..].to_string();
+        }
         let trimmed = text.trim_matches('"').trim();
         if trimmed.is_empty() {
             return None;
