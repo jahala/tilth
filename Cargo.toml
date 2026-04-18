@@ -48,6 +48,7 @@ regex-syntax = "0.8"
 
 # Byte scanning (SIMD-accelerated)
 memchr = "2"
+regex = "1"
 memmap2 = "0.9"
 
 # Parallelism
@@ -64,6 +65,8 @@ toml = "0.8"
 # MCP protocol (JSON-RPC over stdio)
 # (handled manually — no framework needed)
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
