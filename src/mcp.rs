@@ -548,7 +548,7 @@ fn tool_search(
         "callers" => {
             session.record_search(query);
             crate::search::callers::search_callers_expanded(
-                query, &scope, cache, session, bloom, expand, context, None, glob,
+                query, &scope, cache, session, bloom, expand, context, None, 0, glob,
             )
         }
         _ => {

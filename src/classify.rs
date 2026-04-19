@@ -76,10 +76,11 @@ pub fn classify(query: &str, scope: &Path) -> QueryType {
 
     // 7. OR-pattern — "Foo|Bar|Baz" with no spaces, all parts valid identifiers.
     //    Common developer intent: multi-symbol grep (rg "A|B|C" equivalent).
+    //    Wrap in word boundaries so "Foo|Bar" doesn't match "Foobar"/"Barbarian".
     if !query.contains(' ') && query.contains('|') {
         let parts: Vec<&str> = query.split('|').filter(|s| !s.is_empty()).collect();
         if parts.len() >= 2 && parts.iter().all(|p| is_identifier(p)) {
-            return QueryType::Regex(query.into());
+            return QueryType::Regex(format!(r"\b({query})\b"));
         }
     }
 

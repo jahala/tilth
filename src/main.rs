@@ -57,11 +57,11 @@ struct Cli {
     glob: Option<String>,
 
     /// Find all callers of a symbol.
-    #[arg(long, conflicts_with_all = ["deps", "map", "edit"])]
+    #[arg(long, conflicts_with_all = ["deps", "map", "edit", "files"])]
     callers: bool,
 
     /// Analyze blast-radius dependencies of a file.
-    #[arg(long, conflicts_with_all = ["callers", "map", "edit"])]
+    #[arg(long, conflicts_with_all = ["callers", "map", "edit", "files"])]
     deps: bool,
 
     /// Generate a structural codebase map.
@@ -69,10 +69,13 @@ struct Cli {
     map: bool,
 
     /// List only file paths containing matches (like rg -l).
-    #[arg(long, conflicts_with_all = ["map", "full", "expand", "section", "edit"])]
+    #[arg(long, conflicts_with_all = ["map", "full", "expand", "section", "edit", "callers", "deps"])]
     files: bool,
 
-    /// Max results to display. Applies to search, callers, content.
+    /// Max results. Default: unlimited (or 50 for interactive TTY).
+    /// Applies to: symbol/content/regex/callers search.
+    /// NOTE: multi-symbol ("A,B,C") applies the limit per-query, not total.
+    /// NOTE: --files ignores this flag.
     #[arg(long, value_name = "N")]
     limit: Option<usize>,
 
@@ -267,6 +270,16 @@ fn main() {
     let full = cli.full || !is_tty;
     let expand = cli.expand.unwrap_or(0);
 
+    // TTY interactive mode: cap at 50 unless user set --limit or --full.
+    // Piped / scripted → unlimited so grep/wc/etc. see everything.
+    let effective_limit = cli.limit.or({
+        if is_tty && !full {
+            Some(50)
+        } else {
+            None
+        }
+    });
+
     // Callers mode
     if cli.callers {
         let result = tilth::run_callers(
@@ -274,7 +287,8 @@ fn main() {
             &scope,
             expand,
             cli.budget,
-            cli.limit,
+            effective_limit,
+            cli.offset,
             cli.glob.as_deref(),
             &cache,
         );
@@ -319,7 +333,7 @@ fn main() {
             cli.budget,
             full,
             expand,
-            cli.limit,
+            effective_limit,
             cli.offset,
             cli.glob.as_deref(),
             &cache,
@@ -330,7 +344,7 @@ fn main() {
             &scope,
             cli.section.as_deref(),
             cli.budget,
-            cli.limit,
+            effective_limit,
             cli.offset,
             cli.glob.as_deref(),
             &cache,
@@ -341,7 +355,7 @@ fn main() {
             &scope,
             cli.section.as_deref(),
             cli.budget,
-            cli.limit,
+            effective_limit,
             cli.offset,
             cli.glob.as_deref(),
             &cache,

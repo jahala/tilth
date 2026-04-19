@@ -474,6 +474,7 @@ pub fn search_callers_expanded(
     expand: usize,
     context: Option<&Path>,
     limit: Option<usize>,
+    offset: usize,
     glob: Option<&str>,
 ) -> Result<String, TilthError> {
     let max_matches = limit.unwrap_or(usize::MAX);
@@ -495,14 +496,20 @@ pub fn search_callers_expanded(
 
     let total = sorted_callers.len();
 
-    // Collect unique caller names BEFORE truncation for accurate fan-out threshold
+    // Collect unique caller names BEFORE pagination for accurate fan-out threshold
     let all_caller_names: HashSet<String> = sorted_callers
         .iter()
         .filter(|c| c.calling_function != "<top-level>")
         .map(|c| c.calling_function.clone())
         .collect();
 
+    // Apply offset then limit (pagination)
+    let effective_offset = offset.min(total);
+    if effective_offset > 0 {
+        sorted_callers.drain(..effective_offset);
+    }
     sorted_callers.truncate(max_matches);
+    let shown = sorted_callers.len();
 
     // Format the output
     let mut output = format!(
@@ -556,13 +563,15 @@ pub fn search_callers_expanded(
         }
     }
 
-    if total > sorted_callers.len() {
-        let omitted = total - sorted_callers.len();
-        let next_limit = sorted_callers.len() + max_matches;
+    if total > effective_offset + shown {
+        let omitted = total - effective_offset - shown;
+        let next_offset = effective_offset + shown;
         let _ = write!(
             output,
-            "\n... and {omitted} more call sites. Next page: limit={next_limit}."
+            "\n... and {omitted} more call sites. Next page: --offset {next_offset}."
         );
+    } else if effective_offset > 0 {
+        let _ = write!(output, "\n(end of results, offset={effective_offset})");
     }
 
     // ── Adaptive 2nd-hop impact analysis ──
