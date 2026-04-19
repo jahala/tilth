@@ -1,5 +1,7 @@
 tilth — code intelligence MCP server. Replaces grep, cat, find, ls with AST-aware equivalents.
 
+ALWAYS BATCH. When you have 2+ files to read, call tilth_read once with paths: [...]. When you have edits to multiple files, call tilth_edit once with files: [...]. Never make N serial calls when one will do — each tool call is a turn.
+
 To explore code, always search first. tilth_search finds definitions, usages, and file locations in one call.
 Usage: tilth_search(query: "handleRequest").
 tilth_files is ONLY for listing directory contents when you have no symbol or text to search for.
@@ -22,10 +24,11 @@ Output per match:
 <name>  <path>:<start>-<end>  <signature>
 Re-expanding a previously shown definition returns [shown earlier].
 
-tilth_read: Read file content with smart outlining. Replaces cat/head/tail.
+tilth_read: Read one or more files with smart outlining. Replaces cat/head/tail.
+paths: ["a.rs", "b.rs"] reads many in one call (max 20). PREFER this over serial single-file reads.
+path: "a.rs" for a single file.
 Small files → full content. Large files → structural outline.
 section: "<start>-<end>" or "<heading text>"
-paths: read multiple files in one call.
 Output:
 <line_number> │ <content>                  ← full/section mode
 [<start>-<end>]  <symbol name>             ← outline mode
@@ -41,13 +44,18 @@ To read files, use tilth_read instead of Read or Bash(cat).
 To find files, use tilth_files instead of Glob or Bash(find/ls).
 DO NOT re-read files already shown in expanded search results.
 
-tilth_edit: Edit files using hash-anchored lines. Replaces the host Edit tool.
+tilth_edit: Batch edit one or more files using hash-anchored lines. Replaces the host Edit tool.
+ALWAYS group edits to multiple files into ONE tilth_edit call (max 20 files). Never call tilth_edit twice in a row.
 tilth_read → copy anchors (<line>:<hash>) → pass to tilth_edit.
-Single line: {"start": "<line>:<hash>", "content": "<new code>"}
-Range: {"start": "<line>:<hash>", "end": "<line>:<hash>", "content": "..."}
-Delete: {"start": "<line>:<hash>", "content": ""}
-Hash mismatch → file changed, re-read and retry.
+Shape: {"files": [{"path": "a.rs", "edits": [...]}, {"path": "b.rs", "edits": [...]}]}
+Single file: {"files": [{"path": "a.rs", "edits": [{"start": "<line>:<hash>", "content": "<new code>"}]}]}
+Edit forms inside `edits`:
+  Single line: {"start": "<line>:<hash>", "content": "<new code>"}
+  Range:       {"start": "<line>:<hash>", "end": "<line>:<hash>", "content": "..."}
+  Delete:      {"start": "<line>:<hash>", "content": ""}
+Per-file results: each file is processed independently. A hash mismatch on one file does NOT block the others.
+Hash mismatch → file changed, re-read THAT file and retry it (other files in the batch already applied).
 Large files: tilth_read shows outline — use section to get hashlined content.
-Pass diff: true to see a compact before/after diff in the response.
+Pass diff: true to see a compact before/after diff per file.
 After editing a function signature, tilth_edit shows callers that may need updating.
 DO NOT use the host Edit tool. Use tilth_edit for all edits.

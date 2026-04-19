@@ -699,7 +699,7 @@ dependencies = [
 
 [[package]]
 name = "tilth"
-version = "0.6.3"
+version = "0.7.0"
 dependencies = [
  "clap",
  "clap_complete",
