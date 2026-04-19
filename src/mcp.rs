@@ -1,8 +1,6 @@
 use std::fmt::Write as _;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,21 +11,30 @@ use crate::cache::OutlineCache;
 use crate::index::bloom::BloomFilterCache;
 use crate::index::SymbolIndex;
 use crate::session::Session;
+use crate::timeout::{self, spawn_with_timeout, SpawnFailure, ThreadTracker};
 
-/// Tracks abandoned threads (timed out but still running). Warns on stderr
-/// when accumulation exceeds threshold to help diagnose resource pressure.
-static ABANDONED_THREADS: AtomicUsize = AtomicUsize::new(0);
-const ABANDONED_THREAD_WARN: usize = 3;
+/// Shared dependencies passed through the request → dispatch pipeline.
+#[derive(Clone)]
+pub(crate) struct Services {
+    pub(crate) cache: Arc<OutlineCache>,
+    pub(crate) session: Arc<Session>,
+    pub(crate) index: Arc<SymbolIndex>,
+    pub(crate) bloom: Arc<BloomFilterCache>,
+    pub(crate) tracker: Arc<ThreadTracker>,
+    pub(crate) edit_mode: bool,
+}
 
-/// Per-request timeout for tool calls. If a tool doesn't respond within this
-/// duration, the MCP server returns a timeout error instead of hanging.
-/// Override with `TILTH_TIMEOUT` env var (seconds). Default: 90s.
-fn request_timeout() -> Duration {
-    let secs = std::env::var("TILTH_TIMEOUT")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(90);
-    Duration::from_secs(secs)
+impl Services {
+    pub(crate) fn new(edit_mode: bool) -> Self {
+        Self {
+            cache: Arc::new(OutlineCache::new()),
+            session: Arc::new(Session::new()),
+            index: Arc::new(SymbolIndex::new()),
+            bloom: Arc::new(BloomFilterCache::new()),
+            tracker: Arc::new(ThreadTracker::new()),
+            edit_mode,
+        }
+    }
 }
 
 // Sent to the LLM via the MCP `instructions` field during initialization.
@@ -120,10 +127,7 @@ pub fn run(edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
         }
     }
 
-    let cache = Arc::new(OutlineCache::new());
-    let session = Arc::new(Session::new());
-    let symbol_index = Arc::new(SymbolIndex::new());
-    let bloom_cache = Arc::new(BloomFilterCache::new());
+    let services = Services::new(edit_mode);
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
@@ -182,14 +186,7 @@ pub fn run(edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
             params,
         };
 
-        let response = handle_request(
-            &req,
-            &cache,
-            &session,
-            &symbol_index,
-            &bloom_cache,
-            edit_mode,
-        );
+        let response = handle_request(&req, &services);
         serde_json::to_writer(&mut stdout, &response)?;
         stdout.write_all(b"\n")?;
         stdout.flush()?;
@@ -285,14 +282,8 @@ struct JsonRpcError {
     message: String,
 }
 
-fn handle_request(
-    req: &JsonRpcRequest,
-    cache: &Arc<OutlineCache>,
-    session: &Arc<Session>,
-    index: &Arc<SymbolIndex>,
-    bloom: &Arc<BloomFilterCache>,
-    edit_mode: bool,
-) -> JsonRpcResponse {
+fn handle_request(req: &JsonRpcRequest, services: &Services) -> JsonRpcResponse {
+    let edit_mode = services.edit_mode;
     match req.method.as_str() {
         "initialize" => {
             let overview = if std::env::var("TILTH_NO_OVERVIEW").is_ok() {
@@ -339,7 +330,7 @@ fn handle_request(
             error: None,
         },
 
-        "tools/call" => handle_tool_call(req, cache, session, index, bloom, edit_mode),
+        "tools/call" => handle_tool_call(req, services),
 
         "ping" => JsonRpcResponse {
             jsonrpc: "2.0",
@@ -364,26 +355,26 @@ fn handle_request(
 // Tool dispatch
 // ---------------------------------------------------------------------------
 
-/// Execute a tool by name with the given arguments. Returns formatted output or error string.
 /// No classifier involved — the caller specifies the tool explicitly.
-pub(crate) fn dispatch_tool(
-    tool: &str,
-    args: &Value,
-    cache: &OutlineCache,
-    session: &Session,
-    index: &Arc<SymbolIndex>,
-    bloom: &Arc<BloomFilterCache>,
-    edit_mode: bool,
-) -> Result<String, String> {
+fn dispatch_tool(services: &Services, tool: &str, args: &Value) -> Result<String, String> {
+    let edit_mode = services.edit_mode;
     match tool {
-        "tilth_read" => tool_read(args, cache, session, edit_mode),
-        "tilth_search" => tool_search(args, cache, session, index, bloom),
-        "tilth_files" => tool_files(args, cache),
-        "tilth_deps" => tool_deps(args, cache, bloom),
+        "tilth_read" => tool_read(args, &services.cache, &services.session, edit_mode),
+        "tilth_search" => tool_search(
+            args,
+            &services.cache,
+            &services.session,
+            &services.index,
+            &services.bloom,
+        ),
+        "tilth_files" => tool_files(args, &services.cache),
+        "tilth_deps" => tool_deps(args, &services.cache, &services.bloom),
         "tilth_diff" => tool_diff(args),
         "tilth_map" => Err("tilth_map is disabled — use tilth_search instead".into()),
-        "tilth_session" => tool_session(args, session),
-        "tilth_edit" if edit_mode => tool_edit(args, session, cache, bloom),
+        "tilth_session" => tool_session(args, &services.session),
+        "tilth_edit" if edit_mode => {
+            tool_edit(args, &services.session, &services.cache, &services.bloom)
+        }
         _ => Err(format!("unknown tool: {tool}")),
     }
 }
@@ -396,7 +387,7 @@ fn tool_read(
 ) -> Result<String, String> {
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
 
-    // Multi-file batch read (capped at 20 to bound I/O)
+    // Multi-file batch read (capped at 20 to bound I/O).
     if let Some(paths_arr) = args.get("paths").and_then(|v| v.as_array()) {
         if paths_arr.len() > 20 {
             return Err(format!(
@@ -405,37 +396,16 @@ fn tool_read(
             ));
         }
 
-        // Aggregate deadline for batch reads: 60s default, override with TILTH_BATCH_TIMEOUT
-        // Note: deadline is checked between files, so a single massive file could still
-        // exceed it. The per-request timeout (handle_tool_call) catches that case.
-        let batch_timeout = std::env::var("TILTH_BATCH_TIMEOUT")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(60);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(batch_timeout);
+        let paths: Vec<PathBuf> = paths_arr
+            .iter()
+            .map(|p| {
+                p.as_str()
+                    .ok_or("paths must be an array of strings")
+                    .map(PathBuf::from)
+            })
+            .collect::<Result<_, _>>()?;
 
-        let mut results = Vec::with_capacity(paths_arr.len());
-        for (i, p) in paths_arr.iter().enumerate() {
-            // Check deadline before each file
-            if std::time::Instant::now() > deadline {
-                results.push(format!(
-                    "# batch read stopped — deadline exceeded after {}/{} files. \
-                     Reduce batch size or set TILTH_BATCH_TIMEOUT=<seconds>.",
-                    i,
-                    paths_arr.len()
-                ));
-                break;
-            }
-
-            let path_str = p.as_str().ok_or("paths must be an array of strings")?;
-            let path = PathBuf::from(path_str);
-            session.record_read(&path);
-            match crate::read::read_file(&path, None, false, cache, edit_mode) {
-                Ok(output) => results.push(output),
-                Err(e) => results.push(format!("# {} — error: {}", path.display(), e)),
-            }
-        }
-        let combined = results.join("\n\n");
+        let combined = crate::read::read_batch(&paths, cache, session, edit_mode);
         return Ok(apply_budget(combined, budget));
     }
 
@@ -752,99 +722,66 @@ fn apply_budget(output: String, budget: Option<u64>) -> String {
 // MCP tool call handler
 // ---------------------------------------------------------------------------
 
-fn handle_tool_call(
-    req: &JsonRpcRequest,
-    cache: &Arc<OutlineCache>,
-    session: &Arc<Session>,
-    index: &Arc<SymbolIndex>,
-    bloom: &Arc<BloomFilterCache>,
-    edit_mode: bool,
-) -> JsonRpcResponse {
+fn handle_tool_call(req: &JsonRpcRequest, services: &Services) -> JsonRpcResponse {
     let params = &req.params;
     let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let args = params.get("arguments").unwrap_or(&Value::Null);
 
-    // Clone values needed by the worker thread
-    let tool_name_owned = tool_name.to_string();
-    let args_owned = args.clone();
-    let cache_clone = Arc::clone(cache);
-    let session_clone = Arc::clone(session);
-    let index_clone = Arc::clone(index);
-    let bloom_clone = Arc::clone(bloom);
-
-    let (tx, rx) = mpsc::channel();
-    let timeout = request_timeout();
-
-    let handle = std::thread::spawn(move || {
-        let result = dispatch_tool(
-            &tool_name_owned,
-            &args_owned,
-            &cache_clone,
-            &session_clone,
-            &index_clone,
-            &bloom_clone,
-            edit_mode,
-        );
-        let _ = tx.send(result);
-    });
-
-    let result = match rx.recv_timeout(timeout) {
-        Ok(result) => {
-            // Thread finished in time — join it to reclaim resources
-            let _ = handle.join();
-            result
-        }
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            // Thread is still running — we can't safely kill it, but we return
-            // an error to the client immediately. The thread will finish in the
-            // background and its result will be dropped.
-            //
-            // Note: we intentionally do NOT join here to avoid blocking the
-            // main loop. The thread will complete and exit on its own.
-            let abandoned = ABANDONED_THREADS.fetch_add(1, Ordering::Relaxed) + 1;
-            if abandoned >= ABANDONED_THREAD_WARN {
-                eprintln!(
-                    "tilth: warning: {abandoned} abandoned threads still running. \
-                     Consider reducing scope or increasing TILTH_TIMEOUT."
-                );
-            }
-            Err(format!(
-                "tool timed out after {}s — the operation took too long. \
-                 Try: reduce scope, use section instead of full, or set \
-                 TILTH_TIMEOUT=<seconds> to increase the limit.",
-                timeout.as_secs()
-            ))
-        }
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            // Thread panicked — the channel was dropped without sending
-            Err("tool panicked during execution".into())
-        }
+    let result = if services.tracker.is_at_cap() {
+        Err(
+            "server busy: too many prior operations still running after timeout. \
+             Wait or set TILTH_TIMEOUT=<seconds> higher."
+                .into(),
+        )
+    } else {
+        run_tool_with_timeout(services, tool_name, args, timeout::request_timeout())
     };
 
+    build_response(req.id.as_ref(), result)
+}
+
+fn build_response(id: Option<&Value>, result: Result<String, String>) -> JsonRpcResponse {
+    let (text, is_error) = match result {
+        Ok(output) => (output, false),
+        Err(e) => (e, true),
+    };
+    let mut payload = serde_json::json!({
+        "content": [{ "type": "text", "text": text }]
+    });
+    if is_error {
+        payload["isError"] = Value::Bool(true);
+    }
+    JsonRpcResponse {
+        jsonrpc: "2.0",
+        id: id.cloned(),
+        result: Some(payload),
+        error: None,
+    }
+}
+
+fn run_tool_with_timeout(
+    services: &Services,
+    tool_name: &str,
+    args: &Value,
+    timeout: Duration,
+) -> Result<String, String> {
+    let services_worker = services.clone();
+    let tool = tool_name.to_string();
+    let args_owned = args.clone();
+
+    let result = spawn_with_timeout(&services.tracker, timeout, move || {
+        dispatch_tool(&services_worker, &tool, &args_owned)
+    });
+
     match result {
-        Ok(output) => JsonRpcResponse {
-            jsonrpc: "2.0",
-            id: req.id.clone(),
-            result: Some(serde_json::json!({
-                "content": [{
-                    "type": "text",
-                    "text": output
-                }]
-            })),
-            error: None,
-        },
-        Err(e) => JsonRpcResponse {
-            jsonrpc: "2.0",
-            id: req.id.clone(),
-            result: Some(serde_json::json!({
-                "content": [{
-                    "type": "text",
-                    "text": e
-                }],
-                "isError": true
-            })),
-            error: None,
-        },
+        Ok(inner) => inner,
+        Err(SpawnFailure::Timeout) => Err(format!(
+            "tool timed out after {}s — the operation took too long. \
+             Try: reduce scope, use section instead of full, or set \
+             TILTH_TIMEOUT=<seconds> to increase the limit.",
+            timeout.as_secs()
+        )),
+        Err(SpawnFailure::Panic) => Err("tool panicked during execution".into()),
     }
 }
 
@@ -1293,5 +1230,86 @@ mod tests {
         let root_canon = root.unwrap().canonicalize().unwrap();
         let expected_canon = project_path.canonicalize().unwrap();
         assert_eq!(root_canon, expected_canon);
+    }
+
+    fn services_with_tracker(tracker: Arc<ThreadTracker>) -> Services {
+        Services {
+            cache: Arc::new(OutlineCache::new()),
+            session: Arc::new(Session::new()),
+            index: Arc::new(SymbolIndex::new()),
+            bloom: Arc::new(BloomFilterCache::new()),
+            tracker,
+            edit_mode: false,
+        }
+    }
+
+    #[test]
+    fn abandoned_hard_cap_returns_server_busy() {
+        let tracker = Arc::new(ThreadTracker::new());
+        tracker.saturate();
+        let services = services_with_tracker(tracker);
+
+        let req = JsonRpcRequest {
+            _jsonrpc: "2.0".into(),
+            id: Some(serde_json::json!(1)),
+            method: "tools/call".into(),
+            params: serde_json::json!({
+                "name": "tilth_files",
+                "arguments": { "pattern": "*.rs" }
+            }),
+        };
+
+        let resp = handle_tool_call(&req, &services);
+
+        let result = resp.result.expect("response must have a result field");
+        let is_error = result
+            .get("isError")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        assert!(is_error, "response must have isError: true");
+
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        assert!(
+            text.contains("server busy"),
+            "error message must contain 'server busy', got: {text}"
+        );
+        assert!(
+            text.contains("TILTH_TIMEOUT"),
+            "error message must include TILTH_TIMEOUT hint, got: {text}"
+        );
+    }
+
+    /// Batch reads must return the content of every submitted path — no file
+    /// is dropped or reordered on the way through the tool handler.
+    #[test]
+    fn batch_read_returns_all_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_count = 5usize;
+
+        let paths: Vec<PathBuf> = (0..file_count)
+            .map(|i| {
+                let p = dir.path().join(format!("file{i}.txt"));
+                std::fs::write(&p, format!("content-of-file-{i}")).unwrap();
+                p
+            })
+            .collect();
+
+        let paths_json: Vec<serde_json::Value> = paths
+            .iter()
+            .map(|p| serde_json::json!(p.to_str().unwrap()))
+            .collect();
+
+        let args = serde_json::json!({ "paths": paths_json });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+
+        let result = tool_read(&args, &cache, &session, false).expect("batch read must succeed");
+
+        for i in 0..file_count {
+            assert!(
+                result.contains(&format!("content-of-file-{i}")),
+                "output must contain content of file {i}"
+            );
+        }
     }
 }
