@@ -1,4 +1,3 @@
-use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -110,21 +109,31 @@ fn find_definitions(
             let path = entry.path();
 
             // Skip oversized files — avoid tree-sitter parsing multi-MB minified bundles
-            if let Ok(meta) = std::fs::metadata(path) {
-                if meta.len() > 500_000 {
-                    return ignore::WalkState::Continue;
+            let file_size = match std::fs::metadata(path) {
+                Ok(meta) => {
+                    if meta.len() > 500_000 {
+                        return ignore::WalkState::Continue;
+                    }
+                    meta.len()
                 }
-            }
+                Err(_) => return ignore::WalkState::Continue,
+            };
 
-            // Single read: read file once, use buffer for both check and parse
-            let Ok(content) = fs::read_to_string(path) else {
+            // Fast byte-level scan: mmap (or heap-read for tiny files) +
+            // memchr SIMD search. Skips UTF-8 validation on ~90% of files
+            // that don't contain the symbol.
+            let Some(bytes) = super::read_file_bytes(path, file_size) else {
                 return ignore::WalkState::Continue;
             };
 
-            // Fast byte check via memchr::memmem (SIMD) — skip files without the symbol
-            if memchr::memmem::find(content.as_bytes(), needle).is_none() {
+            if memchr::memmem::find(&bytes, needle).is_none() {
                 return ignore::WalkState::Continue;
             }
+
+            // Hit: validate UTF-8 only now (matched files are <10% in typical search)
+            let Ok(content) = std::str::from_utf8(&bytes) else {
+                return ignore::WalkState::Continue;
+            };
 
             // Get file metadata once per file
             let (file_lines, mtime) = file_metadata(path);

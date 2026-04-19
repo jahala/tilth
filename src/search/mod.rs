@@ -67,6 +67,49 @@ pub(crate) const SKIP_DIRS: &[&str] = &[
 
 const EXPAND_FULL_FILE_THRESHOLD: u64 = 800;
 
+/// Open a file for fast byte-level scanning without UTF-8 validation.
+/// Returns None if the file can't be opened or is empty.
+///
+/// Uses `read` (heap) for small files and `mmap` for large ones — syscall
+/// overhead of mmap isn't worth it below ~16KB.
+///
+/// The returned `FileBytes` derefs to `&[u8]` — pass to `memchr` for a fast
+/// miss check. Only validate UTF-8 (via `std::str::from_utf8`) on files that
+/// actually contain the query. This skips UTF-8 validation on ~90% of files
+/// in typical searches, saving significant time on large repos.
+pub(crate) enum FileBytes {
+    Heap(Vec<u8>),
+    Mmap(memmap2::Mmap),
+}
+
+impl std::ops::Deref for FileBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            FileBytes::Heap(v) => v,
+            FileBytes::Mmap(m) => m,
+        }
+    }
+}
+
+/// Threshold below which `read` outperforms `mmap` due to syscall overhead.
+const MMAP_THRESHOLD: u64 = 16_384;
+
+pub(crate) fn read_file_bytes(path: &Path, size: u64) -> Option<FileBytes> {
+    if size == 0 {
+        return None;
+    }
+    if size < MMAP_THRESHOLD {
+        fs::read(path).ok().map(FileBytes::Heap)
+    } else {
+        // Safety: mmap on a regular file. If the file is truncated during
+        // the scan, access could SIGBUS — acceptable risk for a read-only
+        // search tool; ripgrep uses the same pattern.
+        let file = std::fs::File::open(path).ok()?;
+        unsafe { memmap2::Mmap::map(&file).ok().map(FileBytes::Mmap) }
+    }
+}
+
 /// Build a parallel directory walker that searches ALL files except known junk directories.
 /// Does NOT respect .gitignore — ensures gitignored but locally-relevant files are found.
 /// When `glob` is Some, applies a file-pattern override (whitelist or negation).

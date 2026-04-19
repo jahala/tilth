@@ -1,6 +1,5 @@
 use std::collections::HashSet;
 use std::fmt::Write as _;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -78,18 +77,22 @@ pub fn find_callers(
                 return ignore::WalkState::Continue;
             }
 
-            // Single read: read file once, use buffer for both check and parse
-            let Ok(content) = fs::read_to_string(path) else {
+            // Fast byte-level scan: mmap + memchr SIMD pre-filter.
+            let Some(bytes) = super::read_file_bytes(path, file_len) else {
+                return ignore::WalkState::Continue;
+            };
+
+            if memchr::memmem::find(&bytes, needle).is_none() {
+                return ignore::WalkState::Continue;
+            }
+
+            // Hit: validate UTF-8 only now.
+            let Ok(content) = std::str::from_utf8(&bytes) else {
                 return ignore::WalkState::Continue;
             };
 
             // Bloom pre-filter: skip if target is definitely not in file
-            if !bloom.contains(path, mtime, &content, target) {
-                return ignore::WalkState::Continue;
-            }
-
-            // Fast byte check via memchr::memmem (SIMD) — skip files without the symbol
-            if memchr::memmem::find(content.as_bytes(), needle).is_none() {
+            if !bloom.contains(path, mtime, content, target) {
                 return ignore::WalkState::Continue;
             }
 
@@ -258,23 +261,27 @@ pub(crate) fn find_callers_batch(
                 return ignore::WalkState::Continue;
             }
 
-            // Single read: read file once, use buffer for both check and parse
-            let Ok(content) = fs::read_to_string(path) else {
+            // Fast byte-level scan: mmap + memchr SIMD pre-filter for any target.
+            let Some(bytes) = super::read_file_bytes(path, file_len) else {
+                return ignore::WalkState::Continue;
+            };
+
+            if !targets
+                .iter()
+                .any(|t| memchr::memmem::find(&bytes, t.as_bytes()).is_some())
+            {
+                return ignore::WalkState::Continue;
+            }
+
+            // Hit: validate UTF-8 only now.
+            let Ok(content) = std::str::from_utf8(&bytes) else {
                 return ignore::WalkState::Continue;
             };
 
             // Bloom pre-filter: skip if none of the targets are definitely in the file
             if !targets
                 .iter()
-                .any(|t| bloom.contains(path, mtime, &content, t))
-            {
-                return ignore::WalkState::Continue;
-            }
-
-            // Fast byte check via memchr::memmem (SIMD) — skip files without any target symbol
-            if !targets
-                .iter()
-                .any(|t| memchr::memmem::find(content.as_bytes(), t.as_bytes()).is_some())
+                .any(|t| bloom.contains(path, mtime, content, t))
             {
                 return ignore::WalkState::Continue;
             }
