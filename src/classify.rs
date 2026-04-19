@@ -204,13 +204,22 @@ fn has_regex_metachar(s: &str) -> bool {
     })
 }
 
+/// Known source-file extensions. If `after` matches one of these, treat as filename.
+/// Anything else with identifier on both sides → dotted symbol (method/property access).
+const FILE_EXTENSIONS: &[&str] = &[
+    "rs", "go", "py", "pyi", "ts", "tsx", "js", "jsx", "mjs", "cjs", "java", "kt", "kts", "scala",
+    "swift", "rb", "php", "cs", "c", "h", "cc", "cpp", "cxx", "hpp", "hh", "hxx", "m", "mm", "lua",
+    "dart", "ex", "exs", "erl", "hrl", "elm", "hs", "clj", "cljs", "cljc", "ml", "mli", "fs",
+    "fsi", "fsx", "vb", "pas", "pl", "pm", "r", "jl", "nim", "zig", "v", "sh", "bash", "zsh",
+    "fish", "ps1", "bat", "cmd", "html", "htm", "css", "scss", "sass", "less", "vue", "svelte",
+    "astro", "md", "mdx", "rst", "adoc", "txt", "tex", "yaml", "yml", "toml", "json", "jsonc",
+    "json5", "xml", "ini", "cfg", "conf", "env", "proto", "graphql", "gql", "sql", "prisma",
+    "wasm", "lock",
+];
+
 /// Is this a dotted symbol (method/property access) rather than a filename?
 /// "Auth.validate", "std.path" → true (symbol)
 /// "server.go", "config.yaml" → false (filename)
-///
-/// Heuristic: if both sides of the dot are identifiers AND the part after the dot
-/// is longer than 4 chars, it's likely a method call, not a file extension.
-/// Extensions are almost always 1-4 chars (rs, go, java, yaml, toml).
 fn is_dotted_symbol(query: &str) -> bool {
     let Some(dot_pos) = query.rfind('.') else {
         return false;
@@ -224,9 +233,9 @@ fn is_dotted_symbol(query: &str) -> bool {
     if !is_identifier(before) || !is_identifier(after) {
         return false;
     }
-    // Short after-dot part (1-4 chars) → likely file extension, not symbol
-    // Long after-dot part (5+ chars) → likely method/property name
-    after.len() > 4
+    // If `after` is a known file extension → filename, not symbol.
+    let after_lower = after.to_ascii_lowercase();
+    !FILE_EXTENSIONS.contains(&after_lower.as_str())
 }
 
 /// Identifier check without regex: first byte is [a-zA-Z_$@],

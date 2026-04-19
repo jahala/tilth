@@ -987,20 +987,21 @@ fn format_search_result(
         );
     }
 
-    if result.total_found > result.matches.len() {
+    if result.has_more {
+        let omitted = result.total_found - result.matches.len() - result.offset;
+        let next_offset = result.offset + result.matches.len();
+        let _ = write!(
+            out,
+            "\n\n... and {omitted} more matches. Next page: offset={next_offset}. Use --files for full file list."
+        );
+    } else if result.offset > 0 {
+        let _ = write!(out, "\n\n(end of results, offset={})", result.offset);
+    } else if result.total_found > result.matches.len() {
         let omitted = result.total_found - result.matches.len();
-        if result.offset > 0 || result.has_more {
-            let next_offset = result.offset + result.matches.len();
-            let _ = write!(
-                out,
-                "\n\n... and {omitted} more matches. Next page: offset={next_offset}. Use --files for full file list."
-            );
-        } else {
-            let _ = write!(
-                out,
-                "\n\n... and {omitted} more matches. Narrow with scope."
-            );
-        }
+        let _ = write!(
+            out,
+            "\n\n... and {omitted} more matches. Narrow with scope."
+        );
     }
 
     let tokens = estimate_tokens(out.len() as u64);
