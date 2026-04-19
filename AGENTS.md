@@ -10,7 +10,7 @@ DO NOT use Grep, Read, or Glob. Always use the better tools tilth_search (grep),
 
 tilth_search: Search code — finds definitions, usages, and text. Replaces grep/rg for all code search.
 Comma-separated symbols for multi-symbol lookup (max 5).
-kind: "symbol" (default) | "content" (strings/comments) | "callers" (call sites)
+kind: "symbol" (default, declarations only) | "any" (symbol-name matches incl. comments/strings) | "content" (strings/comments) | "callers" (call sites)
 expand (default 2): inline full source for top matches.
 context: path to file being edited — boosts nearby results.
 glob: file pattern filter — "*.rs" (whitelist), "!*.test.ts" (exclude), "*.{go,rs}" (multi).

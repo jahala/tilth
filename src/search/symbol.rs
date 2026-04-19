@@ -39,11 +39,13 @@ fn stratum_for_display(m: &Match) -> u8 {
 
 /// Symbol search: find definitions via tree-sitter, usages via ripgrep, concurrently.
 /// Merge results, deduplicate, definitions first.
+/// When `strict` is true, only declaration matches are returned (no comment/string/usage hits).
 pub fn search(
     query: &str,
     scope: &Path,
     context: Option<&Path>,
     glob: Option<&str>,
+    strict: bool,
 ) -> Result<SearchResult, TilthError> {
     // Compile regex once, share across both arms
     let word_pattern = format!(r"\b{}\b", regex_syntax::escape(query));
@@ -65,12 +67,14 @@ pub fn search(
     let mut merged: Vec<Match> = defs;
     let def_count = merged.len();
 
-    for m in usages {
-        let dominated = merged[..def_count]
-            .iter()
-            .any(|d| d.path == m.path && d.line == m.line);
-        if !dominated {
-            merged.push(m);
+    if !strict {
+        for m in usages {
+            let dominated = merged[..def_count]
+                .iter()
+                .any(|d| d.path == m.path && d.line == m.line);
+            if !dominated {
+                merged.push(m);
+            }
         }
     }
 
@@ -1020,6 +1024,45 @@ end
         assert!(
             !elixir_find(code, "MyError").is_empty(),
             "should find 'MyError' module"
+        );
+    }
+
+    #[test]
+    fn strict_mode_drops_comment_and_usage_matches() {
+        // Python fixture: comment hit, real definition, and a variable usage
+        let py_code = "# class Foo\nclass Foo:\n    pass\n\nfoo = Foo()\n";
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test_strict.py");
+        std::fs::write(&path, py_code).unwrap();
+
+        // strict=true: only the class definition line
+        let strict_result = super::search("Foo", tmp.path(), None, None, true).unwrap();
+        assert_eq!(
+            strict_result.matches.len(),
+            1,
+            "strict mode should return exactly 1 match (the definition), got: {:?}",
+            strict_result
+                .matches
+                .iter()
+                .map(|m| (m.line, &m.text))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            strict_result.matches[0].line, 2,
+            "match should be the class definition line"
+        );
+        assert!(strict_result.matches[0].is_definition);
+
+        // strict=false: comment + definition + usage all returned
+        let any_result = super::search("Foo", tmp.path(), None, None, false).unwrap();
+        assert!(
+            any_result.matches.len() > 1,
+            "non-strict mode should return more than 1 match, got: {:?}",
+            any_result
+                .matches
+                .iter()
+                .map(|m| (m.line, &m.text))
+                .collect::<Vec<_>>()
         );
     }
 
