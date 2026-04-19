@@ -29,6 +29,7 @@ pub mod overview;
 pub(crate) mod read;
 pub(crate) mod search;
 pub(crate) mod session;
+pub(crate) mod timeout;
 pub(crate) mod types;
 
 use std::path::Path;

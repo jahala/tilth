@@ -5,11 +5,13 @@ use std::fs;
 use std::path::Path;
 
 use memmap2::Mmap;
+use rayon::prelude::*;
 
 use crate::cache::OutlineCache;
 use crate::error::TilthError;
 use crate::format;
 use crate::lang::detect_file_type;
+use crate::session::Session;
 use crate::types::{estimate_tokens, FileType, ViewMode};
 
 pub(crate) const TOKEN_THRESHOLD: u64 = 6_000;
@@ -24,6 +26,30 @@ fn full_read_size_cap() -> u64 {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(2_000_000)
+}
+
+/// Read many files in parallel. Each file's output follows the same smart-view
+/// rules as [`read_file`]; errors are inlined as `# <path> — error: <msg>` so
+/// one bad path never aborts the batch. Output ordering matches the input
+/// `paths` — rayon's `par_iter().collect()` preserves index order even though
+/// execution order is not deterministic.
+pub(crate) fn read_batch(
+    paths: &[std::path::PathBuf],
+    cache: &OutlineCache,
+    session: &Session,
+    edit_mode: bool,
+) -> String {
+    let results: Vec<String> = paths
+        .par_iter()
+        .map(|path| {
+            session.record_read(path);
+            match read_file(path, None, false, cache, edit_mode) {
+                Ok(output) => output,
+                Err(e) => format!("# {} — error: {}", path.display(), e),
+            }
+        })
+        .collect();
+    results.join("\n\n")
 }
 
 /// Main entry point for read mode. Routes through the decision tree.
@@ -160,8 +186,7 @@ pub fn read_file(
 /// Would this file produce an outline (rather than full content) in default read mode?
 /// Used by the MCP layer to decide whether to append related-file hints.
 pub fn would_outline(path: &Path) -> bool {
-    std::fs::metadata(path)
-        .is_ok_and(|m| !m.is_dir() && estimate_tokens(m.len()) > TOKEN_THRESHOLD)
+    std::fs::metadata(path).is_ok_and(|m| !m.is_dir() && estimate_tokens(m.len()) > TOKEN_THRESHOLD)
 }
 
 /// Resolve a heading address to a line range in a markdown file.
