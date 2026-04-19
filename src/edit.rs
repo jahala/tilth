@@ -8,7 +8,6 @@ use rayon::prelude::*;
 use crate::error::TilthError;
 use crate::format;
 use crate::index::bloom::BloomFilterCache;
-use crate::session::Session;
 
 /// A single edit operation targeting a line range by hash anchors.
 #[derive(Debug, Clone)]
@@ -41,7 +40,7 @@ struct EditDiff {
 
 /// Result of applying edits to a file.
 #[derive(Debug)]
-pub enum EditResult {
+enum EditResult {
     /// All edits applied successfully.
     Applied {
         /// Compact diff showing `-`/`+` lines per edit site.
@@ -61,7 +60,7 @@ pub enum EditResult {
 /// 4. Splice replacements
 /// 5. Write file
 /// 6. Return hashlined context around edit sites
-pub fn apply_edits(path: &Path, edits: &[Edit]) -> Result<EditResult, TilthError> {
+fn apply_edits(path: &Path, edits: &[Edit]) -> Result<EditResult, TilthError> {
     if edits.is_empty() {
         return Ok(EditResult::Applied {
             diff: String::new(),
@@ -319,41 +318,46 @@ fn format_diffs(diffs: &[EditDiff]) -> String {
 /// index order even though execution order is not deterministic.
 pub fn apply_batch(
     tasks: Vec<FileEditTask>,
-    session: &Session,
     bloom: &Arc<BloomFilterCache>,
     show_diff: bool,
 ) -> Result<String, String> {
     let outcomes: Vec<(String, bool)> = tasks
         .into_par_iter()
-        .map(|task| match task {
-            FileEditTask::ParseError { label, msg } => (format!("## {label}\nerror: {msg}"), false),
-            FileEditTask::Ready { path, edits } => {
-                session.record_read(&path);
-                let header = format!("## {}", path.display());
-                match apply_one(&path, &edits, bloom, show_diff) {
-                    Ok(body) if body.is_empty() => (header, true),
-                    Ok(body) => (format!("{header}\n{body}"), true),
-                    Err(msg) => (format!("{header}\n{msg}"), false),
-                }
-            }
-        })
+        .map(|task| apply_one(task, bloom, show_diff))
         .collect();
 
-    let success_count = outcomes.iter().filter(|(_, ok)| *ok).count();
+    let any_success = outcomes.iter().any(|(_, ok)| *ok);
     let combined = outcomes
         .into_iter()
         .map(|(s, _)| s)
         .collect::<Vec<_>>()
         .join("\n\n---\n\n");
 
-    if success_count == 0 {
-        Err(combined)
-    } else {
+    if any_success {
         Ok(combined)
+    } else {
+        Err(combined)
     }
 }
 
-fn apply_one(
+/// Process one task into a `(section, success)` tuple. Kept separate so the
+/// parallel closure stays trivial and per-file logic is testable in isolation.
+fn apply_one(task: FileEditTask, bloom: &Arc<BloomFilterCache>, show_diff: bool) -> (String, bool) {
+    let (path, edits) = match task {
+        FileEditTask::ParseError { label, msg } => {
+            return (format!("## {label}\nerror: {msg}"), false);
+        }
+        FileEditTask::Ready { path, edits } => (path, edits),
+    };
+    let header = format!("## {}", path.display());
+    match render_applied(&path, &edits, bloom, show_diff) {
+        Ok(body) if body.is_empty() => (header, true),
+        Ok(body) => (format!("{header}\n{body}"), true),
+        Err(msg) => (format!("{header}\n{msg}"), false),
+    }
+}
+
+fn render_applied(
     path: &Path,
     edits: &[Edit],
     bloom: &Arc<BloomFilterCache>,

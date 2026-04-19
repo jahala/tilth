@@ -380,9 +380,7 @@ fn dispatch_tool(services: &Services, tool: &str, args: &Value) -> Result<String
         "tilth_diff" => tool_diff(args),
         "tilth_map" => Err("tilth_map is disabled — use tilth_search instead".into()),
         "tilth_session" => tool_session(args, &services.session),
-        "tilth_edit" if edit_mode => {
-            tool_edit(args, &services.session, &services.cache, &services.bloom)
-        }
+        "tilth_edit" if edit_mode => tool_edit(args, &services.session, &services.bloom),
         _ => Err(format!("unknown tool: {tool}")),
     }
 }
@@ -612,9 +610,9 @@ fn tool_session(args: &Value, session: &Session) -> Result<String, String> {
     }
 }
 
-/// Parse one `files[]` entry into a [`crate::edit::FileEditTask`]. Parse errors
-/// are deferred onto the task so a malformed entry surfaces as a per-file
-/// failure instead of aborting the whole batch.
+/// Parse one `files[]` entry. Parse errors are deferred onto the task so a
+/// malformed entry surfaces as a per-file failure instead of aborting the
+/// whole batch.
 fn parse_file_edit(index: usize, val: &Value) -> crate::edit::FileEditTask {
     use crate::edit::FileEditTask;
 
@@ -633,42 +631,15 @@ fn parse_file_edit(index: usize, val: &Value) -> crate::edit::FileEditTask {
 
     let mut edits = Vec::with_capacity(edits_val.len());
     for (i, e) in edits_val.iter().enumerate() {
-        let Some(start_str) = e.get("start").and_then(|v| v.as_str()) else {
-            return FileEditTask::ParseError {
-                label: path_str.to_string(),
-                msg: format!("edit[{i}]: missing 'start'"),
-            };
-        };
-        let Some((start_line, start_hash)) = crate::format::parse_anchor(start_str) else {
-            return FileEditTask::ParseError {
-                label: path_str.to_string(),
-                msg: format!("edit[{i}]: invalid start anchor '{start_str}'"),
-            };
-        };
-        let (end_line, end_hash) = if let Some(end_str) = e.get("end").and_then(|v| v.as_str()) {
-            let Some(parsed) = crate::format::parse_anchor(end_str) else {
+        match parse_edit_entry(i, e) {
+            Ok(edit) => edits.push(edit),
+            Err(msg) => {
                 return FileEditTask::ParseError {
                     label: path_str.to_string(),
-                    msg: format!("edit[{i}]: invalid end anchor '{end_str}'"),
+                    msg,
                 };
-            };
-            parsed
-        } else {
-            (start_line, start_hash)
-        };
-        let Some(content) = e.get("content").and_then(|v| v.as_str()) else {
-            return FileEditTask::ParseError {
-                label: path_str.to_string(),
-                msg: format!("edit[{i}]: missing 'content'"),
-            };
-        };
-        edits.push(crate::edit::Edit {
-            start_line,
-            start_hash,
-            end_line,
-            end_hash,
-            content: content.to_string(),
-        });
+            }
+        }
     }
 
     FileEditTask::Ready {
@@ -677,12 +648,35 @@ fn parse_file_edit(index: usize, val: &Value) -> crate::edit::FileEditTask {
     }
 }
 
-/// Batch `tilth_edit`. Parses the `files` array, enforces the 20-file cap,
-/// then delegates to [`crate::edit::apply_batch`] for parallel application.
+/// Parse a single `edits[]` entry. Flat early-returns keep nesting shallow.
+fn parse_edit_entry(i: usize, e: &Value) -> Result<crate::edit::Edit, String> {
+    let start_str = e
+        .get("start")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("edit[{i}]: missing 'start'"))?;
+    let (start_line, start_hash) = crate::format::parse_anchor(start_str)
+        .ok_or_else(|| format!("edit[{i}]: invalid start anchor '{start_str}'"))?;
+    let (end_line, end_hash) = match e.get("end").and_then(|v| v.as_str()) {
+        Some(end_str) => crate::format::parse_anchor(end_str)
+            .ok_or_else(|| format!("edit[{i}]: invalid end anchor '{end_str}'"))?,
+        None => (start_line, start_hash),
+    };
+    let content = e
+        .get("content")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("edit[{i}]: missing 'content'"))?;
+    Ok(crate::edit::Edit {
+        start_line,
+        start_hash,
+        end_line,
+        end_hash,
+        content: content.to_string(),
+    })
+}
+
 fn tool_edit(
     args: &Value,
     session: &Session,
-    _cache: &OutlineCache,
     bloom: &Arc<BloomFilterCache>,
 ) -> Result<String, String> {
     let files_val = args
@@ -711,7 +705,13 @@ fn tool_edit(
         .map(|(i, v)| parse_file_edit(i, v))
         .collect();
 
-    crate::edit::apply_batch(tasks, session, bloom, show_diff)
+    for task in &tasks {
+        if let crate::edit::FileEditTask::Ready { path, .. } = task {
+            session.record_read(path);
+        }
+    }
+
+    crate::edit::apply_batch(tasks, bloom, show_diff)
 }
 
 /// Falls back to cwd when scope is invalid, with a warning message.
@@ -1387,8 +1387,7 @@ mod tests {
         });
 
         let (session, bloom) = edit_services();
-        let cache = OutlineCache::new();
-        let out = tool_edit(&args, &session, &cache, &bloom).expect("batch should succeed");
+        let out = tool_edit(&args, &session, &bloom).expect("batch should succeed");
 
         assert!(
             out.contains(a.to_str().unwrap()),
@@ -1398,11 +1397,18 @@ mod tests {
             out.contains(b.to_str().unwrap()),
             "must mention file b: {out}"
         );
+        assert!(
+            !out.contains("error:") && !out.contains("hash mismatch"),
+            "successful batch must not contain error markers: {out}"
+        );
         assert_eq!(
-            std::fs::read_to_string(&a).unwrap(),
+            std::fs::read_to_string(&a).expect("file a should be readable"),
             "alpha\nBRAVO\ncharlie\n"
         );
-        assert_eq!(std::fs::read_to_string(&b).unwrap(), "UNO\ndos\ntres\n");
+        assert_eq!(
+            std::fs::read_to_string(&b).expect("file b should be readable"),
+            "UNO\ndos\ntres\n"
+        );
     }
 
     /// A bad-hash failure on file B must not block file A from applying;
@@ -1432,27 +1438,30 @@ mod tests {
         });
 
         let (session, bloom) = edit_services();
-        let cache = OutlineCache::new();
-        let out =
-            tool_edit(&args, &session, &cache, &bloom).expect("batch is Ok if any file succeeds");
+        let out = tool_edit(&args, &session, &bloom).expect("batch is Ok if any file succeeds");
 
         assert_eq!(
-            std::fs::read_to_string(&a).unwrap(),
+            std::fs::read_to_string(&a).expect("file a should be readable"),
             "first\nSECOND\nthird\n",
             "first file must have applied"
         );
         assert_eq!(
-            std::fs::read_to_string(&b).unwrap(),
+            std::fs::read_to_string(&b).expect("file b should be readable"),
             b_content,
             "second file must remain untouched"
         );
         assert!(
-            out.contains("hash mismatch"),
-            "must report hash mismatch: {out}"
-        );
-        assert!(
             out.contains("---"),
             "must separate per-file sections: {out}"
+        );
+        let (a_section, b_section) = out.split_once("\n\n---\n\n").expect("two sections");
+        assert!(
+            !a_section.contains("hash mismatch"),
+            "file a's section must not report hash mismatch: {a_section}"
+        );
+        assert!(
+            b_section.contains("hash mismatch"),
+            "file b's section must report hash mismatch: {b_section}"
         );
     }
 
@@ -1469,9 +1478,7 @@ mod tests {
         let args = serde_json::json!({ "files": files });
 
         let (session, bloom) = edit_services();
-        let cache = OutlineCache::new();
-        let err =
-            tool_edit(&args, &session, &cache, &bloom).expect_err("21 files must be rejected");
+        let err = tool_edit(&args, &session, &bloom).expect_err("21 files must be rejected");
         assert!(err.contains("limited to 20"), "must mention limit: {err}");
     }
 
@@ -1498,8 +1505,7 @@ mod tests {
         });
 
         let (session, bloom) = edit_services();
-        let cache = OutlineCache::new();
-        let err = tool_edit(&args, &session, &cache, &bloom).expect_err("all-failed → Err");
+        let err = tool_edit(&args, &session, &bloom).expect_err("all-failed → Err");
         assert!(
             err.contains("tilth_does_not_exist_xyz_1"),
             "must include file 1: {err}"
@@ -1515,9 +1521,8 @@ mod tests {
     fn batch_edit_empty_files_array_rejected() {
         let args = serde_json::json!({ "files": [] });
         let (session, bloom) = edit_services();
-        let cache = OutlineCache::new();
-        let err = tool_edit(&args, &session, &cache, &bloom)
-            .expect_err("empty files array must be rejected");
+        let err =
+            tool_edit(&args, &session, &bloom).expect_err("empty files array must be rejected");
         assert!(err.contains("empty"), "must mention empty: {err}");
     }
 }

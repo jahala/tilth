@@ -171,7 +171,7 @@ where
             // If the worker already claimed FINISHED, roll back the increment.
             let n = tracker.record_timeout();
             if coord.claim_timeout() {
-                if n >= ABANDONED_THREAD_WARN {
+                if n == ABANDONED_THREAD_WARN {
                     eprintln!(
                         "tilth: warning: {n} abandoned threads still running. \
                          Consider reducing scope or increasing TILTH_TIMEOUT."

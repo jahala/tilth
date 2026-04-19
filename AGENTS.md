@@ -39,9 +39,17 @@ Output: <path>  (~<token_count> tokens). Respects .gitignore.
 tilth_deps: Blast-radius check — what imports this file and what it imports.
 Use ONLY before renaming, removing, or changing an export's signature.
 
+tilth_diff: Structural diff — shows what changed at function level. Replaces Bash(git diff).
+Usage: tilth_diff(source: "HEAD~1") for last commit. No args = uncommitted changes.
+scope: "file.rs" or "file.rs:fn_name". log: "HEAD~5..HEAD" for per-commit summaries.
+search: filter to lines matching a term. blast: true to show callers of changed signatures.
+Output: [+] added, [-] deleted, [~] body changed, [~:sig] signature changed.
+DO NOT use Bash(git diff) or Bash(git log --patch). Use tilth_diff instead.
+
 To search code, use tilth_search instead of Grep or Bash(grep/rg).
 To read files, use tilth_read instead of Read or Bash(cat).
 To find files, use tilth_files instead of Glob or Bash(find/ls).
+To check what changed, use tilth_diff instead of Bash(git diff/git log).
 DO NOT re-read files already shown in expanded search results.
 
 tilth_edit: Batch edit one or more files using hash-anchored lines. Replaces the host Edit tool.
