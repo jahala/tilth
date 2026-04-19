@@ -275,28 +275,17 @@ pub fn search_multi_symbol_expanded(
 ) -> Result<String, TilthError> {
     let _ = index; // Available but not yet used for search fast-path
 
-    let mut sections: Vec<(usize, String)> = Vec::with_capacity(queries.len());
+    let mut sections: Vec<String> = Vec::with_capacity(queries.len());
     let expand_per_query = if expand == 0 { 0 } else { expand.max(1) };
 
-    // Phase 1: run all symbol searches in parallel. Expansion is NOT shared
-    // across queries in this path (each query gets its own expand budget)
-    // so we can safely parallelize. Tradeoff: may expand slightly more total
-    // files than the sequential version (which shared a single budget).
-    use rayon::prelude::*;
-    let results: Vec<_> = queries
-        .par_iter()
-        .enumerate()
-        .map(|(i, query)| {
-            let r = symbol::search(query, scope, Some(cache), context, glob);
-            (i, r)
-        })
-        .collect();
+    // Phase 1: single-walk batch search — one file I/O per file, one ts parse,
+    // AhoCorasick-gated, per-query buckets. Much faster than N independent walkers.
+    let results = symbol::search_batch(queries, scope, Some(cache), context, glob)?;
 
     // Phase 2: format sequentially (format_matches touches the session mutex
     // and a shared expanded_files set — cheap, keep single-threaded).
     let mut expanded_files = HashSet::new();
-    for (i, result) in results {
-        let mut result = result?;
+    for mut result in results {
         paginate(&mut result, limit, offset);
         let mut out = format::search_header(
             &result.query,
@@ -323,14 +312,9 @@ pub fn search_multi_symbol_expanded(
                 "\n\n... and {omitted} more matches. Narrow with scope."
             );
         }
-        sections.push((i, out));
+        sections.push(out);
     }
-    sections.sort_by_key(|(i, _)| *i);
-    Ok(sections
-        .into_iter()
-        .map(|(_, s)| s)
-        .collect::<Vec<_>>()
-        .join("\n\n---\n"))
+    Ok(sections.join("\n\n---\n"))
 }
 
 pub fn search_content(
