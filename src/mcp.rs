@@ -743,11 +743,39 @@ fn resolve_scope(args: &Value) -> (PathBuf, Option<String>) {
     (resolved, None)
 }
 
+/// Hard ceiling on MCP tool output size (chars). Guards against a single
+/// tool result blowing up the agent's context window (e.g. matches inside
+/// minified `.d.ts.map` or other single-line JSON blobs).
+const MAX_OUTPUT_CHARS: usize = 25_000;
+
 fn apply_budget(output: String, budget: Option<u64>) -> String {
-    match budget {
+    let out = match budget {
         Some(b) => crate::budget::apply(&output, b),
         None => output,
+    };
+    apply_hard_cap(out)
+}
+
+fn apply_hard_cap(output: String) -> String {
+    if output.len() <= MAX_OUTPUT_CHARS {
+        return output;
     }
+    let cut = output.floor_char_boundary(MAX_OUTPUT_CHARS);
+    // Prefer a newline boundary to avoid cutting mid-line.
+    let cut = output[..cut].rfind('\n').map_or(cut, |i| i + 1);
+    let omitted = output.len() - cut;
+    let mut truncated = String::with_capacity(cut + 128);
+    truncated.push_str(&output[..cut]);
+    if !truncated.ends_with('\n') {
+        truncated.push('\n');
+    }
+    use std::fmt::Write as _;
+    let _ = write!(
+        truncated,
+        "\n⚠️  output truncated: {omitted} chars omitted (hard cap {MAX_OUTPUT_CHARS}). \
+         Narrow scope with --glob, lower --expand, or search a subdirectory."
+    );
+    truncated
 }
 
 // ---------------------------------------------------------------------------
