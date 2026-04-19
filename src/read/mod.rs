@@ -186,8 +186,7 @@ pub fn read_file(
 /// Would this file produce an outline (rather than full content) in default read mode?
 /// Used by the MCP layer to decide whether to append related-file hints.
 pub fn would_outline(path: &Path) -> bool {
-    std::fs::metadata(path)
-        .is_ok_and(|m| !m.is_dir() && estimate_tokens(m.len()) > TOKEN_THRESHOLD)
+    std::fs::metadata(path).is_ok_and(|m| !m.is_dir() && estimate_tokens(m.len()) > TOKEN_THRESHOLD)
 }
 
 /// Resolve a heading address to a line range in a markdown file.
