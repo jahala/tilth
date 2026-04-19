@@ -1,6 +1,6 @@
 [package]
 name = "tilth"
-version = "0.6.3"
+version = "0.7.0"
 edition = "2021"
 description = "Tree-sitter indexed lookups — smart code reading for AI agents"
 license = "MIT"
@@ -52,6 +52,11 @@ memmap2 = "0.9"
 
 # Parallelism
 rayon = "1"
+
+# Channel with select! for timeout wrapper (sibling of crossbeam-deque/-epoch/-utils
+# already present as rayon transitive deps; closer-to-Java-Future ergonomics than
+# std::sync::mpsc::recv_timeout).
+crossbeam-channel = "0.5"
 
 # Concurrent cache
 dashmap = "6"

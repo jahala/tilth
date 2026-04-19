@@ -7,6 +7,8 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use rayon::prelude::*;
+
 use crate::types::OutlineKind;
 
 #[derive(Debug)]
@@ -242,7 +244,7 @@ pub fn diff(
 
     // 2. Build structural overlays.
     let mut overlays: Vec<FileOverlay> = file_diffs
-        .iter()
+        .par_iter()
         .map(|fd| overlay::compute_overlay(fd, source))
         .collect();
 
