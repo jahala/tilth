@@ -80,7 +80,8 @@ pub(crate) fn walker(scope: &Path, glob: Option<&str>) -> Result<ignore::WalkPar
 
     let mut builder = WalkBuilder::new(scope);
     builder
-        .follow_links(true)
+        .follow_links(false) // Don't follow symlinks - avoids NFS/mounted volumes
+        .same_file_system(true) // Stay on same device - skip cross-mount traversal
         .hidden(false)
         .git_ignore(false)
         .git_global(false)
