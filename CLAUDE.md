@@ -10,16 +10,25 @@ src/
   lib.rs               Public API: classify query → read/search/glob → formatted output.
   mcp.rs               MCP server (JSON-RPC on stdio). SERVER_INSTRUCTIONS + EDIT_MODE_EXTRA.
   classify.rs          Query type detection (file path, glob, symbol, content, fallthrough).
+  lang/
+    mod.rs             Shared language infrastructure: detect_file_type(), package_root().
+    outline.rs         Tree-sitter outline extraction: outline_language(), walk_top_level(), get_outline_entries().
+    treesitter.rs      Shared AST constants: DEFINITION_KINDS, extract_definition_name(), definition_weight().
+    detection.rs       Generated file detection (lockfiles, .min.js) and binary detection.
+  diff/
+    mod.rs             Structural diff types, source resolution, orchestrator pipeline (diff()).
+    parse.rs           Unified diff parser: git diff output → Vec<FileDiff>.
+    matching.rs        Three-phase symbol matching: identity → structural hash → fuzzy similarity.
+    overlay.rs         Per-file structural overlay: outline old/new, match symbols, attribute hunks.
+    format.rs          Progressive-disclosure formatters: overview, file detail, function detail, log, conflicts.
   read/
     mod.rs             File reading with smart view (full vs outline based on token count).
     outline/
-      code.rs          Tree-sitter outlines for 12 languages. outline_language() maps Lang → grammar.
+      code.rs          Outline string formatting for code files. Uses lang/outline for extraction.
       markdown.rs      Markdown heading-based outlines.
       structured.rs    JSON/YAML/TOML structured outlines.
       test_file.rs     Test file detection (suppresses outline noise).
     imports.rs         Import extraction for deps analysis.
-    generated.rs       Generated file detection (lockfiles, .min.js).
-    binary.rs          Binary file detection.
   search/
     mod.rs             Search orchestration. Symbol, content, regex, callers search types.
     symbol.rs          AST-based symbol search (definitions first, then usages).
@@ -33,7 +42,7 @@ src/
     strip.rs           Cognitive load stripping (comments, blank lines in expanded code).
     truncate.rs        Smart truncation to fit budget constraints.
     glob.rs            File glob search.
-    treesitter.rs      Shared tree-sitter query patterns (callee/caller/sibling).
+    blast.rs           Blast radius — find callers of definitions touched by edits.
   index/
     symbol.rs          In-memory symbol index (built on first search, cached).
     bloom.rs           Bloom filter cache for fast "file contains symbol?" pre-check.
@@ -53,7 +62,7 @@ AGENTS.md              MCP tool usage instructions shipped to users (read by Cla
 
 ## Languages supported
 
-Rust, TypeScript, TSX, JavaScript, Python, Go, Java, C, C++, Ruby, C#, Swift.
+Rust, TypeScript, TSX, JavaScript, Python, Go, Java, C, C++, Ruby, PHP, C#, Swift.
 Kotlin, Dockerfile, Make detected but have no tree-sitter grammar (outline returns None).
 
 ## Build, test, install

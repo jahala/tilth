@@ -7,7 +7,12 @@ pub enum QueryType {
     FilePath(PathBuf),
     Glob(String),
     Symbol(String),
+    /// Broad concept query — single lowercase word or multi-word phrase
+    /// that likely refers to a feature/module/flow rather than an exact symbol.
+    Concept(String),
     Content(String),
+    /// Slash-wrapped regex: `/pattern/` → regex content search.
+    Regex(String),
     /// Path-like query that didn't resolve — try symbol, then content.
     Fallthrough(String),
 }
@@ -15,7 +20,7 @@ pub enum QueryType {
 /// Programming language, carried through the type system so downstream
 /// code never re-detects. Adding a language means adding an arm here
 /// and the compiler tells you everywhere else.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Lang {
     Rust,
     TypeScript,
@@ -28,9 +33,11 @@ pub enum Lang {
     C,
     Cpp,
     Ruby,
+    Php,
     Swift,
     Kotlin,
     CSharp,
+    Elixir,
     Dockerfile,
     Make,
 }
@@ -124,7 +131,7 @@ pub struct OutlineEntry {
     pub doc: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OutlineKind {
     Import,
     Function,

@@ -1,6 +1,6 @@
 [package]
 name = "tilth"
-version = "0.5.1"
+version = "0.6.3"
 edition = "2021"
 description = "Tree-sitter indexed lookups — smart code reading for AI agents"
 license = "MIT"
@@ -30,9 +30,12 @@ tree-sitter-java = "0.23"
 tree-sitter-c = "0.24"
 tree-sitter-cpp = "0.23"
 tree-sitter-ruby = "0.23"
+tree-sitter-php = "0.24"
 tree-sitter-scala = "0.24"
 tree-sitter-c-sharp = "0.23"
 tree-sitter-swift = "0.7"
+tree-sitter-kotlin-ng = "1.1"
+tree-sitter-elixir = "0.3"
 
 # Search (ripgrep internals)
 grep-regex = "0.1"
@@ -61,6 +64,9 @@ toml = "0.8"
 # MCP protocol (JSON-RPC over stdio)
 # (handled manually — no framework needed)
 
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 opt-level = 3

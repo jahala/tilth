@@ -132,7 +132,7 @@ def run_single(
             "--no-session-persistence",
             "--dangerously-skip-permissions",
             "--strict-mcp-config",
-            "--system-prompt", SYSTEM_PROMPT,
+            "--system-prompt", SYSTEM_PROMPT + f"\nYour current working directory is: {repo_path}",
         ]
 
         if mode.tools:
@@ -323,7 +323,7 @@ Examples:
     # Clean real-world repos before starting (removes junk files from previous runs)
     for repo_name in selected_repos:
         repo_path = REPOS[repo_name].path
-        ensure_repo_clean(repo_path)
+        ensure_repo_clean(repo_path, REPOS[repo_name].commit_sha)
         if args.verbose:
             print(f"Cleaned repo: {repo_name}")
 
@@ -369,18 +369,25 @@ Examples:
                         current_run += 1
                         run_id = f"{task_name}/{mode_name}/{model_name}/rep{rep}"
 
-                        # Reset repo if needed (only for synthetic edit tasks)
-                        needs_reset = False
-                        if task.repo == "synthetic":
-                            if task.task_type == "edit":
+                        # Reset repo and apply mutations for tasks that have them
+                        if task.mutations:
+                            repo_path = get_repo_path(task.repo)
+                            if task.repo == "synthetic":
                                 if rep > 0 or mode_name != prev_mode or task_name != prev_task:
-                                    needs_reset = True
-                            elif mode_name != prev_mode:
-                                needs_reset = True
-
-                        if needs_reset:
-                            if args.verbose:
-                                print(f"  Resetting repo...")
+                                    if args.verbose:
+                                        print(f"  Resetting synthetic repo...")
+                                    reset_repo()
+                            else:
+                                # Real repos: always clean + re-mutate before each run
+                                if args.verbose:
+                                    print(f"  Resetting {task.repo}...")
+                                ensure_repo_clean(repo_path, REPOS[task.repo].commit_sha)
+                            # Apply mutations (if any) after clean state
+                            if task.mutations:
+                                if args.verbose:
+                                    print(f"  Applying {len(task.mutations)} mutation(s)...")
+                                task.apply_mutations(str(repo_path))
+                        elif task.repo == "synthetic" and mode_name != prev_mode:
                             reset_repo()
 
                         prev_task = task_name
@@ -451,7 +458,7 @@ Examples:
     # Clean real-world repos after run (remove junk files written by Claude sessions)
     for repo_name in selected_repos:
         repo_path = REPOS[repo_name].path
-        ensure_repo_clean(repo_path)
+        ensure_repo_clean(repo_path, REPOS[repo_name].commit_sha)
 
     # Print summary
     print()

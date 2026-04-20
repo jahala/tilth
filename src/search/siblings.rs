@@ -3,19 +3,20 @@ use std::sync::{LazyLock, Mutex};
 
 use streaming_iterator::StreamingIterator;
 
-use crate::read::outline::code::outline_language;
+use crate::lang::outline::outline_language;
 use crate::types::{Lang, OutlineEntry, OutlineKind};
 
 /// Global cache of compiled tree-sitter queries for sibling extraction.
-/// Keyed by `(language_name, query_str_ptr)` so that distinct query strings
-/// for the same language (the main sibling query vs the Go receiver query)
-/// are stored under separate keys.
-static QUERY_CACHE: LazyLock<Mutex<HashMap<(&'static str, usize), tree_sitter::Query>>> =
+/// Keyed by `(node_kind_count, field_count, query_str_ptr)` so that distinct
+/// query strings for the same language (the main sibling query vs the Go
+/// receiver query) are stored under separate keys. We avoid `Language::name()`
+/// because ABI < 15 grammars (e.g. tree-sitter-kotlin-ng) return `None`.
+#[allow(clippy::type_complexity)]
+static QUERY_CACHE: LazyLock<Mutex<HashMap<(usize, usize, usize), tree_sitter::Query>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Look up or compile `query_str` for `ts_lang`, then invoke `f` with a
-/// reference to the cached `Query`.  Returns `None` if compilation fails or
-/// the language has no registered name.
+/// reference to the cached `Query`.  Returns `None` if compilation fails.
 ///
 /// `query_str` must be `'static` so its pointer address is stable across
 /// calls and can serve as part of the cache key.
@@ -25,9 +26,12 @@ fn with_query<R>(
     f: impl FnOnce(&tree_sitter::Query) -> R,
 ) -> Option<R> {
     use std::collections::hash_map::Entry;
-    let lang_name = ts_lang.name()?;
     // Pointer address distinguishes different queries for the same language.
-    let key = (lang_name, query_str.as_ptr() as usize);
+    let key = (
+        ts_lang.node_kind_count(),
+        ts_lang.field_count(),
+        query_str.as_ptr() as usize,
+    );
     let mut cache = QUERY_CACHE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);

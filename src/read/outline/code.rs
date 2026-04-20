@@ -1,3 +1,4 @@
+use crate::lang::outline::{extract_import_source, outline_language, walk_top_level};
 use crate::types::{Lang, OutlineEntry, OutlineKind};
 
 /// Generate a code outline using tree-sitter. Walks top-level AST nodes,
@@ -21,335 +22,6 @@ pub fn outline(content: &str, lang: Lang, max_lines: usize) -> String {
     let entries = walk_top_level(root, &lines, lang);
 
     format_entries(&entries, &lines, max_lines, lang)
-}
-
-/// Get the tree-sitter Language for a given Lang variant.
-pub fn outline_language(lang: Lang) -> Option<tree_sitter::Language> {
-    let lang = match lang {
-        Lang::Rust => tree_sitter_rust::LANGUAGE,
-        Lang::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT,
-        Lang::Tsx => tree_sitter_typescript::LANGUAGE_TSX,
-        Lang::JavaScript => tree_sitter_javascript::LANGUAGE,
-        Lang::Python => tree_sitter_python::LANGUAGE,
-        Lang::Scala => tree_sitter_scala::LANGUAGE,
-        Lang::Go => tree_sitter_go::LANGUAGE,
-        Lang::Java => tree_sitter_java::LANGUAGE,
-        Lang::C => tree_sitter_c::LANGUAGE,
-        Lang::Cpp => tree_sitter_cpp::LANGUAGE,
-        Lang::Ruby => tree_sitter_ruby::LANGUAGE,
-        // Languages without shipped grammars — fall back
-        Lang::CSharp => tree_sitter_c_sharp::LANGUAGE,
-        Lang::Swift => tree_sitter_swift::LANGUAGE,
-        Lang::Kotlin | Lang::Dockerfile | Lang::Make => {
-            return None;
-        }
-    };
-    Some(lang.into())
-}
-
-/// Walk top-level children of the root node, extracting outline entries.
-pub(crate) fn walk_top_level(
-    root: tree_sitter::Node,
-    lines: &[&str],
-    lang: Lang,
-) -> Vec<OutlineEntry> {
-    let mut entries = Vec::new();
-    let mut cursor = root.walk();
-
-    for child in root.children(&mut cursor) {
-        if let Some(entry) = node_to_entry(child, lines, lang, 0) {
-            entries.push(entry);
-        }
-    }
-
-    entries
-}
-
-/// Convert a tree-sitter node to an `OutlineEntry` based on its kind.
-fn node_to_entry(
-    node: tree_sitter::Node,
-    lines: &[&str],
-    lang: Lang,
-    depth: usize,
-) -> Option<OutlineEntry> {
-    let kind_str = node.kind();
-    let start_line = node.start_position().row as u32 + 1;
-    let end_line = node.end_position().row as u32 + 1;
-
-    let (kind, name, signature) = match kind_str {
-        // Functions
-        "function_declaration"
-        | "function_definition"
-        | "function_item"
-        | "method_definition"
-        | "method_declaration"
-        | "constructor_declaration"
-        | "init_declaration"
-        | "deinit_declaration"
-        | "protocol_function_declaration" => {
-            let name = find_child_text(node, "name", lines)
-                .or_else(|| find_child_text(node, "identifier", lines))
-                .unwrap_or_else(|| {
-                    // Swift deinit has no name field — use the node kind as name
-                    if kind_str == "deinit_declaration" {
-                        "deinit".into()
-                    } else {
-                        "<anonymous>".into()
-                    }
-                });
-            let sig = extract_signature(node, lines);
-            (OutlineKind::Function, name, Some(sig))
-        }
-
-        // Classes & structs
-        "class_declaration" | "class_definition" => {
-            let name = find_child_text(node, "name", lines)
-                .or_else(|| find_child_text(node, "identifier", lines))
-                .unwrap_or_else(|| "<anonymous>".into());
-            (OutlineKind::Class, name, None)
-        }
-        "struct_item" | "struct_declaration" => {
-            let name = find_child_text(node, "name", lines).unwrap_or_else(|| "<anonymous>".into());
-            (OutlineKind::Struct, name, None)
-        }
-
-        // Interfaces & traits
-        "interface_declaration"
-        | "type_alias_declaration"
-        | "trait_item"
-        | "trait_definition"
-        | "protocol_declaration" => {
-            let name = find_child_text(node, "name", lines).unwrap_or_else(|| "<anonymous>".into());
-            (OutlineKind::Interface, name, None)
-        }
-        "type_item" | "type_definition" | "typealias_declaration" => {
-            let name = find_child_text(node, "name", lines).unwrap_or_else(|| "<anonymous>".into());
-            (OutlineKind::TypeAlias, name, None)
-        }
-
-        // Enums
-        "enum_item" | "enum_declaration" | "enum_definition" => {
-            let name = find_child_text(node, "name", lines).unwrap_or_else(|| "<anonymous>".into());
-            (OutlineKind::Enum, name, None)
-        }
-
-        // Impl blocks (Rust)
-        "impl_item" => {
-            let name = find_child_text(node, "type", lines).unwrap_or_else(|| "<impl>".into());
-            (OutlineKind::Module, format!("impl {name}"), None)
-        }
-
-        // Objects (Scala companion objects, singletons)
-        "object_definition" => {
-            let name = find_child_text(node, "name", lines)
-                .or_else(|| find_child_text(node, "identifier", lines))
-                .unwrap_or_else(|| "<anonymous>".into());
-            (OutlineKind::Module, name, None)
-        }
-
-        // Constants and variables
-        "const_item" | "static_item" => {
-            let name = find_child_text(node, "name", lines).unwrap_or_else(|| "<const>".into());
-            (OutlineKind::Constant, name, None)
-        }
-        "val_definition" => {
-            let name = first_identifier_text(node, lines).unwrap_or_else(|| "<val>".into());
-            (OutlineKind::ImmutableVariable, name, None)
-        }
-        "lexical_declaration" | "variable_declaration" | "var_definition" => {
-            let name = first_identifier_text(node, lines).unwrap_or_else(|| "<var>".into());
-            (OutlineKind::Variable, name, None)
-        }
-
-        // Properties (C#, Swift)
-        "property_declaration" | "protocol_property_declaration" => {
-            let name = find_child_text(node, "name", lines).unwrap_or_else(|| "<property>".into());
-            let sig = extract_signature(node, lines);
-            (OutlineKind::Property, name, Some(sig))
-        }
-
-        // Imports — collect as a group
-        "import_statement" | "import_declaration" | "use_declaration" | "use_item"
-        | "using_directive" => {
-            let text = node_text(node, lines);
-            (OutlineKind::Import, text, None)
-        }
-
-        // Exports
-        "export_statement" => {
-            let name = node_text(node, lines);
-            (OutlineKind::Export, name, None)
-        }
-
-        // Module declarations
-        "mod_item" | "module" | "namespace_declaration" | "file_scoped_namespace_declaration" => {
-            let name = find_child_text(node, "name", lines).unwrap_or_else(|| "<module>".into());
-            (OutlineKind::Module, name, None)
-        }
-
-        _ => return None,
-    };
-
-    // Collect children for classes, impls, modules, traits/interfaces
-    let is_namespace = matches!(
-        kind_str,
-        "namespace_declaration" | "file_scoped_namespace_declaration"
-    );
-    let children = if matches!(
-        kind,
-        OutlineKind::Class | OutlineKind::Struct | OutlineKind::Module | OutlineKind::Interface
-    ) && depth < 1
-    {
-        // Namespaces are transparent wrappers — don't consume a depth level,
-        // so classes inside namespaces still collect their methods.
-        let child_depth = if is_namespace { depth } else { depth + 1 };
-        collect_children(node, lines, lang, child_depth)
-    } else {
-        Vec::new()
-    };
-
-    // Extract doc comment if present
-    let doc = extract_doc(node, lines);
-
-    Some(OutlineEntry {
-        kind,
-        name,
-        start_line,
-        end_line,
-        signature,
-        children,
-        doc,
-    })
-}
-
-/// Collect child entries from a class/struct/impl body.
-fn collect_children(
-    node: tree_sitter::Node,
-    lines: &[&str],
-    lang: Lang,
-    depth: usize,
-) -> Vec<OutlineEntry> {
-    let mut children = Vec::new();
-    let mut cursor = node.walk();
-
-    // Look for a body node first (C# uses `declaration_list` instead of `*_body`/`*_block`)
-    let body = node.children(&mut cursor).find(|c| {
-        let k = c.kind();
-        k.contains("body") || k.contains("block") || k == "declaration_list"
-    });
-
-    let parent = body.unwrap_or(node);
-    let mut cursor2 = parent.walk();
-
-    for child in parent.children(&mut cursor2) {
-        if let Some(entry) = node_to_entry(child, lines, lang, depth) {
-            children.push(entry);
-        }
-    }
-
-    children
-}
-
-/// Extract the first line as a function signature (name + params + return type).
-fn extract_signature(node: tree_sitter::Node, lines: &[&str]) -> String {
-    let start_row = node.start_position().row;
-    if start_row < lines.len() {
-        let line = lines[start_row].trim();
-        // Truncate at opening brace
-        if let Some(pos) = line.find('{') {
-            return line[..pos].trim().to_string();
-        }
-        if line.ends_with(':') {
-            // Python — truncate at trailing colon (for `def foo(x: int):` etc.)
-            if let Some(pos) = line.rfind(':') {
-                return line[..pos].trim().to_string();
-            }
-        }
-        // Full first line, truncated
-        if line.len() > 120 {
-            format!("{}...", crate::types::truncate_str(line, 117))
-        } else {
-            line.to_string()
-        }
-    } else {
-        String::new()
-    }
-}
-
-/// Find a named child and return its text.
-fn find_child_text(node: tree_sitter::Node, field: &str, lines: &[&str]) -> Option<String> {
-    node.child_by_field_name(field).map(|n| node_text(n, lines))
-}
-
-/// Get the text of a node, truncated to the first line.
-fn node_text(node: tree_sitter::Node, lines: &[&str]) -> String {
-    let row = node.start_position().row;
-    let col_start = node.start_position().column;
-    let end_row = node.end_position().row;
-
-    if row < lines.len() {
-        if row == end_row {
-            let col_end = node.end_position().column.min(lines[row].len());
-            lines[row][col_start..col_end].to_string()
-        } else {
-            // Multi-line — take first line only, truncated
-            let text = &lines[row][col_start..];
-            if text.len() > 80 {
-                format!("{}...", crate::types::truncate_str(text, 77))
-            } else {
-                text.to_string()
-            }
-        }
-    } else {
-        String::new()
-    }
-}
-
-/// Find the first identifier-like child.
-fn first_identifier_text(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        let kind = child.kind();
-        if kind.contains("identifier") || kind.contains("name") || kind.contains("declarator") {
-            let text = node_text(child, lines);
-            if !text.is_empty() {
-                return Some(text);
-            }
-            // Recurse one level for variable_declarator → identifier
-            let mut inner = child.walk();
-            for grandchild in child.children(&mut inner) {
-                if grandchild.kind().contains("identifier") {
-                    let text = node_text(grandchild, lines);
-                    if !text.is_empty() {
-                        return Some(text);
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Extract a doc comment from the previous sibling.
-fn extract_doc(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
-    let prev = node.prev_sibling()?;
-    let kind = prev.kind();
-    if kind.contains("comment") || kind.contains("doc") {
-        let text = node_text(prev, lines);
-        let trimmed = text
-            .trim_start_matches("///")
-            .trim_start_matches("//!")
-            .trim_start_matches("/**")
-            .trim_start_matches('#')
-            .trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
-    } else {
-        None
-    }
 }
 
 /// Format outline entries into the spec'd output format.
@@ -380,7 +52,7 @@ fn format_entries(
             _ => {
                 // Flush any accumulated imports
                 if !import_groups.is_empty() {
-                    out.push(format_imports(&import_groups, import_group_start));
+                    out.push(format_imports(&import_groups, import_group_start, lang));
                     import_groups.clear();
                 }
             }
@@ -415,7 +87,7 @@ fn format_entries(
 
     // Flush trailing imports
     if !import_groups.is_empty() {
-        out.push(format_imports(&import_groups, import_group_start));
+        out.push(format_imports(&import_groups, import_group_start, lang));
     }
 
     out.join("\n")
@@ -423,7 +95,7 @@ fn format_entries(
 
 /// Format a collapsed import summary grouped by source with counts.
 /// Spec format: `imports: react(4), express(2), @/lib(3)`
-fn format_imports(imports: &[&str], start: u32) -> String {
+fn format_imports(imports: &[&str], start: u32, lang: Lang) -> String {
     let count = imports.len();
 
     // Extract source modules and count occurrences
@@ -431,7 +103,7 @@ fn format_imports(imports: &[&str], start: u32) -> String {
     let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
     for imp in imports {
-        let source = extract_import_source(imp);
+        let source = extract_import_source(imp, Some(lang));
         *seen.entry(source.clone()).or_insert(0) += 1;
         if !sources.contains(&source) {
             sources.push(source);
@@ -458,62 +130,6 @@ fn format_imports(imports: &[&str], start: u32) -> String {
     format!("[{start}-]   imports: {condensed}{suffix}")
 }
 
-/// Extract the source module name from an import statement text.
-/// Handles: `use std::fs;` → `std::fs`, `import X from "react"` → `react`,
-/// `from collections import X` → `collections`
-pub(crate) fn extract_import_source(text: &str) -> String {
-    let trimmed = text.trim().trim_end_matches(';');
-
-    // Rust: `use foo::bar` → `foo::bar`
-    if let Some(rest) = trimmed.strip_prefix("use ") {
-        return rest
-            .split('{')
-            .next()
-            .unwrap_or(rest)
-            .trim()
-            .trim_end_matches("::")
-            .to_string();
-    }
-
-    // JS/TS: `import ... from "source"` or `import "source"`
-    if trimmed.starts_with("import") {
-        if let Some(from_pos) = trimmed.find("from ") {
-            let source = &trimmed[from_pos + 5..];
-            return source
-                .trim()
-                .trim_matches(|c| c == '"' || c == '\'' || c == ';')
-                .to_string();
-        }
-        // Direct import: `import "source"`
-        let after = trimmed.strip_prefix("import ").unwrap_or("");
-        return after
-            .trim()
-            .trim_matches(|c| c == '"' || c == '\'' || c == ';')
-            .to_string();
-    }
-
-    // Python: `from module import ...` or `import module`
-    if let Some(rest) = trimmed.strip_prefix("from ") {
-        return rest.split_whitespace().next().unwrap_or("").to_string();
-    }
-    if let Some(rest) = trimmed.strip_prefix("import ") {
-        return rest.split_whitespace().next().unwrap_or("").to_string();
-    }
-
-    // C/C++: #include "file.h" or #include <header>
-    if let Some(rest) = trimmed.strip_prefix("#include") {
-        return rest.trim().to_string(); // preserves quotes/angles for external detection
-    }
-
-    // Go: `import "source"` — already handled above via "import"
-    // Fallback: first meaningful token
-    trimmed
-        .split_whitespace()
-        .last()
-        .unwrap_or(trimmed)
-        .to_string()
-}
-
 /// Format a single outline entry with optional indentation.
 fn format_entry(entry: &OutlineEntry, indent: usize, lang: Lang) -> String {
     let prefix = "  ".repeat(indent);
@@ -527,6 +143,8 @@ fn format_entry(entry: &OutlineEntry, indent: usize, lang: Lang) -> String {
         OutlineKind::Function => {
             if lang == Lang::Scala {
                 "def"
+            } else if lang == Lang::Kotlin {
+                "fun"
             } else {
                 "fn"
             }
@@ -554,7 +172,7 @@ fn format_entry(entry: &OutlineEntry, indent: usize, lang: Lang) -> String {
         OutlineKind::Export => "export",
         OutlineKind::Property => "prop",
         OutlineKind::Module => {
-            if lang == Lang::Scala {
+            if lang == Lang::Scala || lang == Lang::Kotlin {
                 "object"
             } else {
                 "mod"
@@ -635,5 +253,124 @@ type UserId = String
         assert!(outline.contains("def load"));
         assert!(outline.contains("def connect"));
         assert!(outline.contains("def create"));
+    }
+
+    #[test]
+    fn php_outline_constructs() {
+        let php_code = r#"<?php
+namespace App\Services;
+
+use App\Support\Client;
+
+trait LogsQueries {
+    public function log(string $query): void {}
+}
+
+class UserService {
+    use LogsQueries;
+
+    public function __construct(private Client $client) {}
+
+    public function findUser(int $id): array {
+        return $this->client->loadUser($id);
+    }
+}
+"#;
+
+        let outline = outline(php_code, Lang::Php, 1000);
+
+        assert!(outline.contains("mod App\\Services"));
+        assert!(outline.contains("imports: App\\Support\\Client"));
+        assert!(outline.contains("interface LogsQueries"));
+        assert!(outline.contains("class UserService"));
+        assert!(outline.contains("fn findUser"));
+    }
+
+    #[test]
+    fn kotlin_outline_constructs() {
+        let kotlin_code = r#"
+package com.example
+
+import kotlin.collections.List
+import kotlin.io.println
+
+interface Drawable {
+    fun draw()
+}
+
+data class Point(val x: Int, val y: Int)
+
+class Canvas : Drawable {
+    val width = 800
+    var height = 600
+
+    override fun draw() {
+        println("Drawing")
+    }
+
+    fun resize(w: Int, h: Int) {}
+
+    companion object {
+        fun create(): Canvas = Canvas()
+    }
+}
+
+object Registry {
+    fun register(item: Drawable) {}
+}
+
+enum class Color {
+    RED, GREEN, BLUE
+}
+
+fun String.isPalindrome(): Boolean = this == this.reversed()
+
+fun main() {
+    val canvas = Canvas()
+    canvas.draw()
+}
+"#;
+
+        let outline = outline(kotlin_code, Lang::Kotlin, 1000);
+
+        // Imports
+        assert!(
+            outline.contains("imports:"),
+            "should have collapsed imports"
+        );
+        // Interface (shown as class since Kotlin grammar uses class_declaration)
+        assert!(outline.contains("class Drawable"), "should have Drawable");
+        // Data class
+        assert!(outline.contains("class Point"), "should have Point");
+        // Regular class with methods
+        assert!(outline.contains("class Canvas"), "should have Canvas");
+        assert!(outline.contains("fun draw"), "should have draw method");
+        assert!(outline.contains("fun resize"), "should have resize method");
+        // Properties inside classes
+        assert!(outline.contains("prop width"), "should have width property");
+        assert!(
+            outline.contains("prop height"),
+            "should have height property"
+        );
+        // Object declaration
+        assert!(
+            outline.contains("object Registry"),
+            "should have Registry object"
+        );
+        assert!(
+            outline.contains("fun register"),
+            "should have register method"
+        );
+        // Enum class
+        assert!(outline.contains("class Color"), "should have Color enum");
+        // Top-level functions
+        assert!(
+            outline.contains("fun isPalindrome"),
+            "should have extension fun"
+        );
+        assert!(outline.contains("fun main"), "should have main");
+        // Kotlin-specific labels
+        assert!(outline.contains("fun "), "should use 'fun' not 'fn'");
+        assert!(!outline.contains("fn "), "should not use 'fn' for Kotlin");
     }
 }

@@ -32,7 +32,7 @@ pub fn search(pattern: &str, scope: &Path) -> Result<GlobResult, TilthError> {
     let total_found = std::sync::atomic::AtomicUsize::new(0);
     let extensions: std::sync::Mutex<HashSet<String>> = std::sync::Mutex::new(HashSet::new());
 
-    let walker = super::walker(scope);
+    let walker = super::walker(scope, None)?;
 
     walker.run(|| {
         let matcher = &matcher;
