@@ -14,6 +14,28 @@ use crate::index::bloom::BloomFilterCache;
 use crate::index::SymbolIndex;
 use crate::session::Session;
 
+/// Shared dependencies passed through the request → dispatch pipeline.
+#[derive(Clone)]
+pub(crate) struct Services {
+    pub(crate) cache: Arc<OutlineCache>,
+    pub(crate) session: Arc<Session>,
+    pub(crate) index: Arc<SymbolIndex>,
+    pub(crate) bloom: Arc<BloomFilterCache>,
+    pub(crate) edit_mode: bool,
+}
+
+impl Services {
+    pub(crate) fn new(edit_mode: bool) -> Self {
+        Self {
+            cache: Arc::new(OutlineCache::new()),
+            session: Arc::new(Session::new()),
+            index: Arc::new(SymbolIndex::new()),
+            bloom: Arc::new(BloomFilterCache::new()),
+            edit_mode,
+        }
+    }
+}
+
 /// Tracks abandoned threads (timed out but still running). Warns on stderr
 /// when accumulation exceeds threshold to help diagnose resource pressure.
 static ABANDONED_THREADS: AtomicUsize = AtomicUsize::new(0);
@@ -120,10 +142,7 @@ pub fn run(edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
         }
     }
 
-    let cache = Arc::new(OutlineCache::new());
-    let session = Arc::new(Session::new());
-    let symbol_index = Arc::new(SymbolIndex::new());
-    let bloom_cache = Arc::new(BloomFilterCache::new());
+    let services = Services::new(edit_mode);
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
@@ -182,14 +201,7 @@ pub fn run(edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
             params,
         };
 
-        let response = handle_request(
-            &req,
-            &cache,
-            &session,
-            &symbol_index,
-            &bloom_cache,
-            edit_mode,
-        );
+        let response = handle_request(&req, &services);
         serde_json::to_writer(&mut stdout, &response)?;
         stdout.write_all(b"\n")?;
         stdout.flush()?;
@@ -285,14 +297,8 @@ struct JsonRpcError {
     message: String,
 }
 
-fn handle_request(
-    req: &JsonRpcRequest,
-    cache: &Arc<OutlineCache>,
-    session: &Arc<Session>,
-    index: &Arc<SymbolIndex>,
-    bloom: &Arc<BloomFilterCache>,
-    edit_mode: bool,
-) -> JsonRpcResponse {
+fn handle_request(req: &JsonRpcRequest, services: &Services) -> JsonRpcResponse {
+    let edit_mode = services.edit_mode;
     match req.method.as_str() {
         "initialize" => {
             let overview = if std::env::var("TILTH_NO_OVERVIEW").is_ok() {
@@ -339,7 +345,7 @@ fn handle_request(
             error: None,
         },
 
-        "tools/call" => handle_tool_call(req, cache, session, index, bloom, edit_mode),
+        "tools/call" => handle_tool_call(req, services),
 
         "ping" => JsonRpcResponse {
             jsonrpc: "2.0",
@@ -369,21 +375,26 @@ fn handle_request(
 pub(crate) fn dispatch_tool(
     tool: &str,
     args: &Value,
-    cache: &OutlineCache,
-    session: &Session,
-    index: &Arc<SymbolIndex>,
-    bloom: &Arc<BloomFilterCache>,
-    edit_mode: bool,
+    services: &Services,
 ) -> Result<String, String> {
+    let edit_mode = services.edit_mode;
     match tool {
-        "tilth_read" => tool_read(args, cache, session, edit_mode),
-        "tilth_search" => tool_search(args, cache, session, index, bloom),
-        "tilth_files" => tool_files(args, cache),
-        "tilth_deps" => tool_deps(args, cache, bloom),
+        "tilth_read" => tool_read(args, &services.cache, &services.session, edit_mode),
+        "tilth_search" => tool_search(
+            args,
+            &services.cache,
+            &services.session,
+            &services.index,
+            &services.bloom,
+        ),
+        "tilth_files" => tool_files(args, &services.cache),
+        "tilth_deps" => tool_deps(args, &services.cache, &services.bloom),
         "tilth_diff" => tool_diff(args),
         "tilth_map" => Err("tilth_map is disabled — use tilth_search instead".into()),
-        "tilth_session" => tool_session(args, session),
-        "tilth_edit" if edit_mode => tool_edit(args, session, cache, bloom),
+        "tilth_session" => tool_session(args, &services.session),
+        "tilth_edit" if edit_mode => {
+            tool_edit(args, &services.session, &services.cache, &services.bloom)
+        }
         _ => Err(format!("unknown tool: {tool}")),
     }
 }
@@ -752,14 +763,7 @@ fn apply_budget(output: String, budget: Option<u64>) -> String {
 // MCP tool call handler
 // ---------------------------------------------------------------------------
 
-fn handle_tool_call(
-    req: &JsonRpcRequest,
-    cache: &Arc<OutlineCache>,
-    session: &Arc<Session>,
-    index: &Arc<SymbolIndex>,
-    bloom: &Arc<BloomFilterCache>,
-    edit_mode: bool,
-) -> JsonRpcResponse {
+fn handle_tool_call(req: &JsonRpcRequest, services: &Services) -> JsonRpcResponse {
     let params = &req.params;
     let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let args = params.get("arguments").unwrap_or(&Value::Null);
@@ -767,24 +771,13 @@ fn handle_tool_call(
     // Clone values needed by the worker thread
     let tool_name_owned = tool_name.to_string();
     let args_owned = args.clone();
-    let cache_clone = Arc::clone(cache);
-    let session_clone = Arc::clone(session);
-    let index_clone = Arc::clone(index);
-    let bloom_clone = Arc::clone(bloom);
+    let services_clone = services.clone();
 
     let (tx, rx) = mpsc::channel();
     let timeout = request_timeout();
 
     let handle = std::thread::spawn(move || {
-        let result = dispatch_tool(
-            &tool_name_owned,
-            &args_owned,
-            &cache_clone,
-            &session_clone,
-            &index_clone,
-            &bloom_clone,
-            edit_mode,
-        );
+        let result = dispatch_tool(&tool_name_owned, &args_owned, &services_clone);
         let _ = tx.send(result);
     });
 
