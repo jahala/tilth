@@ -1450,7 +1450,7 @@ mod tests {
     }
 
     #[test]
-    fn walker_follows_symlinked_file() {
+    fn walker_skips_symlinked_file() {
         let tmp = tempfile::tempdir().unwrap();
         let real_dir = tmp.path().join("real");
         std::fs::create_dir(&real_dir).unwrap();
@@ -1469,16 +1469,16 @@ mod tests {
             .iter()
             .filter_map(|p| p.file_name()?.to_str())
             .collect();
-        // Should find hello.rs twice: once in real/, once via the symlink in linked/
+        // With follow_links(false), should find hello.rs only once (in real/, not via symlink)
         assert_eq!(
             names.iter().filter(|n| **n == "hello.rs").count(),
-            2,
-            "expected hello.rs from both real and symlinked dirs, got: {names:?}"
+            1,
+            "expected hello.rs only from real dir (symlinks not followed), got: {names:?}"
         );
     }
 
     #[test]
-    fn walker_follows_symlinked_directory() {
+    fn walker_skips_symlinked_directory() {
         let tmp = tempfile::tempdir().unwrap();
         let real_dir = tmp.path().join("real_pkg");
         std::fs::create_dir(&real_dir).unwrap();
@@ -1496,10 +1496,11 @@ mod tests {
             .iter()
             .filter(|p| p.starts_with(tmp.path().join("deps_link")))
             .collect();
+        // With follow_links(false), symlinked directory should not be traversed
         assert_eq!(
             link_files.len(),
-            2,
-            "expected 2 files via symlinked directory, got: {link_files:?}"
+            0,
+            "expected 0 files via symlinked directory (not followed), got: {link_files:?}"
         );
     }
 
@@ -1525,7 +1526,7 @@ mod tests {
     }
 
     #[test]
-    fn content_search_finds_symbol_through_symlink() {
+    fn content_search_skips_symlinked_directory() {
         let tmp = tempfile::tempdir().unwrap();
         let real_dir = tmp.path().join("real");
         std::fs::create_dir(&real_dir).unwrap();
@@ -1543,10 +1544,10 @@ mod tests {
 
         let result =
             content::search("unique_symlink_test_symbol", tmp.path(), false, None, None).unwrap();
-        // Should find the symbol in both real/api.rs and linked/api.rs
-        assert!(
-            result.total_found >= 2,
-            "expected symbol found via both real and symlinked paths, got {}",
+        // With follow_links(false), should find symbol only in real/api.rs (not via symlink)
+        assert_eq!(
+            result.total_found, 1,
+            "expected symbol found only in real path (symlinks not followed), got {}",
             result.total_found
         );
     }
