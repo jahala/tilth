@@ -213,7 +213,8 @@ fn find_callers_treesitter(
                 };
 
                 // Walk up the tree to find the enclosing function
-                let (calling_function, caller_range) = find_enclosing_function(cap.node, &lines);
+                let (calling_function, caller_range) =
+                    find_enclosing_function(cap.node, &lines, lang);
 
                 callers.push(CallerMatch {
                     path: path.to_path_buf(),
@@ -444,7 +445,8 @@ fn find_callers_treesitter_batch(
                 };
 
                 // Walk up the tree to find the enclosing function
-                let (calling_function, caller_range) = find_enclosing_function(cap.node, &lines);
+                let (calling_function, caller_range) =
+                    find_enclosing_function(cap.node, &lines, lang);
 
                 callers.push((
                     matched_target,
@@ -490,6 +492,7 @@ const TYPE_KINDS: &[&str] = &[
 fn find_enclosing_function(
     node: tree_sitter::Node,
     lines: &[&str],
+    lang: crate::types::Lang,
 ) -> (String, Option<(u32, u32)>) {
     // Walk up the tree until we find a definition node
     let mut current = Some(node);
@@ -497,9 +500,18 @@ fn find_enclosing_function(
     while let Some(n) = current {
         let kind = n.kind();
 
-        if DEFINITION_KINDS.contains(&kind) {
-            let name =
-                extract_definition_name(n, lines).unwrap_or_else(|| "<anonymous>".to_string());
+        // Check standard definition kinds, or Elixir call-node definitions
+        let def_name = if DEFINITION_KINDS.contains(&kind) {
+            extract_definition_name(n, lines)
+        } else if lang == crate::types::Lang::Elixir
+            && crate::lang::treesitter::is_elixir_definition(n, lines)
+        {
+            crate::lang::treesitter::extract_elixir_definition_name(n, lines)
+        } else {
+            None
+        };
+
+        if let Some(name) = def_name {
             let range = Some((
                 n.start_position().row as u32 + 1,
                 n.end_position().row as u32 + 1,
@@ -510,6 +522,17 @@ fn find_enclosing_function(
             while let Some(p) = parent {
                 if TYPE_KINDS.contains(&p.kind()) {
                     if let Some(type_name) = extract_definition_name(p, lines) {
+                        return (format!("{type_name}.{name}"), range);
+                    }
+                }
+                // Elixir: `defmodule` is a `call` node, not in TYPE_KINDS, so it
+                // needs a separate check to qualify function names as Module.func.
+                if lang == crate::types::Lang::Elixir
+                    && crate::lang::treesitter::is_elixir_definition(p, lines)
+                {
+                    if let Some(type_name) =
+                        crate::lang::treesitter::extract_elixir_definition_name(p, lines)
+                    {
                         return (format!("{type_name}.{name}"), range);
                     }
                 }

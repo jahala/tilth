@@ -24,6 +24,7 @@ pub fn detect_file_type(path: &Path) -> FileType {
         Some("swift") => FileType::Code(Lang::Swift),
         Some("kt" | "kts") => FileType::Code(Lang::Kotlin),
         Some("cs") => FileType::Code(Lang::CSharp),
+        Some("ex" | "exs") => FileType::Code(Lang::Elixir),
 
         Some("md" | "mdx" | "rst") => FileType::Markdown,
         Some("json" | "yaml" | "yml" | "toml" | "xml" | "ini") => FileType::StructuredData,
@@ -56,6 +57,7 @@ pub(crate) fn package_root(path: &Path) -> Option<&Path> {
         "pom.xml",
         "build.gradle",
         "build.sbt",
+        "mix.exs",
     ];
     let mut dir = path;
     loop {

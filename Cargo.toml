@@ -1,6 +1,6 @@
 [package]
 name = "tilth"
-version = "0.6.1"
+version = "0.6.3"
 edition = "2021"
 description = "Tree-sitter indexed lookups — smart code reading for AI agents"
 license = "MIT"
@@ -35,6 +35,7 @@ tree-sitter-scala = "0.24"
 tree-sitter-c-sharp = "0.23"
 tree-sitter-swift = "0.7"
 tree-sitter-kotlin-ng = "1.1"
+tree-sitter-elixir = "0.3"
 
 # Search (ripgrep internals)
 grep-regex = "0.1"

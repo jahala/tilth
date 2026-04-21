@@ -5,8 +5,9 @@ use std::time::SystemTime;
 
 use super::file_metadata;
 use crate::lang::treesitter::{
-    definition_weight, extract_definition_name, extract_impl_trait, extract_impl_type,
-    extract_implemented_interfaces, DEFINITION_KINDS,
+    definition_weight, elixir_definition_weight, extract_definition_name,
+    extract_elixir_definition_name, extract_impl_trait, extract_impl_type,
+    extract_implemented_interfaces, is_elixir_definition, DEFINITION_KINDS,
 };
 
 use crate::error::TilthError;
@@ -441,7 +442,7 @@ fn find_definitions(
             let ts_language = lang.and_then(outline_language);
 
             let mut file_defs = if let Some(ref ts_lang) = ts_language {
-                find_defs_treesitter(path, query, ts_lang, content, file_lines, mtime, cache)
+                find_defs_treesitter(path, query, ts_lang, lang, content, file_lines, mtime, cache)
             } else {
                 Vec::new()
             };
@@ -474,6 +475,7 @@ fn find_defs_treesitter(
     path: &Path,
     query: &str,
     ts_lang: &tree_sitter::Language,
+    lang: Option<crate::types::Lang>,
     content: &str,
     file_lines: u32,
     mtime: SystemTime,
@@ -499,7 +501,9 @@ fn find_defs_treesitter(
     let root = tree.root_node();
     let mut defs = Vec::new();
 
-    walk_for_definitions(root, query, path, &lines, file_lines, mtime, &mut defs, 0);
+    walk_for_definitions(
+        root, query, path, &lines, file_lines, mtime, &mut defs, lang, 0,
+    );
 
     defs
 }
@@ -513,6 +517,7 @@ fn walk_for_definitions(
     file_lines: u32,
     mtime: SystemTime,
     defs: &mut Vec<Match>,
+    lang: Option<crate::types::Lang>,
     depth: usize,
 ) {
     if depth > 3 {
@@ -607,6 +612,33 @@ fn walk_for_definitions(
                 });
             }
         }
+    } else if lang == Some(crate::types::Lang::Elixir) && is_elixir_definition(node, lines) {
+        // Elixir: definitions are `call` nodes — check separately
+        if let Some(name) = extract_elixir_definition_name(node, lines) {
+            if name == query {
+                let line_num = node.start_position().row as u32 + 1;
+                let line_text = lines
+                    .get(node.start_position().row)
+                    .unwrap_or(&"")
+                    .trim_end();
+                defs.push(Match {
+                    path: path.to_path_buf(),
+                    line: line_num,
+                    text: line_text.to_string(),
+                    is_definition: true,
+                    exact: true,
+                    file_lines,
+                    mtime,
+                    def_range: Some((
+                        node.start_position().row as u32 + 1,
+                        node.end_position().row as u32 + 1,
+                    )),
+                    def_name: Some(query.to_string()),
+                    def_weight: elixir_definition_weight(node, lines),
+                    impl_target: None,
+                });
+            }
+        }
     }
 
     // Recurse into children (for nested definitions, class bodies, impl blocks, etc.)
@@ -620,6 +652,7 @@ fn walk_for_definitions(
             file_lines,
             mtime,
             defs,
+            lang,
             depth + 1,
         );
     }
@@ -806,6 +839,7 @@ pub(crate) fn dispatch_tool(tool: &str) -> Result<String, String> {
             std::path::Path::new("test.rs"),
             "hello",
             &ts_lang,
+            Some(crate::types::Lang::Rust),
             code,
             15,
             SystemTime::now(),
@@ -819,6 +853,7 @@ pub(crate) fn dispatch_tool(tool: &str) -> Result<String, String> {
             std::path::Path::new("test.rs"),
             "Foo",
             &ts_lang,
+            Some(crate::types::Lang::Rust),
             code,
             15,
             SystemTime::now(),
@@ -830,11 +865,181 @@ pub(crate) fn dispatch_tool(tool: &str) -> Result<String, String> {
             std::path::Path::new("test.rs"),
             "dispatch_tool",
             &ts_lang,
+            Some(crate::types::Lang::Rust),
             code,
             15,
             SystemTime::now(),
             None,
         );
         assert!(!defs.is_empty(), "should find 'dispatch_tool' definition");
+    }
+
+    /// Helper: search for an Elixir definition by name in a code snippet.
+    fn elixir_find(code: &str, name: &str) -> Vec<Match> {
+        let ts_lang = crate::lang::outline::outline_language(crate::types::Lang::Elixir).unwrap();
+        let lines = code.lines().count() as u32;
+        find_defs_treesitter(
+            std::path::Path::new("test.ex"),
+            name,
+            &ts_lang,
+            Some(crate::types::Lang::Elixir),
+            code,
+            lines,
+            SystemTime::now(),
+        )
+    }
+
+    #[test]
+    fn elixir_definitions_detected() {
+        let code = r#"defmodule MyApp.Greeter do
+  @type t :: %{name: String.t()}
+
+  def hello(name) do
+    "Hello, #{name}!"
+  end
+
+  defp private_helper(x), do: x + 1
+
+  defmacro my_macro(expr) do
+    quote do: unquote(expr)
+  end
+end
+"#;
+        // Dotted module name
+        let defs = elixir_find(code, "MyApp.Greeter");
+        assert!(!defs.is_empty(), "should find 'MyApp.Greeter' module def");
+        assert!(defs[0].is_definition);
+
+        // Public function (block form with parens)
+        assert!(
+            !elixir_find(code, "hello").is_empty(),
+            "should find 'hello'"
+        );
+
+        // Private function (keyword form: `, do:`)
+        assert!(
+            !elixir_find(code, "private_helper").is_empty(),
+            "should find 'private_helper'"
+        );
+
+        // Macro
+        assert!(
+            !elixir_find(code, "my_macro").is_empty(),
+            "should find 'my_macro'"
+        );
+    }
+
+    #[test]
+    fn elixir_guard_clause_definitions() {
+        let code = r#"defmodule Guards do
+  def safe_div(a, b) when b != 0 do
+    a / b
+  end
+
+  defp checked(x) when is_integer(x), do: x
+
+  defguard is_positive(x) when x > 0
+end
+"#;
+        // Guard clause with `when` — block form
+        assert!(
+            !elixir_find(code, "safe_div").is_empty(),
+            "should find 'safe_div' with guard clause"
+        );
+
+        // Guard clause with `when` — keyword form
+        assert!(
+            !elixir_find(code, "checked").is_empty(),
+            "should find 'checked' with guard clause"
+        );
+
+        // defguard
+        assert!(
+            !elixir_find(code, "is_positive").is_empty(),
+            "should find 'is_positive' defguard"
+        );
+    }
+
+    #[test]
+    fn elixir_multi_clause_and_no_arg() {
+        let code = r#"defmodule Dispatch do
+  def handle(:ok), do: :success
+  def handle(:error), do: :failure
+
+  def version, do: "1.0"
+end
+"#;
+        // Multi-clause: both clauses should be found
+        let defs = elixir_find(code, "handle");
+        assert!(
+            defs.len() >= 2,
+            "should find both 'handle' clauses, got {}: {defs:?}",
+            defs.len()
+        );
+
+        // No-arg function (bare identifier, no parens)
+        assert!(
+            !elixir_find(code, "version").is_empty(),
+            "should find no-arg 'version'"
+        );
+    }
+
+    #[test]
+    fn elixir_protocol_impl_exception() {
+        let code = r#"defprotocol Printable do
+  @callback format(t) :: String.t()
+  def to_string(data)
+end
+
+defimpl Printable, for: User do
+  def to_string(user), do: user.name
+end
+
+defmodule MyError do
+  defexception [:message, :code]
+end
+"#;
+        // Protocol + defimpl: both indexed under the protocol name "Printable"
+        let defs = elixir_find(code, "Printable");
+        assert!(
+            defs.len() >= 2,
+            "should find both defprotocol and defimpl for 'Printable', got {}",
+            defs.len()
+        );
+
+        // defexception
+        assert!(
+            !elixir_find(code, "defexception").is_empty(),
+            "should find 'defexception'"
+        );
+
+        // Module containing exception
+        assert!(
+            !elixir_find(code, "MyError").is_empty(),
+            "should find 'MyError' module"
+        );
+    }
+
+    #[test]
+    fn elixir_delegate_and_nested_modules() {
+        let code = r#"defmodule Outer do
+  defdelegate count(list), to: Enum
+
+  defmodule Inner do
+    def nested_func, do: :ok
+  end
+end
+"#;
+        // defdelegate
+        assert!(
+            !elixir_find(code, "count").is_empty(),
+            "should find 'count' defdelegate"
+        );
+
+        // Nested module
+        assert!(
+            !elixir_find(code, "Inner").is_empty(),
+            "should find nested 'Inner' module"
+        );
     }
 }

@@ -110,6 +110,10 @@ pub(crate) fn callee_query_str(lang: Lang) -> Option<&'static str> {
             "(call_expression (identifier) @callee)\n",
             "(call_expression (navigation_expression (identifier) @callee .))\n",
         )),
+        Lang::Elixir => Some(concat!(
+            "(call target: (identifier) @callee)\n",
+            "(call target: (dot right: (identifier) @callee))\n",
+        )),
         _ => None,
     }
 }
@@ -220,7 +224,42 @@ pub fn extract_callee_names(
     let mut names = names;
     names.sort();
     names.dedup();
+
+    // Elixir: the callee query `(call target: (identifier) @callee)` also captures
+    // definition keywords (def, defmodule, etc.) and import keywords (use, import,
+    // alias, require) since those are all `call` nodes. Filter them out.
+    if lang == Lang::Elixir {
+        names.retain(|n| !is_elixir_keyword(n));
+    }
+
     names
+}
+
+/// Keywords that should not appear as callee names in Elixir.
+/// These are definition and import forms that are syntactically `call` nodes.
+/// Superset of `ELIXIR_DEFINITION_TARGETS` (treesitter.rs) plus import keywords
+/// (`use`, `import`, `alias`, `require`) and `defoverridable`.
+fn is_elixir_keyword(name: &str) -> bool {
+    matches!(
+        name,
+        "def"
+            | "defp"
+            | "defmodule"
+            | "defmacro"
+            | "defmacrop"
+            | "defguard"
+            | "defguardp"
+            | "defdelegate"
+            | "defstruct"
+            | "defexception"
+            | "defprotocol"
+            | "defimpl"
+            | "defoverridable"
+            | "use"
+            | "import"
+            | "alias"
+            | "require"
+    )
 }
 
 /// Match callee names against outline entries, moving resolved names out of `remaining`.
@@ -539,6 +578,7 @@ mod tests {
             ("csharp", tree_sitter_c_sharp::LANGUAGE.into()),
             ("swift", tree_sitter_swift::LANGUAGE.into()),
             ("kotlin", tree_sitter_kotlin_ng::LANGUAGE.into()),
+            ("elixir", tree_sitter_elixir::LANGUAGE.into()),
         ];
         let mut seen = std::collections::HashMap::new();
         for (name, lang) in &grammars {
@@ -601,5 +641,81 @@ function run($svc): void {
         assert!(names.contains(&"staticCall".to_string()));
         assert!(names.contains(&"methodCall".to_string()));
         assert!(names.contains(&"nullableCall".to_string()));
+    }
+
+    #[test]
+    fn elixir_callee_query_compiles() {
+        let lang: tree_sitter::Language = tree_sitter_elixir::LANGUAGE.into();
+        let query_str = callee_query_str(crate::types::Lang::Elixir).unwrap();
+        tree_sitter::Query::new(&lang, query_str).expect("elixir callee query should compile");
+    }
+
+    #[test]
+    fn extract_elixir_callee_names() {
+        let elixir = r#"defmodule Example do
+  def run(conn) do
+    result = query(conn, "SELECT 1")
+    Enum.map(result, &to_string/1)
+    IO.puts("done")
+    local_func()
+  end
+end
+"#;
+        let names = extract_callee_names(elixir, Lang::Elixir, None);
+
+        assert!(
+            names.contains(&"query".to_string()),
+            "expected query, got: {names:?}"
+        );
+        assert!(
+            names.contains(&"map".to_string()),
+            "expected map (from Enum.map), got: {names:?}"
+        );
+        assert!(
+            names.contains(&"puts".to_string()),
+            "expected puts (from IO.puts), got: {names:?}"
+        );
+        assert!(
+            names.contains(&"local_func".to_string()),
+            "expected local_func, got: {names:?}"
+        );
+
+        // Definition keywords must NOT appear as callees
+        assert!(
+            !names.contains(&"def".to_string()),
+            "definition keyword 'def' should be filtered, got: {names:?}"
+        );
+        assert!(
+            !names.contains(&"defmodule".to_string()),
+            "definition keyword 'defmodule' should be filtered, got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn extract_elixir_callee_names_pipes() {
+        let elixir = r#"defmodule Pipes do
+  def run(conn) do
+    conn
+    |> prepare("sql")
+    |> execute()
+    |> Enum.map(&transform/1)
+  end
+end
+"#;
+        let names = extract_callee_names(elixir, Lang::Elixir, None);
+
+        // Pipe targets are regular call nodes — the callee query should find them
+        assert!(
+            names.contains(&"prepare".to_string()),
+            "expected prepare from pipe, got: {names:?}"
+        );
+        assert!(
+            names.contains(&"execute".to_string()),
+            "expected execute from pipe, got: {names:?}"
+        );
+        assert!(
+            names.contains(&"map".to_string()),
+            "expected map from Enum.map pipe, got: {names:?}"
+        );
     }
 }

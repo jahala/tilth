@@ -68,7 +68,7 @@ fn fingerprint_inner(root: &Path) -> String {
                 }
             })
             .collect();
-        mods.sort_by(|a, b| b.1.cmp(&a.1)); // most files first
+        mods.sort_by_key(|b| std::cmp::Reverse(b.1)); // most files first
 
         // If all modules (or at least most) share a common top-level prefix
         // (e.g., all are "src/..."), strip it so we display short names
@@ -135,7 +135,7 @@ fn fingerprint_inner(root: &Path) -> String {
             !lower.split('/').any(|part| non_source.contains(&part))
         });
         // Sort by file count descending, truncate to 10, extract names
-        mods.sort_by(|a, b| b.1.cmp(&a.1));
+        mods.sort_by_key(|b| std::cmp::Reverse(b.1));
         mods.truncate(10);
         mods.into_iter().map(|(name, _)| name).collect()
     };
@@ -250,6 +250,7 @@ fn lang_display_name(lang: Lang) -> &'static str {
         Lang::Swift => "Swift",
         Lang::Kotlin => "Kotlin",
         Lang::CSharp => "C#",
+        Lang::Elixir => "Elixir",
         Lang::Dockerfile => "Docker",
         Lang::Make => "Make",
     }
@@ -369,7 +370,7 @@ fn walk_dir(
                 *lang_counts.entry(lang).or_insert(0) += 1;
 
                 // Track size for hot files
-                let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                let size = entry.metadata().map_or(0, |m| m.len());
                 if let Ok(rel) = path.strip_prefix(root) {
                     let rel_str = rel.to_string_lossy().to_string();
 
@@ -830,7 +831,7 @@ fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opti
         // Collect import source strings for symbol extraction
         for line in content.lines() {
             if is_import_line(line, lang) {
-                let source = crate::lang::outline::extract_import_source(line);
+                let source = crate::lang::outline::extract_import_source(line, Some(lang));
                 if !source.is_empty() && !crate::read::imports::is_external(&source, lang) {
                     all_import_sources.push(source);
                 }

@@ -36,7 +36,7 @@ pub fn resolve_related_files_with_content(file_path: &Path, content: &str) -> Ve
         if !is_import_line(line, lang) {
             continue;
         }
-        let source = crate::lang::outline::extract_import_source(line);
+        let source = crate::lang::outline::extract_import_source(line, Some(lang));
         if source.is_empty() || is_external(&source, lang) {
             continue;
         }
@@ -59,6 +59,12 @@ pub(crate) fn is_import_line(line: &str, lang: Lang) -> bool {
         Lang::Python => trimmed.starts_with("import ") || trimmed.starts_with("from "),
         Lang::Go | Lang::Java | Lang::Scala | Lang::Kotlin => trimmed.starts_with("import "),
         Lang::C | Lang::Cpp => trimmed.starts_with("#include"),
+        Lang::Elixir => {
+            trimmed.starts_with("alias ")
+                || trimmed.starts_with("import ")
+                || trimmed.starts_with("use ")
+                || trimmed.starts_with("require ")
+        }
         _ => false,
     }
 }
@@ -75,7 +81,7 @@ pub(crate) fn is_external(source: &str, lang: Lang) -> bool {
         }
         Lang::Python => !source.starts_with('.'),
         Lang::C | Lang::Cpp => !source.starts_with('"'),
-        // Go, Java, Scala, Kotlin — can't resolve without build system knowledge.
+        // Elixir, Go, Java, Scala, Kotlin — can't resolve without build system knowledge.
         _ => true,
     }
 }
@@ -86,6 +92,7 @@ fn resolve(dir: &Path, source: &str, lang: Lang) -> Option<PathBuf> {
         Lang::TypeScript | Lang::Tsx | Lang::JavaScript => resolve_js(dir, source),
         Lang::Python => resolve_python(dir, source),
         Lang::C | Lang::Cpp => resolve_c_include(dir, source),
+        // Elixir, Go, Java, etc. — module-to-file mapping requires build system conventions.
         _ => None,
     }
 }
