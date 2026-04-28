@@ -175,9 +175,35 @@ fn find_definitions(
                 Vec::new()
             };
 
-            // Fallback: keyword heuristic for files without grammars
+            // Per-file-type fallback dispatch. The semantics of "definition"
+            // differ by file kind, so handle them separately:
+            //
+            // * Code without a tree-sitter grammar: keyword heuristic (looks
+            //   for lines starting with `function`/`const`/`class`/etc.).
+            // * Markdown / RST: heading-as-definition. A heading whose text
+            //   contains the query (`## parseCitations` in a doc) marks that
+            //   section AS being about the symbol — that is the documentation
+            //   analogue of a code definition. Quoted code blocks inside
+            //   docs are NOT treated as definitions; they're usages, because
+            //   the keyword heuristic would false-positive on every snippet
+            //   that quotes the real source. Heading defs carry a lower
+            //   `def_weight` (30) than code definitions (60-80) so the real
+            //   source still ranks first.
+            // * Structured data / tabular / log / other: no fallback.
+            //   Mentions are config values, data, or noise — not definitions.
+            //   (A future patch could treat top-level config keys matching
+            //   the query as soft definitions, but that's ambiguous enough
+            //   to skip for now.)
             if file_defs.is_empty() && ts_language.is_none() {
-                file_defs = find_defs_heuristic_buf(path, query, &content, file_lines, mtime);
+                file_defs = match file_type {
+                    FileType::Code(_) => {
+                        find_defs_heuristic_buf(path, query, &content, file_lines, mtime)
+                    }
+                    FileType::Markdown => {
+                        find_defs_markdown_buf(path, query, &content, file_lines, mtime)
+                    }
+                    _ => Vec::new(),
+                };
             }
 
             if !file_defs.is_empty() {
@@ -522,6 +548,97 @@ fn find_usages(
         .unwrap_or_else(std::sync::PoisonError::into_inner))
 }
 
+/// Markdown heading definition detector.
+///
+/// A line `^#{1,6}\s+<text>` in a `.md`/`.mdx`/`.rst` file is treated as a
+/// soft definition of the section about <query> when <query> appears in
+/// <text> as a whole identifier (flanked by non-word chars). Setext
+/// headings (`===` underlines) and indented code blocks (4+ spaces) are
+/// intentionally ignored — Setext requires two-line look-ahead, and 4+
+/// space indents are CommonMark indented code blocks, not headings.
+///
+/// Whole-identifier match (not substring-anywhere) prevents false positives
+/// like query `func` matching heading `## refactoring guidelines`. Match is
+/// against the heading TEXT (after stripping `#` markers), so the `#`s
+/// themselves never count as boundary characters.
+fn find_defs_markdown_buf(
+    path: &Path,
+    query: &str,
+    content: &str,
+    file_lines: u32,
+    mtime: SystemTime,
+) -> Vec<Match> {
+    let mut defs = Vec::new();
+
+    for (i, line) in content.lines().enumerate() {
+        let Some(heading_text) = extract_atx_heading_text(line) else {
+            continue;
+        };
+        if !contains_identifier(heading_text, query) {
+            continue;
+        }
+        defs.push(Match {
+            path: path.to_path_buf(),
+            line: (i + 1) as u32,
+            text: line.trim_end().to_string(),
+            is_definition: true,
+            exact: true,
+            file_lines,
+            mtime,
+            def_range: None,
+            def_name: Some(query.to_string()),
+            // Soft definition — code definitions are 60-80, usages 0. Sits
+            // between them so docs headings outrank passing mentions but
+            // never outrank the real source.
+            def_weight: 30,
+            impl_target: None,
+        });
+    }
+
+    defs
+}
+
+/// Extract the text of an ATX-style markdown heading, or `None` if the line
+/// is not a heading. Strips leading `#` markers and optional trailing `#`s.
+/// Per CommonMark: 0-3 spaces of indent allowed; 4+ spaces is a code block.
+fn extract_atx_heading_text(line: &str) -> Option<&str> {
+    let leading_spaces = line.bytes().take_while(|&b| b == b' ').count();
+    if leading_spaces > 3 {
+        return None;
+    }
+    let after_indent = &line[leading_spaces..];
+    let bytes = after_indent.as_bytes();
+    let hashes = bytes.iter().take_while(|&&b| b == b'#').count();
+    if !(1..=6).contains(&hashes) {
+        return None;
+    }
+    if !matches!(bytes.get(hashes), Some(b' ' | b'\t')) {
+        return None;
+    }
+    let text = after_indent[hashes..].trim();
+    // ATX allows optional trailing `#`s: `## Foo ##` — strip them.
+    Some(text.trim_end_matches('#').trim_end())
+}
+
+/// True if `query` appears in `text` as a whole identifier — flanked by
+/// non-word characters (anything outside `[A-Za-z0-9_]`) or string ends.
+fn contains_identifier(text: &str, query: &str) -> bool {
+    if query.is_empty() {
+        return false;
+    }
+    text.match_indices(query).any(|(abs, _)| {
+        let bytes = text.as_bytes();
+        let before_ok = abs == 0 || !is_word_byte(bytes[abs - 1]);
+        let end_pos = abs + query.len();
+        let after_ok = end_pos == bytes.len() || !is_word_byte(bytes[end_pos]);
+        before_ok && after_ok
+    })
+}
+
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
 /// Keyword heuristic fallback — only used when tree-sitter grammar unavailable.
 fn is_definition_line(line: &str) -> bool {
     let trimmed = line.trim();
@@ -786,5 +903,111 @@ end
             !elixir_find(code, "Inner").is_empty(),
             "should find nested 'Inner' module"
         );
+    }
+
+    fn md_find(content: &str, query: &str) -> Vec<Match> {
+        let lines = content.lines().count() as u32;
+        find_defs_markdown_buf(
+            std::path::Path::new("test.md"),
+            query,
+            content,
+            lines,
+            SystemTime::now(),
+        )
+    }
+
+    #[test]
+    fn markdown_heading_named_for_query_matches() {
+        let content = "# Intro\n\n## parseCitations\n\nProse.\n";
+        let defs = md_find(content, "parseCitations");
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].line, 3);
+        assert!(defs[0].is_definition);
+        assert_eq!(defs[0].def_weight, 30);
+    }
+
+    #[test]
+    fn markdown_heading_levels_one_through_six() {
+        for level in 1..=6 {
+            let hashes = "#".repeat(level);
+            let content = format!("{hashes} parseCitations\n");
+            assert_eq!(md_find(&content, "parseCitations").len(), 1, "h{level}");
+        }
+        // h7 is not a heading
+        assert!(md_find("####### parseCitations\n", "parseCitations").is_empty());
+    }
+
+    #[test]
+    fn markdown_heading_without_query_does_not_match() {
+        let content = "## Other section\n\n## Another heading\n";
+        assert!(md_find(content, "parseCitations").is_empty());
+    }
+
+    #[test]
+    fn markdown_substring_inside_word_does_not_match() {
+        // query "func" must not match "function" — that's the maintainer's
+        // word-boundary concern. Same for "factor" inside "refactoring".
+        assert!(md_find("## function pointers\n", "func").is_empty());
+        assert!(md_find("## refactoring guidelines\n", "factor").is_empty());
+        assert!(md_find("## getCitationsBatch\n", "Citations").is_empty());
+    }
+
+    #[test]
+    fn markdown_whole_word_in_phrase_matches() {
+        // Whole-word match anywhere in the heading text is a definition —
+        // a heading like `## How parseCitations works` IS naming the symbol.
+        let defs = md_find("## How parseCitations works\n", "parseCitations");
+        assert_eq!(defs.len(), 1);
+    }
+
+    #[test]
+    fn markdown_query_with_hyphen_matches() {
+        // Tracking-doc identifiers like `GUM-1732` must match. The hyphen
+        // is part of the query; word-boundary check applies only at the ends.
+        let defs = md_find("## GUM-1732: Cost attribution\n", "GUM-1732");
+        assert_eq!(defs.len(), 1);
+    }
+
+    #[test]
+    fn markdown_code_block_lines_do_not_match() {
+        // Fenced code block — line is not an ATX heading, even though
+        // the text contains `function parseCitations`.
+        let content = "## Real heading\n\n```ts\nfunction parseCitations() {}\n```\n";
+        let defs = md_find(content, "parseCitations");
+        assert!(defs.is_empty(), "fenced-code mention is not a definition");
+
+        // Indented code block (4+ space indent) — a `## ...` line indented
+        // 4 spaces is a code block per CommonMark, not a heading.
+        let content = "Intro.\n\n    ## parseCitations\n";
+        assert!(
+            md_find(content, "parseCitations").is_empty(),
+            "4-space-indented `## foo` is a code block, not a heading"
+        );
+    }
+
+    #[test]
+    fn markdown_heading_with_up_to_three_space_indent_matches() {
+        // 0-3 space indents are valid ATX headings per CommonMark.
+        for indent in 0..=3 {
+            let content = format!("{}## parseCitations\n", " ".repeat(indent));
+            assert_eq!(
+                md_find(&content, "parseCitations").len(),
+                1,
+                "indent {indent} should be a heading"
+            );
+        }
+    }
+
+    #[test]
+    fn markdown_heading_with_trailing_hashes_matches() {
+        // ATX allows optional trailing `#`s — strip them before matching.
+        assert_eq!(md_find("## parseCitations ##\n", "parseCitations").len(), 1);
+        assert_eq!(md_find("### parseCitations ###\n", "parseCitations").len(), 1);
+    }
+
+    #[test]
+    fn markdown_hashes_without_space_are_not_headings() {
+        // `##foo` (no space after `#`s) is not a heading.
+        assert!(md_find("##parseCitations\n", "parseCitations").is_empty());
     }
 }
