@@ -16,14 +16,9 @@ use crate::types::{estimate_tokens, FileType};
 pub fn generate(scope: &Path, depth: usize, budget: Option<u64>, cache: &OutlineCache) -> String {
     let mut tree: BTreeMap<PathBuf, Vec<FileEntry>> = BTreeMap::new();
 
-    let walker = WalkBuilder::new(scope)
-        .follow_links(true)
-        .hidden(false)
-        .git_ignore(false)
-        .git_global(false)
-        .git_exclude(false)
-        .ignore(false)
-        .parents(false)
+    let mut builder = WalkBuilder::new(scope);
+    crate::search::apply_ignore_settings(&mut builder);
+    let walker = builder
         .filter_entry(|entry| {
             if entry.file_type().is_some_and(|ft| ft.is_dir()) {
                 if let Some(name) = entry.file_name().to_str() {

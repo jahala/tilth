@@ -66,7 +66,7 @@ tilth_read: Read file content with smart outlining. Replaces cat/head/tail.\n\
     [<start>-<end>]  <symbol name>             ← outline mode\n\
 \n\
 tilth_files: Find files by glob pattern. Replaces find, ls, pwd, and the host Glob tool.\n\
-  Output: <path>  (~<token_count> tokens). Respects .gitignore.\n\
+  Output: <path>  (~<token_count> tokens). Respects .gitignore (use `.tilthignore` with `!path` to re-include).\n\
 \n\
 tilth_deps: Blast-radius check — what imports this file and what it imports.\n\
   Use ONLY before renaming, removing, or changing an export's signature.\n\
@@ -942,7 +942,7 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "tilth_files",
-            "description": "Find files matching a glob pattern. Replaces find/ls/pwd and the host Glob tool — use this for all file discovery. Returns matched file paths sorted by relevance with token size estimates. Respects .gitignore.",
+            "description": "Find files matching a glob pattern. Replaces find/ls/pwd and the host Glob tool — use this for all file discovery. Returns matched file paths sorted by relevance with token size estimates. Respects per-repo .gitignore by default; use a `.tilthignore` file (gitignore syntax with `!path` to re-include) or `TILTH_NO_IGNORE=1` to override.",
             "inputSchema": {
                 "type": "object",
                 "required": ["pattern"],

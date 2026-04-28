@@ -29,8 +29,8 @@ use crate::types::{estimate_tokens, FileType, Match, SearchResult};
 use crate::format::rel;
 
 // Directories that are always skipped — build artifacts, dependencies, VCS internals.
-// We skip these explicitly instead of relying on .gitignore so that locally-relevant
-// gitignored files (docs/, configs, generated code) are still searchable.
+// Enforced regardless of `.gitignore` so a `TILTH_NO_IGNORE=1` walk still skips
+// universally-noisy dirs.
 pub(crate) const SKIP_DIRS: &[&str] = &[
     ".git",
     "node_modules",
@@ -67,9 +67,40 @@ pub(crate) const SKIP_DIRS: &[&str] = &[
 
 const EXPAND_FULL_FILE_THRESHOLD: u64 = 800;
 
-/// Build a parallel directory walker that searches ALL files except known junk directories.
-/// Does NOT respect .gitignore — ensures gitignored but locally-relevant files are found.
-/// When `glob` is Some, applies a file-pattern override (whitelist or negation).
+/// Apply tilth's standard ignore policy to a `WalkBuilder`.
+///
+/// Default: honor per-repo `.gitignore` plus `.tilthignore` files
+/// (gitignore syntax — write `!path` lines to force-include paths the
+/// repo `.gitignore` would have excluded). Global gitignore and
+/// `.git/info/exclude` are never consulted — those tend to list
+/// per-engineer files (agent state, editor scratch) that we still want
+/// to grep.
+///
+/// Set `TILTH_NO_IGNORE=1` to walk every file (the pre-0.7 behavior),
+/// still respecting `SKIP_DIRS`.
+pub(crate) fn apply_ignore_settings(builder: &mut WalkBuilder) -> &mut WalkBuilder {
+    let no_ignore = std::env::var("TILTH_NO_IGNORE")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false);
+    builder
+        .follow_links(true)
+        .hidden(false)
+        .git_ignore(!no_ignore)
+        .git_global(false)
+        .git_exclude(false)
+        .ignore(false)
+        .parents(false);
+    if !no_ignore {
+        builder.add_custom_ignore_filename(".tilthignore");
+    }
+    builder
+}
+
+/// Build a parallel directory walker.
+///
+/// Honors `.gitignore` + `.tilthignore` by default (see `apply_ignore_settings`).
+/// `SKIP_DIRS` is always enforced. When `glob` is Some, applies a file-pattern
+/// override (whitelist or negation).
 pub(crate) fn walker(scope: &Path, glob: Option<&str>) -> Result<ignore::WalkParallel, TilthError> {
     let threads = std::env::var("TILTH_THREADS")
         .ok()
@@ -79,14 +110,7 @@ pub(crate) fn walker(scope: &Path, glob: Option<&str>) -> Result<ignore::WalkPar
         });
 
     let mut builder = WalkBuilder::new(scope);
-    builder
-        .follow_links(true)
-        .hidden(false)
-        .git_ignore(false)
-        .git_global(false)
-        .git_exclude(false)
-        .ignore(false)
-        .parents(false)
+    apply_ignore_settings(&mut builder)
         .threads(threads)
         .filter_entry(|entry| {
             if entry.file_type().is_some_and(|ft| ft.is_dir()) {
