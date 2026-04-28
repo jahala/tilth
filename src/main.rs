@@ -425,7 +425,14 @@ fn emit_output(output: &str, is_tty: bool) {
         }
     }
 
+    // Conventional CLI output ends with a newline so the next shell prompt
+    // starts on its own line. Most internal formatters terminate with `\n`,
+    // but the search-result footer (e.g. `(~507 tokens)`) and a few other
+    // paths do not — guard at the sink rather than auditing every formatter.
     print!("{output}");
+    if !output.ends_with('\n') {
+        println!();
+    }
     let _ = io::stdout().flush();
 }
 
