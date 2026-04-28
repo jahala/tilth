@@ -44,9 +44,10 @@ DO NOT use Grep, Read, or Glob. Always use the better tools tilth_search (grep),
 tilth_search: Search code — finds definitions, usages, and text. Replaces grep/rg for all code search.\n\
   For multi-symbol lookup, separate each with a comma \"symbol1,symbol2\" (max 5).\n\
   kind: \"symbol\" (default) | \"content\" (strings/comments) | \"callers\" (call sites)\n\
-  expand (default 2): inline full source for top matches.\n\
+  expand (default 2): inline full source for top N matches. Pass a large N (e.g. 999) to inline every match.\n\
   context: path to file being edited — boosts nearby results.\n\
   glob: file pattern filter — \"*.rs\" (whitelist), \"!*.test.ts\" (exclude).\n\
+  Respects per-repo .gitignore — write `!path` lines in `.tilthignore` to re-include, or set `TILTH_NO_IGNORE=1` for a one-off bypass.\n\
   Output per match:\n\
     ## <path>:<start>-<end> [definition|usage|impl]\n\
     <outline context>\n\
@@ -70,6 +71,7 @@ tilth_files: Find files by glob pattern. Replaces find, ls, pwd, and the host Gl
 \n\
 tilth_deps: Blast-radius check — what imports this file and what it imports.\n\
   Use ONLY before renaming, removing, or changing an export's signature.\n\
+  Respects per-repo .gitignore (same overrides as tilth_search / tilth_files: `.tilthignore` / `TILTH_NO_IGNORE`).\n\
 \n\
 tilth_diff: Structural diff — shows what changed at function level. Replaces Bash(git diff).\n\
   Usage: tilth_diff(source: \"HEAD~1\") for last commit. No args = uncommitted changes.\n\
@@ -870,7 +872,7 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
     let mut tools = vec![
         serde_json::json!({
             "name": "tilth_search",
-            "description": "Search for symbols, text, or regex patterns in code. Replaces grep/rg and the host Grep tool — use this for all code search. Symbol search returns definitions first (via tree-sitter AST), then usages, with full source code inlined for top matches. Content search finds literal text. Regex search supports full regex patterns. For cross-file tracing, pass comma-separated symbol names (max 5).",
+            "description": "Search for symbols, text, or regex patterns in code. Replaces grep/rg and the host Grep tool — use this for all code search. Symbol search returns definitions first (via tree-sitter AST), then usages, with full source code inlined for top matches. Content search finds literal text. Regex search supports full regex patterns. For cross-file tracing, pass comma-separated symbol names (max 5). Respects per-repo .gitignore by default; use a `.tilthignore` file (gitignore syntax with `!path` to re-include) or `TILTH_NO_IGNORE=1` to override.",
             "inputSchema": {
                 "type": "object",
                 "required": ["query"],
@@ -892,7 +894,7 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     "expand": {
                         "type": "number",
                         "default": 2,
-                        "description": "Number of top matches to expand with full source code. Definitions show the full function/class body. Usages show ±10 context lines."
+                        "description": "Number of top matches to expand with full source code. Definitions show the full function/class body. Usages show ±10 context lines. Default 2; pass a large value (e.g. 999) to inline every match — output stays bounded by `budget`."
                     },
                     "context": {
                         "type": "string",
@@ -964,7 +966,7 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "tilth_deps",
-            "description": "Blast-radius check before breaking changes. Shows what a file imports (local + external) and what other files call its exports, with symbol-level detail. Use ONLY when your planned edit changes a function signature, removes/renames an export, or modifies behavior that callers rely on. Do NOT use for reading files, adding new code, or internal-only changes — use tilth_read instead.",
+            "description": "Blast-radius check before breaking changes. Shows what a file imports (local + external) and what other files call its exports, with symbol-level detail. Use ONLY when your planned edit changes a function signature, removes/renames an export, or modifies behavior that callers rely on. Do NOT use for reading files, adding new code, or internal-only changes — use tilth_read instead. Respects per-repo .gitignore (override via `.tilthignore` or `TILTH_NO_IGNORE=1`).",
             "inputSchema": {
                 "type": "object",
                 "required": ["path"],
