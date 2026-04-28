@@ -28,7 +28,15 @@ struct Cli {
     #[arg(long)]
     budget: Option<u64>,
 
-    /// Force full output (override smart view).
+    /// Force full output (effect depends on query type — see --help).
+    ///
+    /// File path: return the whole file instead of an outline (bypass smart view).
+    ///
+    /// Symbol / text / regex: inline source for every match (equivalent to
+    /// `--expand=<all>`). Explicit `--expand=N` wins. Output stays bounded
+    /// by `--budget`.
+    ///
+    /// Glob: no effect (glob queries already return a flat file list).
     #[arg(long)]
     full: bool,
 
@@ -54,7 +62,12 @@ struct Cli {
     #[arg(long)]
     no_ignore: bool,
 
-    /// Expand top N search matches with inline source (default: 2 when flag present).
+    /// Inline source for top N search matches (default 2 when flag bare).
+    ///
+    /// Applies to symbol / text / regex queries. Without the flag the
+    /// result is just the outline summary. `--full` upgrades this to
+    /// expand every match (subject to `--budget`); explicit `--expand=N`
+    /// wins over `--full`. No effect on file-path or glob queries.
     #[arg(long, num_args = 0..=1, default_missing_value = "2", require_equals = true)]
     expand: Option<usize>,
 
@@ -264,9 +277,34 @@ fn main() {
     let cache = tilth::cache::OutlineCache::new();
     let scope = cli.scope.canonicalize().unwrap_or(cli.scope);
 
-    // When piped (not a TTY), force full output — scripts expect raw content
+    // When piped (not a TTY), force full output — scripts expect raw content.
+    // This promotion exists for FilePath queries (return full file instead of
+    // outline) and is harmless for Glob (which ignores `full`). Search queries
+    // also receive `full=true` here but stay outline-only — they do not auto-
+    // expand on piping. See the `cli.full` guard on the expand override below.
     let full = cli.full || !is_tty;
-    let expand = cli.expand.unwrap_or(0);
+
+    // Explicit `--full` on a search query means expand every match. Guarded on
+    // `cli.full` (NOT the piped-derived `full` above) so that subprocess /
+    // pipeline callers (Claude Code's Bash tool, CI scripts, `tilth foo | rg`)
+    // still receive the concise outline they want. They opt into expand-all by
+    // adding `--full` themselves. Explicit `--expand=N` still wins because it
+    // produces `expand != 0`. We over-apply to all query types — `run_inner`
+    // only forwards `expand` to search dispatches, so the value is silently
+    // ignored for FilePath and Glob.
+    //
+    // Cap at FULL_EXPAND_CAP rather than `usize::MAX`: `--budget` already
+    // bounds output, but `expand=usize::MAX` makes tilth compute the
+    // expanded source for every match before truncating, wasting parsing
+    // and rendering work on pathological queries. 50 is well above any
+    // practical "show me everything that matters" case (MAX_MATCHES is 10
+    // for symbol search anyway).
+    const FULL_EXPAND_CAP: usize = 50;
+    let expand = match (cli.expand, cli.full) {
+        (Some(n), _) => n,
+        (None, true) => FULL_EXPAND_CAP,
+        (None, false) => 0,
+    };
 
     // Callers mode
     if cli.callers {
