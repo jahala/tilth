@@ -263,9 +263,16 @@ fn resolve_heading(buf: &[u8], heading: &str) -> Option<(usize, usize)> {
 ///
 /// Used when a heading lookup misses — agents typo'd anchors, or the heading
 /// renamed since they last read. Returning the closest matches lets them
-/// retry with the right anchor without re-reading the whole file. Skips
-/// headings inside fenced code blocks and ignores ATX-close trailing `#`s
-/// and kramdown-style `{#anchor}` markers in the comparison text.
+/// retry with the right anchor without re-reading the whole file.
+///
+/// Recognizes `ATX` headings (`CommonMark` §4.6: 1–6 leading `#`s followed
+/// by a space). Skips headings inside fenced code blocks delimited by either
+/// triple backticks or triple tildes. `Setext` headings (`Title\n===`) are
+/// not recognized — they are rare in practice and would require lookback.
+/// Caveat on ranking: Levenshtein favours candidates of similar length to
+/// the query, so very short queries against long headings can rank tighter
+/// matches first; this is acceptable for a hint and aligned with the rest
+/// of the project's `edit_distance` use.
 fn suggest_headings(buf: &[u8], query: &str, top_n: usize) -> Vec<String> {
     let q_text = query.trim_end().trim_start_matches('#').trim();
     if q_text.is_empty() {
@@ -280,14 +287,26 @@ fn suggest_headings(buf: &[u8], query: &str, top_n: usize) -> Vec<String> {
             continue;
         };
         let trimmed = s.trim_end();
-        if trimmed.starts_with("```") {
+        // CommonMark allows both ``` and ~~~ as fence delimiters.
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
             in_code_block = !in_code_block;
             continue;
         }
         if in_code_block || !trimmed.starts_with('#') {
             continue;
         }
-        let h_text = trimmed.trim_start_matches('#').trim();
+        // CommonMark §4.6.1: ATX headings have 1–6 `#`s followed by a space
+        // (or end-of-line). Reject longer hash runs and hash-prefixes that
+        // aren't followed by whitespace (`##foo` is not a heading).
+        let hash_count = trimmed.bytes().take_while(|&b| b == b'#').count();
+        if !(1..=6).contains(&hash_count) {
+            continue;
+        }
+        let after_hashes = trimmed.as_bytes().get(hash_count).copied();
+        if !matches!(after_hashes, None | Some(b' ' | b'\t')) {
+            continue;
+        }
+        let h_text = trimmed[hash_count..].trim();
         if h_text.is_empty() {
             continue;
         }
@@ -455,10 +474,16 @@ fn suggest_similar(path: &Path) -> Option<String> {
     best.map(|(_, name)| name)
 }
 
-/// Simple Levenshtein distance — only used on short file names.
+/// Levenshtein distance over Unicode scalar values.
+///
+/// Operates on `char`s, not bytes — a single CJK or emoji glyph is one
+/// edit unit, not 3-4. Byte-level Levenshtein on UTF-8 inflates distances
+/// for non-ASCII content and breaks ranking for international markdown
+/// or filenames. Used by both filename suggestion (`suggest_similar`) and
+/// heading suggestion (`suggest_headings`).
 fn edit_distance(a: &str, b: &str) -> usize {
-    let a = a.as_bytes();
-    let b = b.as_bytes();
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
     let mut prev: Vec<usize> = (0..=b.len()).collect();
     let mut curr = vec![0; b.len() + 1];
 
@@ -638,5 +663,59 @@ mod tests {
         let input = b"# A\n## B\n";
         assert!(suggest_headings(input, "", 5).is_empty());
         assert!(suggest_headings(input, "###", 5).is_empty());
+    }
+
+    /// CommonMark allows `~~~` as a fence delimiter. Headings inside
+    /// must not be treated as suggestable.
+    #[test]
+    fn suggest_headings_skips_tilde_fenced_blocks() {
+        let input = b"## Real Heading\nfoo\n~~~md\n## Inside Tilde Fence\n~~~\n";
+        let suggestions = suggest_headings(input, "## Heading", 5);
+        assert!(
+            !suggestions.iter().any(|h| h.contains("Inside Tilde Fence")),
+            "tilde-fenced heading leaked: {suggestions:?}"
+        );
+        assert!(
+            suggestions.iter().any(|h| h.contains("Real Heading")),
+            "real heading missing: {suggestions:?}"
+        );
+    }
+
+    /// CommonMark §4.6.1 limits ATX headings to 1–6 `#`s. Lines with 7+
+    /// hashes are not headings, even with a space after.
+    #[test]
+    fn suggest_headings_rejects_seven_or_more_hashes() {
+        let input = b"## Real Heading\nfoo\n####### Not a Heading\n";
+        let suggestions = suggest_headings(input, "## Heading", 5);
+        assert!(
+            !suggestions.iter().any(|h| h.contains("Not a Heading")),
+            "7-hash line leaked as heading: {suggestions:?}"
+        );
+    }
+
+    /// CommonMark §4.6.1: hashes must be followed by a space (or EOL).
+    /// `##foo` (no space) is not a heading.
+    #[test]
+    fn suggest_headings_rejects_hashes_without_space() {
+        let input = b"## Real Heading\nfoo\n##NoSpace\n";
+        let suggestions = suggest_headings(input, "## Heading", 5);
+        assert!(
+            !suggestions.iter().any(|h| h.contains("NoSpace")),
+            "##NoSpace leaked as heading: {suggestions:?}"
+        );
+    }
+
+    /// edit_distance must operate on `char`s so non-ASCII headings rank
+    /// correctly. Byte-level Levenshtein would inflate distances for
+    /// CJK or emoji because those occupy 3–4 bytes per scalar value.
+    #[test]
+    fn edit_distance_is_unicode_aware() {
+        // 设置 (Settings) and 設定 (Configuration) — different chars,
+        // each one Unicode scalar. Distance should be 2, not 6.
+        assert_eq!(edit_distance("设置", "設定"), 2);
+        // emoji single-scalar: 🦀 vs 🐙 = distance 1.
+        assert_eq!(edit_distance("🦀", "🐙"), 1);
+        // ASCII baseline still works.
+        assert_eq!(edit_distance("kitten", "sitting"), 3);
     }
 }
