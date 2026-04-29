@@ -165,9 +165,32 @@ fn node_to_entry(
             (OutlineKind::Import, text, None)
         }
 
-        // Exports
+        // Exports — `export` is a modifier on a wrapped declaration, not a
+        // peer of `function`/`class`/`const`. Recurse into the inner
+        // declaration so the entry renders with its real kind. Falling back to
+        // `OutlineKind::Export` only when there is no nameable declaration
+        // inside (`export { … }`, `export * from …`, `export default <expr>`).
+        // Without this, `export_statement`'s `name` is the full source span
+        // (already starts with `export `), and the renderer prepends the
+        // `Export` kind_label `"export"` again — producing the doubled-keyword
+        // outline header `export export async function foo(`.
         "export_statement" => {
-            let name = node_text(node, lines);
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if let Some(mut inner) = node_to_entry(child, lines, lang, depth) {
+                    // Extend the entry's range to cover the `export` keyword
+                    // so the outline byte range still points at the statement.
+                    inner.start_line = start_line;
+                    return Some(inner);
+                }
+            }
+            // No nameable inner declaration; strip leading `export ` so the
+            // rendered name doesn't duplicate the `kind_label`.
+            let raw = node_text(node, lines);
+            let name = raw
+                .strip_prefix("export ")
+                .map(str::to_string)
+                .unwrap_or(raw);
             (OutlineKind::Export, name, None)
         }
 
