@@ -273,6 +273,53 @@ fn resolve_heading(buf: &[u8], heading: &str) -> Option<(usize, usize)> {
     Some((start_line, total_lines))
 }
 
+/// Return up to `top_n` markdown headings ranked by edit distance to `query`.
+///
+/// Used when a heading lookup misses — agents typo'd anchors, or the heading
+/// renamed since they last read. Returning the closest matches lets them
+/// retry with the right anchor without re-reading the whole file. Skips
+/// headings inside fenced code blocks and ignores ATX-close trailing `#`s
+/// and kramdown-style `{#anchor}` markers in the comparison text.
+fn suggest_headings(buf: &[u8], query: &str, top_n: usize) -> Vec<String> {
+    let q_text = query.trim_end().trim_start_matches('#').trim();
+    if q_text.is_empty() {
+        return Vec::new();
+    }
+    let q_lower = q_text.to_ascii_lowercase();
+
+    let mut in_code_block = false;
+    let mut scored: Vec<(usize, String)> = Vec::new();
+    for line in buf.split(|&b| b == b'\n') {
+        let Ok(s) = std::str::from_utf8(line) else {
+            continue;
+        };
+        let trimmed = s.trim_end();
+        if trimmed.starts_with("```") {
+            in_code_block = !in_code_block;
+            continue;
+        }
+        if in_code_block || !trimmed.starts_with('#') {
+            continue;
+        }
+        let h_text = trimmed.trim_start_matches('#').trim();
+        if h_text.is_empty() {
+            continue;
+        }
+        // Strip kramdown attr blocks and ATX-close `#`s from comparison text.
+        let h_clean = h_text
+            .split('{')
+            .next()
+            .unwrap_or(h_text)
+            .trim_end_matches('#')
+            .trim();
+        let dist = edit_distance(&q_lower, &h_clean.to_ascii_lowercase());
+        scored.push((dist, trimmed.to_string()));
+    }
+
+    scored.sort_by_key(|(d, _)| *d);
+    scored.into_iter().take(top_n).map(|(_, h)| h).collect()
+}
+
 /// Read a specific line range from a file.
 /// Uses memchr to find the Nth newline offset and slice the mmap buffer directly
 /// instead of collecting all lines into a Vec.
@@ -289,9 +336,20 @@ fn read_section(path: &Path, range: &str, edit_mode: bool) -> Result<String, Til
 
     // Check if this is a heading-based address (markdown)
     let (start, end) = if range.starts_with('#') {
-        resolve_heading(buf, range).ok_or_else(|| TilthError::InvalidQuery {
-            query: range.to_string(),
-            reason: "heading not found in file".into(),
+        resolve_heading(buf, range).ok_or_else(|| {
+            let suggestions = suggest_headings(buf, range, 5);
+            let reason = if suggestions.is_empty() {
+                "heading not found in file".to_string()
+            } else {
+                format!(
+                    "heading not found in file. Closest matches:\n  {}",
+                    suggestions.join("\n  ")
+                )
+            };
+            TilthError::InvalidQuery {
+                query: range.to_string(),
+                reason,
+            }
         })?
     } else {
         parse_range(range).ok_or_else(|| TilthError::InvalidQuery {
@@ -550,5 +608,49 @@ mod tests {
 
         std::env::remove_var("TILTH_FULL_SIZE_CAP");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn suggest_headings_returns_close_matches() {
+        let input = b"# Architecture\nfoo\n## Getting Started\nbar\n## Configuration\nbaz\n";
+        let suggestions = suggest_headings(input, "## Get Started", 5);
+        assert!(
+            suggestions.iter().any(|h| h.contains("Getting Started")),
+            "expected 'Getting Started' in suggestions, got: {suggestions:?}"
+        );
+    }
+
+    #[test]
+    fn suggest_headings_top_n_orders_by_distance() {
+        let input = b"# A\nfoo\n## Configuration\nbar\n## Authentication\nbaz\n## Settings\nqux\n";
+        // Whole-word typo of "Configuration" — Levenshtein favours close-length
+        // candidates here, so "Configuration" must rank ahead of the others.
+        let suggestions = suggest_headings(input, "## Configurashun", 5);
+        assert!(
+            suggestions[0].contains("Configuration"),
+            "expected 'Configuration' first, got: {suggestions:?}"
+        );
+    }
+
+    #[test]
+    fn suggest_headings_skips_code_blocks() {
+        let input = b"## Real Heading\nfoo\n```md\n## Inside Code\n```\n";
+        let suggestions = suggest_headings(input, "## Heading", 5);
+        // Heading inside code block must NOT appear
+        assert!(
+            !suggestions.iter().any(|h| h.contains("Inside Code")),
+            "fenced heading leaked into suggestions: {suggestions:?}"
+        );
+        assert!(
+            suggestions.iter().any(|h| h.contains("Real Heading")),
+            "expected real heading in suggestions: {suggestions:?}"
+        );
+    }
+
+    #[test]
+    fn suggest_headings_empty_query_returns_empty() {
+        let input = b"# A\n## B\n";
+        assert!(suggest_headings(input, "", 5).is_empty());
+        assert!(suggest_headings(input, "###", 5).is_empty());
     }
 }
