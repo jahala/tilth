@@ -41,14 +41,19 @@ pub struct CallerMatch {
 }
 
 /// Find all call sites of a target symbol across the codebase using tree-sitter.
+/// Walk the scope once, return all direct call sites of `target` plus
+/// whether the literal name appeared anywhere (used to distinguish
+/// "real symbol with no direct callers" from "typo'd query" — the hint
+/// shown to the agent differs between those cases).
 pub fn find_callers(
     target: &str,
     scope: &Path,
     bloom: &crate::index::bloom::BloomFilterCache,
     glob: Option<&str>,
-) -> Result<Vec<CallerMatch>, TilthError> {
+) -> Result<(Vec<CallerMatch>, bool), TilthError> {
     let matches: Mutex<Vec<CallerMatch>> = Mutex::new(Vec::new());
     let found_count = AtomicUsize::new(0);
+    let target_seen = std::sync::atomic::AtomicBool::new(false);
     let needle = target.as_bytes();
 
     let walker = super::walker(scope, glob)?;
@@ -56,6 +61,7 @@ pub fn find_callers(
     walker.run(|| {
         let matches = &matches;
         let found_count = &found_count;
+        let target_seen = &target_seen;
 
         Box::new(move |entry| {
             // Early termination: enough callers found
@@ -100,6 +106,9 @@ pub fn find_callers(
                 return ignore::WalkState::Continue;
             }
 
+            // Symbol literal exists in this file (whether or not it's a call site).
+            target_seen.store(true, Ordering::Relaxed);
+
             // Only process files with tree-sitter grammars
             let file_type = detect_file_type(path);
             let FileType::Code(lang) = file_type else {
@@ -124,9 +133,10 @@ pub fn find_callers(
         })
     });
 
-    Ok(matches
+    let callers = matches
         .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner))
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Ok((callers, target_seen.load(Ordering::Relaxed)))
 }
 
 /// Tree-sitter call site detection.
@@ -505,16 +515,10 @@ pub fn search_callers_expanded(
     context: Option<&Path>,
     glob: Option<&str>,
 ) -> Result<String, TilthError> {
-    let callers = find_callers(target, scope, bloom, glob)?;
+    let (callers, target_seen) = find_callers(target, scope, bloom, glob)?;
 
     if callers.is_empty() {
-        return Ok(format!(
-            "# Callers of \"{}\" in {} — no call sites found\n\n\
-             Tip: the symbol may be called via interface/trait dispatch. \
-             Try symbol search instead.",
-            target,
-            scope.display()
-        ));
+        return Ok(no_callers_message(target, scope, target_seen));
     }
 
     // Sort by relevance (context file first, then by proximity)
@@ -655,6 +659,37 @@ pub fn search_callers_expanded(
     Ok(output)
 }
 
+/// Build the user-facing message when callers search returns no hits.
+/// Splits two cases that mean very different things to an agent:
+/// `target_seen = true` means the symbol exists somewhere but has no direct
+/// call sites — probable indirect dispatch, so we show a richer hint
+/// listing the common indirection mechanisms. `target_seen = false` means
+/// the literal name never appears in scope — most often a typo or wrong
+/// scope, so we suppress the indirect-dispatch hint to avoid misleading
+/// the agent.
+fn no_callers_message(target: &str, scope: &Path, target_seen: bool) -> String {
+    if !target_seen {
+        return format!(
+            "# Callers of \"{target}\" in {scope_disp} — no call sites found\n\n\
+             The name \"{target}\" does not appear anywhere in scope. \
+             Check the spelling, or widen scope if you expected hits outside this directory.",
+            scope_disp = scope.display()
+        );
+    }
+    format!(
+        "# Callers of \"{target}\" in {scope_disp} — no direct call sites found\n\n\
+         \"{target}\" appears in the codebase but has no syntactic call sites. \
+         tilth detects only direct, by-name calls; this symbol may still be reachable via:\n\
+         \n  • interface / trait dispatch (Rust `dyn Trait`, Go interface, Java/Kotlin abstract method)\
+         \n  • reflection or dynamic dispatch (`getattr`, `Method::invoke`, `eval`)\
+         \n  • framework registration (HTTP routes, JSON-RPC, plugin systems, decorators)\
+         \n  • function values stored in maps, structs, or passed as callbacks\
+         \n  • test files (if `glob` excluded them)\n\
+         \nVerify with `tilth_search \"{target}\"` to see how it's referenced before assuming dead code.",
+        scope_disp = scope.display()
+    )
+}
+
 /// Simple ranking: context file first, then by path length (proximity heuristic).
 fn rank_callers(callers: &mut [CallerMatch], scope: &Path, context: Option<&Path>) {
     callers.sort_by(|a, b| {
@@ -677,4 +712,32 @@ fn rank_callers(callers: &mut [CallerMatch], scope: &Path, context: Option<&Path
             .then_with(|| a.path.cmp(&b.path))
             .then_with(|| a.line.cmp(&b.line))
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::no_callers_message;
+    use std::path::Path;
+
+    #[test]
+    fn no_callers_message_for_unseen_symbol_says_typo_or_scope() {
+        let msg = no_callers_message("doesNotExist", Path::new("/repo"), false);
+        assert!(msg.contains("does not appear anywhere in scope"));
+        assert!(msg.contains("Check the spelling"));
+        // Must NOT include the indirect-dispatch hint — that would mislead.
+        assert!(!msg.contains("interface"));
+        assert!(!msg.contains("reflection"));
+    }
+
+    #[test]
+    fn no_callers_message_for_seen_symbol_lists_indirection_modes() {
+        let msg = no_callers_message("Foo", Path::new("/repo"), true);
+        assert!(msg.contains("appears in the codebase"));
+        assert!(msg.contains("interface"));
+        assert!(msg.contains("reflection"));
+        assert!(msg.contains("framework registration"));
+        assert!(msg.contains("Verify with `tilth_search"));
+        // Must NOT pretend the symbol is missing — different signal than typo case.
+        assert!(!msg.contains("does not appear"));
+    }
 }
