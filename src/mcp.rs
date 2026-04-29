@@ -17,11 +17,11 @@ use crate::session::Session;
 /// Shared dependencies passed through the request → dispatch pipeline.
 #[derive(Clone)]
 pub(crate) struct Services {
-    pub(crate) cache: Arc<OutlineCache>,
-    pub(crate) session: Arc<Session>,
-    pub(crate) index: Arc<SymbolIndex>,
-    pub(crate) bloom: Arc<BloomFilterCache>,
-    pub(crate) edit_mode: bool,
+    cache: Arc<OutlineCache>,
+    session: Arc<Session>,
+    index: Arc<SymbolIndex>,
+    bloom: Arc<BloomFilterCache>,
+    edit_mode: bool,
 }
 
 impl Services {
@@ -33,6 +33,26 @@ impl Services {
             bloom: Arc::new(BloomFilterCache::new()),
             edit_mode,
         }
+    }
+
+    pub(crate) fn cache(&self) -> &OutlineCache {
+        &self.cache
+    }
+
+    pub(crate) fn session(&self) -> &Session {
+        &self.session
+    }
+
+    pub(crate) fn index(&self) -> &Arc<SymbolIndex> {
+        &self.index
+    }
+
+    pub(crate) fn bloom(&self) -> &Arc<BloomFilterCache> {
+        &self.bloom
+    }
+
+    pub(crate) fn edit_mode(&self) -> bool {
+        self.edit_mode
     }
 }
 
@@ -298,7 +318,7 @@ struct JsonRpcError {
 }
 
 fn handle_request(req: &JsonRpcRequest, services: &Services) -> JsonRpcResponse {
-    let edit_mode = services.edit_mode;
+    let edit_mode = services.edit_mode();
     match req.method.as_str() {
         "initialize" => {
             let overview = if std::env::var("TILTH_NO_OVERVIEW").is_ok() {
@@ -377,23 +397,23 @@ pub(crate) fn dispatch_tool(
     args: &Value,
     services: &Services,
 ) -> Result<String, String> {
-    let edit_mode = services.edit_mode;
+    let edit_mode = services.edit_mode();
     match tool {
-        "tilth_read" => tool_read(args, &services.cache, &services.session, edit_mode),
+        "tilth_read" => tool_read(args, services.cache(), services.session(), edit_mode),
         "tilth_search" => tool_search(
             args,
-            &services.cache,
-            &services.session,
-            &services.index,
-            &services.bloom,
+            services.cache(),
+            services.session(),
+            services.index(),
+            services.bloom(),
         ),
-        "tilth_files" => tool_files(args, &services.cache),
-        "tilth_deps" => tool_deps(args, &services.cache, &services.bloom),
+        "tilth_files" => tool_files(args, services.cache()),
+        "tilth_deps" => tool_deps(args, services.cache(), services.bloom()),
         "tilth_diff" => tool_diff(args),
         "tilth_map" => Err("tilth_map is disabled — use tilth_search instead".into()),
-        "tilth_session" => tool_session(args, &services.session),
+        "tilth_session" => tool_session(args, services.session()),
         "tilth_edit" if edit_mode => {
-            tool_edit(args, &services.session, &services.cache, &services.bloom)
+            tool_edit(args, services.session(), services.cache(), services.bloom())
         }
         _ => Err(format!("unknown tool: {tool}")),
     }
