@@ -432,21 +432,11 @@ fn format_grouped_usages(group: &[&Match], scope: &Path, cache: &OutlineCache, o
     let lines: Vec<u32> = group.iter().map(|m| m.line).collect();
     let line_str = format_line_list(&lines);
 
-    // Get enclosing function name from outline
-    let fn_name = get_outline_str(&first.path, cache).and_then(|outline_str| {
-        let outline_lines: Vec<&str> = outline_str.lines().collect();
-        let idx = outline_lines.iter().position(|line| {
-            extract_line_range(line).is_some_and(|(s, e)| first.line >= s && first.line <= e)
-        })?;
-        // Extract name: outline lines look like "  [45-79]      fn TestMiddlewareNoRoute"
-        let entry = outline_lines[idx].trim();
-        // Find the name after "fn " or similar keyword
-        entry.split_whitespace().last().map(String::from)
-    });
+    let scope_label = enclosing_scope_label(&first.path, first.line, cache);
 
     let _ = write!(out, "\n\n## {path_str}:{line_str} [{} usages", group.len());
-    if let Some(ref name) = fn_name {
-        let _ = write!(out, " in {name}");
+    if let Some(ref label) = scope_label {
+        let _ = write!(out, " in {label}");
     }
     out.push(']');
 
@@ -510,6 +500,16 @@ fn format_single_match(
         "usage"
     };
 
+    // For usages, append the enclosing function/section if we can recover one.
+    // Definitions and impls already are the named scope.
+    let scope_suffix = if m.is_definition || m.impl_target.is_some() {
+        String::new()
+    } else {
+        enclosing_scope_label(&m.path, m.line, cache)
+            .map(|s| format!(" in {s}"))
+            .unwrap_or_default()
+    };
+
     // Show line range for definitions with def_range, otherwise just the line
     if m.is_definition {
         if let Some((start, end)) = m.def_range {
@@ -524,7 +524,12 @@ fn format_single_match(
             let _ = write!(out, "\n\n## {}:{} [{kind}]", rel(&m.path, scope), m.line);
         }
     } else {
-        let _ = write!(out, "\n\n## {}:{} [{kind}]", rel(&m.path, scope), m.line);
+        let _ = write!(
+            out,
+            "\n\n## {}:{} [{kind}{scope_suffix}]",
+            rel(&m.path, scope),
+            m.line
+        );
     }
 
     // Skip outline for small files — the expanded code speaks for itself
@@ -1165,6 +1170,70 @@ fn outline_context_for_match(
     Some(context)
 }
 
+/// Annotate a usage match with its enclosing scope: `"function foo"` /
+/// `"class Bar"` for code (via tree-sitter), `"§Heading"` for markdown
+/// (via line walk). Returns `None` for top-level matches and unsupported
+/// file types — the formatter renders those without an `in …` suffix.
+fn enclosing_scope_label(
+    path: &std::path::Path,
+    match_line: u32,
+    cache: &OutlineCache,
+) -> Option<String> {
+    match crate::lang::detect_file_type(path) {
+        FileType::Code(_) => {
+            let scope = callers::enclosing_definition_at(path, match_line, cache)?;
+            Some(format!("{} {}", scope.kind, scope.name))
+        }
+        FileType::Markdown => markdown_enclosing_scope(path, match_line),
+        _ => None,
+    }
+}
+
+/// Find the nearest preceding ATX heading (`#`–`######`) above `match_line`.
+/// Markdown has no AST in tilth, so a backwards line walk is the right tool —
+/// kept narrow so it can't drift into other markdown semantics.
+fn markdown_enclosing_scope(path: &std::path::Path, match_line: u32) -> Option<String> {
+    if match_line == 0 {
+        return None;
+    }
+    let content = std::fs::read_to_string(path).ok()?;
+    let lines: Vec<&str> = content.lines().collect();
+    let start = (match_line as usize).min(lines.len()).saturating_sub(1);
+    for line in lines[..=start].iter().rev() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with('#') {
+            continue;
+        }
+        let mut hashes = 0;
+        let mut rest = trimmed;
+        while hashes < 6 {
+            match rest.strip_prefix('#') {
+                Some(r) => {
+                    hashes += 1;
+                    rest = r;
+                }
+                None => break,
+            }
+        }
+        if hashes == 0 {
+            continue;
+        }
+        let text = rest.trim_start_matches([' ', '\t']).trim_end();
+        if text.is_empty() {
+            continue;
+        }
+        let display: String = if text.chars().count() > 60 {
+            let mut s: String = text.chars().take(57).collect();
+            s.push_str("...");
+            s
+        } else {
+            text.to_string()
+        };
+        return Some(format!("§{display}"));
+    }
+    None
+}
+
 /// Extract (`start_line`, `end_line`) from an outline entry like "[20-115]" or "[16]".
 fn extract_line_range(line: &str) -> Option<(u32, u32)> {
     let trimmed = line.trim();
@@ -1547,6 +1616,98 @@ mod tests {
             result.total_found >= 2,
             "expected symbol found via both real and symlinked paths, got {}",
             result.total_found
+        );
+    }
+
+    // ── enclosing_scope_label / markdown tests ──
+
+    #[test]
+    fn scope_label_code_combines_kind_and_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("a.ts");
+        std::fs::write(&p, "class Foo {\n  bar() {\n    const x = 1;\n  }\n}\n").unwrap();
+        let cache = OutlineCache::new();
+        let label = enclosing_scope_label(&p, 3, &cache).unwrap();
+        assert_eq!(label, "function Foo.bar");
+    }
+
+    #[test]
+    fn scope_label_markdown_returns_section() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("a.md");
+        std::fs::write(
+            &p,
+            "# Top\n\n## Cost Accounting\n\nsome text\n\nmore text\n",
+        )
+        .unwrap();
+        let cache = OutlineCache::new();
+        let label = enclosing_scope_label(&p, 7, &cache).unwrap();
+        assert_eq!(label, "§Cost Accounting");
+    }
+
+    #[test]
+    fn markdown_scope_truncates_long_headings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("a.md");
+        let long = "x".repeat(80);
+        std::fs::write(&p, format!("## {long}\n\nbody\n")).unwrap();
+        let label = markdown_enclosing_scope(&p, 3).unwrap();
+        // 60-char window means 57 chars + "..." (display starts after the "§").
+        assert!(label.starts_with("§"));
+        assert!(label.ends_with("..."));
+        assert_eq!(label.chars().count(), 1 + 57 + 3);
+    }
+
+    #[test]
+    fn markdown_scope_returns_none_before_first_heading() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("a.md");
+        std::fs::write(&p, "preamble line one\npreamble line two\n").unwrap();
+        assert!(markdown_enclosing_scope(&p, 2).is_none());
+    }
+
+    #[test]
+    fn format_single_match_renders_usage_scope_suffix() {
+        use crate::types::Match;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("a.ts");
+        std::fs::write(&p, "class Foo {\n  bar() {\n    const x = 1;\n  }\n}\n").unwrap();
+
+        let m = Match {
+            path: p.clone(),
+            line: 3,
+            text: "    const x = 1;".to_string(),
+            is_definition: false,
+            exact: false,
+            file_lines: 5,
+            mtime: SystemTime::now(),
+            def_range: None,
+            def_name: None,
+            def_weight: 0,
+            impl_target: None,
+        };
+        let cache = OutlineCache::new();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let mut expand_remaining = 0usize;
+        let mut expanded_files: HashSet<PathBuf> = HashSet::new();
+        let mut out = String::new();
+
+        format_single_match(
+            &m,
+            tmp.path(),
+            &cache,
+            None,
+            &bloom,
+            &mut expand_remaining,
+            &mut expanded_files,
+            false,
+            &mut out,
+        );
+
+        assert!(
+            out.contains("[usage in function Foo.bar]"),
+            "expected scope suffix in output, got: {out}"
         );
     }
 }
