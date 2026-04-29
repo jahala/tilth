@@ -43,9 +43,15 @@ pub fn generate(
 
 /// Append a note when the outline likely hit `max_lines` and more symbols
 /// exist below. Without this note, agents read the outline as exhaustive
-/// and miss symbols below the cap. Heuristic: line count >= cap signals
-/// truncation; we accept the rare false positive on files with exactly
-/// `OUTLINE_CAP` lines for the simpler implementation.
+/// and miss symbols below the cap.
+///
+/// Note: `max_lines` is an entry cap inside `format_entries` (one
+/// `out.push(...)` per entry, joined with `\n`). For the code-outline path
+/// `outline.lines().count() == entry_count` exactly. For other backends
+/// (markdown, structured, tabular) the same identity holds because each
+/// pushes single-line entries. So the heuristic compares like-for-like.
+/// We avoid claiming a specific count in the user-facing message — we
+/// only state that more symbols exist, which is the actionable signal.
 fn with_omission_note(outline: String, max_lines: usize) -> String {
     if max_lines == usize::MAX {
         return outline;
@@ -54,8 +60,9 @@ fn with_omission_note(outline: String, max_lines: usize) -> String {
         return outline;
     }
     format!(
-        "{outline}\n\n> outline truncated at {max_lines} lines — more symbols exist below. \
-         Use section=\"start-end\" for a specific range, or tilth_search \"<name>\" for a known symbol."
+        "{outline}\n\n> outline truncated — more symbols exist below the cap. \
+         Use section=\"<start>-<end>\" with the line numbers shown in [...] \
+         brackets above, or tilth_search \"<name>\" for a specific symbol."
     )
 }
 
@@ -91,5 +98,41 @@ mod tests {
             .join("\n");
         let result = with_omission_note(outline.clone(), usize::MAX);
         assert_eq!(result, outline);
+    }
+
+    /// Integration test: drive the full `generate()` pipeline with a
+    /// real Rust source containing more than OUTLINE_CAP top-level
+    /// functions. Verifies the cap actually fires and that
+    /// `with_omission_note` is wired into the pipeline correctly —
+    /// not just exercised in isolation.
+    #[test]
+    fn integration_note_on_capped_code_file() {
+        let src: String = (0..150)
+            .map(|i| format!("pub fn func_{i}() {{}}\n"))
+            .collect();
+        let path = std::path::Path::new("fake.rs");
+        let file_type = crate::types::FileType::Code(crate::types::Lang::Rust);
+        let result = super::generate(path, file_type, &src, src.as_bytes(), true);
+        assert!(
+            result.contains("outline truncated"),
+            "expected truncation note for 150 funcs over OUTLINE_CAP=100, got:\n{result}"
+        );
+    }
+
+    /// Integration test: a small file (5 functions) must NOT produce
+    /// the truncation note even when `capped=true` is passed, because
+    /// the actual entry count is well below the cap.
+    #[test]
+    fn integration_no_note_on_small_code_file() {
+        let src: String = (0..5)
+            .map(|i| format!("pub fn func_{i}() {{}}\n"))
+            .collect();
+        let path = std::path::Path::new("fake.rs");
+        let file_type = crate::types::FileType::Code(crate::types::Lang::Rust);
+        let result = super::generate(path, file_type, &src, src.as_bytes(), true);
+        assert!(
+            !result.contains("outline truncated"),
+            "spurious truncation note for 5 funcs (under OUTLINE_CAP=100):\n{result}"
+        );
     }
 }
