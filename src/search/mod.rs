@@ -1425,9 +1425,9 @@ mod tests {
     fn callers_search_glob_restricts_results() {
         let scope = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let bloom = crate::index::bloom::BloomFilterCache::new();
-        let (rs_callers, _) =
+        let rs_callers =
             callers::find_callers("walker", &scope, &bloom, Some("*.rs")).expect("callers failed");
-        let (toml_callers, _) = callers::find_callers("walker", &scope, &bloom, Some("*.toml"))
+        let toml_callers = callers::find_callers("walker", &scope, &bloom, Some("*.toml"))
             .expect("callers toml failed");
 
         assert!(
