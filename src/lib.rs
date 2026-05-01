@@ -27,6 +27,7 @@ pub mod map;
 pub mod mcp;
 pub mod overview;
 pub(crate) mod read;
+pub mod run;
 pub(crate) mod search;
 pub(crate) mod session;
 pub(crate) mod types;
