@@ -63,6 +63,7 @@ pub enum ViewMode {
     HeadTail,
     Empty,
     Generated,
+    Minified,
     #[allow(dead_code)]
     Binary,
     #[allow(dead_code)]
@@ -79,6 +80,7 @@ impl std::fmt::Display for ViewMode {
             Self::HeadTail => write!(f, "head+tail"),
             Self::Empty => write!(f, "empty"),
             Self::Generated => write!(f, "generated — skipped"),
+            Self::Minified => write!(f, "minified — skipped"),
             Self::Binary => write!(f, "skipped"),
             Self::Error => write!(f, "error"),
             Self::Section => write!(f, "section"),

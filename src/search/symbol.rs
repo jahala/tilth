@@ -120,12 +120,25 @@ fn find_definitions(
 
             let path = entry.path();
 
-            // Skip oversized files — avoid tree-sitter parsing multi-MB minified bundles
-            if let Ok(meta) = std::fs::metadata(path) {
-                if meta.len() > 500_000 {
-                    return ignore::WalkState::Continue;
-                }
+            // Skip files that look minified by filename — `.min.js`, `app-min.css`.
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(crate::lang::detection::is_minified_by_name)
+            {
+                return ignore::WalkState::Continue;
             }
+
+            // Skip oversized files — avoid tree-sitter parsing multi-MB minified bundles
+            let file_size = match std::fs::metadata(path) {
+                Ok(meta) => {
+                    if meta.len() > 500_000 {
+                        return ignore::WalkState::Continue;
+                    }
+                    meta.len()
+                }
+                Err(_) => 0,
+            };
 
             // Single read: read file once, use buffer for both check and parse
             let Ok(content) = fs::read_to_string(path) else {
@@ -134,6 +147,13 @@ fn find_definitions(
 
             // Fast byte check via memchr::memmem (SIMD) — skip files without the symbol
             if memchr::memmem::find(content.as_bytes(), needle).is_none() {
+                return ignore::WalkState::Continue;
+            }
+
+            // Catch unmarked minified bundles that slipped past the filename check.
+            if file_size >= crate::lang::detection::MINIFIED_CHECK_THRESHOLD
+                && crate::lang::detection::is_minified_by_content(content.as_bytes())
+            {
                 return ignore::WalkState::Continue;
             }
 
@@ -425,11 +445,38 @@ fn find_usages(
 
             let path = entry.path();
 
+            // Skip files that look minified by filename — `.min.js`, `app-min.css`.
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(crate::lang::detection::is_minified_by_name)
+            {
+                return ignore::WalkState::Continue;
+            }
+
             // Skip oversized files
-            if let Ok(meta) = std::fs::metadata(path) {
-                if meta.len() > 500_000 {
-                    return ignore::WalkState::Continue;
+            let file_size = match std::fs::metadata(path) {
+                Ok(meta) => {
+                    if meta.len() > 500_000 {
+                        return ignore::WalkState::Continue;
+                    }
+                    meta.len()
                 }
+                Err(_) => 0,
+            };
+
+            // Read once and dispatch via `search_slice` so the minified
+            // heuristic and the search share a single kernel read.
+            let Ok(bytes) = std::fs::read(path) else {
+                return ignore::WalkState::Continue;
+            };
+
+            // Catch unmarked minified bundles between 100KB and 500KB — they
+            // were not skipped by the filename check or the size cap above.
+            if file_size >= crate::lang::detection::MINIFIED_CHECK_THRESHOLD
+                && crate::lang::detection::is_minified_by_content(&bytes)
+            {
+                return ignore::WalkState::Continue;
             }
 
             let (file_lines, mtime) = file_metadata(path);
@@ -437,9 +484,9 @@ fn find_usages(
             let mut file_matches = Vec::new();
             let mut searcher = Searcher::new();
 
-            let _ = searcher.search_path(
+            let _ = searcher.search_slice(
                 matcher,
-                path,
+                &bytes,
                 UTF8(|line_num, line| {
                     file_matches.push(Match {
                         path: path.to_path_buf(),

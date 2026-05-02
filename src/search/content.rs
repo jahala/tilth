@@ -60,11 +60,39 @@ pub fn search(
 
             let path = entry.path();
 
+            // Skip files that look minified by filename — `.min.js`, `app-min.css`.
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(crate::lang::detection::is_minified_by_name)
+            {
+                return ignore::WalkState::Continue;
+            }
+
             // Skip oversized files — tree-sitter and ripgrep shouldn't spend time on minified bundles
-            if let Ok(meta) = std::fs::metadata(path) {
-                if meta.len() > MAX_SEARCH_FILE_SIZE {
-                    return ignore::WalkState::Continue;
+            let file_size = match std::fs::metadata(path) {
+                Ok(meta) => {
+                    if meta.len() > MAX_SEARCH_FILE_SIZE {
+                        return ignore::WalkState::Continue;
+                    }
+                    meta.len()
                 }
+                Err(_) => 0,
+            };
+
+            // Read the file once. Use `search_slice` instead of `search_path`
+            // so the minified-check (when triggered) and the actual search
+            // share a single kernel read — no double I/O, no TOCTOU window
+            // between the heuristic and the search.
+            let Ok(bytes) = std::fs::read(path) else {
+                return ignore::WalkState::Continue;
+            };
+
+            // Catch unmarked minified bundles in the 100KB–500KB range.
+            if file_size >= crate::lang::detection::MINIFIED_CHECK_THRESHOLD
+                && crate::lang::detection::is_minified_by_content(&bytes)
+            {
+                return ignore::WalkState::Continue;
             }
 
             let (file_lines, mtime) = file_metadata(path);
@@ -72,9 +100,9 @@ pub fn search(
             let mut file_matches = Vec::new();
             let mut searcher = Searcher::new();
 
-            let _ = searcher.search_path(
+            let _ = searcher.search_slice(
                 matcher,
-                path,
+                &bytes,
                 UTF8(|line_num, line| {
                     file_matches.push(Match {
                         path: path.to_path_buf(),

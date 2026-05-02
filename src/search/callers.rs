@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use streaming_iterator::StreamingIterator;
@@ -41,14 +41,19 @@ pub struct CallerMatch {
 }
 
 /// Find all call sites of a target symbol across the codebase using tree-sitter.
+/// Walk the scope once, return all direct call sites of `target` plus
+/// whether the literal name appeared anywhere (used to distinguish
+/// "real symbol with no direct callers" from "typo'd query" — the hint
+/// shown to the agent differs between those cases).
 pub fn find_callers(
     target: &str,
     scope: &Path,
     bloom: &crate::index::bloom::BloomFilterCache,
     glob: Option<&str>,
-) -> Result<Vec<CallerMatch>, TilthError> {
+) -> Result<(Vec<CallerMatch>, bool), TilthError> {
     let matches: Mutex<Vec<CallerMatch>> = Mutex::new(Vec::new());
     let found_count = AtomicUsize::new(0);
+    let target_seen = AtomicBool::new(false);
     let needle = target.as_bytes();
 
     let walker = super::walker(scope, glob)?;
@@ -56,6 +61,7 @@ pub fn find_callers(
     walker.run(|| {
         let matches = &matches;
         let found_count = &found_count;
+        let target_seen = &target_seen;
 
         Box::new(move |entry| {
             // Early termination: enough callers found
@@ -82,6 +88,20 @@ pub fn find_callers(
                 Err(_) => return ignore::WalkState::Continue,
             };
             if file_len > 500_000 {
+                // Oversized files are not parsed, but we still need to know
+                // whether the literal target appears anywhere in scope so the
+                // "no callers" message can distinguish "real symbol, indirect
+                // dispatch" from "typo, doesn't exist." mmap is lazy, so the
+                // scan only touches pages that contain the needle prefix.
+                if !target_seen.load(Ordering::Relaxed) {
+                    if let Ok(file) = std::fs::File::open(path) {
+                        if let Ok(mmap) = unsafe { memmap2::Mmap::map(&file) } {
+                            if memchr::memmem::find(&mmap, needle).is_some() {
+                                target_seen.store(true, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
                 return ignore::WalkState::Continue;
             }
 
@@ -99,6 +119,9 @@ pub fn find_callers(
             if memchr::memmem::find(content.as_bytes(), needle).is_none() {
                 return ignore::WalkState::Continue;
             }
+
+            // Symbol literal exists in this file (whether or not it's a call site).
+            target_seen.store(true, Ordering::Relaxed);
 
             // Only process files with tree-sitter grammars
             let file_type = detect_file_type(path);
@@ -124,9 +147,13 @@ pub fn find_callers(
         })
     });
 
-    Ok(matches
+    let callers = matches
         .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner))
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Relaxed is sufficient: walker.run() uses thread::scope under the hood,
+    // and the join at the end of run() establishes happens-before between
+    // every worker store and this load. No Acquire/Release pair needed.
+    Ok((callers, target_seen.load(Ordering::Relaxed)))
 }
 
 /// Tree-sitter call site detection.
@@ -505,16 +532,10 @@ pub fn search_callers_expanded(
     context: Option<&Path>,
     glob: Option<&str>,
 ) -> Result<String, TilthError> {
-    let callers = find_callers(target, scope, bloom, glob)?;
+    let (callers, target_seen) = find_callers(target, scope, bloom, glob)?;
 
     if callers.is_empty() {
-        return Ok(format!(
-            "# Callers of \"{}\" in {} — no call sites found\n\n\
-             Tip: the symbol may be called via interface/trait dispatch. \
-             Try symbol search instead.",
-            target,
-            scope.display()
-        ));
+        return Ok(no_callers_message(target, scope, target_seen, glob));
     }
 
     // Sort by relevance (context file first, then by proximity)
@@ -655,6 +676,44 @@ pub fn search_callers_expanded(
     Ok(output)
 }
 
+/// Build the user-facing message when callers search returns no hits.
+/// Splits two cases that mean very different things to an agent:
+/// `target_seen = true` means the symbol exists somewhere but has no direct
+/// call sites — probable indirect dispatch, so we show a richer hint
+/// listing the common indirection mechanisms. `target_seen = false` means
+/// the literal name never appears in scope — most often a typo or wrong
+/// scope, so we suppress the indirect-dispatch hint to avoid misleading
+/// the agent.
+fn no_callers_message(target: &str, scope: &Path, target_seen: bool, glob: Option<&str>) -> String {
+    if !target_seen {
+        return format!(
+            "# Callers of \"{target}\" in {scope_disp} — no call sites found\n\n\
+             The name \"{target}\" does not appear anywhere in scope. \
+             Check the spelling, or widen scope if you expected hits outside this directory.",
+            scope_disp = scope.display()
+        );
+    }
+    // Only mention glob-driven test exclusion when a glob was actually used.
+    // Otherwise the line implies a filter that the caller didn't apply, which
+    // would mislead an agent reasoning about what tilth searched.
+    let glob_hint = if glob.is_some() {
+        "\n  • test files (if `glob` excluded them)"
+    } else {
+        ""
+    };
+    format!(
+        "# Callers of \"{target}\" in {scope_disp} — no direct call sites found\n\n\
+         \"{target}\" appears in the codebase but has no syntactic call sites. \
+         tilth detects only direct, by-name calls; this symbol may still be reachable via:\n\
+         \n  • interface / trait dispatch (Rust `dyn Trait`, Go interface, Java/Kotlin abstract method)\
+         \n  • reflection or dynamic dispatch (`getattr`, `Method::invoke`, `eval`)\
+         \n  • framework registration (HTTP routes, JSON-RPC, plugin systems, decorators)\
+         \n  • function values stored in maps, structs, or passed as callbacks{glob_hint}\n\
+         \nVerify with `tilth_search \"{target}\"` to see how it's referenced before assuming dead code.",
+        scope_disp = scope.display()
+    )
+}
+
 /// Simple ranking: context file first, then by path length (proximity heuristic).
 fn rank_callers(callers: &mut [CallerMatch], scope: &Path, context: Option<&Path>) {
     callers.sort_by(|a, b| {
@@ -677,4 +736,53 @@ fn rank_callers(callers: &mut [CallerMatch], scope: &Path, context: Option<&Path
             .then_with(|| a.path.cmp(&b.path))
             .then_with(|| a.line.cmp(&b.line))
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::no_callers_message;
+    use std::path::Path;
+
+    #[test]
+    fn no_callers_message_for_unseen_symbol_says_typo_or_scope() {
+        let msg = no_callers_message("doesNotExist", Path::new("/repo"), false, None);
+        assert!(msg.contains("does not appear anywhere in scope"));
+        assert!(msg.contains("Check the spelling"));
+        // Must NOT include the indirect-dispatch hint — that would mislead.
+        assert!(!msg.contains("interface"));
+        assert!(!msg.contains("reflection"));
+    }
+
+    #[test]
+    fn no_callers_message_for_seen_symbol_lists_indirection_modes() {
+        let msg = no_callers_message("Foo", Path::new("/repo"), true, None);
+        assert!(msg.contains("appears in the codebase"));
+        assert!(msg.contains("interface"));
+        assert!(msg.contains("reflection"));
+        assert!(msg.contains("framework registration"));
+        assert!(msg.contains("Verify with `tilth_search"));
+        // Must NOT pretend the symbol is missing — different signal than typo case.
+        assert!(!msg.contains("does not appear"));
+    }
+
+    /// The "test files (if glob excluded them)" hint is only meaningful when
+    /// the caller actually used a glob. Without a glob it would mislead an
+    /// agent into thinking tilth filtered something it did not.
+    #[test]
+    fn no_callers_message_omits_glob_hint_when_no_glob() {
+        let msg = no_callers_message("Foo", Path::new("/repo"), true, None);
+        assert!(
+            !msg.contains("test files"),
+            "glob-driven hint must not appear when glob is None: {msg}"
+        );
+    }
+
+    #[test]
+    fn no_callers_message_includes_glob_hint_when_glob_set() {
+        let msg = no_callers_message("Foo", Path::new("/repo"), true, Some("*.rs"));
+        assert!(
+            msg.contains("test files"),
+            "glob-driven hint should appear when glob is Some: {msg}"
+        );
+    }
 }
