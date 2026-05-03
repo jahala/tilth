@@ -67,6 +67,11 @@ pub(crate) const SKIP_DIRS: &[&str] = &[
 
 const EXPAND_FULL_FILE_THRESHOLD: u64 = 800;
 
+/// Cap for inlined markdown section bodies in the default preview slot.
+/// Long sections get a tail "… (N more lines — pass --expand to see the full
+/// section)" so the user knows to expand for the rest.
+const MARKDOWN_PREVIEW_MAX_LINES: usize = 40;
+
 /// Build a parallel directory walker that searches ALL files except known junk directories.
 /// Does NOT respect .gitignore — ensures gitignored but locally-relevant files are found.
 /// When `glob` is Some, applies a file-pattern override (whitelist or negation).
@@ -543,6 +548,44 @@ fn format_single_match(
             rel(&m.path, scope),
             m.line
         );
+    }
+
+    // Markdown-heading defs (`def_weight == 30`): the heading text alone is
+    // just the query, so the default preview slot would carry no information.
+    // Inline the section body directly. Bypasses the --expand budget — this
+    // is a fixed-cost preview, not the on-demand expand — and short-circuits
+    // the rest of the function (no callees / siblings etc. apply to a
+    // markdown section). On any read failure or empty body, fall through to
+    // the existing outline / single-line preview branches.
+    if m.is_definition && m.def_weight == 30 {
+        if let Some((heading_line_1, section_end_1)) = m.def_range {
+            if let Ok(content) = fs::read_to_string(&m.path) {
+                let lines: Vec<&str> = content.lines().collect();
+                // def_range is `(heading_line, section_end)` in 1-indexed
+                // inclusive form (see `find_defs_markdown_buf`). The body
+                // starts at the line *after* the heading. In 0-indexed
+                // half-open form: `[heading_line_1 .. section_end_1)`.
+                let body_start = heading_line_1 as usize;
+                let body_end = (section_end_1 as usize).min(lines.len());
+                if body_start < body_end {
+                    let total_body_lines = body_end - body_start;
+                    let take_n = total_body_lines.min(MARKDOWN_PREVIEW_MAX_LINES);
+                    out.push('\n');
+                    for line in &lines[body_start..body_start + take_n] {
+                        out.push_str(line);
+                        out.push('\n');
+                    }
+                    if total_body_lines > take_n {
+                        let truncated = total_body_lines - take_n;
+                        let _ = write!(
+                            out,
+                            "… ({truncated} more lines — pass --expand to see the full section)"
+                        );
+                    }
+                    return;
+                }
+            }
+        }
     }
 
     // Skip outline for small files — the expanded code speaks for itself
@@ -1800,6 +1843,128 @@ mod tests {
         assert_eq!(count_label(10, 14), "10/14");
         // Zero / zero — still bare (no header is emitted at zero anyway).
         assert_eq!(count_label(0, 0), "0");
+    }
+
+    #[test]
+    fn format_single_match_inlines_markdown_section_body() {
+        use crate::types::Match;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("notes.md");
+        std::fs::write(
+            &p,
+            "# Top\n\n## Session 50\n\nFirst paragraph.\n\nSecond line.\n\n## Other\n\nUnrelated.\n",
+        )
+        .unwrap();
+
+        // Mimic the `Match` `find_defs_markdown_buf` would produce for a
+        // markdown-heading def: weight 30, def_range covers the section span.
+        let m = Match {
+            path: p.clone(),
+            line: 3, // `## Session 50`
+            text: "## Session 50".to_string(),
+            is_definition: true,
+            exact: true,
+            file_lines: 10,
+            mtime: SystemTime::now(),
+            def_range: Some((3, 7)), // heading line .. section_end (1-indexed inclusive)
+            def_name: Some("Session 50".to_string()),
+            def_weight: 30,
+            impl_target: None,
+        };
+        let cache = OutlineCache::new();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let mut expand_remaining = 0usize;
+        let mut expanded_files: HashSet<PathBuf> = HashSet::new();
+        let mut out = String::new();
+
+        format_single_match(
+            &m,
+            tmp.path(),
+            &cache,
+            None,
+            &bloom,
+            &mut expand_remaining,
+            &mut expanded_files,
+            false,
+            &mut out,
+        );
+
+        assert!(
+            out.contains("First paragraph."),
+            "section body must be inlined, got: {out:?}"
+        );
+        assert!(
+            out.contains("Second line."),
+            "section body must include later body lines, got: {out:?}"
+        );
+        assert!(
+            !out.contains("Unrelated."),
+            "must stop at section_end, got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn format_single_match_caps_long_markdown_section() {
+        use crate::types::Match;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("long.md");
+        // Heading on line 1, then 60 body lines.
+        let mut content = String::from("## Big Section\n");
+        for i in 0..60 {
+            let _ = write!(content, "body line {i}\n");
+        }
+        std::fs::write(&p, &content).unwrap();
+
+        let m = Match {
+            path: p.clone(),
+            line: 1,
+            text: "## Big Section".to_string(),
+            is_definition: true,
+            exact: true,
+            file_lines: 61,
+            mtime: SystemTime::now(),
+            def_range: Some((1, 61)),
+            def_name: Some("Big Section".to_string()),
+            def_weight: 30,
+            impl_target: None,
+        };
+        let cache = OutlineCache::new();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let mut expand_remaining = 0usize;
+        let mut expanded_files: HashSet<PathBuf> = HashSet::new();
+        let mut out = String::new();
+
+        format_single_match(
+            &m,
+            tmp.path(),
+            &cache,
+            None,
+            &bloom,
+            &mut expand_remaining,
+            &mut expanded_files,
+            false,
+            &mut out,
+        );
+
+        // Cap is 40 lines; expect 60 - 40 = 20 truncated.
+        assert!(
+            out.contains("body line 0"),
+            "first body line must appear, got: {out:?}"
+        );
+        assert!(
+            out.contains("body line 39"),
+            "last kept body line must appear, got: {out:?}"
+        );
+        assert!(
+            !out.contains("body line 40"),
+            "body line beyond cap must be trimmed, got: {out:?}"
+        );
+        assert!(
+            out.contains("20 more lines"),
+            "must signal truncated lines, got: {out:?}"
+        );
     }
 
     #[test]
