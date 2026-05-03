@@ -1285,49 +1285,69 @@ fn enclosing_scope_label(
     }
 }
 
-/// Find the nearest preceding ATX heading (`#`–`######`) above `match_line`.
-/// Markdown has no AST in tilth, so a backwards line walk is the right tool —
-/// kept narrow so it can't drift into other markdown semantics.
+/// Find the deepest ATX-heading section that encloses `match_line`. Returns
+/// the heading text prefixed with `§`. A `# foo` line inside a fenced or
+/// indented code block is NOT a heading — the tree-sitter-md block grammar
+/// owns that distinction, so we don't need our own fence pre-pass.
 fn markdown_enclosing_scope(path: &std::path::Path, match_line: u32) -> Option<String> {
     if match_line == 0 {
         return None;
     }
     let content = std::fs::read_to_string(path).ok()?;
+    let tree = crate::lang::outline::parse_markdown(&content)?;
     let lines: Vec<&str> = content.lines().collect();
-    let start = (match_line as usize).min(lines.len()).saturating_sub(1);
-    for line in lines[..=start].iter().rev() {
-        let trimmed = line.trim_start();
-        if !trimmed.starts_with('#') {
+    let mut best: Option<(tree_sitter::Node, u32)> = None;
+    walk_md_for_enclosing(tree.root_node(), match_line, &mut best);
+    let (heading, _) = best?;
+    let text = crate::lang::outline::heading_text(heading, &lines);
+    if text.is_empty() {
+        return None;
+    }
+    let display: String = if text.chars().count() > 60 {
+        let mut s: String = text.chars().take(57).collect();
+        s.push_str("...");
+        s
+    } else {
+        text
+    };
+    Some(format!("§{display}"))
+}
+
+fn walk_md_for_enclosing<'a>(
+    node: tree_sitter::Node<'a>,
+    match_line: u32,
+    best: &mut Option<(tree_sitter::Node<'a>, u32)>,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() != "section" {
             continue;
         }
-        let mut hashes = 0;
-        let mut rest = trimmed;
-        while hashes < 6 {
-            match rest.strip_prefix('#') {
-                Some(r) => {
-                    hashes += 1;
-                    rest = r;
-                }
-                None => break,
+        let start = (child.start_position().row + 1) as u32;
+        let end_excl = child.end_position();
+        let end = if end_excl.column == 0 {
+            end_excl.row as u32
+        } else {
+            (end_excl.row + 1) as u32
+        };
+        if match_line < start || match_line > end {
+            continue;
+        }
+        // Section contains match_line. Record its heading if it has one,
+        // then recurse to find a deeper section.
+        let mut sec_cursor = child.walk();
+        if let Some(heading) = child
+            .children(&mut sec_cursor)
+            .find(|c| c.kind() == "atx_heading")
+        {
+            // Update best to the *deepest* (largest start_line) match.
+            match best {
+                Some((_, prev_start)) if *prev_start >= start => {}
+                _ => *best = Some((heading, start)),
             }
         }
-        if hashes == 0 {
-            continue;
-        }
-        let text = rest.trim_start_matches([' ', '\t']).trim_end();
-        if text.is_empty() {
-            continue;
-        }
-        let display: String = if text.chars().count() > 60 {
-            let mut s: String = text.chars().take(57).collect();
-            s.push_str("...");
-            s
-        } else {
-            text.to_string()
-        };
-        return Some(format!("§{display}"));
+        walk_md_for_enclosing(child, match_line, best);
     }
-    None
 }
 
 /// Extract (`start_line`, `end_line`) from an outline entry like "[20-115]" or "[16]".
@@ -1762,6 +1782,24 @@ mod tests {
         let p = tmp.path().join("a.md");
         std::fs::write(&p, "preamble line one\npreamble line two\n").unwrap();
         assert!(markdown_enclosing_scope(&p, 2).is_none());
+    }
+
+    /// `#`-prefixed lines inside fenced code blocks are NOT headings, so they
+    /// must not become the enclosing scope label of usages on adjacent lines.
+    /// Pre-fix this returned `§...` derived from a Python comment inside the
+    /// fence; post-fix the AST owns the distinction.
+    #[test]
+    fn markdown_scope_skips_hashes_inside_fenced_code() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("a.md");
+        std::fs::write(
+            &p,
+            "## Outer\n\nbefore fence\n\n```python\n# fake heading\nx = 1\n```\n\nafter fence\n",
+        )
+        .unwrap();
+        // Line 7 (`x = 1`) is inside the fence; the only real heading is `## Outer`.
+        let label = markdown_enclosing_scope(&p, 7).unwrap();
+        assert_eq!(label, "§Outer");
     }
 
     #[test]
