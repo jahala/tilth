@@ -422,7 +422,7 @@ fn format_grouped_usages(group: &[&Match], scope: &Path, cache: &OutlineCache, o
 
     let scope_label = enclosing_scope_label(&first.path, first.line, cache);
 
-    let _ = write!(out, "\n\n## {path_str}:{line_str} [{} usages", group.len());
+    let _ = write!(out, "\n\n### {path_str}:{line_str} [{} usages", group.len());
     if let Some(ref label) = scope_label {
         let _ = write!(out, " in {label}");
     }
@@ -1697,6 +1697,49 @@ mod tests {
         assert!(
             out.contains("[usage in function Foo.bar]"),
             "expected scope suffix in output, got: {out}"
+        );
+    }
+
+    #[test]
+    fn format_grouped_usages_emits_h3_heading() {
+        use crate::types::Match;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("a.ts");
+        std::fs::write(
+            &p,
+            "function host() {\n  doThing();\n  doThing();\n  doThing();\n}\n",
+        )
+        .unwrap();
+
+        let mk = |line: u32| Match {
+            path: p.clone(),
+            line,
+            text: "  doThing();".to_string(),
+            is_definition: false,
+            exact: false,
+            file_lines: 5,
+            mtime: SystemTime::now(),
+            def_range: None,
+            def_name: None,
+            def_weight: 0,
+            impl_target: None,
+        };
+        let m1 = mk(2);
+        let m2 = mk(3);
+        let m3 = mk(4);
+        let group: Vec<&Match> = vec![&m1, &m2, &m3];
+        let cache = OutlineCache::new();
+        let mut out = String::new();
+        format_grouped_usages(&group, tmp.path(), &cache, &mut out);
+
+        assert!(
+            out.starts_with("\n\n### "),
+            "grouped-usage heading must be H3, got: {out:?}"
+        );
+        assert!(
+            !out.starts_with("\n\n## "),
+            "grouped-usage heading must not be H2, got: {out:?}"
         );
     }
 }
