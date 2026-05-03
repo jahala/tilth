@@ -402,7 +402,6 @@ pub(crate) fn dispatch_tool(
         "tilth_files" => tool_files(args, services.cache()),
         "tilth_deps" => tool_deps(args, services.cache(), services.bloom()),
         "tilth_diff" => tool_diff(args),
-        "tilth_map" => Err("tilth_map is disabled — use tilth_search instead".into()),
         "tilth_session" => tool_session(args, services.session()),
         "tilth_edit" if edit_mode => {
             tool_edit(args, services.session(), services.cache(), services.bloom())
@@ -988,12 +987,6 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                 }
             }
         }),
-        // tilth_map disabled — benchmark data shows 62% of losing tasks use map
-        // vs 22% of winners. Re-enable after measuring impact.
-        // serde_json::json!({
-        //     "name": "tilth_map",
-        //     ...
-        // }),
         serde_json::json!({
             "name": "tilth_diff",
             "description": "Structural diff showing function-level changes. Replaces git diff. Call with no args for uncommitted changes overview.",
