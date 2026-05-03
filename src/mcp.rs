@@ -394,13 +394,11 @@ pub(crate) fn dispatch_tool(
     match tool {
         "tilth_read" => tool_read(args, services.cache(), services.session(), edit_mode),
         "tilth_search" => tool_search(args, services.cache(), services.session(), services.bloom()),
-        "tilth_files" => tool_files(args, services.cache()),
-        "tilth_deps" => tool_deps(args, services.cache(), services.bloom()),
+        "tilth_files" => tool_files(args),
+        "tilth_deps" => tool_deps(args, services.bloom()),
         "tilth_diff" => tool_diff(args),
         "tilth_session" => tool_session(args, services.session()),
-        "tilth_edit" if edit_mode => {
-            tool_edit(args, services.session(), services.cache(), services.bloom())
-        }
+        "tilth_edit" if edit_mode => tool_edit(args, services.session(), services.bloom()),
         _ => Err(format!("unknown tool: {tool}")),
     }
 }
@@ -562,7 +560,7 @@ fn tool_search(
         "callers" => {
             session.record_search(query);
             crate::search::callers::search_callers_expanded(
-                query, &scope, cache, session, bloom, expand, context, glob,
+                query, &scope, bloom, expand, context, glob,
             )
         }
         _ => {
@@ -578,7 +576,7 @@ fn tool_search(
     Ok(result)
 }
 
-fn tool_files(args: &Value, cache: &OutlineCache) -> Result<String, String> {
+fn tool_files(args: &Value) -> Result<String, String> {
     let pattern = args
         .get("pattern")
         .and_then(|v| v.as_str())
@@ -586,18 +584,14 @@ fn tool_files(args: &Value, cache: &OutlineCache) -> Result<String, String> {
     let (scope, scope_warning) = resolve_scope(args);
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
 
-    let output = crate::search::search_glob(pattern, &scope, cache).map_err(|e| e.to_string())?;
+    let output = crate::search::search_glob(pattern, &scope).map_err(|e| e.to_string())?;
 
     let mut result = scope_warning.unwrap_or_default();
     result.push_str(&apply_budget(output, budget));
     Ok(result)
 }
 
-fn tool_deps(
-    args: &Value,
-    cache: &OutlineCache,
-    bloom: &Arc<BloomFilterCache>,
-) -> Result<String, String> {
+fn tool_deps(args: &Value, bloom: &Arc<BloomFilterCache>) -> Result<String, String> {
     let path_str = args
         .get("path")
         .and_then(|v| v.as_str())
@@ -609,7 +603,7 @@ fn tool_deps(
         .and_then(serde_json::Value::as_u64)
         .map(|b| b as usize);
 
-    let deps_result = crate::search::deps::analyze_deps(&path, &scope, cache, bloom)
+    let deps_result = crate::search::deps::analyze_deps(&path, &scope, bloom)
         .map_err(|e| e.to_string())?;
     let mut output = scope_warning.unwrap_or_default();
     output.push_str(&crate::search::deps::format_deps(
@@ -653,7 +647,6 @@ fn tool_session(args: &Value, session: &Session) -> Result<String, String> {
 fn tool_edit(
     args: &Value,
     session: &Session,
-    _cache: &OutlineCache,
     bloom: &Arc<BloomFilterCache>,
 ) -> Result<String, String> {
     let path_str = args

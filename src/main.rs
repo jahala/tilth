@@ -257,14 +257,7 @@ fn main() {
 
     // Callers mode
     if cli.callers {
-        let result = tilth::run_callers(
-            &query,
-            &scope,
-            expand,
-            cli.budget,
-            cli.glob.as_deref(),
-            &cache,
-        );
+        let result = tilth::run_callers(&query, &scope, expand, cli.budget, cli.glob.as_deref());
         emit_result(result, &query, cli.json, is_tty);
         return;
     }
@@ -286,7 +279,7 @@ fn main() {
                 }
             }
         };
-        let result = tilth::run_deps(&path, &scope, cli.budget, &cache);
+        let result = tilth::run_deps(&path, &scope, cli.budget);
         emit_result(result, &query, cli.json, is_tty);
         return;
     }

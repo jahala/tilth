@@ -9,11 +9,9 @@ use streaming_iterator::StreamingIterator;
 
 use crate::lang::treesitter::{extract_definition_name, DEFINITION_KINDS};
 
-use crate::cache::OutlineCache;
 use crate::error::TilthError;
 use crate::lang::detect_file_type;
 use crate::lang::outline::outline_language;
-use crate::session::Session;
 use crate::types::FileType;
 
 const MAX_MATCHES: usize = 10;
@@ -358,8 +356,6 @@ fn find_enclosing_function(
 pub fn search_callers_expanded(
     target: &str,
     scope: &Path,
-    _cache: &OutlineCache,
-    _session: &Session,
     bloom: &crate::index::bloom::BloomFilterCache,
     expand: usize,
     context: Option<&Path>,

@@ -4,7 +4,6 @@ use std::sync::{LazyLock, Mutex};
 
 use streaming_iterator::StreamingIterator;
 
-use crate::cache::OutlineCache;
 use crate::lang::outline::{get_outline_entries, outline_language};
 use crate::types::{Lang, OutlineEntry};
 
@@ -283,7 +282,6 @@ pub fn resolve_callees(
     callee_names: &[String],
     source_path: &Path,
     source_content: &str,
-    _cache: &OutlineCache,
     bloom: &crate::index::bloom::BloomFilterCache,
 ) -> Vec<ResolvedCallee> {
     if callee_names.is_empty() {
@@ -426,13 +424,12 @@ pub fn resolve_callees_transitive(
     initial_names: &[String],
     source_path: &Path,
     source_content: &str,
-    cache: &OutlineCache,
     bloom: &crate::index::bloom::BloomFilterCache,
     depth_limit: u32,
     budget: usize,
 ) -> Vec<ResolvedCalleeNode> {
     // 1st hop: resolve direct callees (existing logic)
-    let first_hop = resolve_callees(initial_names, source_path, source_content, cache, bloom);
+    let first_hop = resolve_callees(initial_names, source_path, source_content, bloom);
 
     if depth_limit < 2 || first_hop.is_empty() {
         return first_hop
@@ -457,7 +454,7 @@ pub fn resolve_callees_transitive(
 
     for parent in first_hop {
         let children = if budget_remaining > 0 {
-            resolve_second_hop(&parent, cache, bloom, &mut visited, &mut budget_remaining)
+            resolve_second_hop(&parent, bloom, &mut visited, &mut budget_remaining)
         } else {
             Vec::new()
         };
@@ -473,7 +470,6 @@ pub fn resolve_callees_transitive(
 /// Resolve 2nd-hop callees for a single parent callee.
 fn resolve_second_hop(
     parent: &ResolvedCallee,
-    cache: &OutlineCache,
     bloom: &crate::index::bloom::BloomFilterCache,
     visited: &mut HashSet<(PathBuf, u32)>,
     budget: &mut usize,
@@ -494,7 +490,7 @@ fn resolve_second_hop(
         return Vec::new();
     }
 
-    let mut resolved = resolve_callees(&nested_names, &parent.file, &content, cache, bloom);
+    let mut resolved = resolve_callees(&nested_names, &parent.file, &content, bloom);
 
     // Filter: skip self-recursive calls and already-visited callees
     resolved.retain(|c| {

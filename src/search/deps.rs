@@ -6,7 +6,6 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::cache::OutlineCache;
 use crate::error::TilthError;
 use crate::lang::detect_file_type;
 use crate::lang::outline::{extract_import_source, get_outline_entries};
@@ -56,7 +55,6 @@ pub struct Dependent {
 pub fn analyze_deps(
     path: &Path,
     scope: &Path,
-    cache: &OutlineCache,
     bloom: &crate::index::bloom::BloomFilterCache,
 ) -> Result<DepsResult, TilthError> {
     // Canonicalize for reliable path comparison (callers return absolute paths).
@@ -86,7 +84,6 @@ pub fn analyze_deps(
     // ── Phase 1: Extract exported symbols ────────────────────────────────────
 
     let entries = get_outline_entries(&content, lang);
-    let _ = cache; // available for future caching
 
     let mut all_names: Vec<String> = Vec::new();
     for entry in &entries {
@@ -119,7 +116,7 @@ pub fn analyze_deps(
 
     // Local deps via callee resolution
     let callee_names = extract_callee_names(&content, lang, None);
-    let resolved = resolve_callees(&callee_names, path, &content, cache, bloom);
+    let resolved = resolve_callees(&callee_names, path, &content, bloom);
 
     // Group resolved callees by file
     let mut local_by_file: HashMap<PathBuf, Vec<String>> = HashMap::new();
