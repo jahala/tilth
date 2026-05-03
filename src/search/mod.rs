@@ -1417,9 +1417,11 @@ mod tests {
     fn callers_search_glob_restricts_results() {
         let scope = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let bloom = crate::index::bloom::BloomFilterCache::new();
-        let (rs_callers, _) =
-            callers::find_callers("walker", &scope, &bloom, Some("*.rs")).expect("callers failed");
-        let (toml_callers, _) = callers::find_callers("walker", &scope, &bloom, Some("*.toml"))
+        let single: std::collections::HashSet<String> =
+            std::iter::once("walker".to_string()).collect();
+        let rs_callers = callers::find_callers_batch(&single, &scope, &bloom, Some("*.rs"))
+            .expect("callers failed");
+        let toml_callers = callers::find_callers_batch(&single, &scope, &bloom, Some("*.toml"))
             .expect("callers toml failed");
 
         assert!(
@@ -1430,7 +1432,7 @@ mod tests {
             toml_callers.is_empty(),
             "*.toml should not find callers of 'walker'"
         );
-        for c in &rs_callers {
+        for (_, c) in &rs_callers {
             assert_eq!(
                 c.path.extension().and_then(|e| e.to_str()),
                 Some("rs"),

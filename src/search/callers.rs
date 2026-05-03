@@ -17,13 +17,11 @@ use crate::session::Session;
 use crate::types::FileType;
 
 const MAX_MATCHES: usize = 10;
-/// Stop walking once we have this many raw matches. Generous headroom for dedup + ranking.
-const EARLY_QUIT_THRESHOLD: usize = 30;
 /// Max unique caller functions to trace for 2nd hop. Above this = wide fan-out, skip.
 const IMPACT_FANOUT_THRESHOLD: usize = 10;
 /// Max 2nd-hop results to display.
 const IMPACT_MAX_RESULTS: usize = 15;
-/// Early quit for batch caller search.
+/// Stop the batch caller walk once we have this many raw matches. Generous headroom for dedup + ranking.
 const BATCH_EARLY_QUIT: usize = 50;
 
 /// A single caller match — a call site of a target symbol.
@@ -35,217 +33,52 @@ pub struct CallerMatch {
     pub call_text: String,
     /// Line range of the calling function (for expand).
     pub caller_range: Option<(u32, u32)>,
-    /// File content, already read during `find_callers` — avoids re-reading during expand.
+    /// File content, already read during `find_callers_batch` — avoids re-reading during expand.
     /// Shared across all call sites in the same file via reference counting.
     pub content: Arc<String>,
 }
 
-/// Find all call sites of a target symbol across the codebase using tree-sitter.
-/// Walk the scope once, return all direct call sites of `target` plus
-/// whether the literal name appeared anywhere (used to distinguish
-/// "real symbol with no direct callers" from "typo'd query" — the hint
-/// shown to the agent differs between those cases).
-pub fn find_callers(
-    target: &str,
-    scope: &Path,
-    bloom: &crate::index::bloom::BloomFilterCache,
-    glob: Option<&str>,
-) -> Result<(Vec<CallerMatch>, bool), TilthError> {
-    let matches: Mutex<Vec<CallerMatch>> = Mutex::new(Vec::new());
-    let found_count = AtomicUsize::new(0);
-    let target_seen = AtomicBool::new(false);
+/// Scan `scope` for the literal `target` byte sequence. Used by the
+/// single-symbol `search_callers_expanded` path to distinguish "typo,
+/// doesn't exist" from "real symbol with no direct callers" (indirect
+/// dispatch, dead code, framework registration, …) when the caller walk
+/// returned zero matches. mmap is lazy, so the scan only pages in regions
+/// that contain the needle prefix.
+fn target_seen_in_scope(target: &str, scope: &Path, glob: Option<&str>) -> bool {
+    let Ok(walker) = super::walker(scope, glob) else {
+        return false;
+    };
     let needle = target.as_bytes();
-
-    let walker = super::walker(scope, glob)?;
+    let seen = AtomicBool::new(false);
 
     walker.run(|| {
-        let matches = &matches;
-        let found_count = &found_count;
-        let target_seen = &target_seen;
-
+        let seen = &seen;
         Box::new(move |entry| {
-            // Early termination: enough callers found
-            if found_count.load(Ordering::Relaxed) >= EARLY_QUIT_THRESHOLD {
+            if seen.load(Ordering::Relaxed) {
                 return ignore::WalkState::Quit;
             }
-
             let Ok(entry) = entry else {
                 return ignore::WalkState::Continue;
             };
-
             if !entry.file_type().is_some_and(|ft| ft.is_file()) {
                 return ignore::WalkState::Continue;
             }
-
             let path = entry.path();
-
-            // Single metadata call: check size and capture mtime together
-            let (file_len, mtime) = match std::fs::metadata(path) {
-                Ok(meta) => (
-                    meta.len(),
-                    meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
-                ),
-                Err(_) => return ignore::WalkState::Continue,
-            };
-            if file_len > 500_000 {
-                // Oversized files are not parsed, but we still need to know
-                // whether the literal target appears anywhere in scope so the
-                // "no callers" message can distinguish "real symbol, indirect
-                // dispatch" from "typo, doesn't exist." mmap is lazy, so the
-                // scan only touches pages that contain the needle prefix.
-                if !target_seen.load(Ordering::Relaxed) {
-                    if let Ok(file) = std::fs::File::open(path) {
-                        if let Ok(mmap) = unsafe { memmap2::Mmap::map(&file) } {
-                            if memchr::memmem::find(&mmap, needle).is_some() {
-                                target_seen.store(true, Ordering::Relaxed);
-                            }
-                        }
-                    }
-                }
-                return ignore::WalkState::Continue;
-            }
-
-            // Single read: read file once, use buffer for both check and parse
-            let Ok(content) = fs::read_to_string(path) else {
+            let Ok(file) = std::fs::File::open(path) else {
                 return ignore::WalkState::Continue;
             };
-
-            // Bloom pre-filter: skip if target is definitely not in file
-            if !bloom.contains(path, mtime, &content, target) {
-                return ignore::WalkState::Continue;
-            }
-
-            // Fast byte check via memchr::memmem (SIMD) — skip files without the symbol
-            if memchr::memmem::find(content.as_bytes(), needle).is_none() {
-                return ignore::WalkState::Continue;
-            }
-
-            // Symbol literal exists in this file (whether or not it's a call site).
-            target_seen.store(true, Ordering::Relaxed);
-
-            // Only process files with tree-sitter grammars
-            let file_type = detect_file_type(path);
-            let FileType::Code(lang) = file_type else {
+            let Ok(mmap) = (unsafe { memmap2::Mmap::map(&file) }) else {
                 return ignore::WalkState::Continue;
             };
-
-            let Some(ts_lang) = outline_language(lang) else {
-                return ignore::WalkState::Continue;
-            };
-
-            let file_callers = find_callers_treesitter(path, target, &ts_lang, &content, lang);
-
-            if !file_callers.is_empty() {
-                found_count.fetch_add(file_callers.len(), Ordering::Relaxed);
-                let mut all = matches
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                all.extend(file_callers);
+            if memchr::memmem::find(&mmap, needle).is_some() {
+                seen.store(true, Ordering::Relaxed);
+                return ignore::WalkState::Quit;
             }
-
             ignore::WalkState::Continue
         })
     });
 
-    let callers = matches
-        .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    // Relaxed is sufficient: walker.run() uses thread::scope under the hood,
-    // and the join at the end of run() establishes happens-before between
-    // every worker store and this load. No Acquire/Release pair needed.
-    Ok((callers, target_seen.load(Ordering::Relaxed)))
-}
-
-/// Tree-sitter call site detection.
-fn find_callers_treesitter(
-    path: &Path,
-    target: &str,
-    ts_lang: &tree_sitter::Language,
-    content: &str,
-    lang: crate::types::Lang,
-) -> Vec<CallerMatch> {
-    // Get the query string for this language
-    let Some(query_str) = super::callees::callee_query_str(lang) else {
-        return Vec::new();
-    };
-
-    let mut parser = tree_sitter::Parser::new();
-    if parser.set_language(ts_lang).is_err() {
-        return Vec::new();
-    }
-
-    let Some(tree) = parser.parse(content, None) else {
-        return Vec::new();
-    };
-
-    let content_bytes = content.as_bytes();
-    let lines: Vec<&str> = content.lines().collect();
-
-    // One Arc per file — all call sites share the same allocation.
-    let shared_content: Arc<String> = Arc::new(content.to_string());
-
-    let Some(callers) = super::callees::with_callee_query(ts_lang, query_str, |query| {
-        let Some(callee_idx) = query.capture_index_for_name("callee") else {
-            return Vec::new();
-        };
-
-        let mut cursor = tree_sitter::QueryCursor::new();
-        let mut matches = cursor.matches(query, tree.root_node(), content_bytes);
-        let mut callers = Vec::new();
-
-        while let Some(m) = matches.next() {
-            for cap in m.captures {
-                if cap.index != callee_idx {
-                    continue;
-                }
-
-                // Check if the captured text matches our target symbol
-                let Ok(text) = cap.node.utf8_text(content_bytes) else {
-                    continue;
-                };
-
-                if text != target {
-                    continue;
-                }
-
-                // Found a call site! Now walk up to find the calling function
-                let line = cap.node.start_position().row as u32 + 1;
-
-                // Get the call text (the whole call expression, not just the callee)
-                let call_node = cap.node.parent().unwrap_or(cap.node);
-                let same_line = call_node.start_position().row == call_node.end_position().row;
-                let call_text: String = if same_line {
-                    let row = call_node.start_position().row;
-                    if row < lines.len() {
-                        lines[row].trim().to_string()
-                    } else {
-                        text.to_string()
-                    }
-                } else {
-                    text.to_string()
-                };
-
-                // Walk up the tree to find the enclosing function
-                let (calling_function, caller_range) =
-                    find_enclosing_function(cap.node, &lines, lang);
-
-                callers.push(CallerMatch {
-                    path: path.to_path_buf(),
-                    line,
-                    calling_function,
-                    call_text,
-                    caller_range,
-                    content: Arc::clone(&shared_content),
-                });
-            }
-        }
-
-        callers
-    }) else {
-        return Vec::new();
-    };
-
-    callers
+    seen.load(Ordering::Relaxed)
 }
 
 /// Find all call sites of any symbol in `targets` across the codebase using a single walk.
@@ -532,9 +365,12 @@ pub fn search_callers_expanded(
     context: Option<&Path>,
     glob: Option<&str>,
 ) -> Result<String, TilthError> {
-    let (callers, target_seen) = find_callers(target, scope, bloom, glob)?;
+    let single: HashSet<String> = std::iter::once(target.to_string()).collect();
+    let raw = find_callers_batch(&single, scope, bloom, glob)?;
+    let callers: Vec<CallerMatch> = raw.into_iter().map(|(_, m)| m).collect();
 
     if callers.is_empty() {
+        let target_seen = target_seen_in_scope(target, scope, glob);
         return Ok(no_callers_message(target, scope, target_seen, glob));
     }
 
