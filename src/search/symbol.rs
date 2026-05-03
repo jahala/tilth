@@ -13,7 +13,7 @@ use crate::lang::treesitter::{
 
 use crate::error::TilthError;
 use crate::lang::detect_file_type;
-use crate::lang::outline::outline_language;
+use crate::lang::outline::{heading_text, outline_language, parse_markdown};
 use crate::search::rank;
 use crate::types::{FacetTotals, FileType, Match, SearchResult};
 use grep_regex::RegexMatcher;
@@ -589,17 +589,19 @@ fn find_usages(
 
 /// Markdown heading definition detector.
 ///
-/// A line `^#{1,6}\s+<text>` in a `.md`/`.mdx`/`.rst` file is treated as a
-/// soft definition of the section about <query> when <query> appears in
-/// <text> as a whole identifier (flanked by non-word chars). Setext
-/// headings (`===` underlines) and indented code blocks (4+ spaces) are
-/// intentionally ignored — Setext requires two-line look-ahead, and 4+
-/// space indents are CommonMark indented code blocks, not headings.
+/// An ATX heading (`^#{1,6}\s+<text>`) in a `.md`/`.mdx`/`.rst` file is
+/// treated as a soft definition of the section about <query> when <query>
+/// appears in <text> as a whole identifier (flanked by non-word chars).
+/// Setext headings, indented code blocks, and lines inside fenced code
+/// blocks are filtered out by the tree-sitter-md parser before we see them.
+///
+/// Section span (`def_range`) covers the heading line through the last
+/// non-blank line before the next same-or-higher-level heading, and is
+/// computed from the enclosing `section` node's end position. Sub-headings
+/// nest as child sections of the parent and don't terminate the parent.
 ///
 /// Whole-identifier match (not substring-anywhere) prevents false positives
-/// like query `func` matching heading `## refactoring guidelines`. Match is
-/// against the heading TEXT (after stripping `#` markers), so the `#`s
-/// themselves never count as boundary characters.
+/// like query `func` matching heading `## refactoring guidelines`.
 fn find_defs_markdown_buf(
     path: &Path,
     query: &str,
@@ -607,80 +609,115 @@ fn find_defs_markdown_buf(
     file_lines: u32,
     mtime: SystemTime,
 ) -> Vec<Match> {
-    let mut defs = Vec::new();
+    let Some(tree) = parse_markdown(content) else {
+        return Vec::new();
+    };
     let lines: Vec<&str> = content.lines().collect();
-
-    for (i, line) in lines.iter().enumerate() {
-        let Some((level, heading_text)) = parse_atx_heading(line) else {
-            continue;
-        };
-        if !contains_identifier(heading_text, query) {
-            continue;
-        }
-
-        // Section span: heading line through the line before the next ATX
-        // heading at the same or higher level (smaller `level` = higher).
-        // If no such heading follows, the section runs to EOF. Trailing
-        // blank lines are trimmed so the rendered range is tight.
-        let heading_line = (i + 1) as u32;
-        let mut end = lines.len();
-        for (j, peek) in lines.iter().enumerate().skip(i + 1) {
-            if let Some((peek_level, _)) = parse_atx_heading(peek) {
-                if peek_level <= level {
-                    end = j;
-                    break;
-                }
-            }
-        }
-        while end > i + 1 && lines[end - 1].trim().is_empty() {
-            end -= 1;
-        }
-        let section_end = end as u32;
-
-        defs.push(Match {
-            path: path.to_path_buf(),
-            line: heading_line,
-            text: line.trim_end().to_string(),
-            is_definition: true,
-            exact: true,
-            file_lines,
-            mtime,
-            // Populating def_range lets the renderer expand to the section
-            // body — the markdown analogue of a code definition's body.
-            def_range: Some((heading_line, section_end)),
-            def_name: Some(query.to_string()),
-            // Soft definition — code definitions are 60-80, usages 0. Sits
-            // between them so docs headings outrank passing mentions but
-            // never outrank the real source.
-            def_weight: 30,
-            impl_target: None,
-        });
-    }
-
+    let mut defs = Vec::new();
+    walk_md_sections(
+        tree.root_node(),
+        &lines,
+        query,
+        path,
+        file_lines,
+        mtime,
+        &mut defs,
+    );
     defs
 }
 
-/// Parse an ATX-style markdown heading. Returns `(level, text)` or `None`
-/// if the line is not a heading. Strips leading `#` markers and optional
-/// trailing `#`s. Per CommonMark: 0-3 spaces of indent allowed; 4+ spaces
-/// is a code block.
-fn parse_atx_heading(line: &str) -> Option<(usize, &str)> {
-    let leading_spaces = line.bytes().take_while(|&b| b == b' ').count();
-    if leading_spaces > 3 {
-        return None;
+#[allow(clippy::too_many_arguments)]
+fn walk_md_sections(
+    node: tree_sitter::Node,
+    lines: &[&str],
+    query: &str,
+    path: &Path,
+    file_lines: u32,
+    mtime: SystemTime,
+    defs: &mut Vec<Match>,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "section" => {
+                emit_md_section_match(child, lines, query, path, file_lines, mtime, defs);
+                walk_md_sections(child, lines, query, path, file_lines, mtime, defs);
+            }
+            // The parser owns these — no headings hide inside.
+            "fenced_code_block" | "indented_code_block" | "html_block" => {}
+            _ => walk_md_sections(child, lines, query, path, file_lines, mtime, defs),
+        }
     }
-    let after_indent = &line[leading_spaces..];
-    let bytes = after_indent.as_bytes();
-    let hashes = bytes.iter().take_while(|&&b| b == b'#').count();
-    if !(1..=6).contains(&hashes) {
-        return None;
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_md_section_match(
+    section: tree_sitter::Node,
+    lines: &[&str],
+    query: &str,
+    path: &Path,
+    file_lines: u32,
+    mtime: SystemTime,
+    defs: &mut Vec<Match>,
+) {
+    let mut cursor = section.walk();
+    let Some(heading) = section
+        .children(&mut cursor)
+        .find(|c| c.kind() == "atx_heading")
+    else {
+        return;
+    };
+    let text = heading_text(heading, lines);
+    if !contains_identifier(&text, query) {
+        return;
     }
-    if !matches!(bytes.get(hashes), Some(b' ' | b'\t')) {
-        return None;
+    let heading_line = (heading.start_position().row + 1) as u32;
+    let raw_end = md_section_end_line(section);
+    let section_end = trim_trailing_blank_lines(lines, heading_line, raw_end);
+    let line_text = lines
+        .get(heading.start_position().row)
+        .copied()
+        .unwrap_or("");
+    defs.push(Match {
+        path: path.to_path_buf(),
+        line: heading_line,
+        text: line_text.trim_end().to_string(),
+        is_definition: true,
+        exact: true,
+        file_lines,
+        mtime,
+        // Populating def_range lets the renderer expand to the section
+        // body — the markdown analogue of a code definition's body.
+        def_range: Some((heading_line, section_end)),
+        def_name: Some(query.to_string()),
+        // Soft definition — code definitions are 60-80, usages 0. Sits
+        // between them so docs headings outrank passing mentions but
+        // never outrank the real source.
+        def_weight: 30,
+        impl_target: None,
+    });
+}
+
+/// 1-indexed inclusive last line of a tree-sitter section node.
+fn md_section_end_line(section: tree_sitter::Node) -> u32 {
+    let end = section.end_position();
+    if end.column == 0 {
+        end.row as u32
+    } else {
+        (end.row + 1) as u32
     }
-    let text = after_indent[hashes..].trim();
-    // ATX allows optional trailing `#`s: `## Foo ##` — strip them.
-    Some((hashes, text.trim_end_matches('#').trim_end()))
+}
+
+fn trim_trailing_blank_lines(lines: &[&str], start: u32, end: u32) -> u32 {
+    let mut e = end;
+    while e > start
+        && lines
+            .get((e - 1) as usize)
+            .is_some_and(|l| l.trim().is_empty())
+    {
+        e -= 1;
+    }
+    e
 }
 
 /// True if `query` appears in `text` as a whole identifier — flanked by
