@@ -119,6 +119,22 @@ pub struct SearchResult {
     pub total_found: usize,
     pub definitions: usize,
     pub usages: usize,
+    /// Pre-cap subfacet counts. Computed in `symbol::search` by faceting the
+    /// merged set before truncation; used by the renderer to print
+    /// `displayed/total` headings and the per-facet hidden-count tail line.
+    pub facet_totals: FacetTotals,
+}
+
+/// Pre-cap counts per subfacet. Defaults to all-zero for callers that don't
+/// facet (`content::search`, `regex` paths) — the renderer renders a bare
+/// count when displayed == total, so zero totals never surface a header.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FacetTotals {
+    pub definitions: usize,
+    pub implementations: usize,
+    pub tests: usize,
+    pub usages_local: usize,
+    pub usages_cross: usize,
 }
 
 /// A single entry in a code outline.

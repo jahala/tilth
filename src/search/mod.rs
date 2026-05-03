@@ -310,6 +310,18 @@ pub fn search_glob(pattern: &str, scope: &Path) -> Result<String, TilthError> {
     format_glob_result(&result, scope)
 }
 
+/// Render the count for a facet section heading. Returns the bare displayed
+/// count when nothing was hidden (`shown == total`), or `displayed/total`
+/// when the cap dropped some entries — so a reader sees at a glance whether
+/// the facet was truncated.
+fn count_label(shown: usize, total: usize) -> String {
+    if shown >= total {
+        format!("{shown}")
+    } else {
+        format!("{shown}/{total}")
+    }
+}
+
 /// Format match entries with optional expansion.
 /// Groups consecutive usage matches in the same enclosing function to reduce token noise.
 /// Shared expand state enables cross-query dedup in multi-symbol search.
@@ -863,10 +875,15 @@ fn format_search_result(
     // Apply faceting when there are many matches (>5)
     if result.matches.len() > 5 {
         let faceted = facets::facet_matches(result.matches.clone(), &result.scope);
+        let totals = &result.facet_totals;
 
         // Format each non-empty facet with section headers
         if !faceted.definitions.is_empty() {
-            let _ = write!(out, "\n\n## Definitions ({})", faceted.definitions.len());
+            let _ = write!(
+                out,
+                "\n\n## Definitions ({})",
+                count_label(faceted.definitions.len(), totals.definitions)
+            );
             format_matches(
                 &faceted.definitions,
                 &result.scope,
@@ -883,7 +900,7 @@ fn format_search_result(
             let _ = write!(
                 out,
                 "\n\n## Implementations ({})",
-                faceted.implementations.len()
+                count_label(faceted.implementations.len(), totals.implementations)
             );
             format_matches(
                 &faceted.implementations,
@@ -898,7 +915,11 @@ fn format_search_result(
         }
 
         if !faceted.tests.is_empty() {
-            let _ = write!(out, "\n\n## Tests ({})", faceted.tests.len());
+            let _ = write!(
+                out,
+                "\n\n## Tests ({})",
+                count_label(faceted.tests.len(), totals.tests)
+            );
             // Compact test format — one line per match, no expand budget consumed
             for m in &faceted.tests {
                 let _ = write!(
@@ -915,7 +936,7 @@ fn format_search_result(
             let _ = write!(
                 out,
                 "\n\n## Usages — same package ({})",
-                faceted.usages_local.len()
+                count_label(faceted.usages_local.len(), totals.usages_local)
             );
             format_matches(
                 &faceted.usages_local,
@@ -933,7 +954,7 @@ fn format_search_result(
             let _ = write!(
                 out,
                 "\n\n## Usages — other ({})",
-                faceted.usages_cross.len()
+                count_label(faceted.usages_cross.len(), totals.usages_cross)
             );
             format_matches(
                 &faceted.usages_cross,
@@ -1698,6 +1719,18 @@ mod tests {
             out.contains("[usage in function Foo.bar]"),
             "expected scope suffix in output, got: {out}"
         );
+    }
+
+    #[test]
+    fn count_label_renders_displayed_over_total_only_when_truncated() {
+        // No truncation — bare count.
+        assert_eq!(count_label(3, 3), "3");
+        // Defensive: shown > total (shouldn't happen in practice) — bare count.
+        assert_eq!(count_label(4, 3), "4");
+        // Truncated — displayed/total form.
+        assert_eq!(count_label(10, 14), "10/14");
+        // Zero / zero — still bare (no header is emitted at zero anyway).
+        assert_eq!(count_label(0, 0), "0");
     }
 
     #[test]

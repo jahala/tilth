@@ -15,7 +15,7 @@ use crate::error::TilthError;
 use crate::lang::detect_file_type;
 use crate::lang::outline::outline_language;
 use crate::search::rank;
-use crate::types::{FileType, Match, SearchResult};
+use crate::types::{FacetTotals, FileType, Match, SearchResult};
 use grep_regex::RegexMatcher;
 use grep_searcher::sinks::UTF8;
 use grep_searcher::Searcher;
@@ -85,9 +85,25 @@ pub fn search(
     // markdown-heading "definition" of the same query. Stable within each
     // stratum, so the relevance ordering from rank::sort is preserved. Code
     // defs (def_weight >= 60) come first, doc-heading defs (def_weight 30)
-    // second, usages last. Display-side only — pre-cap totals (Phase 5) and
-    // the underlying ranking semantics for `--json` callers are unchanged.
+    // second, usages last. Display-side only — pre-cap totals below and the
+    // underlying ranking semantics for `--json` callers are unchanged.
     merged.sort_by_key(stratum_for_display);
+
+    // Compute per-subfacet totals on the *pre-cap* set so the renderer can
+    // print `displayed/total` headings + per-facet hidden-count lines.
+    // `merged` is bounded by the early-quit thresholds (~80 entries), so the
+    // clone is cheap. Faceting is pure / side-effect-free.
+    let totals = {
+        let snapshot = merged.clone();
+        let f = super::facets::facet_matches(snapshot, scope);
+        FacetTotals {
+            definitions: f.definitions.len(),
+            implementations: f.implementations.len(),
+            tests: f.tests.len(),
+            usages_local: f.usages_local.len(),
+            usages_cross: f.usages_cross.len(),
+        }
+    };
 
     merged.truncate(MAX_MATCHES);
 
@@ -98,6 +114,7 @@ pub fn search(
         total_found: total,
         definitions: def_count,
         usages: usage_count,
+        facet_totals: totals,
     })
 }
 

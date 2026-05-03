@@ -6,7 +6,7 @@ use super::file_metadata;
 
 use crate::error::TilthError;
 use crate::search::rank;
-use crate::types::{Match, SearchResult};
+use crate::types::{FacetTotals, Match, SearchResult};
 use grep_regex::RegexMatcher;
 use grep_searcher::sinks::UTF8;
 use grep_searcher::Searcher;
@@ -152,5 +152,6 @@ pub fn search(
         total_found: total,
         definitions: 0,
         usages: total,
+        facet_totals: FacetTotals::default(),
     })
 }
