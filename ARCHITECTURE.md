@@ -2,7 +2,7 @@
 
 This document walks a reader unfamiliar with the source through tilth's
 subsystems, data flow, key types, and extension points. It is written
-against the `choongng/tilth@dev` fork at commit `c592109` (23 commits
+against the `choongng/tilth@dev` fork at commit `5d81660` (27 commits
 ahead of `origin/main`, which itself tracks upstream `jahala/tilth` at
 v0.7.0). Where the fork has diverged from upstream architecturally, that
 is called out inline; the [Fork delta](#fork-delta) section tabulates
@@ -12,8 +12,8 @@ Tilth is a single Rust binary that exposes two surfaces: a CLI
 (`tilth`) and an MCP server (`tilth --mcp`). Both speak to the same
 core: a query classifier, a tree-sitter-driven search engine, a smart
 file reader, and supporting subsystems for diff, edit, blast-radius
-analysis, and codebase mapping. The whole project is ~22.8k lines of
-Rust across 48 files in `src/` (about half of which is in-source
+analysis, and codebase mapping. The whole project is ~22.3k lines of
+Rust across 47 files in `src/` (about half of which is in-source
 `#[cfg(test)]` modules), plus a Cargo workspace, an `install.rs` that
 writes MCP-host configs, and a benchmark harness.
 
@@ -110,10 +110,8 @@ src/
 │                        parse_markdown / heading_level / heading_text
 │                        helpers shared by markdown outline + search defs
 │
-├── index/           Pre-computed indexes (currently allocated, not all
-│                    used in the active code path)
+├── index/           Pre-computed indexes used by the relational-query paths
 │   ├── mod.rs
-│   ├── symbol.rs        SymbolIndex: name → [SymbolLocation] DashMap
 │   └── bloom.rs         Per-file Bloom filter for fast "does X contain Y?"
 │                        (BloomFilterCache wraps the per-file filters)
 │
@@ -192,9 +190,10 @@ methods worth describing in detail:
 Tool dispatch is routed by name through `dispatch_tool` to
 `tool_read` / `tool_search` / `tool_files` / `tool_deps` / `tool_diff` /
 `tool_session` / `tool_edit` (the last only in edit mode).
-`tilth_map` is exposed but always returns "use tilth_search instead"
-— a deliberate redirect introduced when the structural map proved less
-useful than search for agent workflows.
+`tilth_map` is no longer reachable through MCP — its schema is omitted
+from `tools/list` and the dispatch stub has been removed. The CLI
+still has `tilth --map`; the MCP boundary was retired after benchmark
+data showed structural maps hurt agent task success rates.
 
 Concurrency: each `tools/call` spawns a worker thread, communicates via
 `mpsc::channel`, and waits with `recv_timeout`. The default per-tool
@@ -499,8 +498,10 @@ gateway. The decision tree, in order:
 2. **Directory** → `list_directory` (sorted entries, file types).
 3. **Empty file** → header with `ViewMode::Empty`.
 4. **`section: Some(...)`** → `read_section`. Either a line range
-   (`"45-89"`) or a heading address (`"## Architecture"`,
-   resolved by `resolve_heading` via fence-aware ATX scan). Returns
+   (`"45-89"`) or a heading address (`"## Architecture"`, resolved by
+   `resolve_heading`'s walk over tree-sitter-md `section` nodes — the
+   same parser the search-side `find_defs_markdown_buf` uses, so
+   fenced and indented code blocks never surface as headings). Returns
    the verbatim slice regardless of file size.
 5. **mmap + binary check** — `is_binary` looks for null bytes in the
    first 512 bytes via `memchr`. Binary files emit just a header.
@@ -580,9 +581,9 @@ resolve a project root from cwd.
 
 ## Caches and indexes
 
-Tilth keeps four pieces of state across calls. Lifetimes are
-deliberately scoped — only `OutlineCache`, `Session`, `SymbolIndex`,
-and `BloomFilterCache` survive between MCP requests.
+Tilth keeps three pieces of state across calls. Lifetimes are
+deliberately scoped — only `OutlineCache`, `Session`, and
+`BloomFilterCache` survive between MCP requests.
 
 ### `OutlineCache` (`cache.rs`)
 
@@ -619,20 +620,6 @@ maps. Poison handling is uniform via
 `unwrap_or_else(PoisonError::into_inner)` — tilth deliberately doesn't
 try to handle a poisoned mutex specially; the data is best-effort
 telemetry.
-
-### `SymbolIndex` (`index/symbol.rs`)
-
-Pre-computed symbol-to-file mapping. `DashMap<Arc<str>, Vec<SymbolLocation>>`
-plus a `DashMap<PathBuf, SystemTime>` for tracking what's been indexed.
-`build()` parses every code file in scope using tree-sitter and rayon
-in parallel, populating the maps.
-
-**Status**: allocated in both `lib.rs` and `mcp.rs`, threaded through
-the search-expanded entry points, and explicitly unused —
-`search/mod.rs:194` does `let _ = index;` with the comment "Index is
-available but not yet used for search fast-path. Build will be
-triggered when the lookup path is wired in." This is a planned but
-inert subsystem; today every symbol search still does a full walk.
 
 ### `BloomFilterCache` (`index/bloom.rs`)
 
@@ -794,8 +781,8 @@ user-facing.
   that the MCP `initialize` response prepends to `SERVER_INSTRUCTIONS`.
 - **`map.rs`** — `tilth --map` generates a structural codebase tree:
   per-directory token estimates, top-level symbols per file, depth
-  control. The `dispatch_tool` arm explicitly disables this for MCP
-  ("use tilth_search instead").
+  control. CLI-only — the MCP boundary doesn't expose it (no schema
+  in `tools/list`, no dispatch arm).
 - **`install.rs`** — `tilth install <host>` writes tilth's MCP server
   entry into a host's config file. Supports about 20 hosts:
   claude-code, cursor, windsurf, vscode, claude-desktop, opencode,
@@ -806,8 +793,8 @@ user-facing.
 
 ## Fork delta
 
-The fork (`choongng/tilth@dev`, 23 commits ahead of `origin/main`,
-which is at upstream v0.7.0) groups into six themes. Listed
+The fork (`choongng/tilth@dev`, 27 commits ahead of `origin/main`,
+which is at upstream v0.7.0) groups into seven themes. Listed
 oldest-first.
 
 | Commit    | Theme                | Summary |
@@ -832,6 +819,9 @@ oldest-first.
 | `12c7045` | Markdown AST         | Switch markdown outline to tree-sitter-md (`lang/outline.rs::{parse_markdown, heading_level, heading_text}`); delete fence pre-pass in `read/outline/markdown.rs`. |
 | `47c3471` | Markdown AST         | Switch `find_defs_markdown_buf` to walk tree-sitter `section` nodes; delete the second fence pre-pass + the `parse_atx_heading` helper. |
 | `c592109` | Markdown AST         | Switch `markdown_enclosing_scope` to AST so `#`-prefixed lines inside fenced code blocks no longer become enclosing-heading labels. |
+| `76dfb7f` | Markdown AST         | Switch `read/mod.rs::{resolve_heading, suggest_headings}` to AST so `tilth_read foo.md section="## Foo"` and the did-you-mean fallback both reuse the same parser; delete the last three hand-rolled fence-aware loops in `src/`. |
+| `8b585f4` | Simplification       | Delete inert `SymbolIndex` plumbing — the type was allocated, threaded through dispatch, and discarded with `let _ = index;` at every search call site. Drop the file, prune `index/mod.rs` to `BloomFilterCache`, strip the unused parameter from `search_*_expanded` / `dispatch_tool` / `tool_search` / `handle_tool_call`. Net −547 / +6. |
+| `5d81660` | Simplification       | Delete dead `tilth_map` MCP dispatch arm + orphaned schema-comment block. Schema was already commented out of `tools/list` (so the dispatch arm was unreachable); CLI keeps `tilth --map`. |
 
 The seven "agent usability" patches are the oldest layer and cover
 everything from default ignore behaviour to terminal sizing to output
@@ -840,10 +830,13 @@ landed Sessions 51-52. The `feat/usage-enclosing-scope-ast`
 (`7cad3f1`) and `feat/markdown-section-span-expansion` (`02e9a51` →
 `7d76b16` → six search-output follow-ups) trees are the two
 substantial features. `fd3de77` rewrote `SERVER_INSTRUCTIONS` as a
-pre-flight gate. The newest cluster (`12c7045` → `47c3471` →
-`c592109`) replaces three hand-rolled markdown scanners with
-tree-sitter-md walks — fenced-code-block awareness now lives at the
-parser level instead of in three separate per-line pre-passes.
+pre-flight gate. The Markdown-AST cluster (`12c7045` → `47c3471` →
+`c592109` → `76dfb7f`) replaces four hand-rolled markdown scanners
+with tree-sitter-md walks — fenced-code-block awareness now lives at
+the parser level rather than in four separate per-line pre-passes;
+no in-tree caller still hand-rolls fence state. The Simplification
+pair (`8b585f4` → `5d81660`) follows up by deleting the
+two largest pieces of dead plumbing the architectural review surfaced.
 
 None of these have an obvious upstream blocker; they are
 fork-divergent because of bandwidth / drift, not architectural
@@ -906,30 +899,6 @@ tracking.
   `format_search_result`. Worth a small upstream PR once thought
   through; today it's a known workaround.
 
-- **`SymbolIndex` allocated but unused.** Both `lib.rs` and `mcp.rs`
-  build a `SymbolIndex`, thread it through to
-  `search::search_symbol_expanded`, and that function explicitly
-  discards it (`let _ = index;`). The build path is finished and
-  parallel; the lookup path was never wired in. Either delete the
-  inert plumbing (clean) or finish the wiring (right answer if the
-  performance is meaningful — it would shift the per-query cost from
-  O(files) to O(matches), and a symbol-heavy MCP session can easily
-  walk 5k+ files per call today). This is the single largest design
-  cleanup available short of a full async rewrite.
-
-- **`read/mod.rs::resolve_heading` still scans manually.** Three small
-  hand-rolled fence-aware loops live in the markdown-section-lookup
-  path that backs `tilth_read foo.md section="## Foo"`. They each
-  toggle an `in_code_block` flag on ```` ``` ```` delimiters
-  (`read/mod.rs:203,239,297`). The behaviour is correct on the cases
-  the unit tests cover, but the surface is exactly the kind that
-  surfaced bugs in the search-side scanners (e.g. `~~~` fences are
-  not handled). The sibling refactor (`12c7045` → `c592109`) gave
-  these scanners an AST-based replacement target — `parse_markdown`
-  plus a section-by-heading-text walk would collapse all three loops.
-  Deferred because nothing's broken in practice; worth picking up
-  next time read-path markdown logic needs work.
-
 - **MCP per-request thread model.** Every `tools/call` spawns a fresh
   thread; on timeout the thread is abandoned. This is correct given
   Rust's lack of safe thread cancellation, but it means a
@@ -949,10 +918,3 @@ tracking.
   thousands of distinct files would grow the cache without bound.
   An LRU layer or an mtime-staleness sweeper at request boundaries
   would be a small, targeted fix.
-
-- **`tilth_map` disabled at the MCP boundary but kept in CLI.** The
-  MCP dispatch arm explicitly returns "use tilth_search instead,"
-  which suggests either the CLI should stop advertising it as a
-  feature too, or the MCP boundary should re-enable it once the
-  shape is right. Today the asymmetry leaves dead code in
-  `dispatch_tool` and confused users at the CLI level.
