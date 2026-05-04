@@ -8,6 +8,8 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use serde::Deserialize;
+
 use crate::lang::detect_file_type;
 use crate::read::imports::is_import_line;
 use crate::search::SKIP_DIRS;
@@ -445,73 +447,50 @@ fn parse_manifest(root: &Path, manifest: &str) -> Option<ManifestInfo> {
 }
 
 fn parse_cargo_toml(root: &Path) -> Option<ManifestInfo> {
-    let content = fs::read_to_string(root.join("Cargo.toml")).ok()?;
-    let mut name = None;
-    let mut version = None;
-    let mut deps: Vec<String> = Vec::new();
-    let mut in_package = false;
-    let mut in_deps = false;
-
-    for line in content.lines() {
-        let trimmed = line.trim();
-
-        if trimmed.starts_with('[') {
-            in_package = trimmed == "[package]";
-            in_deps = trimmed == "[dependencies]";
-            continue;
-        }
-
-        if in_package {
-            if let Some(val) = extract_toml_string_value(trimmed, "name") {
-                name = Some(val);
-            } else if let Some(val) = extract_toml_string_value(trimmed, "version") {
-                version = Some(val);
-            }
-        }
-
-        if in_deps {
-            // dep_name = "version" or dep_name = { version = "..." }
-            if let Some(dep_name) = trimmed.split('=').next() {
-                let dep = dep_name.trim();
-                if !dep.is_empty() && !dep.starts_with('#') {
-                    deps.push(dep.to_string());
-                }
-            }
-        }
+    #[derive(Deserialize)]
+    struct CargoToml {
+        package: Option<Package>,
+        dependencies: Option<toml::Table>,
+    }
+    #[derive(Deserialize)]
+    struct Package {
+        name: Option<String>,
+        version: Option<String>,
     }
 
+    let content = fs::read_to_string(root.join("Cargo.toml")).ok()?;
+    let parsed: CargoToml = toml::from_str(&content).ok()?;
+    let (name, version) = parsed
+        .package
+        .map_or((None, None), |p| (p.name, p.version));
+    let mut deps: Vec<String> = parsed
+        .dependencies
+        .map(|d| d.into_iter().map(|(k, _)| k).collect())
+        .unwrap_or_default();
     deps.sort();
     deps.truncate(10);
-
-    Some(ManifestInfo {
-        name,
-        version,
-        deps,
-    })
+    Some(ManifestInfo { name, version, deps })
 }
 
 fn parse_package_json(root: &Path) -> Option<ManifestInfo> {
-    let content = fs::read_to_string(root.join("package.json")).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
-
-    let name = json.get("name").and_then(|v| v.as_str()).map(String::from);
-    let version = json
-        .get("version")
-        .and_then(|v| v.as_str())
-        .map(String::from);
-
-    let mut deps: Vec<String> = Vec::new();
-    if let Some(obj) = json.get("dependencies").and_then(|v| v.as_object()) {
-        for key in obj.keys() {
-            deps.push(key.clone());
-        }
+    #[derive(Deserialize)]
+    struct PackageJson {
+        name: Option<String>,
+        version: Option<String>,
+        dependencies: Option<serde_json::Map<String, serde_json::Value>>,
     }
+
+    let content = fs::read_to_string(root.join("package.json")).ok()?;
+    let parsed: PackageJson = serde_json::from_str(&content).ok()?;
+    let mut deps: Vec<String> = parsed
+        .dependencies
+        .map(|d| d.into_iter().map(|(k, _)| k).collect())
+        .unwrap_or_default();
     deps.sort();
     deps.truncate(10);
-
     Some(ManifestInfo {
-        name,
-        version,
+        name: parsed.name,
+        version: parsed.version,
         deps,
     })
 }
@@ -558,108 +537,39 @@ fn parse_go_mod(root: &Path) -> Option<ManifestInfo> {
 }
 
 fn parse_pyproject_toml(root: &Path) -> Option<ManifestInfo> {
-    let content = fs::read_to_string(root.join("pyproject.toml")).ok()?;
-    let mut name = None;
-    let mut version = None;
-    let mut deps: Vec<String> = Vec::new();
-    let mut in_project = false;
-    let mut in_deps = false;
-
-    for line in content.lines() {
-        let trimmed = line.trim();
-
-        if trimmed.starts_with('[') {
-            in_project = trimmed == "[project]";
-            in_deps = trimmed == "[project.dependencies]"
-                || (in_project && trimmed == "dependencies = [");
-            continue;
-        }
-
-        if in_project {
-            if let Some(val) = extract_toml_string_value(trimmed, "name") {
-                name = Some(val);
-            } else if let Some(val) = extract_toml_string_value(trimmed, "version") {
-                version = Some(val);
-            }
-
-            // Inline dependencies array
-            if trimmed.starts_with("dependencies") && trimmed.contains('[') {
-                // Parse inline: dependencies = ["dep1", "dep2>=1.0"]
-                if let Some(arr_start) = trimmed.find('[') {
-                    let arr_content = &trimmed[arr_start..];
-                    for item in arr_content.split('"') {
-                        let item = item.trim();
-                        if item.is_empty()
-                            || item.starts_with('[')
-                            || item.starts_with(']')
-                            || item.starts_with(',')
-                        {
-                            continue;
-                        }
-                        // Extract package name (before any version specifier)
-                        let dep_name = item
-                            .split(&['>', '<', '=', '~', '!', ';', '['][..])
-                            .next()
-                            .unwrap_or(item)
-                            .trim();
-                        if !dep_name.is_empty() {
-                            deps.push(dep_name.to_string());
-                        }
-                    }
-                }
-            }
-        }
-
-        if in_deps && !trimmed.starts_with('[') {
-            // Multi-line deps array items: "dep_name>=1.0",
-            let clean = trimmed.trim_matches(&['"', '\'', ',', ' '][..]);
-            if !clean.is_empty() && clean != "]" {
-                let dep_name = clean
-                    .split(&['>', '<', '=', '~', '!', ';', '['][..])
-                    .next()
-                    .unwrap_or(clean)
-                    .trim();
-                if !dep_name.is_empty() {
-                    deps.push(dep_name.to_string());
-                }
-            }
-        }
+    #[derive(Default, Deserialize)]
+    struct PyProject {
+        project: Option<Project>,
+    }
+    #[derive(Default, Deserialize)]
+    struct Project {
+        name: Option<String>,
+        version: Option<String>,
+        dependencies: Option<Vec<String>>,
     }
 
+    let content = fs::read_to_string(root.join("pyproject.toml")).ok()?;
+    let parsed: PyProject = toml::from_str(&content).ok()?;
+    let project = parsed.project.unwrap_or_default();
+    let mut deps: Vec<String> = project
+        .dependencies
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|spec| {
+            let bare = spec
+                .split(&['>', '<', '=', '~', '!', ';', '[', ' '][..])
+                .next()?
+                .trim();
+            (!bare.is_empty()).then(|| bare.to_string())
+        })
+        .collect();
     deps.sort();
     deps.truncate(10);
-
     Some(ManifestInfo {
-        name,
-        version,
+        name: project.name,
+        version: project.version,
         deps,
     })
-}
-
-/// Extract a string value from a TOML key = "value" line.
-fn extract_toml_string_value(line: &str, key: &str) -> Option<String> {
-    let trimmed = line.trim();
-    if !trimmed.starts_with(key) {
-        return None;
-    }
-    let rest = trimmed[key.len()..].trim_start();
-    if !rest.starts_with('=') {
-        return None;
-    }
-    let after_eq = rest[1..].trim();
-    // Extract value between quotes: "value" or 'value'
-    let val = if let Some(rest) = after_eq.strip_prefix('"') {
-        rest.split('"').next().unwrap_or("")
-    } else if let Some(rest) = after_eq.strip_prefix('\'') {
-        rest.split('\'').next().unwrap_or("")
-    } else {
-        // Bare value — take up to whitespace or comment
-        after_eq.split_whitespace().next().unwrap_or("")
-    };
-    if val.is_empty() {
-        return None;
-    }
-    Some(val.to_string())
 }
 
 // ---------------------------------------------------------------------------
