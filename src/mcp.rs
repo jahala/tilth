@@ -95,6 +95,7 @@ tilth_search: Search code — finds definitions, usages, and text. Replaces grep
 tilth_read: Read file content with smart outlining. Replaces cat/head/tail.\n\
   Small files → full content. Large files → structural outline.\n\
   section: \"<start>-<end>\" or \"<heading text>\"\n\
+  sections: array of ranges/headings — multiple slices from the same file in one call.\n\
   paths: read multiple files in one call.\n\
   Output:\n\
     <line_number> │ <content>                  ← full/section mode\n\
@@ -461,10 +462,37 @@ fn tool_read(
         .ok_or("missing required parameter: path (or use paths for batch read)")?;
     let path = PathBuf::from(path_str);
     let section = args.get("section").and_then(|v| v.as_str());
+    let sections_arr = args.get("sections").and_then(|v| v.as_array());
     let full = args
         .get("full")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
+
+    if section.is_some() && sections_arr.is_some() {
+        return Err("provide either section (single) or sections (array), not both".into());
+    }
+
+    // Multi-section path: bypass smart view + related-file hints (those only
+    // apply to whole-file reads).
+    if let Some(arr) = sections_arr {
+        let ranges: Vec<&str> = arr
+            .iter()
+            .map(|v| v.as_str().ok_or("sections must be an array of strings"))
+            .collect::<Result<Vec<_>, _>>()?;
+        if ranges.is_empty() {
+            return Err("sections must contain at least one range".into());
+        }
+        if ranges.len() > 20 {
+            return Err(format!(
+                "sections limited to 20 per call (got {})",
+                ranges.len()
+            ));
+        }
+        session.record_read(&path);
+        let output = crate::read::read_ranges(&path, &ranges, edit_mode)
+            .map_err(|e| e.to_string())?;
+        return Ok(apply_budget(output, budget));
+    }
 
     session.record_read(&path);
     let mut output = crate::read::read_file(&path, section, full, cache, edit_mode)
@@ -849,13 +877,15 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
          use this for all file reading. Output uses hashline format (line:hash|content) — \
          the line:hash anchors are required by tilth_edit. Small files return full hashlined content. \
          Large files return a structural outline (no hashlines); use `section` to get hashlined \
-         content for the lines you want to edit. Use `full` to force complete content. \
+         content for the lines you want to edit. Use `sections` to grab several disjoint slices \
+         from the same file in one call. Use `full` to force complete content. \
          Use `paths` to read multiple files in one call."
     } else {
         "Read a file with smart outlining. Replaces cat/head/tail and the host Read tool — \
          use this for all file reading. Small files return full content. Large files return \
          a structural outline (functions, classes, imports) so you see the shape without \
-         consuming your context window. Use `section` to read specific line ranges. \
+         consuming your context window. Use `section` to read a specific line range or heading. \
+         Use `sections` to grab several disjoint slices from the same file in one call. \
          Use `full` to force complete content. Use `paths` to read multiple files in one call."
     };
     let mut tools = vec![
@@ -917,7 +947,12 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     },
                     "section": {
                         "type": "string",
-                        "description": "Line range e.g. '45-89', or heading e.g. '## Architecture'. Bypasses smart view."
+                        "description": "Line range e.g. '45-89', or heading e.g. '## Architecture'. Bypasses smart view. Use `sections` for multiple ranges."
+                    },
+                    "sections": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Multiple ranges from the same file in one call. Each entry is a line range or heading. Emits each block in user-supplied order, separated by `─── lines X-Y ───` delimiters. Mutually exclusive with `section`. Capped at 20 ranges."
                     },
                     "full": {
                         "type": "boolean",

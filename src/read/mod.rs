@@ -1,6 +1,7 @@
 pub mod imports;
 pub mod outline;
 
+use std::fmt::Write;
 use std::fs;
 use std::path::Path;
 
@@ -70,7 +71,7 @@ pub fn read_file(
 
     // Section param → return those lines verbatim, any size
     if let Some(range) = section {
-        return read_section(path, range, edit_mode);
+        return read_ranges(path, &[range], edit_mode);
     }
 
     // Binary detection
@@ -354,22 +355,10 @@ fn collect_atx_headings(
     }
 }
 
-/// Read a specific line range from a file.
-/// Uses memchr to find the Nth newline offset and slice the mmap buffer directly
-/// instead of collecting all lines into a Vec.
-fn read_section(path: &Path, range: &str, edit_mode: bool) -> Result<String, TilthError> {
-    let file = fs::File::open(path).map_err(|e| TilthError::IoError {
-        path: path.to_path_buf(),
-        source: e,
-    })?;
-    let mmap = unsafe { Mmap::map(&file) }.map_err(|e| TilthError::IoError {
-        path: path.to_path_buf(),
-        source: e,
-    })?;
-    let buf = &mmap[..];
-
-    // Check if this is a heading-based address (markdown)
-    let (start, end) = if range.starts_with('#') {
+/// Resolve a single range string (line range like "45-89" or heading like
+/// "## Architecture") to a 1-indexed inclusive `(start, end)` pair.
+fn resolve_range(buf: &[u8], range: &str) -> Result<(usize, usize), TilthError> {
+    if range.starts_with('#') {
         resolve_heading(buf, range).ok_or_else(|| {
             let suggestions = suggest_headings(buf, range, 5);
             let reason = if suggestions.is_empty() {
@@ -384,48 +373,109 @@ fn read_section(path: &Path, range: &str, edit_mode: bool) -> Result<String, Til
                 query: range.to_string(),
                 reason,
             }
-        })?
+        })
     } else {
         parse_range(range).ok_or_else(|| TilthError::InvalidQuery {
             query: range.to_string(),
             reason: "expected format: \"start-end\" (e.g. \"45-89\") or heading (e.g. \"## Architecture\")".into(),
-        })?
-    };
+        })
+    }
+}
 
-    // Find line offsets using memchr — no full-file Vec<&str> allocation
+/// One resolved range, ready to format.
+struct Block {
+    start: usize, // 1-indexed inclusive
+    end: usize,   // 1-indexed inclusive (clamped to file length)
+    text: String,
+}
+
+/// Read one or more line ranges from a file. Each range is "start-end"
+/// (e.g. "45-89") or a heading anchor (e.g. "## Architecture") for
+/// markdown files. Mmaps the file once and emits a single `[section]`
+/// header followed by the formatted blocks; when more than one range is
+/// requested, each block is preceded by a `─── lines X-Y ───` delimiter.
+///
+/// Ranges are emitted in the order supplied — overlapping or out-of-order
+/// ranges are honored verbatim, not coalesced or sorted. Any invalid
+/// range fails the whole call.
+pub fn read_ranges(
+    path: &Path,
+    ranges: &[&str],
+    edit_mode: bool,
+) -> Result<String, TilthError> {
+    if ranges.is_empty() {
+        return Err(TilthError::InvalidQuery {
+            query: String::new(),
+            reason: "at least one range is required".into(),
+        });
+    }
+
+    let file = fs::File::open(path).map_err(|e| TilthError::IoError {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    let mmap = unsafe { Mmap::map(&file) }.map_err(|e| TilthError::IoError {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    let buf = &mmap[..];
+
+    // Find line offsets once — shared across all ranges.
     let mut line_offsets: Vec<usize> = vec![0];
     for pos in memchr::memchr_iter(b'\n', buf) {
         line_offsets.push(pos + 1);
     }
     let total = line_offsets.len();
 
-    let s = (start.saturating_sub(1)).min(total);
-    let e = end.min(total);
+    let mut blocks: Vec<Block> = Vec::with_capacity(ranges.len());
+    let mut total_bytes: u64 = 0;
+    let mut total_lines: u32 = 0;
 
-    if s >= e {
-        return Err(TilthError::InvalidQuery {
-            query: range.to_string(),
-            reason: format!("range out of bounds (file has {total} lines)"),
+    for range in ranges {
+        let (start, end) = resolve_range(buf, range)?;
+        let s = start.saturating_sub(1).min(total);
+        let e = end.min(total);
+        if s >= e {
+            return Err(TilthError::InvalidQuery {
+                query: (*range).to_string(),
+                reason: format!("range out of bounds (file has {total} lines)"),
+            });
+        }
+        let start_byte = line_offsets[s];
+        let end_byte = if e < line_offsets.len() {
+            line_offsets[e]
+        } else {
+            buf.len()
+        };
+        let selected = String::from_utf8_lossy(&buf[start_byte..end_byte]);
+        total_bytes += selected.len() as u64;
+        total_lines += (e - s) as u32;
+        let formatted = if edit_mode {
+            format::hashlines(&selected, start as u32)
+        } else {
+            format::number_lines(&selected, start as u32)
+        };
+        blocks.push(Block {
+            start,
+            end: e,
+            text: formatted,
         });
     }
 
-    let start_byte = line_offsets[s];
-    let end_byte = if e < line_offsets.len() {
-        line_offsets[e]
-    } else {
-        buf.len()
-    };
+    let header = format::file_header(path, total_bytes, total_lines, ViewMode::Section);
 
-    let selected = String::from_utf8_lossy(&buf[start_byte..end_byte]);
-    let byte_len = selected.len() as u64;
-    let line_count = (e - s) as u32;
-    let header = format::file_header(path, byte_len, line_count, ViewMode::Section);
-    let formatted = if edit_mode {
-        format::hashlines(&selected, start as u32)
-    } else {
-        format::number_lines(&selected, start as u32)
-    };
-    Ok(format!("{header}\n\n{formatted}"))
+    if blocks.len() == 1 {
+        let b = &blocks[0];
+        return Ok(format!("{header}\n\n{}", b.text));
+    }
+
+    let mut out = String::with_capacity(header.len() + total_bytes as usize + blocks.len() * 32);
+    out.push_str(&header);
+    for b in &blocks {
+        let _ = write!(out, "\n\n─── lines {}-{} ───\n", b.start, b.end);
+        out.push_str(&b.text);
+    }
+    Ok(out)
 }
 
 /// Parse "45-89" into (45, 89). 1-indexed.
@@ -746,5 +796,113 @@ mod tests {
         assert_eq!(edit_distance("🦀", "🐙"), 1);
         // ASCII baseline still works.
         assert_eq!(edit_distance("kitten", "sitting"), 3);
+    }
+
+    fn write_temp(name: &str, content: &str) -> std::path::PathBuf {
+        use std::io::Write;
+        let path = std::env::temp_dir().join(name);
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+        path
+    }
+
+    #[test]
+    fn read_ranges_single_matches_legacy_section() {
+        // One range produces no `─── lines X-Y ───` delimiter — output is
+        // identical in shape to the pre-multi-section read.
+        let path = write_temp(
+            "tilth_test_ranges_single.txt",
+            "alpha\nbeta\ngamma\ndelta\nepsilon\n",
+        );
+        let out = read_ranges(&path, &["2-3"], false).unwrap();
+        assert!(out.contains("[section]"), "expected section header: {out}");
+        assert!(!out.contains("─── lines"), "single range must not emit delimiter: {out}");
+        assert!(out.contains("2  beta"), "expected line 2: {out}");
+        assert!(out.contains("3  gamma"), "expected line 3: {out}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_ranges_disjoint_two_blocks() {
+        let path = write_temp(
+            "tilth_test_ranges_disjoint.txt",
+            "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n",
+        );
+        let out = read_ranges(&path, &["1-2", "6-7"], false).unwrap();
+        assert!(out.contains("─── lines 1-2 ───"), "first delimiter: {out}");
+        assert!(out.contains("─── lines 6-7 ───"), "second delimiter: {out}");
+        assert!(out.contains("1  l1") && out.contains("7  l7"), "content: {out}");
+        // Header reports summed lines — 2 + 2 = 4
+        assert!(out.contains("(4 lines"), "summed line_count: {out}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_ranges_preserves_user_order() {
+        // Out-of-order ranges are NOT sorted — emit verbatim.
+        let path = write_temp(
+            "tilth_test_ranges_order.txt",
+            "a\nb\nc\nd\ne\nf\n",
+        );
+        let out = read_ranges(&path, &["5-6", "1-2"], false).unwrap();
+        let later = out.find("─── lines 5-6 ───").unwrap();
+        let earlier = out.find("─── lines 1-2 ───").unwrap();
+        assert!(later < earlier, "5-6 must appear before 1-2 (user order): {out}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_ranges_overlap_is_emitted_verbatim() {
+        // Overlap is honored — duplicated content, no coalescing.
+        let path = write_temp(
+            "tilth_test_ranges_overlap.txt",
+            "x1\nx2\nx3\nx4\nx5\n",
+        );
+        let out = read_ranges(&path, &["1-3", "2-4"], false).unwrap();
+        assert!(out.contains("─── lines 1-3 ───"), "first block: {out}");
+        assert!(out.contains("─── lines 2-4 ───"), "second block: {out}");
+        // line 2 ("x2") appears in both blocks
+        let occurrences = out.matches("  x2\n").count();
+        assert_eq!(occurrences, 2, "expected x2 to appear twice (overlap): {out}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_ranges_mixed_line_and_heading() {
+        let path = write_temp(
+            "tilth_test_ranges_mixed.md",
+            "# Top\nintro line\n## Foo\nfoo body\n## Bar\nbar body\n",
+        );
+        let out = read_ranges(&path, &["1-2", "## Bar"], false).unwrap();
+        assert!(out.contains("─── lines 1-2 ───"), "line-range delimiter: {out}");
+        // "## Bar" lives at lines 5-6 in this fixture
+        assert!(out.contains("─── lines 5-6 ───"), "heading-resolved delimiter: {out}");
+        assert!(out.contains("intro line") && out.contains("bar body"), "content: {out}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_ranges_invalid_second_range_fails_whole_call() {
+        let path = write_temp(
+            "tilth_test_ranges_invalid.txt",
+            "one\ntwo\nthree\n",
+        );
+        let err = read_ranges(&path, &["1-2", "not-a-range"], false).unwrap_err();
+        assert!(
+            matches!(err, TilthError::InvalidQuery { .. }),
+            "expected InvalidQuery, got: {err:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_ranges_empty_input_errors() {
+        let path = write_temp("tilth_test_ranges_empty.txt", "a\nb\n");
+        let err = read_ranges(&path, &[], false).unwrap_err();
+        assert!(
+            matches!(err, TilthError::InvalidQuery { .. }),
+            "expected InvalidQuery for empty input, got: {err:?}"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }
