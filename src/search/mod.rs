@@ -11,6 +11,10 @@ pub mod strip;
 pub mod symbol;
 pub mod truncate;
 
+mod bloom_walk;
+mod callee_query;
+pub mod scope;
+
 use std::collections::HashSet;
 use std::fmt::Write;
 use std::fs;
@@ -1274,8 +1278,8 @@ fn enclosing_scope_label(
 ) -> Option<String> {
     match crate::lang::detect_file_type(path) {
         FileType::Code(_) => {
-            let scope = callers::enclosing_definition_at(path, match_line, cache)?;
-            Some(format!("{} {}", scope.kind, scope.name))
+            let s = scope::enclosing_definition_at(path, match_line, cache)?;
+            Some(format!("{} {}", s.kind, s.name))
         }
         FileType::Markdown => markdown_enclosing_scope(path, match_line),
         _ => None,
