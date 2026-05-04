@@ -905,4 +905,29 @@ mod tests {
         );
         let _ = std::fs::remove_file(&path);
     }
+
+    #[test]
+    fn read_ranges_edit_mode_emits_hashlines_per_block() {
+        // Edit-mode output must be hashlined inside every block, not just the first.
+        // Hashline format is `<line>:<3hex>|<content>`.
+        let path = write_temp(
+            "tilth_test_ranges_edit_mode.txt",
+            "alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\n",
+        );
+        let out = read_ranges(&path, &["1-2", "5-6"], true).unwrap();
+        // Both delimiters present
+        assert!(out.contains("─── lines 1-2 ───"), "first delimiter: {out}");
+        assert!(out.contains("─── lines 5-6 ───"), "second delimiter: {out}");
+        // Hashline anchors present for at least one line in each block (the
+        // exact hash depends on FNV-1a so just check the `<n>:<hex>|` shape).
+        let line_one_match = out
+            .lines()
+            .any(|l| l.starts_with("1:") && l.contains("|alpha"));
+        let line_six_match = out
+            .lines()
+            .any(|l| l.starts_with("6:") && l.contains("|zeta"));
+        assert!(line_one_match, "expected hashline for line 1: {out}");
+        assert!(line_six_match, "expected hashline for line 6: {out}");
+        let _ = std::fs::remove_file(&path);
+    }
 }
