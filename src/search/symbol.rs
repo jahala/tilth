@@ -619,6 +619,45 @@ pub(crate) fn dispatch_tool(tool: &str) -> Result<String, String> {
         assert!(!defs.is_empty(), "should find 'dispatch_tool' definition");
     }
 
+    #[test]
+    fn typescript_export_const_detected_as_definition() {
+        let code = r#"export const UNTAGGED_REQUESTS_SQL = `SELECT foo FROM bar`;
+
+export const anotherConst = 42;
+
+const unexported = "hello";
+"#;
+        let ts_lang =
+            crate::lang::outline::outline_language(crate::types::Lang::TypeScript).unwrap();
+        let lines = code.lines().count() as u32;
+
+        let defs = find_defs_treesitter(
+            std::path::Path::new("test.ts"),
+            "UNTAGGED_REQUESTS_SQL",
+            &ts_lang,
+            Some(crate::types::Lang::TypeScript),
+            code,
+            lines,
+            SystemTime::now(),
+        );
+        assert!(!defs.is_empty(), "should find 'UNTAGGED_REQUESTS_SQL' definition");
+        assert!(defs[0].is_definition);
+        assert!(defs[0].def_range.is_some());
+
+        // Non-exported const also detected
+        let defs = find_defs_treesitter(
+            std::path::Path::new("test.ts"),
+            "unexported",
+            &ts_lang,
+            Some(crate::types::Lang::TypeScript),
+            code,
+            lines,
+            SystemTime::now(),
+        );
+        assert!(!defs.is_empty(), "should find 'unexported' definition");
+        assert!(defs[0].is_definition);
+    }
+
     /// Helper: search for an Elixir definition by name in a code snippet.
     fn elixir_find(code: &str, name: &str) -> Vec<Match> {
         let ts_lang = crate::lang::outline::outline_language(crate::types::Lang::Elixir).unwrap();
