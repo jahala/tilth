@@ -57,11 +57,7 @@ fn walk(
 
 /// If `section` opens with an `atx_heading` or `setext_heading`, append an
 /// entry of the form `[start-end] {indent}{hashes} {text}` to `entries`.
-fn emit_section_heading(
-    section: tree_sitter::Node,
-    lines: &[&str],
-    entries: &mut Vec<String>,
-) {
+fn emit_section_heading(section: tree_sitter::Node, lines: &[&str], entries: &mut Vec<String>) {
     let mut cursor = section.walk();
     for inner in section.children(&mut cursor) {
         // Only ATX headings nest as proper sections in the block grammar;

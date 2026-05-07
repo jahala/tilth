@@ -341,12 +341,7 @@ fn collect_atx_headings(
                 }
                 let dist = edit_distance(q_lower, &h_clean.to_ascii_lowercase());
                 let row = child.start_position().row;
-                let line_text = lines
-                    .get(row)
-                    .copied()
-                    .unwrap_or("")
-                    .trim_end()
-                    .to_string();
+                let line_text = lines.get(row).copied().unwrap_or("").trim_end().to_string();
                 out.push((dist, line_text));
             }
             "fenced_code_block" | "indented_code_block" | "html_block" => {}
@@ -398,11 +393,7 @@ struct Block {
 /// Ranges are emitted in the order supplied — overlapping or out-of-order
 /// ranges are honored verbatim, not coalesced or sorted. Any invalid
 /// range fails the whole call.
-pub fn read_ranges(
-    path: &Path,
-    ranges: &[&str],
-    edit_mode: bool,
-) -> Result<String, TilthError> {
+pub fn read_ranges(path: &Path, ranges: &[&str], edit_mode: bool) -> Result<String, TilthError> {
     if ranges.is_empty() {
         return Err(TilthError::InvalidQuery {
             query: String::new(),
@@ -816,7 +807,10 @@ mod tests {
         );
         let out = read_ranges(&path, &["2-3"], false).unwrap();
         assert!(out.contains("[section]"), "expected section header: {out}");
-        assert!(!out.contains("─── lines"), "single range must not emit delimiter: {out}");
+        assert!(
+            !out.contains("─── lines"),
+            "single range must not emit delimiter: {out}"
+        );
         assert!(out.contains("2  beta"), "expected line 2: {out}");
         assert!(out.contains("3  gamma"), "expected line 3: {out}");
         let _ = std::fs::remove_file(&path);
@@ -831,7 +825,10 @@ mod tests {
         let out = read_ranges(&path, &["1-2", "6-7"], false).unwrap();
         assert!(out.contains("─── lines 1-2 ───"), "first delimiter: {out}");
         assert!(out.contains("─── lines 6-7 ───"), "second delimiter: {out}");
-        assert!(out.contains("1  l1") && out.contains("7  l7"), "content: {out}");
+        assert!(
+            out.contains("1  l1") && out.contains("7  l7"),
+            "content: {out}"
+        );
         // Header reports summed lines — 2 + 2 = 4
         assert!(out.contains("(4 lines"), "summed line_count: {out}");
         let _ = std::fs::remove_file(&path);
@@ -840,30 +837,30 @@ mod tests {
     #[test]
     fn read_ranges_preserves_user_order() {
         // Out-of-order ranges are NOT sorted — emit verbatim.
-        let path = write_temp(
-            "tilth_test_ranges_order.txt",
-            "a\nb\nc\nd\ne\nf\n",
-        );
+        let path = write_temp("tilth_test_ranges_order.txt", "a\nb\nc\nd\ne\nf\n");
         let out = read_ranges(&path, &["5-6", "1-2"], false).unwrap();
         let later = out.find("─── lines 5-6 ───").unwrap();
         let earlier = out.find("─── lines 1-2 ───").unwrap();
-        assert!(later < earlier, "5-6 must appear before 1-2 (user order): {out}");
+        assert!(
+            later < earlier,
+            "5-6 must appear before 1-2 (user order): {out}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn read_ranges_overlap_is_emitted_verbatim() {
         // Overlap is honored — duplicated content, no coalescing.
-        let path = write_temp(
-            "tilth_test_ranges_overlap.txt",
-            "x1\nx2\nx3\nx4\nx5\n",
-        );
+        let path = write_temp("tilth_test_ranges_overlap.txt", "x1\nx2\nx3\nx4\nx5\n");
         let out = read_ranges(&path, &["1-3", "2-4"], false).unwrap();
         assert!(out.contains("─── lines 1-3 ───"), "first block: {out}");
         assert!(out.contains("─── lines 2-4 ───"), "second block: {out}");
         // line 2 ("x2") appears in both blocks
         let occurrences = out.matches("  x2\n").count();
-        assert_eq!(occurrences, 2, "expected x2 to appear twice (overlap): {out}");
+        assert_eq!(
+            occurrences, 2,
+            "expected x2 to appear twice (overlap): {out}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -874,19 +871,25 @@ mod tests {
             "# Top\nintro line\n## Foo\nfoo body\n## Bar\nbar body\n",
         );
         let out = read_ranges(&path, &["1-2", "## Bar"], false).unwrap();
-        assert!(out.contains("─── lines 1-2 ───"), "line-range delimiter: {out}");
+        assert!(
+            out.contains("─── lines 1-2 ───"),
+            "line-range delimiter: {out}"
+        );
         // "## Bar" lives at lines 5-6 in this fixture
-        assert!(out.contains("─── lines 5-6 ───"), "heading-resolved delimiter: {out}");
-        assert!(out.contains("intro line") && out.contains("bar body"), "content: {out}");
+        assert!(
+            out.contains("─── lines 5-6 ───"),
+            "heading-resolved delimiter: {out}"
+        );
+        assert!(
+            out.contains("intro line") && out.contains("bar body"),
+            "content: {out}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn read_ranges_invalid_second_range_fails_whole_call() {
-        let path = write_temp(
-            "tilth_test_ranges_invalid.txt",
-            "one\ntwo\nthree\n",
-        );
+        let path = write_temp("tilth_test_ranges_invalid.txt", "one\ntwo\nthree\n");
         let err = read_ranges(&path, &["1-2", "not-a-range"], false).unwrap_err();
         assert!(
             matches!(err, TilthError::InvalidQuery { .. }),

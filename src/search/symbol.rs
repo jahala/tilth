@@ -27,15 +27,13 @@ const EARLY_QUIT_THRESHOLD_DEFINITIONS: usize = 50;
 const EARLY_QUIT_THRESHOLD_USAGES: usize = MAX_MATCHES * 3;
 
 /// Display-side stratum: 0 = code def, 1 = doc-heading def, 2 = usage. Used
-/// as a stable sort key after `rank::sort` so the MAX_MATCHES cap can't drop
+/// as a stable sort key after `rank::sort` so the `MAX_MATCHES` cap can't drop
 /// real code defs in favor of markdown-heading defs of the same query.
 fn stratum_for_display(m: &Match) -> u8 {
-    if !m.is_definition {
-        2
-    } else if m.def_weight >= 60 {
-        0
+    if m.is_definition {
+        u8::from(m.def_weight < 60)
     } else {
-        1
+        2
     }
 }
 
@@ -1145,7 +1143,10 @@ end
     fn markdown_heading_with_trailing_hashes_matches() {
         // ATX allows optional trailing `#`s — strip them before matching.
         assert_eq!(md_find("## parseCitations ##\n", "parseCitations").len(), 1);
-        assert_eq!(md_find("### parseCitations ###\n", "parseCitations").len(), 1);
+        assert_eq!(
+            md_find("### parseCitations ###\n", "parseCitations").len(),
+            1
+        );
     }
 
     #[test]
@@ -1263,11 +1264,11 @@ Body to end.
 
         // Pre-cap order (after rank::sort): doc def, code def, doc def, code def, usage.
         let mut matches = vec![
-            mk(1, 30, true),  // doc def — high relevance
-            mk(2, 70, true),  // code def
-            mk(3, 30, true),  // doc def
-            mk(4, 70, true),  // code def
-            mk(5, 0, false),  // usage
+            mk(1, 30, true), // doc def — high relevance
+            mk(2, 70, true), // code def
+            mk(3, 30, true), // doc def
+            mk(4, 70, true), // code def
+            mk(5, 0, false), // usage
         ];
         matches.sort_by_key(stratum_for_display);
 

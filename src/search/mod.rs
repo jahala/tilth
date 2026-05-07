@@ -333,10 +333,7 @@ fn count_label(shown: usize, total: usize) -> String {
 fn write_hidden_tail(out: &mut String, shown: usize, total: usize, kind: &str) {
     if shown < total {
         let hidden = total - shown;
-        let _ = write!(
-            out,
-            "\n\n... and {hidden} more {kind}. Narrow with scope."
-        );
+        let _ = write!(out, "\n\n... and {hidden} more {kind}. Narrow with scope.");
     }
 }
 
@@ -1851,24 +1848,15 @@ mod tests {
     fn write_hidden_tail_emits_only_when_truncated() {
         let mut out = String::new();
         write_hidden_tail(&mut out, 3, 3, "definitions");
-        assert!(
-            out.is_empty(),
-            "no truncation → no tail line, got {out:?}"
-        );
+        assert!(out.is_empty(), "no truncation → no tail line, got {out:?}");
 
         let mut out = String::new();
         write_hidden_tail(&mut out, 10, 14, "definitions");
-        assert_eq!(
-            out,
-            "\n\n... and 4 more definitions. Narrow with scope."
-        );
+        assert_eq!(out, "\n\n... and 4 more definitions. Narrow with scope.");
 
         let mut out = String::new();
         write_hidden_tail(&mut out, 3, 27, "usages");
-        assert_eq!(
-            out,
-            "\n\n... and 24 more usages. Narrow with scope."
-        );
+        assert_eq!(out, "\n\n... and 24 more usages. Narrow with scope.");
     }
 
     #[test]
