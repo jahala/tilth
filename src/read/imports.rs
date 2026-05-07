@@ -111,7 +111,7 @@ fn normalize_path(path: &Path) -> PathBuf {
             Component::ParentDir => {
                 let pop_ok = matches!(
                     out.components().next_back(),
-                    Some(Component::Normal(_)) | Some(Component::Prefix(_))
+                    Some(Component::Normal(_) | Component::Prefix(_))
                 );
                 if pop_ok {
                     out.pop();
@@ -274,16 +274,10 @@ mod tests {
         fs::create_dir_all(root.join("temporal/utils")).unwrap();
         fs::write(root.join("temporal/utils/activityProxies.ts"), "").unwrap();
 
-        let resolved = resolve_js(
-            &root.join("temporal/workflows"),
-            "../utils/activityProxies",
-        )
-        .expect("should resolve");
+        let resolved = resolve_js(&root.join("temporal/workflows"), "../utils/activityProxies")
+            .expect("should resolve");
         let normalized = normalize_path(&resolved);
-        assert_eq!(
-            normalized,
-            root.join("temporal/utils/activityProxies.ts")
-        );
+        assert_eq!(normalized, root.join("temporal/utils/activityProxies.ts"));
         // No "../" component should survive normalization.
         assert!(
             !normalized

@@ -393,12 +393,7 @@ pub(crate) fn dispatch_tool(
     let edit_mode = services.edit_mode();
     match tool {
         "tilth_read" => tool_read(args, services.cache(), services.session(), edit_mode),
-        "tilth_search" => tool_search(
-            args,
-            services.cache(),
-            services.session(),
-            services.bloom(),
-        ),
+        "tilth_search" => tool_search(args, services.cache(), services.session(), services.bloom()),
         "tilth_files" => tool_files(args, services.cache()),
         "tilth_deps" => tool_deps(args, services.cache(), services.bloom()),
         "tilth_diff" => tool_diff(args),

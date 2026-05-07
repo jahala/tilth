@@ -640,7 +640,10 @@ const unexported = "hello";
             lines,
             SystemTime::now(),
         );
-        assert!(!defs.is_empty(), "should find 'UNTAGGED_REQUESTS_SQL' definition");
+        assert!(
+            !defs.is_empty(),
+            "should find 'UNTAGGED_REQUESTS_SQL' definition"
+        );
         assert!(defs[0].is_definition);
         assert!(defs[0].def_range.is_some());
 
