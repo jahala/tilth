@@ -1799,6 +1799,51 @@ mod tests {
         assert_eq!(label, "§Outer");
     }
 
+    /// CommonMark §4.6.1 caps ATX headings at 6 leading `#`s. 7+ hashes is
+    /// raw text, not a heading, and must not surface as the enclosing scope.
+    /// Pre-AST migration the regex matched `#######` and produced a bogus
+    /// `§# Fake Heading 7` label.
+    #[test]
+    fn markdown_scope_rejects_seven_hash_atx_heading() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("a.md");
+        std::fs::write(
+            &p,
+            "## Real Heading\n\nbody line\n\n####### Fake Heading 7\n\ntrailing line\n",
+        )
+        .unwrap();
+        // Line 5 is the 7-hash line; line 7 is the line after.
+        // Both should resolve to the only real heading, "Real Heading".
+        assert_eq!(
+            markdown_enclosing_scope(&p, 5),
+            Some("§Real Heading".to_string())
+        );
+        assert_eq!(
+            markdown_enclosing_scope(&p, 7),
+            Some("§Real Heading".to_string())
+        );
+    }
+
+    /// CommonMark §4.6.1 requires whitespace after the leading `#`s. `##NoSpace`
+    /// is paragraph text, not a heading. Pre-AST migration the regex accepted
+    /// it and produced `§NoSpace`.
+    #[test]
+    fn markdown_scope_rejects_no_space_atx_heading() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("a.md");
+        std::fs::write(&p, "## Real Heading\n\n##NoSpace\n\ntrailing line\n").unwrap();
+        // Line 3 is the no-space candidate; both line 3 and line 5 must
+        // resolve to the only real heading.
+        assert_eq!(
+            markdown_enclosing_scope(&p, 3),
+            Some("§Real Heading".to_string())
+        );
+        assert_eq!(
+            markdown_enclosing_scope(&p, 5),
+            Some("§Real Heading".to_string())
+        );
+    }
+
     #[test]
     fn format_single_match_renders_usage_scope_suffix() {
         use crate::types::Match;
