@@ -18,7 +18,7 @@ DO NOT re-read files whose content is already shown in expanded search results.
 tilth <path>                      # smart view: full if small, outline if large
 tilth <path> --section 45-89      # exact line range
 tilth <path> --section "## Foo"   # markdown heading (suggests fuzzy matches on miss)
-tilth <path> --full               # force full content
+tilth <path> --full               # force full content (file paths)
 ```
 
 Outline format: `[<start>-<end>]  <symbol>`. Full/section format: `<line> │ <content>`. Binary files print `[skipped]`; lockfiles, minified bundles, generated code print `[generated]`.
@@ -30,11 +30,19 @@ tilth <symbol> --scope <dir>                # definitions + usages
 tilth "Foo,Bar,Baz" --scope <dir>           # multi-symbol (max 5)
 tilth <symbol> --expand                     # inline source for top 2 matches
 tilth <symbol> --expand=5                   # inline source for top 5
+tilth <symbol> --full                       # expand every match (capped at 50)
 tilth <symbol> --callers --scope <dir>      # call sites (structural, not text)
 tilth "TODO: fix" --scope <dir>             # content search (literal text)
 tilth "/regex/" --scope <dir>               # regex search
 tilth <symbol> --glob "*.rs" --scope <dir>  # file pattern filter
 ```
+
+`--full` semantics depend on query type:
+- File path → return whole file (bypass smart-view outline).
+- Symbol / text / regex → expand every match (capped at 50). Explicit `--expand=N` wins.
+- Glob → no-op.
+
+Symbol search also surfaces **markdown headings as soft definitions** — `tilth StreamingResponse --scope docs/` finds `## StreamingResponse` headings ranked between code defs (60-80) and usages (0). Section body inlines automatically in the default preview (capped at 40 lines; pass `--expand` for the rest).
 
 Output per match:
 ```
