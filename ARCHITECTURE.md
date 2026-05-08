@@ -1,44 +1,18 @@
 # Tilth — architectural review
 
 This document walks a reader unfamiliar with the source through tilth's
-subsystems, data flow, key types, and extension points. It is written
-against the `choongng/tilth@dev` fork at commit `cb2d875` (30 commits
-ahead of `origin/main`, which itself tracks upstream `jahala/tilth` at
-v0.7.0). Where the fork has diverged from upstream architecturally, that
-is called out inline; the [Fork delta](#fork-delta) section tabulates
-every fork commit.
+subsystems, data flow, key types, and extension points. The intent is
+to capture the *durable* shape — the type alphabet, dispatch flow, and
+extension seams — not file sizes or specific commits, which decay
+faster than they can be re-checked.
 
 Tilth is a single Rust binary that exposes two surfaces: a CLI
 (`tilth`) and an MCP server (`tilth --mcp`). Both speak to the same
 core: a query classifier, a tree-sitter-driven search engine, a smart
 file reader, and supporting subsystems for diff, edit, blast-radius
-analysis, and codebase mapping. The whole project is ~22.1k lines of
-Rust across 47 files in `src/` (about a quarter of which is in-source
-`#[cfg(test)]` modules), plus a Cargo workspace, an `install.rs` that
-writes MCP-host configs, and a benchmark harness.
-
-## Reading order
-
-Read in this order to learn the codebase from scratch:
-
-1. `src/types.rs` (~195 lines) — the type alphabet. `QueryType`, `Lang`,
-   `FileType`, `ViewMode`, `Match`, `SearchResult`, `FacetTotals`,
-   `OutlineEntry`, `OutlineKind`. Every other module speaks in these.
-2. `src/lib.rs` (~400 lines) — the public API. Five entry points
-   (`run`, `run_full`, `run_expanded`, `run_callers`, `run_deps`),
-   one shared dispatcher (`run_inner`), and the cascade helpers
-   `single_query_search` / `multi_word_concept_search`.
-3. `src/classify.rs` (~370 lines, but ~140 of those are tests) —
-   query string → `QueryType` by byte-pattern matching, in priority
-   order.
-4. `src/main.rs` and `src/mcp.rs` — the two surfaces. Read `main.rs`
-   first to see the clap shape; `mcp.rs` is the larger one but follows
-   the same dispatch logic in JSON-RPC clothing.
-5. `src/search/mod.rs` and `src/search/symbol.rs` — the search
-   subsystem's spine. Then the rest of `src/search/` opportunistically.
-6. `src/read/mod.rs` and `src/read/outline/` — the read subsystem.
-7. Subsystems in any order: `src/lang/`, `src/index/`, `src/diff/`,
-   `src/edit.rs`, `src/overview.rs`, `src/map.rs`, `src/install.rs`.
+analysis, and codebase mapping. There's also a Cargo workspace, an
+`install.rs` that writes MCP-host configs, a benchmark harness, and an
+npm wrapper that fetches a prebuilt binary on `npm install`.
 
 The single most useful function for orienting yourself is
 `lib.rs::run_inner` — every search query funnels through it.
@@ -68,7 +42,7 @@ src/
 ├── install.rs       Writes MCP server entries into ~20 host configs
 ├── edit.rs          Hash-anchored line edits + EditResult diff preview
 │
-├── search/          Search engine (~8000 lines, 13 files)
+├── search/          Search engine
 │   ├── mod.rs           Walker, ignore policy, formatter, dispatch
 │   ├── symbol.rs        Tree-sitter definition detection per language;
 │   │                    markdown-heading defs; usage matching
@@ -86,11 +60,20 @@ src/
 │   ├── callees.rs       Resolve function calls inside a definition
 │   ├── deps.rs          Blast-radius analysis (`tilth_deps`)
 │   ├── glob.rs          Glob query → file list (`tilth_files`)
-│   └── blast.rs         Symbol-level blast radius
+│   ├── blast.rs         Symbol-level blast radius
+│   ├── bloom_walk.rs    Shared walker preamble (size gating, mtime,
+│   │                    bloom filter) factored out of callers/callees
+│   ├── callee_query.rs  Cached tree-sitter `Query` objects for callee
+│   │                    extraction across languages
+│   └── scope.rs         `enclosing_definition_at` — walks up the AST
+│                        from a match to find the enclosing function /
+│                        type, used by both `callers` annotation and
+│                        the search-time `[in foo]` suffix
 │
-├── read/            Read engine (~2000 lines, 9 files)
-│   ├── mod.rs           read_file decision tree, section reader,
-│   │                    heading resolver, suggestion fallback
+├── read/            Read engine
+│   ├── mod.rs           read_file decision tree, multi-section reader
+│   │                    (`read_ranges`), heading resolver, suggestion
+│   │                    fallback
 │   ├── imports.rs       Resolve "Related: file1, file2" hints
 │   └── outline/
 │       ├── mod.rs       Dispatch by FileType
@@ -106,7 +89,7 @@ src/
 │   ├── detection.rs     Binary / generated / minified detection
 │   ├── treesitter.rs    DEFINITION_KINDS, extract_definition_name
 │   └── outline.rs       outline_language(Lang) → tree_sitter::Language;
-│                        node_to_entry walker (~945 lines);
+│                        node_to_entry walker (the bulk of this file);
 │                        parse_markdown / heading_level / heading_text
 │                        helpers shared by markdown outline + search defs
 │
@@ -115,7 +98,7 @@ src/
 │   └── bloom.rs         Per-file Bloom filter for fast "does X contain Y?"
 │                        (BloomFilterCache wraps the per-file filters)
 │
-└── diff/            Structural diff (~4000 lines, 5 files)
+└── diff/            Structural diff
     ├── mod.rs           DiffSource resolution; diff() pipeline orchestrator
     ├── parse.rs         Parse unified diff text → FileDiff structs
     ├── overlay.rs       FileDiff + on-disk source → structural FileOverlay
@@ -152,16 +135,15 @@ verbatim to stdout. JSON output (`--json`) emits a serde-serialized
 `SearchResult`; otherwise the human-readable formatter wins.
 
 `main.rs` also handles two operational concerns the MCP path doesn't
-touch: it detects terminal height via `TIOCGWINSZ` (fork commit
-`4fa6832` replaced a stale 24-row fallback) and writes shell completions
-(`--completions <shell>`) using `clap_complete`.
+touch: it detects terminal height via `TIOCGWINSZ` (so paging respects
+the actual terminal, not a stale 24-row fallback) and writes shell
+completions (`--completions <shell>`) using `clap_complete`.
 
 ### MCP server (`src/mcp.rs`)
 
 Invoked as `tilth --mcp` (or `tilth --mcp --edit` for edit mode). The
 binary becomes a JSON-RPC server speaking newline-delimited messages
-over stdio. The body is a hand-rolled loop, not a framework — about 1300
-lines total.
+over stdio. The body is a hand-rolled loop, not a framework.
 
 Startup (`mcp::run`) resolves a project root in priority order:
 explicit `--scope` argument > MCP `roots/list` response > nearest
@@ -326,8 +308,10 @@ checked when the shape suggests a file").
 
 ## Search subsystem (`src/search/`)
 
-The search subsystem is the largest area of code and the thing most fork
-work has touched. Roughly 7900 lines across 13 files.
+The search subsystem is the largest area of code. The walker preamble
+(size gating + mtime + bloom filter) is factored into `bloom_walk.rs`
+so all relational paths share it; AST-scope walking is in `scope.rs`;
+cached tree-sitter `Query` objects live in `callee_query.rs`.
 
 ### Walker and ignore policy (`mod.rs`)
 
@@ -359,9 +343,7 @@ gitignore-style with whitelist, negation (`!`), and brace expansion.
 
 ### Symbol search (`symbol.rs`)
 
-The biggest production-only file in the subsystem (~1290 lines; only
-`mod.rs` is larger overall, and most of that is in-source tests). Three
-layers stacked:
+The biggest production-only file in the subsystem. Three layers stacked:
 
 1. **`search()`** — top-level entry. Walks files via `walker`, parses
    each via `OutlineCache::get_or_parse` (cap: 500 KB), dispatches to
@@ -384,11 +366,10 @@ layers stacked:
      position; trailing blank lines are trimmed.
 3. **Usage matching** (`find_usages`) — line-level identifier
    matching, with word-boundary checks to avoid substring false hits.
-   Each usage is annotated with its enclosing definition (fork commit
-   `7cad3f1`, `walk_to_enclosing_definition`). When fork commit
-   `c8ae866` lands the `stratum_for_display` sort, the renderer shows
-   real code defs (weight ≥60) ahead of doc-heading defs (weight 30)
-   when the display cap is binding.
+   Each usage is annotated with its enclosing definition via
+   `scope::walk_to_enclosing_definition`. The `stratum_for_display`
+   sort key in `symbol.rs` ensures real code defs (weight ≥60) outrank
+   doc-heading defs (weight 30) when the display cap is binding.
 
 Both markdown paths (`read/outline/markdown.rs` for outlines and
 `find_defs_markdown_buf` for search defs) share the same parser and
@@ -436,13 +417,13 @@ using 11 boosts/penalties:
 definition (`lang::package_root`). The faceted output shows facet
 headers and per-facet limits.
 
-`truncate.rs` enforces those limits. Two recent fork changes shape what
-the user sees:
+`truncate.rs` enforces those limits. Two display behaviors worth knowing:
 
-- `ac21c9b` adds `FacetTotals` to `SearchResult` so the renderer can
-  print `displayed/total` headers (`Definitions (10/24)`).
-- `cc1525a` adds the per-facet hidden-count tail
-  (`... and 14 more definitions. Narrow with scope.`).
+- `FacetTotals` on `SearchResult` lets the renderer print
+  `displayed/total` headers (`Definitions (10/24)`).
+- Per-facet hidden-count tails appear under each facet
+  (`... and 14 more definitions. Narrow with scope.`); the global
+  "more matches" tail is suppressed when faceting is active.
 
 `strip.rs` ("cognitive load stripping") prunes line-level noise from
 expanded source bodies — logging statements, redundant comments,
@@ -455,35 +436,34 @@ Java/Kotlin/C#, C/C++).
 These produce derived views from the same walker + tree-sitter
 machinery:
 
-- **Callers** (`callers.rs`, ~900 lines). `find_callers_batch` is the
-  single tree-sitter walk that resolves call sites for any number of
-  target symbols (1 to N) — `search_callers_expanded` calls it with a
+- **Callers** (`callers.rs`). `find_callers_batch` is the single
+  tree-sitter walk that resolves call sites for any number of target
+  symbols (1 to N) — `search_callers_expanded` calls it with a
   one-element set, the deps / blast / 2nd-hop paths call it with the
-  full set. Each caller is annotated with its `EnclosingScope` (fork
-  commit `7cad3f1`) so the user sees `[usage in function foo]` instead
-  of just a line number. When the walk returns empty, a small
-  `target_seen_in_scope` helper does an mmap-based literal scan so
-  `no_callers_message` can distinguish typo from "real symbol with no
-  direct callers" (indirect dispatch, dead code, framework
-  registration). The "no callers found, here are similar names" output
-  is fork-side polish (see Session 51).
+  full set. Each caller is annotated with its enclosing scope via
+  `scope::walk_to_enclosing_definition` so the user sees
+  `[caller: foo]` instead of just a line number. When the walk returns
+  empty, a small `target_seen_in_scope` helper does an mmap-based
+  literal scan so `no_callers_message` can distinguish typo from
+  "real symbol with no direct callers" (indirect dispatch, dead code,
+  framework registration).
 - **Callees** (`callees.rs`) — resolve outgoing calls inside a
   definition body. Drives the `── calls ──` footer under each
-  expanded match.
+  expanded match. Cached `Query` compilation lives in
+  `callee_query.rs`.
 - **Siblings** (`siblings.rs`) — extract the surrounding outline
   context (the entries immediately before and after the matched
   definition). Compiles tree-sitter `Query` objects lazily and caches
   them in a process-wide `LazyLock<Mutex<HashMap>>`. The cache key
   uses the query string's pointer address (`&'static str`) so distinct
   queries against the same language stay separated.
-- **Deps** (`deps.rs`, ~580 lines) — `analyze_deps` is what
-  `tilth_deps` runs. Returns a `DepsResult` with `Uses` (local +
-  external) and `Used by`. `format_deps` does the human output. The
-  external-dep stdlib heuristic (`is_stdlib`) per-language; module-path
-  validation (`is_valid_module_path`) avoids treating relative paths as
-  packages.
-- **Blast** (`blast.rs`, ~290 lines) — symbol-level blast radius for
-  diff workflows; called by `tilth_diff --blast`.
+- **Deps** (`deps.rs`) — `analyze_deps` is what `tilth_deps` runs.
+  Returns a `DepsResult` with `Uses` (local + external) and `Used by`.
+  `format_deps` does the human output. The external-dep stdlib
+  heuristic (`is_stdlib`) is per-language; module-path validation
+  (`is_valid_module_path`) avoids treating relative paths as packages.
+- **Blast** (`blast.rs`) — symbol-level blast radius for diff
+  workflows; called by `tilth_diff --blast`.
 
 ### Glob (`glob.rs`)
 
@@ -502,12 +482,16 @@ gateway. The decision tree, in order:
    (Levenshtein on directory siblings).
 2. **Directory** → `list_directory` (sorted entries, file types).
 3. **Empty file** → header with `ViewMode::Empty`.
-4. **`section: Some(...)`** → `read_section`. Either a line range
-   (`"45-89"`) or a heading address (`"## Architecture"`, resolved by
-   `resolve_heading`'s walk over tree-sitter-md `section` nodes — the
-   same parser the search-side `find_defs_markdown_buf` uses, so
-   fenced and indented code blocks never surface as headings). Returns
-   the verbatim slice regardless of file size.
+4. **`section: Some(...)` or `sections: [...]`** → `read_ranges`.
+   Each range is either a line range (`"45-89"`) or a heading address
+   (`"## Architecture"`, resolved by `resolve_heading`'s walk over
+   tree-sitter-md `section` nodes — the same parser the search-side
+   `find_defs_markdown_buf` uses, so fenced and indented code blocks
+   never surface as headings). Single-section reads stay
+   shape-identical (no delimiter); multiple ranges share one `[section]`
+   header followed by per-block `─── lines X-Y ───` delimiters and are
+   emitted in user-supplied order — overlap is honored verbatim, no
+   coalescing. Returns the verbatim slice regardless of file size.
 5. **mmap + binary check** — `is_binary` looks for null bytes in the
    first 512 bytes via `memchr`. Binary files emit just a header.
 6. **Generated** — by name (`Cargo.lock`, `package-lock.json`, etc.) or
@@ -687,8 +671,7 @@ and emits a structural change list per commit.
 
 ### Edit (`src/edit.rs`)
 
-Hash-anchored line edits. The implementation is ~300 lines of code
-(plus ~360 lines of tests). The `Edit` struct carries a start line
+Hash-anchored line edits. The `Edit` struct carries a start line
 and hash (`<line>:<hash>`), an end line and hash (equal to the start
 for single-line edits — the MCP `tool_edit` parser fills these in
 when the JSON payload omits `end`), and a content string (empty =
@@ -743,15 +726,19 @@ shapes; the in-process `dispatch_tool` and the per-tool functions
 lookups rather than typed structs.
 
 **Instructions injection.** The `SERVER_INSTRUCTIONS` constant is the
-strategic guidance every host gets at `initialize`. Fork commit
-`fd3de77` rewrote it as a pre-flight gate after observing that
-agents kept reaching for `Bash(grep/cat/find)` despite the older
-"DO NOT use Grep/Read/Glob" rule. The new shape names exact bad
-commands and provides `<bad>→<good>` rewrites. Edit mode appends an
-`EDIT_MODE_EXTRA` block with the `tilth_edit` instructions.
-`overview::fingerprint(cwd)` is prepended unless `TILTH_NO_OVERVIEW` is
-set — about a 100-line summary of language counts, manifests, hot
-files, and git context.
+strategic guidance every host gets at `initialize`. It names exact bad
+commands (`Bash(grep/cat/find)`) and provides `<bad>→<good>` rewrites
+because agents kept reaching for those despite earlier "DO NOT use
+Grep/Read/Glob" rules. Edit mode appends an `EDIT_MODE_EXTRA` block
+with the `tilth_edit` instructions. `overview::fingerprint(cwd)` is
+prepended unless `TILTH_NO_OVERVIEW` is set — a brief summary of
+language counts, manifests, hot files, and git context.
+
+`AGENTS.md` at the repo root is the user-facing copy of these
+instructions for hosts that read prompts from disk rather than via
+the MCP `instructions` field. It must stay in sync with
+`SERVER_INSTRUCTIONS`; that's a manual discipline, not enforced by
+tooling.
 
 ## Cross-cutting modules
 
@@ -795,68 +782,6 @@ user-facing.
   cline, roo-code, trae, qwen-code, crush, pi. Each host has its own
   config-file location and JSON/TOML format quirks; `resolve_host`
   returns a `HostInfo` that drives the right writer.
-
-## Fork delta
-
-The fork (`choongng/tilth@dev`, 30 commits ahead of `origin/main`,
-which is at upstream v0.7.0) groups into seven themes. Listed
-oldest-first.
-
-| Commit    | Theme                | Summary |
-|-----------|----------------------|---------|
-| `7e4d963` | Agent usability      | Respect `.gitignore` by default; add `.tilthignore` and `--no-ignore` escape. |
-| `16212fc` | Agent usability      | Make `--full` imply expand-all on search queries; clarify `--full`/`--expand` help. |
-| `4fa6832` | Agent usability      | Detect terminal height via `TIOCGWINSZ`; stop paging on stale 24-row fallback. |
-| `d621828` | Agent usability      | Don't tag quoted-code mentions as definitions; recognise markdown headings. |
-| `d8c9617` | Agent usability      | Ensure CLI output ends with a newline. |
-| `e706d99` | Agent usability      | Thread `.gitignore` + `.tilthignore` guidance through `search`/`deps` tool descriptions. |
-| `87b0b94` | Agent usability      | Drop `OutlineKind::Export` doubling; recurse into wrapped declaration. |
-| `7cad3f1` | Enclosing scope      | Annotate usages with their enclosing scope via tree-sitter — `[usage in function foo]` instead of bare line numbers (touches `search/callers.rs`, `search/symbol.rs`). |
-| `02e9a51` | Markdown sections    | Expand markdown-heading definitions to the section body (precursor to `e1785a6`). |
-| `7d76b16` | Heading hierarchy    | Fix inverted markdown heading levels in search output. |
-| `3e10ab6` | Search output        | Render grouped-usage entries as H3 to match single-match path. |
-| `8882d72` | Search output        | Track fence state in markdown heading detection (`find_defs_markdown_buf`). |
-| `c8ae866` | Search output        | Prefer code definitions over doc-heading defs when filling display cap (`stratum_for_display`). |
-| `ac21c9b` | Search output        | Show `displayed/total` in facet headings via `FacetTotals`. |
-| `cc1525a` | Search output        | Emit per-facet hidden-count tail; drop global tail on facet path. |
-| `99c4a3d` | Search output        | Inline section body for markdown-heading defs in default preview. |
-| `fd3de77` | Server instructions  | Tighten `SERVER_INSTRUCTIONS` into a pre-flight gate. |
-| `12c7045` | Markdown AST         | Switch markdown outline to tree-sitter-md (`lang/outline.rs::{parse_markdown, heading_level, heading_text}`); delete fence pre-pass in `read/outline/markdown.rs`. |
-| `47c3471` | Markdown AST         | Switch `find_defs_markdown_buf` to walk tree-sitter `section` nodes; delete the second fence pre-pass + the `parse_atx_heading` helper. |
-| `c592109` | Markdown AST         | Switch `markdown_enclosing_scope` to AST so `#`-prefixed lines inside fenced code blocks no longer become enclosing-heading labels. |
-| `76dfb7f` | Markdown AST         | Switch `read/mod.rs::{resolve_heading, suggest_headings}` to AST so `tilth_read foo.md section="## Foo"` and the did-you-mean fallback both reuse the same parser; delete the last three hand-rolled fence-aware loops in `src/`. |
-| `8b585f4` | Simplification       | Delete inert `SymbolIndex` plumbing — the type was allocated, threaded through dispatch, and discarded with `let _ = index;` at every search call site. Drop the file, prune `index/mod.rs` to `BloomFilterCache`, strip the unused parameter from `search_*_expanded` / `dispatch_tool` / `tool_search` / `handle_tool_call`. Net −547 / +6. |
-| `5d81660` | Simplification       | Delete dead `tilth_map` MCP dispatch arm + orphaned schema-comment block. Schema was already commented out of `tools/list` (so the dispatch arm was unreachable); CLI keeps `tilth --map`. |
-| `2d5365b` | Simplification       | Collapse the single-symbol caller path into `find_callers_batch`. Replace `find_callers` + `find_callers_treesitter` with a small `target_seen_in_scope` helper that runs only when the batch walk returns empty. Net −162 lines; same caller output for the happy path. |
-| `cb2d875` | Simplification       | Drop unused `_cache` / `_session` parameters from five helpers (`search_callers_expanded`, `search_glob`, `resolve_callees{_transitive}` / `resolve_second_hop`, `analyze_deps`, `tool_edit`); thread the simpler signatures back through every call site. Public API: `tilth::run_callers` and `tilth::run_deps` no longer take a `cache` argument. Net −31 lines. |
-
-The seven "agent usability" patches are the oldest layer and cover
-everything from default ignore behaviour to terminal sizing to output
-trailing-newline polish — they predated the search-output project that
-landed Sessions 51-52. The `feat/usage-enclosing-scope-ast`
-(`7cad3f1`) and `feat/markdown-section-span-expansion` (`02e9a51` →
-`7d76b16` → six search-output follow-ups) trees are the two
-substantial features. `fd3de77` rewrote `SERVER_INSTRUCTIONS` as a
-pre-flight gate. The Markdown-AST cluster (`12c7045` → `47c3471` →
-`c592109` → `76dfb7f`) replaces four hand-rolled markdown scanners
-with tree-sitter-md walks — fenced-code-block awareness now lives at
-the parser level rather than in four separate per-line pre-passes;
-no in-tree caller still hand-rolls fence state. The Simplification
-quartet (`8b585f4` → `5d81660` → `2d5365b` → `cb2d875`) follows up by
-deleting the two largest pieces of dead plumbing the architectural
-review surfaced (`SymbolIndex`, `tilth_map` dispatch arm), then
-collapsing the structural-duplicate single-symbol caller path into the
-batch walk, and finally peeling off the residual `_cache` / `_session`
-parameters left over from earlier shape-only contracts.
-
-None of these have an obvious upstream blocker; they are
-fork-divergent because of bandwidth / drift, not architectural
-disagreement. The most upstream-ready cluster is the
-`feat/markdown-section-span-expansion` line — small, additive, with
-tests, and not entangled with other unmerged work. The
-`feat/usage-enclosing-scope-ast` adds a public-ish API
-(`EnclosingScope`, `enclosing_definition_at`) and would benefit from a
-short upstream design discussion.
 
 ## Extension points
 
