@@ -53,6 +53,17 @@ Tree-sitter finds where symbols are **defined** — not just where strings appea
 
 Expanded definitions include a **callee footer** (`── calls ──`) showing resolved callees with file, line range, and signature — the agent can follow call chains without separate searches for each callee.
 
+### Expanded search
+
+CLI search returns compact results by default. Use `--expand` to inline source for the top matches:
+
+```bash
+$ tilth handleAuth --scope src/ --expand       # top 2 (default when flag is bare)
+$ tilth handleAuth --scope src/ --expand=5     # top 5
+```
+
+In MCP mode, `expand` defaults to 2 — no flag needed.
+
 ### Multi-symbol search
 
 Trace across files in one call:
@@ -68,12 +79,36 @@ Each symbol gets its own result block with definitions and expansions. The expan
 Find all call sites of a symbol using structural tree-sitter matching (not text search):
 
 ```bash
-$ tilth isTrustedProxy --kind callers --scope .
+$ tilth isTrustedProxy --callers --scope .
 # Callers of "isTrustedProxy" — 5 call sites
 
 ## context.go:1011 [caller: ClientIP]
 → trusted = c.engine.isTrustedProxy(remoteIP)
 ```
+
+In MCP mode, use `kind: "callers"` on `tilth_search` instead.
+
+### Blast-radius deps
+
+See what a file imports and what depends on it — useful before renaming or changing exports:
+
+```bash
+$ tilth src/auth.ts --deps
+# deps: src/auth.ts
+
+## Imports (3)
+  jsonwebtoken      (external)
+  @/config          src/config.ts
+  express           (external)
+
+## Dependents (4)
+  src/routes/api.ts        uses: handleAuth, AuthManager
+  src/middleware/cors.ts   uses: validateToken
+  src/app.ts               uses: AuthManager
+  test/auth.test.ts        uses: handleAuth, AuthManager
+```
+
+In MCP mode, use the `tilth_deps` tool.
 
 ### Session dedup
 
@@ -159,7 +194,7 @@ Add `--edit` to enable hash-anchored file editing (see [Edit mode](#edit-mode)):
 tilth install claude-code --edit
 ```
 
-Or call it from bash — see [AGENTS.md](./AGENTS.md) for the agent prompt.
+Or call it from bash — see [AGENTS.md](./AGENTS.md) for the MCP agent prompt, or [skills/SKILL.md](./skills/SKILL.md) for a Claude Code skill prompt.
 
 ### Smaller models
 
@@ -216,10 +251,13 @@ tilth <path> --section 45-89      # exact line range
 tilth <path> --section "## Foo"   # markdown heading
 tilth <path> --full               # force full content
 tilth <symbol> --scope <dir>      # definitions + usages
+tilth <symbol> --expand=5         # inline source for top 5 matches
+tilth <symbol> --callers          # find call sites (structural)
+tilth <path> --deps               # imports + dependents
 tilth "TODO: fix" --scope <dir>   # content search
 tilth "/<regex>/" --scope <dir>   # regex search
 tilth "*.test.ts" --scope <dir>   # glob files
-tilth diff HEAD~1                     # structural diff (function-level)
+tilth diff HEAD~1                 # structural diff (function-level)
 tilth --map --scope <dir>         # codebase skeleton (CLI only)
 ```
 
