@@ -72,6 +72,24 @@ pub(crate) fn extract_definition_name(node: tree_sitter::Node, lines: &[&str]) -
         }
     }
 
+    // JS/TS `lexical_declaration` and C# `variable_declaration` store the
+    // identifier inside a `variable_declarator` child (field "declarations" /
+    // unnamed children), not as a direct named field on the declaration node.
+    // Walk children to find the first `variable_declarator` and pull its `name`.
+    if node.kind() == "lexical_declaration" || node.kind() == "variable_declaration" {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.kind() == "variable_declarator" {
+                if let Some(name_node) = child.child_by_field_name("name") {
+                    let text = node_text_simple(name_node, lines);
+                    if !text.is_empty() {
+                        return Some(text);
+                    }
+                }
+            }
+        }
+    }
+
     None
 }
 

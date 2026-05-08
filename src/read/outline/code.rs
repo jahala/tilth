@@ -373,4 +373,53 @@ fun main() {
         assert!(outline.contains("fun "), "should use 'fun' not 'fn'");
         assert!(!outline.contains("fn "), "should not use 'fn' for Kotlin");
     }
+
+    #[test]
+    fn ts_export_outline_no_doubled_keyword() {
+        // Regression: `export_statement` must recurse into the wrapped
+        // declaration (function/class/lexical) and render with that
+        // declaration's real kind label. Pre-fix, both the kind label and
+        // the synthesized name began with `export `, so the renderer
+        // emitted `export export async function foo(`. Leaf-fallback cases
+        // (`export { ... }`, `export * from ...`) keep `OutlineKind::Export`
+        // but strip the leading `export ` from the name to avoid duplication.
+        let ts_code = r#"
+export async function foo() {}
+
+export class Foo {}
+
+export const x = 1;
+
+export { foo };
+
+export * from './bar';
+
+export default class Bar {}
+"#;
+
+        let outline = outline(ts_code, Lang::TypeScript, 1000);
+
+        // No outline line may contain a doubled `export` keyword.
+        for line in outline.lines() {
+            assert!(
+                !line.contains("export export"),
+                "doubled `export` in outline line: {line:?}\nfull outline:\n{outline}"
+            );
+        }
+
+        // Wrapped declarations must render with the real kind, not as
+        // `OutlineKind::Export` carrying the entire source as `name`.
+        assert!(
+            outline.contains("fn foo"),
+            "export async function foo should render as `fn foo`:\n{outline}"
+        );
+        assert!(
+            outline.contains("class Foo"),
+            "export class Foo should render as `class Foo`:\n{outline}"
+        );
+        assert!(
+            outline.contains("class Bar"),
+            "export default class Bar should render as `class Bar`:\n{outline}"
+        );
+    }
 }

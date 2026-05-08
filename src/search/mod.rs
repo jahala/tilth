@@ -154,16 +154,11 @@ pub fn search_symbol_expanded(
     scope: &Path,
     cache: &OutlineCache,
     session: &Session,
-    index: &crate::index::SymbolIndex,
     bloom: &crate::index::bloom::BloomFilterCache,
     expand: usize,
     context: Option<&Path>,
     glob: Option<&str>,
 ) -> Result<String, TilthError> {
-    // Index is available but not yet used for search fast-path.
-    // Build will be triggered when the lookup path is wired in.
-    let _ = index;
-
     let result = symbol::search(query, scope, context, glob)?;
     format_search_result(&result, cache, Some(session), bloom, expand)
 }
@@ -173,14 +168,11 @@ pub fn search_multi_symbol_expanded(
     scope: &Path,
     cache: &OutlineCache,
     session: &Session,
-    index: &crate::index::SymbolIndex,
     bloom: &crate::index::bloom::BloomFilterCache,
     expand: usize,
     context: Option<&Path>,
     glob: Option<&str>,
 ) -> Result<String, TilthError> {
-    let _ = index; // Available but not yet used for search fast-path
-
     // Shared expand budget: at least 1 slot per query, or explicit expand if higher.
     // expand=0 means no expansion at all.
     let mut expand_remaining = if expand == 0 {

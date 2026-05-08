@@ -64,6 +64,9 @@ toml = "0.8"
 # MCP protocol (JSON-RPC over stdio)
 # (handled manually — no framework needed)
 
+# Terminal size detection (TIOCGWINSZ ioctl, falls back to env vars)
+terminal_size = "0.4"
+
 
 [dev-dependencies]
 tempfile = "3"

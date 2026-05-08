@@ -374,18 +374,31 @@ fn emit_output(output: &str, is_tty: bool) {
         }
     }
 
+    // Conventional CLI output ends with a newline so the next shell prompt
+    // starts on its own line. Most internal formatters terminate with `\n`,
+    // but the search-result footer (e.g. `(~507 tokens)`) and a few other
+    // paths do not — guard at the sink rather than auditing every formatter.
     print!("{output}");
+    if !output.ends_with('\n') {
+        println!();
+    }
     let _ = io::stdout().flush();
 }
 
 fn terminal_height() -> usize {
-    // Try LINES env var first (set by some shells)
+    // ioctl(TIOCGWINSZ) on stdout — the real terminal height. Bash maintains
+    // $LINES as an unexported shell variable, so most subprocesses (us included)
+    // never receive it; relying on it alone made tilth assume 24 rows in any
+    // typical interactive shell and page nearly every result. Fall back to
+    // $LINES then to 24 only if the ioctl is unavailable (tests, exotic TTYs).
+    if let Some((_, terminal_size::Height(h))) = terminal_size::terminal_size() {
+        return h as usize;
+    }
     if let Ok(lines) = std::env::var("LINES") {
         if let Ok(h) = lines.parse::<usize>() {
             return h;
         }
     }
-    // Fallback
     24
 }
 

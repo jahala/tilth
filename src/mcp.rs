@@ -11,7 +11,6 @@ use serde_json::Value;
 
 use crate::cache::OutlineCache;
 use crate::index::bloom::BloomFilterCache;
-use crate::index::SymbolIndex;
 use crate::session::Session;
 
 /// Shared dependencies passed through the request → dispatch pipeline.
@@ -19,7 +18,6 @@ use crate::session::Session;
 pub(crate) struct Services {
     cache: Arc<OutlineCache>,
     session: Arc<Session>,
-    index: Arc<SymbolIndex>,
     bloom: Arc<BloomFilterCache>,
     edit_mode: bool,
 }
@@ -29,7 +27,6 @@ impl Services {
         Self {
             cache: Arc::new(OutlineCache::new()),
             session: Arc::new(Session::new()),
-            index: Arc::new(SymbolIndex::new()),
             bloom: Arc::new(BloomFilterCache::new()),
             edit_mode,
         }
@@ -41,10 +38,6 @@ impl Services {
 
     pub(crate) fn session(&self) -> &Session {
         &self.session
-    }
-
-    pub(crate) fn index(&self) -> &Arc<SymbolIndex> {
-        &self.index
     }
 
     pub(crate) fn bloom(&self) -> &Arc<BloomFilterCache> {
@@ -400,17 +393,10 @@ pub(crate) fn dispatch_tool(
     let edit_mode = services.edit_mode();
     match tool {
         "tilth_read" => tool_read(args, services.cache(), services.session(), edit_mode),
-        "tilth_search" => tool_search(
-            args,
-            services.cache(),
-            services.session(),
-            services.index(),
-            services.bloom(),
-        ),
+        "tilth_search" => tool_search(args, services.cache(), services.session(), services.bloom()),
         "tilth_files" => tool_files(args, services.cache()),
         "tilth_deps" => tool_deps(args, services.cache(), services.bloom()),
         "tilth_diff" => tool_diff(args),
-        "tilth_map" => Err("tilth_map is disabled — use tilth_search instead".into()),
         "tilth_session" => tool_session(args, services.session()),
         "tilth_edit" if edit_mode => {
             tool_edit(args, services.session(), services.cache(), services.bloom())
@@ -507,7 +493,6 @@ fn tool_search(
     args: &Value,
     cache: &OutlineCache,
     session: &Session,
-    index: &Arc<SymbolIndex>,
     bloom: &Arc<BloomFilterCache>,
 ) -> Result<String, String> {
     let query = args
@@ -543,7 +528,7 @@ fn tool_search(
                 1 => {
                     session.record_search(queries[0]);
                     crate::search::search_symbol_expanded(
-                        queries[0], &scope, cache, session, index, bloom, expand, context, glob,
+                        queries[0], &scope, cache, session, bloom, expand, context, glob,
                     )
                 }
                 2..=5 => {
@@ -551,7 +536,7 @@ fn tool_search(
                         session.record_search(q);
                     }
                     crate::search::search_multi_symbol_expanded(
-                        &queries, &scope, cache, session, index, bloom, expand, context, glob,
+                        &queries, &scope, cache, session, bloom, expand, context, glob,
                     )
                 }
                 _ => {
@@ -997,12 +982,6 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                 }
             }
         }),
-        // tilth_map disabled — benchmark data shows 62% of losing tasks use map
-        // vs 22% of winners. Re-enable after measuring impact.
-        // serde_json::json!({
-        //     "name": "tilth_map",
-        //     ...
-        // }),
         serde_json::json!({
             "name": "tilth_diff",
             "description": "Structural diff showing function-level changes. Replaces git diff. Call with no args for uncommitted changes overview.",

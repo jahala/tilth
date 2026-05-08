@@ -42,7 +42,6 @@ use types::QueryType;
 /// Avoids scattered `Option<T>` + `unwrap()` throughout dispatch.
 struct ExpandedCtx {
     session: session::Session,
-    sym_index: index::SymbolIndex,
     bloom: index::bloom::BloomFilterCache,
     expand: usize,
 }
@@ -167,11 +166,10 @@ fn run_inner(
         }
         if parts.len() >= 2 && parts.len() <= 5 && all_identifiers {
             let session = session::Session::new();
-            let sym_index = index::SymbolIndex::new();
             let bloom = index::bloom::BloomFilterCache::new();
             let expand = if expand > 0 { expand } else { 2 };
             let output = search::search_multi_symbol_expanded(
-                &parts, scope, cache, &session, &sym_index, &bloom, expand, None, glob,
+                &parts, scope, cache, &session, &bloom, expand, None, glob,
             )?;
             return match budget_tokens {
                 Some(b) => Ok(budget::apply(&output, b)),
@@ -202,7 +200,6 @@ fn run_inner(
         _ if use_expanded => {
             let ctx = ExpandedCtx {
                 session: session::Session::new(),
-                sym_index: index::SymbolIndex::new(),
                 bloom: index::bloom::BloomFilterCache::new(),
                 expand,
             };
@@ -232,7 +229,6 @@ fn run_query_expanded(
             scope,
             cache,
             &ctx.session,
-            &ctx.sym_index,
             &ctx.bloom,
             ctx.expand,
             None,
@@ -256,7 +252,6 @@ fn run_query_expanded(
             scope,
             cache,
             &ctx.session,
-            &ctx.sym_index,
             &ctx.bloom,
             ctx.expand,
             None,
