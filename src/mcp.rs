@@ -101,7 +101,8 @@ tilth_read: Read file content with smart outlining. Replaces cat/head/tail.\n\
     [<start>-<end>]  <symbol name>             ← outline mode\n\
 \n\
 tilth_files: Find files by glob pattern. Replaces find, ls, pwd, and the host Glob tool.\n\
-  Output: <path>  (~<token_count> tokens). Respects .gitignore.\n\
+  patterns: run multiple globs in one call (e.g. patterns: [\"*.rs\", \"*.toml\"]).\n\
+  Output: <path>  (~<token_count> tokens).\n\
 \n\
 tilth_deps: Blast-radius check — what imports this file and what it imports.\n\
   Use ONLY before renaming, removing, or changing an export's signature.\n\
@@ -577,17 +578,42 @@ fn tool_search(
 }
 
 fn tool_files(args: &Value) -> Result<String, String> {
-    let pattern = args
-        .get("pattern")
-        .and_then(|v| v.as_str())
-        .ok_or("missing required parameter: pattern")?;
     let (scope, scope_warning) = resolve_scope(args);
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
 
-    let output = crate::search::search_glob(pattern, &scope).map_err(|e| e.to_string())?;
+    let single = args.get("pattern").and_then(|v| v.as_str());
+    let patterns_arr = args.get("patterns").and_then(|v| v.as_array());
+
+    if single.is_some() && patterns_arr.is_some() {
+        return Err("provide either pattern (single) or patterns (array), not both".into());
+    }
+
+    let patterns: Vec<&str> = if let Some(arr) = patterns_arr {
+        if arr.is_empty() {
+            return Err("patterns must contain at least one glob".into());
+        }
+        if arr.len() > 20 {
+            return Err(format!(
+                "patterns limited to 20 per call (got {})",
+                arr.len()
+            ));
+        }
+        arr.iter()
+            .map(|v| v.as_str().ok_or("patterns must be an array of strings"))
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        vec![single.ok_or("missing required parameter: pattern (or use patterns for batch)")?]
+    };
+
+    let mut blocks = Vec::with_capacity(patterns.len());
+    for p in &patterns {
+        let block = crate::search::search_glob(p, &scope).map_err(|e| e.to_string())?;
+        blocks.push(block);
+    }
+    let combined = blocks.join("\n\n");
 
     let mut result = scope_warning.unwrap_or_default();
-    result.push_str(&apply_budget(output, budget));
+    result.push_str(&apply_budget(combined, budget));
     Ok(result)
 }
 
@@ -933,14 +959,18 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "tilth_files",
-            "description": "Find files matching a glob pattern. Replaces find/ls/pwd and the host Glob tool — use this for all file discovery. Returns matched file paths sorted by relevance with token size estimates. Respects .gitignore.",
+            "description": "Find files matching a glob pattern. Replaces find/ls/pwd and the host Glob tool — use this for all file discovery. Returns matched file paths sorted by relevance with token size estimates. Use `patterns` to run several globs in one call.",
             "inputSchema": {
                 "type": "object",
-                "required": ["pattern"],
                 "properties": {
                     "pattern": {
                         "type": "string",
-                        "description": "Glob pattern e.g. '*' (list directory), '*.rs', 'src/**/*.ts'"
+                        "description": "Glob pattern e.g. '*' (list directory), '*.rs', 'src/**/*.ts'. Use `patterns` for multiple globs."
+                    },
+                    "patterns": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Multiple glob patterns to run in one call against the same scope. Each pattern emits its own `# Glob: ...` block, separated by a blank line. Mutually exclusive with `pattern`. Capped at 20."
                     },
                     "scope": {
                         "type": "string",
@@ -1255,6 +1285,73 @@ mod tests {
 
         // Restore
         std::env::set_current_dir(orig_cwd).unwrap();
+    }
+
+    // -- tool_files multi-pattern --------------------------------------------
+
+    /// Build a small scratch project with .rs and .toml files, switch cwd to
+    /// it, and return the tempdir guard so the caller controls cleanup.
+    fn scratch_project() -> tempfile::TempDir {
+        let project = tempfile::tempdir().unwrap();
+        let p = project.path();
+        std::fs::write(p.join("Cargo.toml"), "[package]\nname = \"t\"").unwrap();
+        std::fs::create_dir(p.join("src")).unwrap();
+        std::fs::write(p.join("src/main.rs"), "fn main() {}").unwrap();
+        std::fs::write(p.join("src/lib.rs"), "pub fn x() {}").unwrap();
+        project
+    }
+
+    #[test]
+    fn tool_files_patterns_emits_one_block_per_pattern() {
+        let project = scratch_project();
+        let args = serde_json::json!({
+            "patterns": ["*.rs", "*.toml"],
+            "scope": project.path().to_str().unwrap(),
+        });
+        let out = tool_files(&args).expect("tool_files should succeed");
+        // Two `# Glob:` headers — one per pattern.
+        let header_count = out.matches("# Glob:").count();
+        assert_eq!(header_count, 2, "expected 2 Glob headers, got: {out}");
+        assert!(out.contains("\"*.rs\""), "missing rs header in: {out}");
+        assert!(out.contains("\"*.toml\""), "missing toml header in: {out}");
+        // Files from both patterns appear in the combined output.
+        assert!(out.contains("main.rs"), "missing main.rs in: {out}");
+        assert!(out.contains("Cargo.toml"), "missing Cargo.toml in: {out}");
+    }
+
+    #[test]
+    fn tool_files_pattern_and_patterns_mutually_exclusive() {
+        let args = serde_json::json!({
+            "pattern": "*.rs",
+            "patterns": ["*.rs"],
+        });
+        let err = tool_files(&args).expect_err("expected mutual-exclusion error");
+        assert!(err.contains("either pattern"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn tool_files_empty_patterns_errors() {
+        let args = serde_json::json!({ "patterns": [] });
+        let err = tool_files(&args).expect_err("expected empty-patterns error");
+        assert!(err.contains("at least one"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn tool_files_patterns_capped_at_20() {
+        let twenty_one: Vec<&str> = vec!["*.rs"; 21];
+        let args = serde_json::json!({ "patterns": twenty_one });
+        let err = tool_files(&args).expect_err("expected cap error");
+        assert!(err.contains("limited to 20"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn tool_files_missing_pattern_and_patterns_errors() {
+        let args = serde_json::json!({});
+        let err = tool_files(&args).expect_err("expected missing-pattern error");
+        assert!(
+            err.contains("missing required parameter"),
+            "unexpected error: {err}"
+        );
     }
 
     // -- package_root fallback from subdirectory ------------------------------
