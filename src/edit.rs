@@ -1,9 +1,13 @@
 use std::fmt::Write as _;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use rayon::prelude::*;
 
 use crate::error::TilthError;
 use crate::format;
+use crate::index::bloom::BloomFilterCache;
 
 /// A single edit operation targeting a line range by hash anchors.
 #[derive(Debug, Clone)]
@@ -13,6 +17,15 @@ pub struct Edit {
     pub end_line: usize,
     pub end_hash: u16,
     pub content: String,
+}
+
+/// One file's worth of work for a batch `tilth_edit`. Parse errors are deferred
+/// onto the task so a malformed entry surfaces as a per-file failure instead of
+/// aborting the whole batch.
+#[derive(Debug)]
+pub enum FileEditTask {
+    Ready { path: PathBuf, edits: Vec<Edit> },
+    ParseError { label: String, msg: String },
 }
 
 /// Per-edit diff: old lines removed vs new lines added.
@@ -26,9 +39,10 @@ struct EditDiff {
     new_lines: Vec<String>,
 }
 
-/// Result of applying edits to a file.
+/// Result of applying edits to a file. Internal — callers go through
+/// [`apply_batch`], which renders the per-file outcome to a Markdown section.
 #[derive(Debug)]
-pub enum EditResult {
+enum EditResult {
     /// All edits applied successfully.
     Applied {
         /// Compact diff showing `-`/`+` lines per edit site.
@@ -48,7 +62,7 @@ pub enum EditResult {
 /// 4. Splice replacements
 /// 5. Write file
 /// 6. Return hashlined context around edit sites
-pub fn apply_edits(path: &Path, edits: &[Edit]) -> Result<EditResult, TilthError> {
+fn apply_edits(path: &Path, edits: &[Edit]) -> Result<EditResult, TilthError> {
     if edits.is_empty() {
         return Ok(EditResult::Applied {
             diff: String::new(),
@@ -294,6 +308,89 @@ fn format_diffs(diffs: &[EditDiff]) -> String {
     }
 
     out
+}
+
+/// Apply a batch of file edits in parallel.
+///
+/// Each task is processed independently — a hash mismatch, parse error, or
+/// I/O failure on one file does not block siblings. Output is a series of
+/// `## <path>` sections joined by `---`. Returns `Err` only when every file
+/// failed (so the MCP response sets `isError: true`). Output ordering
+/// matches the input `tasks` — rayon's `par_iter().collect()` preserves
+/// index order even though execution order is not deterministic.
+pub fn apply_batch(
+    tasks: Vec<FileEditTask>,
+    bloom: &Arc<BloomFilterCache>,
+    show_diff: bool,
+) -> Result<String, String> {
+    let outcomes: Vec<(String, bool)> = tasks
+        .into_par_iter()
+        .map(|task| apply_one(task, bloom, show_diff))
+        .collect();
+
+    let any_success = outcomes.iter().any(|(_, ok)| *ok);
+    let combined = outcomes
+        .into_iter()
+        .map(|(s, _)| s)
+        .collect::<Vec<_>>()
+        .join("\n\n---\n\n");
+
+    if any_success {
+        Ok(combined)
+    } else {
+        Err(combined)
+    }
+}
+
+/// Process one task into a `(section, success)` tuple. Kept separate so the
+/// parallel closure stays trivial and per-file logic is testable in isolation.
+fn apply_one(task: FileEditTask, bloom: &Arc<BloomFilterCache>, show_diff: bool) -> (String, bool) {
+    let (path, edits) = match task {
+        FileEditTask::ParseError { label, msg } => {
+            return (format!("## {label}\nerror: {msg}"), false);
+        }
+        FileEditTask::Ready { path, edits } => (path, edits),
+    };
+    let header = format!("## {}", path.display());
+    match render_applied(&path, &edits, bloom, show_diff) {
+        Ok(body) if body.is_empty() => (header, true),
+        Ok(body) => (format!("{header}\n{body}"), true),
+        Err(msg) => (format!("{header}\n{msg}"), false),
+    }
+}
+
+fn render_applied(
+    path: &Path,
+    edits: &[Edit],
+    bloom: &Arc<BloomFilterCache>,
+    show_diff: bool,
+) -> Result<String, String> {
+    match apply_edits(path, edits).map_err(|e| e.to_string())? {
+        EditResult::Applied { diff, context } => {
+            let mut output = String::new();
+            if show_diff && !diff.is_empty() {
+                output.push_str(&diff);
+                if !context.is_empty() {
+                    output.push_str("\n\n");
+                }
+            }
+            if !context.is_empty() {
+                output.push_str(&context);
+            }
+            let abs_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            let scope = crate::lang::package_root(&abs_path).map_or_else(
+                || std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                Path::to_path_buf,
+            );
+            if let Some(blast) = crate::search::blast::blast_radius(path, edits, &scope, bloom) {
+                output.push_str(&blast);
+            }
+            Ok(output)
+        }
+        EditResult::HashMismatch(msg) => Err(format!(
+            "hash mismatch — file changed since last read:\n\n{msg}"
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -660,5 +757,150 @@ mod tests {
         assert_eq!(after, "A1\nA2\nA3\nbbb\nCCC\nddd\n");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ----------------------------------------------------------------- batch
+
+    fn ready_task(path: PathBuf, edits: Vec<Edit>) -> FileEditTask {
+        FileEditTask::Ready { path, edits }
+    }
+
+    fn fresh_bloom() -> Arc<BloomFilterCache> {
+        Arc::new(BloomFilterCache::new())
+    }
+
+    #[test]
+    fn batch_two_files_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        std::fs::write(&a, "aaa\nbbb\n").unwrap();
+        std::fs::write(&b, "ccc\nddd\n").unwrap();
+        let ha = hash_at("aaa\nbbb\n", 1);
+        let hb = hash_at("ccc\nddd\n", 2);
+
+        let tasks = vec![
+            ready_task(
+                a.clone(),
+                vec![Edit {
+                    start_line: 1,
+                    start_hash: ha,
+                    end_line: 1,
+                    end_hash: ha,
+                    content: "AAA".into(),
+                }],
+            ),
+            ready_task(
+                b.clone(),
+                vec![Edit {
+                    start_line: 2,
+                    start_hash: hb,
+                    end_line: 2,
+                    end_hash: hb,
+                    content: "DDD".into(),
+                }],
+            ),
+        ];
+
+        let out = apply_batch(tasks, &fresh_bloom(), false).expect("batch should succeed");
+        assert!(out.contains(&format!("## {}", a.display())));
+        assert!(out.contains(&format!("## {}", b.display())));
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "AAA\nbbb\n");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "ccc\nDDD\n");
+    }
+
+    #[test]
+    fn batch_partial_failure_does_not_block_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good.txt");
+        let bad = dir.path().join("bad.txt");
+        std::fs::write(&good, "x\n").unwrap();
+        std::fs::write(&bad, "y\n").unwrap();
+        let h_good = hash_at("x\n", 1);
+
+        let tasks = vec![
+            ready_task(
+                good.clone(),
+                vec![Edit {
+                    start_line: 1,
+                    start_hash: h_good,
+                    end_line: 1,
+                    end_hash: h_good,
+                    content: "X".into(),
+                }],
+            ),
+            ready_task(
+                bad.clone(),
+                vec![Edit {
+                    start_line: 1,
+                    // wrong hash → HashMismatch on this file only
+                    start_hash: 0xFFF,
+                    end_line: 1,
+                    end_hash: 0xFFF,
+                    content: "Y".into(),
+                }],
+            ),
+        ];
+
+        let out = apply_batch(tasks, &fresh_bloom(), false).expect("good half succeeded");
+        assert!(out.contains("hash mismatch"), "bad file reports mismatch");
+        assert!(out.contains(&format!("## {}", bad.display())));
+        // good file actually got written
+        assert_eq!(std::fs::read_to_string(&good).unwrap(), "X\n");
+        // bad file unchanged
+        assert_eq!(std::fs::read_to_string(&bad).unwrap(), "y\n");
+    }
+
+    #[test]
+    fn batch_all_failed_returns_err() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.txt");
+        std::fs::write(&a, "z\n").unwrap();
+
+        let tasks = vec![ready_task(
+            a,
+            vec![Edit {
+                start_line: 1,
+                start_hash: 0xABC,
+                end_line: 1,
+                end_hash: 0xABC,
+                content: "Z".into(),
+            }],
+        )];
+
+        let err = apply_batch(tasks, &fresh_bloom(), false)
+            .expect_err("batch with no successes returns Err");
+        assert!(err.contains("hash mismatch"));
+    }
+
+    #[test]
+    fn batch_parse_error_surfaces_per_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("g.txt");
+        std::fs::write(&good, "k\n").unwrap();
+        let h = hash_at("k\n", 1);
+
+        let tasks = vec![
+            ready_task(
+                good.clone(),
+                vec![Edit {
+                    start_line: 1,
+                    start_hash: h,
+                    end_line: 1,
+                    end_hash: h,
+                    content: "K".into(),
+                }],
+            ),
+            FileEditTask::ParseError {
+                label: "files[1]".into(),
+                msg: "missing 'edits' array".into(),
+            },
+        ];
+
+        let out =
+            apply_batch(tasks, &fresh_bloom(), false).expect("good half kept the batch alive");
+        assert!(out.contains("## files[1]"));
+        assert!(out.contains("error: missing 'edits' array"));
+        assert_eq!(std::fs::read_to_string(&good).unwrap(), "K\n");
     }
 }

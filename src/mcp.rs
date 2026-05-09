@@ -123,15 +123,21 @@ DO NOT re-read files already shown in expanded search results.";
 
 const EDIT_MODE_EXTRA: &str = "\n\
 \n\
-tilth_edit: Edit files using hash-anchored lines. Replaces the host Edit tool.\n\
+tilth_edit: Batch edit one or more files using hash-anchored lines. Replaces the host Edit tool.\n\
+  ALWAYS group edits to multiple files into ONE tilth_edit call (max 20 files). Never call tilth_edit twice in a row.\n\
   tilth_read → copy anchors (<line>:<hash>) (BOTH line and hash required) → pass to tilth_edit.\n\
   tilth_search does NOT provide hashes — you MUST tilth_read the file or section first.\n\
-  Single line: {\"start\": \"<line>:<hash>\", \"content\": \"<new code>\"}\n\
-  Range: {\"start\": \"<line>:<hash>\", \"end\": \"<line>:<hash>\", \"content\": \"...\"}\n\
-  Delete: {\"start\": \"<line>:<hash>\", \"content\": \"\"}\n\
-  Hash mismatch → file changed, re-read and retry.\n\
+  Shape: {\"files\": [{\"path\": \"a.rs\", \"edits\": [...]}, {\"path\": \"b.rs\", \"edits\": [...]}]}\n\
+  Single file: {\"files\": [{\"path\": \"a.rs\", \"edits\": [{\"start\": \"<line>:<hash>\", \"content\": \"<new code>\"}]}]}\n\
+  Edit forms inside `edits`:\n\
+    Single line: {\"start\": \"<line>:<hash>\", \"content\": \"<new code>\"}\n\
+    Range:       {\"start\": \"<line>:<hash>\", \"end\": \"<line>:<hash>\", \"content\": \"...\"}\n\
+    Delete:      {\"start\": \"<line>:<hash>\", \"content\": \"\"}\n\
+  Per-file results: each file is processed independently. A hash mismatch on one file does NOT block the others.\n\
+  Hash mismatch → file changed, re-read THAT file and retry it (other files in the batch already applied).\n\
+  Each file path may appear at most once per call — group all edits for a file under its single entry.\n\
   Large files: tilth_read shows outline — use section to get hashlined content.\n\
-  Pass diff: true to see a compact before/after diff in the response.\n\
+  Pass diff: true to see a compact before/after diff per file.\n\
   After editing a function signature, tilth_edit shows callers that may need updating.\n\
 DO NOT use the host Edit tool. Use tilth_edit for all edits.";
 
@@ -698,50 +704,111 @@ fn tool_session(args: &Value, session: &Session) -> Result<String, String> {
     }
 }
 
+/// Parse one `files[]` entry. Parse errors are deferred onto the task so a
+/// malformed entry surfaces as a per-file failure instead of aborting the
+/// whole batch.
+fn parse_file_edit(index: usize, val: &Value) -> crate::edit::FileEditTask {
+    use crate::edit::FileEditTask;
+
+    let Some(path_str) = val.get("path").and_then(|v| v.as_str()) else {
+        return FileEditTask::ParseError {
+            label: format!("files[{index}]"),
+            msg: "missing 'path'".into(),
+        };
+    };
+    let Some(edits_val) = val.get("edits").and_then(|v| v.as_array()) else {
+        return FileEditTask::ParseError {
+            label: path_str.to_string(),
+            msg: "missing 'edits' array".into(),
+        };
+    };
+
+    let mut edits = Vec::with_capacity(edits_val.len());
+    for (i, e) in edits_val.iter().enumerate() {
+        match parse_edit_entry(i, e) {
+            Ok(edit) => edits.push(edit),
+            Err(msg) => {
+                return FileEditTask::ParseError {
+                    label: path_str.to_string(),
+                    msg,
+                };
+            }
+        }
+    }
+
+    FileEditTask::Ready {
+        path: PathBuf::from(path_str),
+        edits,
+    }
+}
+
+/// Parse a single `edits[]` entry. Errors carry the edit index so the LLM
+/// can fix exactly the right entry instead of guessing.
+fn parse_edit_entry(i: usize, e: &Value) -> Result<crate::edit::Edit, String> {
+    let start_str = e
+        .get("start")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("edit[{i}]: missing 'start'"))?;
+    let (start_line, start_hash) = crate::format::parse_anchor(start_str)
+        .ok_or_else(|| format!("edit[{i}]: invalid start anchor '{start_str}'"))?;
+    let (end_line, end_hash) = match e.get("end").and_then(|v| v.as_str()) {
+        Some(end_str) => crate::format::parse_anchor(end_str)
+            .ok_or_else(|| format!("edit[{i}]: invalid end anchor '{end_str}'"))?,
+        None => (start_line, start_hash),
+    };
+    let content = e
+        .get("content")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("edit[{i}]: missing 'content'"))?;
+    Ok(crate::edit::Edit {
+        start_line,
+        start_hash,
+        end_line,
+        end_hash,
+        content: content.to_string(),
+    })
+}
+
+/// Return an error if any two `Ready` tasks resolve to the same file.
+/// Canonicalising catches the obvious aliases (`./a.rs` vs `a.rs`) before two
+/// rayon workers can race writes against the same inode and silently lose an
+/// edit. Falls back to the raw path when the file does not yet exist on disk;
+/// either way, distinct keys are required to dispatch.
+fn detect_duplicate_paths(tasks: &[crate::edit::FileEditTask]) -> Option<String> {
+    use std::collections::HashSet;
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    for task in tasks {
+        if let crate::edit::FileEditTask::Ready { path, .. } = task {
+            let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+            if !seen.insert(key) {
+                return Some(format!(
+                    "duplicate file path in batch: {} — group all edits for a file under one entry",
+                    path.display()
+                ));
+            }
+        }
+    }
+    None
+}
+
 fn tool_edit(
     args: &Value,
     session: &Session,
     bloom: &Arc<BloomFilterCache>,
 ) -> Result<String, String> {
-    let path_str = args
-        .get("path")
-        .and_then(|v| v.as_str())
-        .ok_or("missing required parameter: path")?;
-    let path = PathBuf::from(path_str);
-
-    let edits_val = args
-        .get("edits")
+    let files_val = args
+        .get("files")
         .and_then(|v| v.as_array())
-        .ok_or("missing required parameter: edits")?;
+        .ok_or("missing required parameter: files (array of {path, edits})")?;
 
-    let mut edits = Vec::with_capacity(edits_val.len());
-    for (i, e) in edits_val.iter().enumerate() {
-        let start_str = e
-            .get("start")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| format!("edit[{i}]: missing 'start'"))?;
-        let (start_line, start_hash) = crate::format::parse_anchor(start_str)
-            .ok_or_else(|| format!("edit[{i}]: invalid start anchor '{start_str}'"))?;
-
-        let (end_line, end_hash) = if let Some(end_str) = e.get("end").and_then(|v| v.as_str()) {
-            crate::format::parse_anchor(end_str)
-                .ok_or_else(|| format!("edit[{i}]: invalid end anchor '{end_str}'"))?
-        } else {
-            (start_line, start_hash)
-        };
-
-        let content = e
-            .get("content")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| format!("edit[{i}]: missing 'content'"))?;
-
-        edits.push(crate::edit::Edit {
-            start_line,
-            start_hash,
-            end_line,
-            end_hash,
-            content: content.to_string(),
-        });
+    if files_val.is_empty() {
+        return Err("files array is empty".into());
+    }
+    if files_val.len() > 20 {
+        return Err(format!(
+            "batch edit limited to 20 files (got {})",
+            files_val.len()
+        ));
     }
 
     let show_diff = args
@@ -749,39 +816,23 @@ fn tool_edit(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
 
-    session.record_read(&path);
+    let tasks: Vec<crate::edit::FileEditTask> = files_val
+        .iter()
+        .enumerate()
+        .map(|(i, v)| parse_file_edit(i, v))
+        .collect();
 
-    match crate::edit::apply_edits(&path, &edits).map_err(|e| e.to_string())? {
-        crate::edit::EditResult::Applied { diff, context } => {
-            let mut output = String::new();
-
-            if show_diff && !diff.is_empty() {
-                output.push_str(&diff);
-                if !context.is_empty() {
-                    output.push_str("\n\n");
-                }
-            }
-
-            if !context.is_empty() {
-                output.push_str(&context);
-            }
-
-            let abs_path = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-            let scope = crate::lang::package_root(&abs_path).map_or_else(
-                || std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-                std::path::Path::to_path_buf,
-            );
-
-            if let Some(blast) = crate::search::blast::blast_radius(&path, &edits, &scope, bloom) {
-                output.push_str(&blast);
-            }
-
-            Ok(output)
-        }
-        crate::edit::EditResult::HashMismatch(msg) => Err(format!(
-            "hash mismatch — file changed since last read:\n\n{msg}"
-        )),
+    if let Some(msg) = detect_duplicate_paths(&tasks) {
+        return Err(msg);
     }
+
+    for task in &tasks {
+        if let crate::edit::FileEditTask::Ready { path, .. } = task {
+            session.record_read(path);
+        }
+    }
+
+    crate::edit::apply_batch(tasks, bloom, show_diff)
 }
 
 /// Falls back to cwd when scope is invalid, with a warning message.
@@ -1096,33 +1147,46 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
     if edit_mode {
         tools.push(serde_json::json!({
             "name": "tilth_edit",
-            "description": "Apply edits to a file using hashline anchors from tilth_read. Each edit targets a line range by line:hash anchors. Edits are verified against content hashes and rejected if the file has changed since the last read.",
+            "description": "Batch edit one or more files in one call using hashline anchors from tilth_read. ALWAYS group edits to multiple files into a single tilth_edit call — never call tilth_edit twice in a row. Each file is processed independently (best-effort): a hash mismatch on one file does not block the others; results are reported per file. Each file path may appear at most once per call. Max 20 files per call.",
             "inputSchema": {
                 "type": "object",
-                "required": ["path", "edits"],
+                "required": ["files"],
                 "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Absolute or relative file path to edit."
-                    },
-                    "edits": {
+                    "files": {
                         "type": "array",
-                        "description": "Array of edit operations, applied atomically.",
+                        "minItems": 1,
+                        "maxItems": 20,
+                        "description": "One entry per file. Use a single-element array for a single-file edit. Each path must be unique within the call.",
                         "items": {
                             "type": "object",
-                            "required": ["start", "content"],
+                            "required": ["path", "edits"],
                             "properties": {
-                                "start": {
+                                "path": {
                                     "type": "string",
-                                    "description": "Start anchor: 'line:hash' (e.g. '42:a3f'). Hash from tilth_read hashline output."
+                                    "description": "Absolute or relative file path to edit."
                                 },
-                                "end": {
-                                    "type": "string",
-                                    "description": "End anchor: 'line:hash'. If omitted, replaces only the start line."
-                                },
-                                "content": {
-                                    "type": "string",
-                                    "description": "Replacement text (can be multi-line). Empty string to delete the line(s)."
+                                "edits": {
+                                    "type": "array",
+                                    "minItems": 1,
+                                    "description": "Edit operations for this file, applied atomically per file.",
+                                    "items": {
+                                        "type": "object",
+                                        "required": ["start", "content"],
+                                        "properties": {
+                                            "start": {
+                                                "type": "string",
+                                                "description": "Start anchor: 'line:hash' (e.g. '42:a3f'). Hash from tilth_read hashline output."
+                                            },
+                                            "end": {
+                                                "type": "string",
+                                                "description": "End anchor: 'line:hash'. If omitted, replaces only the start line."
+                                            },
+                                            "content": {
+                                                "type": "string",
+                                                "description": "Replacement text (can be multi-line). Empty string to delete the line(s)."
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1130,7 +1194,7 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     "diff": {
                         "type": "boolean",
                         "default": false,
-                        "description": "Set true to include a compact diff of changes in the response. Useful for batch edits or verifying unexpected results."
+                        "description": "Set true to include a compact diff of changes in the response per file."
                     }
                 }
             }
