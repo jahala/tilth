@@ -17,7 +17,7 @@ DO NOT re-read files already shown in expanded search results.
 tilth_search: Code search — finds definitions, usages, and text. Replaces grep/rg.
   Usage: tilth_search(query: "handleRequest")
   For multi-symbol lookup, separate with comma: "symbol1,symbol2" (max 5)
-  kind: "symbol" (default) | "content" (strings/comments) | "callers" (call sites)
+  kind: "symbol" (default, declarations only — no comment/string hits) | "any" (declarations + usages + comment/string mentions) | "content" (literal text in strings/comments) | "regex" (regex pattern over file content) | "callers" (call sites of a symbol)
   expand: (default 2) inline full source for top matches
   context: path to file being edited — boosts nearby results
   glob: file pattern filter — "*.rs" (whitelist), "!*.test.ts" (exclude)

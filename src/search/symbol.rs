@@ -37,28 +37,49 @@ fn stratum_for_display(m: &Match) -> u8 {
     }
 }
 
+/// Result shape for `search` — mirrors the MCP `kind` knob.
+///
+/// `Strict` returns only declarations (the `kind="symbol"` surface):
+/// tree-sitter AST nodes where supported, with keyword-heuristic and
+/// markdown-heading fallbacks for code without grammars and for docs.
+/// No comment or string hits.
+///
+/// `Any` adds word-boundary usage matches alongside the strict
+/// declarations — usage call-sites plus comment/string mentions
+/// (the `kind="any"` surface).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymbolMode {
+    Strict,
+    Any,
+}
+
 /// Symbol search: find definitions via tree-sitter, usages via ripgrep, concurrently.
 /// Merge results, deduplicate, definitions first.
+/// `SymbolMode::Strict` skips the usage scan entirely; `SymbolMode::Any` adds
+/// word-boundary usage matches alongside the definitions.
 pub fn search(
     query: &str,
     scope: &Path,
     context: Option<&Path>,
     glob: Option<&str>,
+    mode: SymbolMode,
 ) -> Result<SearchResult, TilthError> {
-    // Compile regex once, share across both arms
-    let word_pattern = format!(r"\b{}\b", regex_syntax::escape(query));
-    let matcher = RegexMatcher::new(&word_pattern).map_err(|e| TilthError::InvalidQuery {
-        query: query.to_string(),
-        reason: e.to_string(),
-    })?;
-
-    let (defs, usages) = rayon::join(
-        || find_definitions(query, scope, glob),
-        || find_usages(query, &matcher, scope, glob),
-    );
-
-    let defs = defs?;
-    let usages = usages?;
+    let (defs, usages) = match mode {
+        SymbolMode::Strict => (find_definitions(query, scope, glob)?, Vec::new()),
+        SymbolMode::Any => {
+            let word_pattern = format!(r"\b{}\b", regex_syntax::escape(query));
+            let matcher =
+                RegexMatcher::new(&word_pattern).map_err(|e| TilthError::InvalidQuery {
+                    query: query.to_string(),
+                    reason: e.to_string(),
+                })?;
+            let (defs, usages) = rayon::join(
+                || find_definitions(query, scope, glob),
+                || find_usages(query, &matcher, scope, glob),
+            );
+            (defs?, usages?)
+        }
+    };
 
     // Deduplicate: remove usage matches that overlap with definition matches.
     // Linear scan — max ~30 defs from EARLY_QUIT_THRESHOLD, no allocation needed.
@@ -1020,6 +1041,60 @@ end
         assert!(
             !elixir_find(code, "MyError").is_empty(),
             "should find 'MyError' module"
+        );
+    }
+
+    #[test]
+    fn strict_mode_drops_comment_and_usage_matches() {
+        // Python fixture: comment hit, real definition, and a variable usage
+        let py_code = "# class Foo\nclass Foo:\n    pass\n\nfoo = Foo()\n";
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test_strict.py");
+        std::fs::write(&path, py_code).unwrap();
+
+        // SymbolMode::Strict: only the class definition line
+        let strict_result =
+            super::search("Foo", tmp.path(), None, None, super::SymbolMode::Strict).unwrap();
+        assert_eq!(
+            strict_result.matches.len(),
+            1,
+            "strict mode should return exactly 1 match (the definition), got: {:?}",
+            strict_result
+                .matches
+                .iter()
+                .map(|m| (m.line, &m.text))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            strict_result.matches[0].line, 2,
+            "match should be the class definition line"
+        );
+        assert!(strict_result.matches[0].is_definition);
+
+        // SymbolMode::Any: comment (line 1) + definition (line 2) + usage (line 5).
+        let any_result =
+            super::search("Foo", tmp.path(), None, None, super::SymbolMode::Any).unwrap();
+        let any_lines: Vec<(u32, bool)> = any_result
+            .matches
+            .iter()
+            .map(|m| (m.line, m.is_definition))
+            .collect();
+        assert_eq!(
+            any_result.matches.len(),
+            3,
+            "SymbolMode::Any should return exactly 3 matches (comment + def + usage), got: {any_lines:?}"
+        );
+        assert!(
+            any_lines.contains(&(2, true)),
+            "Any should include the class definition at line 2, got: {any_lines:?}"
+        );
+        assert!(
+            any_lines.contains(&(1, false)),
+            "Any should include the comment hit at line 1, got: {any_lines:?}"
+        );
+        assert!(
+            any_lines.contains(&(5, false)),
+            "Any should include the usage at line 5, got: {any_lines:?}"
         );
     }
 

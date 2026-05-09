@@ -152,8 +152,9 @@ pub fn search_symbol(
     scope: &Path,
     cache: &OutlineCache,
     glob: Option<&str>,
+    mode: symbol::SymbolMode,
 ) -> Result<String, TilthError> {
-    let result = symbol::search(query, scope, None, glob)?;
+    let result = symbol::search(query, scope, None, glob, mode)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
     format_search_result(&result, cache, None, &bloom, 0)
 }
@@ -167,8 +168,9 @@ pub fn search_symbol_expanded(
     expand: usize,
     context: Option<&Path>,
     glob: Option<&str>,
+    mode: symbol::SymbolMode,
 ) -> Result<String, TilthError> {
-    let result = symbol::search(query, scope, context, glob)?;
+    let result = symbol::search(query, scope, context, glob, mode)?;
     format_search_result(&result, cache, Some(session), bloom, expand)
 }
 
@@ -181,6 +183,7 @@ pub fn search_multi_symbol_expanded(
     expand: usize,
     context: Option<&Path>,
     glob: Option<&str>,
+    mode: symbol::SymbolMode,
 ) -> Result<String, TilthError> {
     // Shared expand budget: at least 1 slot per query, or explicit expand if higher.
     // expand=0 means no expansion at all.
@@ -193,7 +196,7 @@ pub fn search_multi_symbol_expanded(
     let mut sections = Vec::with_capacity(queries.len());
 
     for query in queries {
-        let result = symbol::search(query, scope, context, glob)?;
+        let result = symbol::search(query, scope, context, glob, mode)?;
         let mut out = format::search_header(
             &result.query,
             &result.scope,
@@ -282,8 +285,9 @@ pub fn search_symbol_raw(
     query: &str,
     scope: &Path,
     glob: Option<&str>,
+    mode: symbol::SymbolMode,
 ) -> Result<SearchResult, TilthError> {
-    symbol::search(query, scope, None, glob)
+    symbol::search(query, scope, None, glob, mode)
 }
 
 /// Raw content search — returns structured result for programmatic inspection.
@@ -1587,10 +1591,22 @@ mod tests {
     #[test]
     fn symbol_search_glob_restricts_results() {
         let scope = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let rs_result =
-            symbol::search("walker", &scope, None, Some("*.rs")).expect("symbol search failed");
-        let toml_result = symbol::search("walker", &scope, None, Some("*.toml"))
-            .expect("symbol search with toml failed");
+        let rs_result = symbol::search(
+            "walker",
+            &scope,
+            None,
+            Some("*.rs"),
+            symbol::SymbolMode::Any,
+        )
+        .expect("symbol search failed");
+        let toml_result = symbol::search(
+            "walker",
+            &scope,
+            None,
+            Some("*.toml"),
+            symbol::SymbolMode::Any,
+        )
+        .expect("symbol search with toml failed");
 
         assert!(rs_result.total_found > 0, "*.rs should find 'walker'");
         assert_eq!(
