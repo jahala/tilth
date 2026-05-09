@@ -35,82 +35,28 @@ impl Services {
 }
 
 // Sent to the LLM via the MCP `instructions` field during initialization.
-// Keeps the strategic guidance from AGENTS.md available to any host.
-const SERVER_INSTRUCTIONS: &str = "\
-tilth — code intelligence MCP server. Replaces grep, cat, find, ls with AST-aware equivalents.\n\
-\n\
-ALWAYS BATCH. When you have 2+ files to read, call tilth_read once with paths: [...]. When you have edits to multiple files, call tilth_edit once with files: [...]. Never make N serial calls when one will do — each tool call is a turn.\n\
-\n\
-To explore code, always search first. tilth_search finds definitions, usages, and file locations in one call.\n\
-Usage: tilth_search(query: \"handleRequest\").\n\
-tilth_files is ONLY for listing directory contents when you have no symbol or text to search for.\n\
-DO NOT use Read if content is already shown in expanded search results.\n\
-DO NOT use Grep, Read, or Glob. Always use the better tools tilth_search (grep), tilth_read (read), tilth_files (glob).\n\
-\n\
-tilth_search: Search code — finds definitions, usages, and text. Replaces grep/rg for all code search.\n\
-  For multi-symbol lookup, separate each with a comma \"symbol1,symbol2\" (max 5).\n\
-  kind: \"symbol\" (default) | \"content\" (strings/comments) | \"callers\" (call sites)\n\
-  expand (default 2): inline full source for top matches.\n\
-  context: path to file being edited — boosts nearby results.\n\
-  glob: file pattern filter — \"*.rs\" (whitelist), \"!*.test.ts\" (exclude).\n\
-  Output per match:\n\
-    ## <path>:<start>-<end> [definition|usage|impl]\n\
-    <outline context>\n\
-    <expanded source block>\n\
-    ── calls ──\n\
-      <name>  <path>:<start>-<end>  <signature>\n\
-    ── siblings ──\n\
-      <name>  <path>:<start>-<end>  <signature>\n\
-  Re-expanding a previously shown definition returns [shown earlier].\n\
-\n\
-tilth_read: Read one or more files with smart outlining. Replaces cat/head/tail.\n\
-  paths: [\"a.rs\", \"b.rs\"] reads many in one call (max 20). PREFER this over serial single-file reads.\n\
-  path: \"a.rs\" for a single file.\n\
-  Small files → full content. Large files → structural outline.\n\
-  section: \"<start>-<end>\" or \"<heading text>\"\n\
-  sections: array of ranges/headings — multiple slices from the same file in one call.\n\
-  Output:\n\
-    <line_number> │ <content>                  ← full/section mode\n\
-    [<start>-<end>]  <symbol name>             ← outline mode\n\
-\n\
-tilth_files: Find files by glob pattern. Replaces find, ls, pwd, and the host Glob tool.\n\
-  patterns: run multiple globs in one call (e.g. patterns: [\"*.rs\", \"*.toml\"]).\n\
-  Output: <path>  (~<token_count> tokens).\n\
-\n\
-tilth_deps: Blast-radius check — what imports this file and what it imports.\n\
-  Use ONLY before renaming, removing, or changing an export's signature.\n\
-\n\
-tilth_diff: Structural diff — shows what changed at function level. Replaces Bash(git diff).\n\
-  Usage: tilth_diff(source: \"HEAD~1\") for last commit. No args = uncommitted changes.\n\
-  scope: \"file.rs\" or \"file.rs:fn_name\". log: \"HEAD~5..HEAD\" for per-commit summaries.\n\
-  search: filter to lines matching a term. blast: true to show callers of changed signatures.\n\
-  Output: [+] added, [-] deleted, [~] body changed, [~:sig] signature changed.\n\
-  DO NOT use Bash(git diff) or Bash(git log --patch). Use tilth_diff instead.\n\
-\n\
-To search code, use tilth_search instead of Grep or Bash(grep/rg).\n\
-To read files, use tilth_read instead of Read or Bash(cat).\n\
-To find files, use tilth_files instead of Glob or Bash(find/ls).\n\
-To check what changed, use tilth_diff instead of Bash(git diff/git log).\n\
-DO NOT re-read files already shown in expanded search results.";
+// Source of truth: prompts/mcp-base.md and prompts/mcp-edit.md.
+// AGENTS.md is regenerated from these via scripts/regen-agents-md.sh.
+const SERVER_INSTRUCTIONS: &str = include_str!("../prompts/mcp-base.md");
+const EDIT_MODE_EXTRA: &str = include_str!("../prompts/mcp-edit.md");
 
-const EDIT_MODE_EXTRA: &str = "\n\
-\n\
-tilth_edit: Batch edit one or more files using hash-anchored lines. Replaces the host Edit tool.\n\
-  ALWAYS group edits to multiple files into ONE tilth_edit call (max 20 files). Never call tilth_edit twice in a row.\n\
-  tilth_read → copy anchors (<line>:<hash>) (BOTH line and hash required) → pass to tilth_edit.\n\
-  tilth_search does NOT provide hashes — you MUST tilth_read the file or section first.\n\
-  Shape: {\"files\": [{\"path\": \"a.rs\", \"edits\": [...]}, {\"path\": \"b.rs\", \"edits\": [...]}]}\n\
-  Single file: {\"files\": [{\"path\": \"a.rs\", \"edits\": [{\"start\": \"<line>:<hash>\", \"content\": \"<new code>\"}]}]}\n\
-  Edit forms inside `edits`:\n\
-    Single line: {\"start\": \"<line>:<hash>\", \"content\": \"<new code>\"}\n\
-    Range:       {\"start\": \"<line>:<hash>\", \"end\": \"<line>:<hash>\", \"content\": \"...\"}\n\
-    Delete:      {\"start\": \"<line>:<hash>\", \"content\": \"\"}\n\
-  Per-file results: each file is processed independently. A hash mismatch on one file does NOT block the others.\n\
-  Hash mismatch → file changed, re-read THAT file and retry it (other files in the batch already applied).\n\
-  Large files: tilth_read shows outline — use section to get hashlined content.\n\
-  Pass diff: true to see a compact before/after diff per file.\n\
-  After editing a function signature, tilth_edit shows callers that may need updating.\n\
-DO NOT use the host Edit tool. Use tilth_edit for all edits.";
+/// Compose the `instructions` field for MCP `initialize`. Trims the embedded
+/// markdown so that trailing file newlines don't leak into the wire format,
+/// then reinjects `\n\n` between sections.
+fn build_instructions(edit_mode: bool, overview: &str) -> String {
+    let base = SERVER_INSTRUCTIONS.trim();
+    let mut out = String::with_capacity(SERVER_INSTRUCTIONS.len() + EDIT_MODE_EXTRA.len() + 64);
+    if !overview.is_empty() {
+        out.push_str(overview);
+        out.push_str("\n\n");
+    }
+    out.push_str(base);
+    if edit_mode {
+        out.push_str("\n\n");
+        out.push_str(EDIT_MODE_EXTRA.trim());
+    }
+    out
+}
 
 /// MCP server over stdio. When `edit_mode` is true, exposes `tilth_edit` and
 /// switches `tilth_read` to hashline output format.
@@ -299,17 +245,7 @@ fn handle_request(req: &JsonRpcRequest, services: &Services) -> JsonRpcResponse 
                 let cwd = std::env::current_dir().unwrap_or_default();
                 crate::overview::fingerprint(&cwd)
             };
-            let instructions = if edit_mode {
-                if overview.is_empty() {
-                    format!("{SERVER_INSTRUCTIONS}{EDIT_MODE_EXTRA}")
-                } else {
-                    format!("{overview}\n\n{SERVER_INSTRUCTIONS}{EDIT_MODE_EXTRA}")
-                }
-            } else if overview.is_empty() {
-                SERVER_INSTRUCTIONS.to_string()
-            } else {
-                format!("{overview}\n\n{SERVER_INSTRUCTIONS}")
-            };
+            let instructions = build_instructions(edit_mode, &overview);
             JsonRpcResponse {
                 jsonrpc: "2.0",
                 id: req.id.clone(),
@@ -1131,6 +1067,58 @@ fn write_error(w: &mut impl Write, id: Option<Value>, code: i32, msg: &str) -> i
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- build_instructions ---------------------------------------------------
+
+    #[test]
+    fn build_instructions_base_has_expected_anchors() {
+        let s = build_instructions(false, "");
+        assert!(
+            s.starts_with("tilth — code intelligence MCP server."),
+            "missing opening anchor: {:?}",
+            &s[..60.min(s.len())]
+        );
+        assert!(
+            s.ends_with("DO NOT re-read files already shown in expanded search results."),
+            "missing closing anchor"
+        );
+        assert!(
+            !s.contains("tilth_edit:"),
+            "edit-mode content leaked into base"
+        );
+    }
+
+    #[test]
+    fn build_instructions_edit_appends_extra_with_blank_line() {
+        let s = build_instructions(true, "");
+        assert!(
+            s.contains(
+                "DO NOT re-read files already shown in expanded search results.\n\ntilth_edit:"
+            ),
+            "expected single blank-line separator between base and edit-mode sections"
+        );
+        assert!(s.ends_with("DO NOT use the host Edit tool. Use tilth_edit for all edits."));
+    }
+
+    #[test]
+    fn build_instructions_overview_prepends_with_blank_line() {
+        let s = build_instructions(false, "OVERVIEW");
+        assert!(
+            s.starts_with("OVERVIEW\n\ntilth — "),
+            "overview should be followed by blank line then base"
+        );
+    }
+
+    #[test]
+    fn build_instructions_no_trailing_whitespace() {
+        for &edit in &[false, true] {
+            let s = build_instructions(edit, "");
+            assert!(
+                !s.ends_with('\n') && !s.ends_with(' '),
+                "wire output must not end with whitespace (edit={edit})"
+            );
+        }
+    }
 
     // -- extract_root_from_response -------------------------------------------
 

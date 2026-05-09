@@ -122,11 +122,11 @@ Task definitions are in `benchmark/tasks/*.py`. Each has `name`, `prompt`, `grou
 
 ## MCP instructions
 
-Server instructions sent via MCP protocol live in `src/mcp.rs`:
-- `SERVER_INSTRUCTIONS` — base instructions for all modes
-- `EDIT_MODE_EXTRA` — appended in edit mode (hashline format, edit workflow)
+Server instructions live in `prompts/`:
+- `prompts/mcp-base.md` — base instructions for all modes (compiled into the binary as `SERVER_INSTRUCTIONS` via `include_str!` in `src/mcp.rs`)
+- `prompts/mcp-edit.md` — appended in edit mode (compiled in as `EDIT_MODE_EXTRA`)
 
-`AGENTS.md` is the user-facing copy read directly by Claude Code (not via MCP protocol). Both should stay in sync.
+After editing either file, run `scripts/regen-agents-md.sh` to refresh `AGENTS.md` (which is a generated artifact for hosts that read repo-root prompt files). The MCP-connected agent receives the contents of `prompts/*.md` directly via the protocol's `instructions` field.
 
 Changes to MCP instructions must be surgical — no bloat. Haiku is sensitive to:
 - Instruction positioning (top-weighted — put important guidance first)
