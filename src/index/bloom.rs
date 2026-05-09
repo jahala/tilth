@@ -7,127 +7,11 @@
 //! Identifier extraction uses a simple byte-level state machine -- no
 //! tree-sitter needed -- making it fast enough to run on every uncached file.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use dashmap::DashMap;
-
-// ---------------------------------------------------------------------------
-// BloomFilter
-// ---------------------------------------------------------------------------
-
-/// A probabilistic set membership data structure.
-///
-/// Supports `insert` and `contains`. `contains` may return false positives
-/// but never false negatives: if it returns `false`, the item is definitely
-/// absent.
-pub struct BloomFilter {
-    bits: Vec<u64>,
-    num_hashes: u8,
-    num_bits: usize,
-}
-
-impl BloomFilter {
-    /// Create a new Bloom filter sized for `expected_items` with the given
-    /// target false-positive rate.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `expected_items` is 0 or `target_fpr` is not in (0, 1).
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use tilth::index::bloom::BloomFilter;
-    ///
-    /// let bf = BloomFilter::new(100, 0.01);
-    /// assert!(!bf.contains("hello"));
-    /// ```
-    #[must_use]
-    #[allow(clippy::cast_precision_loss)] // expected_items fits in f64 mantissa for practical sizes
-    pub fn new(expected_items: usize, target_fpr: f64) -> Self {
-        assert!(expected_items > 0, "expected_items must be > 0");
-        assert!(
-            target_fpr > 0.0 && target_fpr < 1.0,
-            "target_fpr must be in (0, 1)"
-        );
-
-        let n = expected_items as f64;
-        let ln2 = std::f64::consts::LN_2;
-
-        // Optimal number of bits: m = -(n * ln(p)) / (ln(2)^2)
-        let m = (-(n * target_fpr.ln()) / (ln2 * ln2)).ceil() as usize;
-        let m = m.max(64); // minimum 1 word
-
-        // Optimal number of hash functions: k = (m/n) * ln(2)
-        #[allow(clippy::cast_precision_loss)]
-        let k = ((m as f64 / n) * ln2).ceil() as u8;
-        let k = k.clamp(1, 32);
-
-        // Round up to full u64 words
-        let num_words = m.div_ceil(64);
-        let num_bits = num_words * 64;
-
-        Self {
-            bits: vec![0u64; num_words],
-            num_hashes: k,
-            num_bits,
-        }
-    }
-
-    /// Insert an item into the filter.
-    pub fn insert(&mut self, item: &str) {
-        let (h1, h2) = double_hash(item);
-        for i in 0..u64::from(self.num_hashes) {
-            let idx = combined_hash(h1, h2, i, self.num_bits);
-            let word = idx / 64;
-            let bit = idx % 64;
-            self.bits[word] |= 1u64 << bit;
-        }
-    }
-
-    /// Check if an item is probably in the filter.
-    ///
-    /// Returns `true` if the item is PROBABLY present, `false` if it is
-    /// DEFINITELY absent.
-    #[must_use]
-    pub fn contains(&self, item: &str) -> bool {
-        let (h1, h2) = double_hash(item);
-        for i in 0..u64::from(self.num_hashes) {
-            let idx = combined_hash(h1, h2, i, self.num_bits);
-            let word = idx / 64;
-            let bit = idx % 64;
-            if self.bits[word] & (1u64 << bit) == 0 {
-                return false;
-            }
-        }
-        true
-    }
-}
-
-/// Compute two independent hashes for double-hashing.
-fn double_hash(item: &str) -> (u64, u64) {
-    let h1 = hash_with_seed(item, 0);
-    let h2 = hash_with_seed(item, 0x517c_c1b7_2722_0a95); // arbitrary non-zero seed
-    (h1, h2)
-}
-
-/// Combine h1 and h2 into the i-th hash value, mapped to `[0, num_bits)`.
-fn combined_hash(h1: u64, h2: u64, i: u64, num_bits: usize) -> usize {
-    // h(i) = h1 + i * h2 (mod num_bits)
-    let hash = h1.wrapping_add(i.wrapping_mul(h2));
-    (hash % num_bits as u64) as usize
-}
-
-/// Hash a string with a given seed using `DefaultHasher`.
-fn hash_with_seed(item: &str, seed: u64) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    seed.hash(&mut hasher);
-    item.hash(&mut hasher);
-    hasher.finish()
-}
+use fastbloom::BloomFilter;
 
 // ---------------------------------------------------------------------------
 // BloomFilterCache
@@ -181,11 +65,12 @@ impl BloomFilterCache {
 
 /// Build a Bloom filter from file content by extracting all identifiers.
 fn build_filter(content: &str) -> BloomFilter {
-    // Count identifiers first to size the filter appropriately.
     let idents: Vec<&str> = extract_identifiers(content).collect();
+    // Sized for total token count, not unique identifiers -- duplicates over-allocate
+    // the filter, so the achieved FPR is well below the 0.01 target in practice.
     let expected = idents.len().max(1);
 
-    let mut filter = BloomFilter::new(expected, 0.01);
+    let mut filter = BloomFilter::with_false_pos(0.01).expected_items(expected);
     for ident in idents {
         filter.insert(ident);
     }
@@ -375,7 +260,7 @@ mod tests {
 
     #[test]
     fn test_basic_membership() {
-        let mut bf = BloomFilter::new(100, 0.01);
+        let mut bf = BloomFilter::with_false_pos(0.01).expected_items(100);
         bf.insert("foo");
         bf.insert("bar");
         bf.insert("baz");
@@ -387,7 +272,7 @@ mod tests {
 
     #[test]
     fn test_definitely_not_present() {
-        let mut bf = BloomFilter::new(10, 0.01);
+        let mut bf = BloomFilter::with_false_pos(0.01).expected_items(10);
         bf.insert("alpha");
         bf.insert("beta");
         bf.insert("gamma");
@@ -415,7 +300,7 @@ mod tests {
     #[test]
     fn test_false_positive_rate() {
         let n = 500;
-        let mut bf = BloomFilter::new(n, 0.01);
+        let mut bf = BloomFilter::with_false_pos(0.01).expected_items(n);
 
         // Insert N items
         for i in 0..n {
@@ -517,17 +402,6 @@ mod tests {
         // Different mtime: should rebuild from new content
         assert!(cache.contains(path, mtime_new, new_content, "new_function"));
         assert!(!cache.contains(path, mtime_new, new_content, "old_function"));
-    }
-
-    #[test]
-    fn test_bloom_filter_sizing() {
-        // Verify the filter creates a reasonable number of bits
-        let bf = BloomFilter::new(100, 0.01);
-        // Optimal: ~960 bits (15 words). Allow some rounding.
-        assert!(bf.num_bits >= 896, "too few bits: {}", bf.num_bits);
-        assert!(bf.num_bits <= 1088, "too many bits: {}", bf.num_bits);
-        assert!(bf.num_hashes >= 5, "too few hashes: {}", bf.num_hashes);
-        assert!(bf.num_hashes <= 10, "too many hashes: {}", bf.num_hashes);
     }
 
     #[test]
