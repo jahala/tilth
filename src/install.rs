@@ -431,20 +431,9 @@ fn resolve_host(host: &str) -> Result<HostInfo, String> {
     }
 }
 
+/// Cross-platform home-directory lookup, with an actionable error message.
 fn home_dir() -> Result<PathBuf, String> {
-    #[cfg(target_os = "windows")]
-    {
-        std::env::var("USERPROFILE")
-            .map(PathBuf::from)
-            .map_err(|_| "USERPROFILE not set".into())
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        std::env::var("HOME")
-            .map(PathBuf::from)
-            .map_err(|_| "HOME not set".into())
-    }
+    home::home_dir().ok_or_else(|| "home directory not found ($HOME / $USERPROFILE)".into())
 }
 
 /// Merge a tilth server entry into a JSON config under the given servers key.

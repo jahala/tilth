@@ -65,6 +65,9 @@ toml = "0.8"
 # MCP protocol (JSON-RPC over stdio)
 # (handled manually — no framework needed)
 
+# Cross-platform home directory lookup (cargo-team maintained)
+home = "0.5"
+
 # Terminal size detection (TIOCGWINSZ ioctl, falls back to env vars)
 terminal_size = "0.4"
 
