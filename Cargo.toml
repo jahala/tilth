@@ -66,6 +66,15 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 
+# Error types
+thiserror = "2"
+
+# Bloom filter (fast SIMD-optimized impl)
+fastbloom = "0.17"
+
+# String similarity (fuzzy symbol-rename detection)
+strsim = "0.11"
+
 # MCP protocol (JSON-RPC over stdio)
 # (handled manually — no framework needed)
 

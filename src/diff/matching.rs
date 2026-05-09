@@ -219,7 +219,7 @@ pub(crate) fn match_symbols(old: &[DiffSymbol], new: &[DiffSymbol]) -> Vec<Symbo
             if max_len == 0 || (min_len as f32 / max_len as f32) < 0.8 {
                 continue;
             }
-            let score = jaccard_similarity(&old[oi].source_text, &new[ni].source_text);
+            let score = strsim::sorensen_dice(&old[oi].source_text, &new[ni].source_text) as f32;
             if score >= 0.8 {
                 candidates.push((oi, ni, score));
             }
@@ -486,20 +486,6 @@ fn trim_ascii(bytes: &[u8]) -> &[u8] {
         .rposition(|b| !b.is_ascii_whitespace())
         .map_or(start, |p| p + 1);
     &bytes[start..end]
-}
-
-fn jaccard_similarity(a: &str, b: &str) -> f32 {
-    let set_a: HashSet<&str> = a.split_whitespace().collect();
-    let set_b: HashSet<&str> = b.split_whitespace().collect();
-    let intersection = set_a.intersection(&set_b).count();
-    let union = set_a.union(&set_b).count();
-    if union == 0 {
-        return 0.0;
-    }
-    #[allow(clippy::cast_precision_loss)]
-    {
-        intersection as f32 / union as f32
-    }
 }
 
 // ---------------------------------------------------------------------------
