@@ -250,40 +250,17 @@ fn extract_root_from_response(msg: &Value) -> Option<PathBuf> {
     for root in roots {
         let uri = root.get("uri")?.as_str()?;
         let raw_path = uri.strip_prefix("file://").unwrap_or(uri);
-        let path = PathBuf::from(percent_decode(raw_path));
+        // On invalid UTF-8 in a percent-encoded path, fall back to the
+        // original input rather than substituting U+FFFD replacements.
+        let decoded = percent_encoding::percent_decode_str(raw_path)
+            .decode_utf8()
+            .map_or_else(|_| raw_path.to_string(), std::borrow::Cow::into_owned);
+        let path = PathBuf::from(decoded);
         if path.is_dir() {
             return Some(path);
         }
     }
     None
-}
-
-/// Decode percent-encoded URI path components (e.g. `%20` → space).
-fn percent_decode(input: &str) -> String {
-    let mut out = Vec::with_capacity(input.len());
-    let bytes = input.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
-                out.push(hi << 4 | lo);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8(out).unwrap_or_else(|_| input.to_string())
-}
-
-fn hex_val(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
 }
 
 #[derive(Deserialize)]
@@ -1189,17 +1166,6 @@ mod tests {
         });
         let path = extract_root_from_response(&msg);
         assert_eq!(path, Some(space_dir));
-    }
-
-    #[test]
-    fn percent_decode_basic() {
-        assert_eq!(
-            percent_decode("/Users/Jan%20Hallvard/project"),
-            "/Users/Jan Hallvard/project"
-        );
-        assert_eq!(percent_decode("/normal/path"), "/normal/path");
-        assert_eq!(percent_decode("%2F%2Fweird"), "//weird");
-        assert_eq!(percent_decode("no%percent"), "no%percent"); // incomplete sequence preserved
     }
 
     #[test]

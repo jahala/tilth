@@ -65,8 +65,15 @@ pub fn is_minified_by_name(name: &str) -> bool {
         }
     }
     // `-min.<ext>` (e.g. `bundle-min.js`). Compare in place to avoid the
-    // per-call lowercase allocation.
-    stem.len() >= 4 && stem[stem.len() - 4..].eq_ignore_ascii_case("-min")
+    // per-call lowercase allocation.  Use char-boundary-safe slicing:
+    // `stem.len() - 4` is a byte offset that may land inside a multi-byte
+    // UTF-8 character, so use `char_indices().nth_back()` instead.
+    if let Some(start) = stem.char_indices().nth_back(3).map(|(i, _)| i) {
+        if stem[start..].eq_ignore_ascii_case("-min") {
+            return true;
+        }
+    }
+    false
 }
 
 /// Heuristic: does this content look minified? Samples first 2KB and counts
@@ -110,6 +117,21 @@ mod tests {
         assert!(!is_minified_by_name("admin.js"));
         assert!(!is_minified_by_name("README.md"));
         assert!(!is_minified_by_name("noext"));
+    }
+
+    /// Regression: multi-byte UTF-8 filenames must not panic when slicing
+    /// the stem suffix. `stem.len() - 4` is a byte offset, not a char
+    /// offset — it can land inside a CJK or emoji character.
+    #[test]
+    fn minified_filename_multibyte_utf8() {
+        // CJK: each character is 3 bytes in UTF-8.
+        assert!(!is_minified_by_name("日本語ファイル.js"));
+        assert!(is_minified_by_name("パネル-min.js"));
+        assert!(is_minified_by_name("データ.min.css"));
+        // Short name: stem < 4 chars, `nth_back(3)` returns None.
+        assert!(!is_minified_by_name("設定.md"));
+        // Emoji: 4 bytes each in UTF-8.
+        assert!(!is_minified_by_name("🚀📦🎯📋.js"));
     }
 
     /// A leading dot is a hidden-file marker, not an extension separator —
