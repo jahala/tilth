@@ -546,26 +546,12 @@ fn suggest_similar(path: &Path) -> Option<String> {
 
 /// Levenshtein distance over Unicode scalar values.
 ///
-/// Operates on `char`s, not bytes — a single CJK or emoji glyph is one
-/// edit unit, not 3-4. Byte-level Levenshtein on UTF-8 inflates distances
-/// for non-ASCII content and breaks ranking for international markdown
-/// or filenames. Used by both filename suggestion (`suggest_similar`) and
-/// heading suggestion (`suggest_headings`).
+/// Wraps `strsim::levenshtein`, which iterates `.chars()` so a single CJK
+/// or emoji glyph counts as one edit unit (not 3-4 bytes). Used by both
+/// filename suggestion (`suggest_similar`) and heading suggestion
+/// (`suggest_headings`).
 fn edit_distance(a: &str, b: &str) -> usize {
-    let a: Vec<char> = a.chars().collect();
-    let b: Vec<char> = b.chars().collect();
-    let mut prev: Vec<usize> = (0..=b.len()).collect();
-    let mut curr = vec![0; b.len() + 1];
-
-    for (i, &ca) in a.iter().enumerate() {
-        curr[0] = i + 1;
-        for (j, &cb) in b.iter().enumerate() {
-            let cost = usize::from(ca != cb);
-            curr[j + 1] = (prev[j] + cost).min(prev[j + 1] + 1).min(curr[j] + 1);
-        }
-        std::mem::swap(&mut prev, &mut curr);
-    }
-    prev[b.len()]
+    strsim::levenshtein(a, b)
 }
 
 /// Guess MIME type from extension for binary file headers.
@@ -775,9 +761,10 @@ mod tests {
         );
     }
 
-    /// edit_distance must operate on `char`s so non-ASCII headings rank
-    /// correctly. Byte-level Levenshtein would inflate distances for
-    /// CJK or emoji because those occupy 3–4 bytes per scalar value.
+    /// Filename and heading suggestion rely on Unicode-scalar-level edit
+    /// distance, not byte-level — locks in the contract `strsim::levenshtein`
+    /// provides via its char-iterating wrapper. If `strsim` ever switches
+    /// to a byte-level distance, this test fails loudly.
     #[test]
     fn edit_distance_is_unicode_aware() {
         // 设置 (Settings) and 設定 (Configuration) — different chars,
