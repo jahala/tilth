@@ -2,7 +2,7 @@ tilth — code intelligence MCP server. Replaces grep, cat, find, ls with AST-aw
 
 ## Core Principles
 
-ALWAYS BATCH: tilth_read takes `paths: [...]`, tilth_files takes `patterns: [...]`, tilth_edit takes `files: [...]`. Always pass every file/glob/edit you need in one call. Even for a single item, use a one-element array: `paths: ["a.rs"]`, `patterns: ["*.rs"]`. Never call these tools twice in a row — each tool call is a turn.
+ALWAYS BATCH: tilth_read takes `paths: [...]`, tilth_files takes `patterns: [...]`, tilth_edit takes `files: [...]`. Batch all known reads, globs, and edits into the first call; each extra call costs a turn. Even for one item, use a one-element array: `paths: ["a.rs"]`, `patterns: ["*.rs"]`. Never call the same batch-capable tool twice in a row when one call could include all items.
 
 Search first: To explore code, always call tilth_search before reaching for other tools. It finds definitions, usages, and file locations in one call.
 
@@ -31,6 +31,7 @@ tilth_search: Code search — finds definitions, usages, and text. Replaces grep
 
 tilth_read: File reading with smart outlining. Replaces cat/head/tail.
   Usage: tilth_read(paths: ["a.rs", "b.rs"]) — always an array, max 20 files in one call.
+  Before calling, collect every file you already know you need; include them all.
   For a single file: tilth_read(paths: ["a.rs"]). The singular `path` form is NOT accepted.
   Small files return full content. Large files return structural outline.
   section: "<start>-<end>" or "<heading text>" — only valid with a single-element paths array
@@ -41,6 +42,7 @@ tilth_read: File reading with smart outlining. Replaces cat/head/tail.
 
 tilth_files: File glob search. Replaces find, ls, pwd.
   Usage: tilth_files(patterns: ["*.rs", "*.toml"]) — always an array, max 20 globs in one call.
+  Before calling, collect every glob you already know you need; include them all.
   For a single glob: tilth_files(patterns: ["*.rs"]). The singular `pattern` form is NOT accepted.
   Output: <path>  (~<token_count> tokens)
 

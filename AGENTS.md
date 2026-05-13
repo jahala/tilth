@@ -4,7 +4,7 @@ tilth — code intelligence MCP server. Replaces grep, cat, find, ls with AST-aw
 
 ## Core Principles
 
-ALWAYS BATCH: tilth_read takes `paths: [...]`, tilth_files takes `patterns: [...]`, tilth_edit takes `files: [...]`. Always pass every file/glob/edit you need in one call. Even for a single item, use a one-element array: `paths: ["a.rs"]`, `patterns: ["*.rs"]`. Never call these tools twice in a row — each tool call is a turn.
+ALWAYS BATCH: tilth_read takes `paths: [...]`, tilth_files takes `patterns: [...]`, tilth_edit takes `files: [...]`. Batch all known reads, globs, and edits into the first call; each extra call costs a turn. Even for one item, use a one-element array: `paths: ["a.rs"]`, `patterns: ["*.rs"]`. Never call the same batch-capable tool twice in a row when one call could include all items.
 
 Search first: To explore code, always call tilth_search before reaching for other tools. It finds definitions, usages, and file locations in one call.
 
@@ -33,6 +33,7 @@ tilth_search: Code search — finds definitions, usages, and text. Replaces grep
 
 tilth_read: File reading with smart outlining. Replaces cat/head/tail.
   Usage: tilth_read(paths: ["a.rs", "b.rs"]) — always an array, max 20 files in one call.
+  Before calling, collect every file you already know you need; include them all.
   For a single file: tilth_read(paths: ["a.rs"]). The singular `path` form is NOT accepted.
   Small files return full content. Large files return structural outline.
   section: "<start>-<end>" or "<heading text>" — only valid with a single-element paths array
@@ -43,6 +44,7 @@ tilth_read: File reading with smart outlining. Replaces cat/head/tail.
 
 tilth_files: File glob search. Replaces find, ls, pwd.
   Usage: tilth_files(patterns: ["*.rs", "*.toml"]) — always an array, max 20 globs in one call.
+  Before calling, collect every glob you already know you need; include them all.
   For a single glob: tilth_files(patterns: ["*.rs"]). The singular `pattern` form is NOT accepted.
   Output: <path>  (~<token_count> tokens)
 
@@ -60,7 +62,7 @@ tilth_diff: Structural diff at function level. Replaces Bash(git diff/git log --
 
 tilth_edit: Batch edit files using hash-anchored lines. Replaces the host Edit tool.
 
-ALWAYS group edits to multiple files into ONE tilth_edit call (max 20 files). Never call tilth_edit twice in a row.
+ALWAYS group edits to all files you are ready to modify into ONE tilth_edit call (max 20 files). Never call tilth_edit twice in a row when one `files` array could include every file.
 
 Workflow: tilth_read → copy anchors (<line>:<hash>) (BOTH line and hash required) → pass to tilth_edit.
 Note: tilth_search does NOT provide hashes — you MUST tilth_read the file or section first to get them.
@@ -90,7 +92,10 @@ Edit forms inside `edits`:
 
 Behavior:
 - Each file is processed independently. A hash mismatch on one file does NOT block the others.
-- Hash mismatch means the file changed after you read it. Re-read THAT file and retry (other files in the batch already applied).
+- If at least one file succeeds, the MCP response has `isError: false`; still scan every `## <path>` section for per-file failures.
+- Hash mismatch means the file changed after you read it. Re-read THAT file and retry only that file (other files in the batch already applied).
+- A malformed edit entry fails that whole file before any of its edits apply; fix the entry and retry the file.
+- Each path may appear only once per call. Group all edits for the same file under one `files[]` entry.
 - Large files: tilth_read shows outline — use section to get hashlined content.
 - Pass diff: true to see a compact before/after diff per file.
 - After editing a function signature, tilth_edit shows callers that may need updating.

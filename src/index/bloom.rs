@@ -66,6 +66,8 @@ impl BloomFilterCache {
 /// Build a Bloom filter from file content by extracting all identifiers.
 fn build_filter(content: &str) -> BloomFilter {
     let idents: Vec<&str> = extract_identifiers(content).collect();
+    // Sized for total token count, not unique identifiers -- duplicates over-allocate
+    // the filter, so the achieved FPR is well below the 0.01 target in practice.
     let expected = idents.len().max(1);
 
     let mut filter = BloomFilter::with_false_pos(0.01).expected_items(expected);
