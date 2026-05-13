@@ -587,6 +587,12 @@ fn parse_file_edit(index: usize, val: &Value) -> crate::edit::FileEditTask {
             msg: "missing 'edits' array".into(),
         };
     };
+    if edits_val.is_empty() {
+        return FileEditTask::ParseError {
+            label: path_str.to_string(),
+            msg: "'edits' array is empty".into(),
+        };
+    }
 
     let mut edits = Vec::with_capacity(edits_val.len());
     for (i, e) in edits_val.iter().enumerate() {
@@ -664,13 +670,14 @@ fn tool_edit(
         .map(|(i, v)| parse_file_edit(i, v))
         .collect();
 
-    for task in &tasks {
-        if let crate::edit::FileEditTask::Ready { path, .. } = task {
-            session.record_read(path);
-        }
+    // Record reads only for files whose edits actually committed. Hash
+    // mismatches, parse errors, and I/O failures didn't change the file, so
+    // they shouldn't inflate the session activity counter.
+    let outcome = crate::edit::apply_batch(tasks, bloom, show_diff)?;
+    for path in &outcome.applied {
+        session.record_read(path);
     }
-
-    crate::edit::apply_batch(tasks, bloom, show_diff)
+    Ok(outcome.output)
 }
 
 /// Falls back to cwd when scope is invalid, with a warning message.
@@ -1430,6 +1437,16 @@ mod tests {
         format!("{line}:{h:03x}")
     }
 
+    /// Anchor with a hash guaranteed not to match the line's real hash.
+    /// XOR-flipping a bit can't collide with the original — used to force
+    /// hash-mismatch paths without depending on hardcoded sentinel values.
+    fn wrong_anchor_for(content: &str, line: usize) -> String {
+        let lines: Vec<_> = content.lines().collect();
+        let real = crate::format::line_hash(lines[line - 1].as_bytes());
+        let wrong = (real ^ 0x1) & 0xFFF;
+        format!("{line}:{wrong:03x}")
+    }
+
     fn edit_services() -> (Session, Arc<BloomFilterCache>) {
         (Session::new(), Arc::new(BloomFilterCache::new()))
     }
@@ -1595,5 +1612,184 @@ mod tests {
         let err =
             tool_edit(&args, &session, &bloom).expect_err("empty files array must be rejected");
         assert!(err.contains("empty"), "must mention empty: {err}");
+    }
+
+    /// Empty `edits` array must be rejected at parse time. Otherwise
+    /// `apply_edits` short-circuits to `Applied` without writing the file,
+    /// and the path would still flow into `BatchOutcome.applied` — inflating
+    /// the session read counter for a file that was never touched.
+    #[test]
+    fn batch_edit_empty_edits_array_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good.txt");
+        let untouched = dir.path().join("untouched.txt");
+        std::fs::write(&good, "alpha\n").unwrap();
+        std::fs::write(&untouched, "beta\n").unwrap();
+
+        let args = serde_json::json!({
+            "files": [
+                {
+                    "path": good.to_str().unwrap(),
+                    "edits": [{ "start": anchor_for("alpha\n", 1), "content": "ALPHA" }],
+                },
+                {
+                    "path": untouched.to_str().unwrap(),
+                    "edits": [],
+                },
+            ]
+        });
+
+        let (session, bloom) = edit_services();
+        let out = tool_edit(&args, &session, &bloom).expect("good half keeps batch alive");
+
+        assert!(
+            out.contains("'edits' array is empty"),
+            "empty edits must surface as parse error: {out}"
+        );
+        assert_eq!(std::fs::read_to_string(&untouched).unwrap(), "beta\n");
+        assert_eq!(
+            session.reads_count(),
+            1,
+            "empty-edits file must not be counted as read"
+        );
+    }
+
+    // -- record_read counter gating -------------------------------------------
+
+    /// A batch with one good file and one file with a deliberate hash
+    /// mismatch must record exactly one read — only the file whose edit
+    /// actually committed. Guards against the prior bug where every `Ready`
+    /// task counted as a read regardless of `apply_batch` outcome.
+    #[test]
+    fn tool_edit_records_read_only_for_applied_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good.txt");
+        let bad = dir.path().join("bad.txt");
+        std::fs::write(&good, "alpha\n").unwrap();
+        std::fs::write(&bad, "beta\n").unwrap();
+
+        let args = serde_json::json!({
+            "files": [
+                {
+                    "path": good.to_str().unwrap(),
+                    "edits": [{ "start": anchor_for("alpha\n", 1), "content": "ALPHA" }],
+                },
+                {
+                    "path": bad.to_str().unwrap(),
+                    // Derive a guaranteed-wrong hash so the mismatch is
+                    // forced regardless of what `beta` actually hashes to.
+                    "edits": [{ "start": wrong_anchor_for("beta\n", 1), "content": "BETA" }],
+                },
+            ]
+        });
+
+        let (session, bloom) = edit_services();
+        let out = tool_edit(&args, &session, &bloom).expect("good half should keep batch alive");
+
+        assert!(out.contains("hash mismatch"), "bad file reports mismatch");
+        assert_eq!(std::fs::read_to_string(&good).unwrap(), "ALPHA\n");
+        assert_eq!(std::fs::read_to_string(&bad).unwrap(), "beta\n");
+        assert_eq!(
+            session.reads_count(),
+            1,
+            "only the applied file should be counted as read"
+        );
+    }
+
+    /// Boundary: an IO failure on a `Ready` task (file doesn't exist) is a
+    /// different code path than a hash mismatch — it never reaches the hash
+    /// check. The applied-list gate must still exclude it from `record_read`.
+    #[test]
+    fn tool_edit_io_failure_excludes_from_reads_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good.txt");
+        std::fs::write(&good, "alpha\n").unwrap();
+        let missing = dir.path().join("nonexistent.txt"); // never created
+
+        let args = serde_json::json!({
+            "files": [
+                {
+                    "path": good.to_str().unwrap(),
+                    "edits": [{ "start": anchor_for("alpha\n", 1), "content": "ALPHA" }],
+                },
+                {
+                    "path": missing.to_str().unwrap(),
+                    // Hash value is irrelevant — the file read fails first.
+                    "edits": [{ "start": "1:000", "content": "X" }],
+                },
+            ]
+        });
+
+        let (session, bloom) = edit_services();
+        let out = tool_edit(&args, &session, &bloom).expect("good half keeps batch alive");
+
+        assert!(
+            out.contains(&format!("## {}", missing.display())),
+            "missing file should still get a section header: {out}"
+        );
+        assert_eq!(std::fs::read_to_string(&good).unwrap(), "ALPHA\n");
+        assert_eq!(
+            session.reads_count(),
+            1,
+            "IO failures must not inflate the read counter"
+        );
+    }
+
+    /// Boundary: when every entry is a parse error, `applied` is empty so
+    /// `apply_batch` returns `Err`. `tool_edit` must propagate that error AND
+    /// leave the read counter at zero — no `Ready` task ever existed.
+    #[test]
+    fn tool_edit_all_parse_errors_returns_err_with_no_reads() {
+        let args = serde_json::json!({
+            "files": [
+                { "path": "a.txt" }, // missing 'edits'
+                { "path": "b.txt", "edits": [{ "no_start": "x" }] }, // malformed edit
+            ]
+        });
+
+        let (session, bloom) = edit_services();
+        let err = tool_edit(&args, &session, &bloom)
+            .expect_err("an all-parse-error batch must surface as Err");
+
+        assert!(err.contains("a.txt") || err.contains("b.txt"), "err: {err}");
+        assert_eq!(
+            session.reads_count(),
+            0,
+            "no Ready task means no read should be recorded"
+        );
+    }
+
+    /// Boundary: a mixed parse-error + good-file batch at the wire layer.
+    /// The record_read gate sits in `tool_edit`, not in `apply_batch`, so it
+    /// needs explicit wire-level coverage.
+    #[test]
+    fn tool_edit_mixed_parse_error_and_good_file_records_only_good() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good.txt");
+        std::fs::write(&good, "alpha\n").unwrap();
+
+        let args = serde_json::json!({
+            "files": [
+                {
+                    "path": good.to_str().unwrap(),
+                    "edits": [{ "start": anchor_for("alpha\n", 1), "content": "ALPHA" }],
+                },
+                { "path": "malformed.txt" }, // parse error: missing 'edits'
+            ]
+        });
+
+        let (session, bloom) = edit_services();
+        let out = tool_edit(&args, &session, &bloom).expect("good half keeps batch alive");
+
+        assert!(
+            out.contains("missing 'edits'"),
+            "parse error should surface in output: {out}"
+        );
+        assert_eq!(std::fs::read_to_string(&good).unwrap(), "ALPHA\n");
+        assert_eq!(
+            session.reads_count(),
+            1,
+            "parse errors must not inflate the read counter"
+        );
     }
 }

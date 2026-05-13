@@ -308,6 +308,15 @@ fn format_diffs(diffs: &[EditDiff]) -> String {
     out
 }
 
+/// Successful return from [`apply_batch`]. `applied` lists the files whose
+/// edits actually committed so callers can gate session bookkeeping on real
+/// writes instead of on the upstream `Ready`/`ParseError` discriminant.
+#[derive(Debug)]
+pub struct BatchOutcome {
+    pub output: String,
+    pub applied: Vec<PathBuf>,
+}
+
 /// Apply a batch of file edits in parallel.
 ///
 /// Each task is processed independently — a hash mismatch, parse error, or
@@ -320,40 +329,50 @@ pub fn apply_batch(
     tasks: Vec<FileEditTask>,
     bloom: &Arc<BloomFilterCache>,
     show_diff: bool,
-) -> Result<String, String> {
-    let outcomes: Vec<(String, bool)> = tasks
+) -> Result<BatchOutcome, String> {
+    let outcomes: Vec<(String, Option<PathBuf>)> = tasks
         .into_par_iter()
         .map(|task| apply_one(task, bloom, show_diff))
         .collect();
 
-    let any_success = outcomes.iter().any(|(_, ok)| *ok);
-    let combined = outcomes
-        .into_iter()
-        .map(|(s, _)| s)
-        .collect::<Vec<_>>()
-        .join("\n\n---\n\n");
+    let mut applied = Vec::with_capacity(outcomes.len());
+    let mut sections = Vec::with_capacity(outcomes.len());
+    for (section, path) in outcomes {
+        if let Some(p) = path {
+            applied.push(p);
+        }
+        sections.push(section);
+    }
+    let output = sections.join("\n\n---\n\n");
 
-    if any_success {
-        Ok(combined)
+    if applied.is_empty() {
+        Err(output)
     } else {
-        Err(combined)
+        Ok(BatchOutcome { output, applied })
     }
 }
 
-/// Process one task into a `(section, success)` tuple. Kept separate so the
-/// parallel closure stays trivial and per-file logic is testable in isolation.
-fn apply_one(task: FileEditTask, bloom: &Arc<BloomFilterCache>, show_diff: bool) -> (String, bool) {
+/// Process one task into a `(section, applied_path)` tuple. The path is
+/// `Some` only when the file's edits committed — callers use that to gate
+/// session bookkeeping (e.g. `record_read`) on actual writes rather than on
+/// the upstream `Ready`/`ParseError` discriminant, which only reflects parse
+/// validation.
+fn apply_one(
+    task: FileEditTask,
+    bloom: &Arc<BloomFilterCache>,
+    show_diff: bool,
+) -> (String, Option<PathBuf>) {
     let (path, edits) = match task {
         FileEditTask::ParseError { label, msg } => {
-            return (format!("## {label}\nerror: {msg}"), false);
+            return (format!("## {label}\nerror: {msg}"), None);
         }
         FileEditTask::Ready { path, edits } => (path, edits),
     };
     let header = format!("## {}", path.display());
     match render_applied(&path, &edits, bloom, show_diff) {
-        Ok(body) if body.is_empty() => (header, true),
-        Ok(body) => (format!("{header}\n{body}"), true),
-        Err(msg) => (format!("{header}\n{msg}"), false),
+        Ok(body) if body.is_empty() => (header, Some(path)),
+        Ok(body) => (format!("{header}\n{body}"), Some(path)),
+        Err(msg) => (format!("{header}\n{msg}"), None),
     }
 }
 
