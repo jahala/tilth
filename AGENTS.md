@@ -4,7 +4,7 @@ tilth — code intelligence MCP server. Replaces grep, cat, find, ls with AST-aw
 
 ## Core Principles
 
-ALWAYS BATCH: When you have 2+ files to read, call tilth_read with paths: [...]. When you have edits to multiple files, call tilth_edit with files: [...]. Never make N serial calls when one will do — each tool call is a turn.
+ALWAYS BATCH: tilth_read takes `paths: [...]`, tilth_files takes `patterns: [...]`, tilth_edit takes `files: [...]`. Always pass every file/glob/edit you need in one call. Even for a single item, use a one-element array: `paths: ["a.rs"]`, `patterns: ["*.rs"]`. Never call these tools twice in a row — each tool call is a turn.
 
 Search first: To explore code, always call tilth_search before reaching for other tools. It finds definitions, usages, and file locations in one call.
 
@@ -32,16 +32,18 @@ tilth_search: Code search — finds definitions, usages, and text. Replaces grep
   Re-expanding a previously shown definition returns [shown earlier].
 
 tilth_read: File reading with smart outlining. Replaces cat/head/tail.
-  Usage: tilth_read(path: "a.rs") or tilth_read(paths: ["a.rs", "b.rs"]) (max 20 files in one call)
+  Usage: tilth_read(paths: ["a.rs", "b.rs"]) — always an array, max 20 files in one call.
+  For a single file: tilth_read(paths: ["a.rs"]). The singular `path` form is NOT accepted.
   Small files return full content. Large files return structural outline.
-  section: "<start>-<end>" or "<heading text>" to read a specific slice
-  sections: array of ranges/headings for multiple slices from the same file in one call
+  section: "<start>-<end>" or "<heading text>" — only valid with a single-element paths array
+  sections: array of ranges/headings for multiple slices — only valid with a single-element paths array
   Output modes:
     Full/section: <line_number> │ <content>
     Outline: [<start>-<end>]  <symbol name>
 
 tilth_files: File glob search. Replaces find, ls, pwd.
-  Usage: tilth_files(patterns: ["*.rs", "*.toml"]) — run multiple globs in one call
+  Usage: tilth_files(patterns: ["*.rs", "*.toml"]) — always an array, max 20 globs in one call.
+  For a single glob: tilth_files(patterns: ["*.rs"]). The singular `pattern` form is NOT accepted.
   Output: <path>  (~<token_count> tokens)
 
 tilth_deps: Blast-radius check before signature changes.

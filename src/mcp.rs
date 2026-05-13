@@ -299,34 +299,34 @@ fn tool_read(
 ) -> Result<String, String> {
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
 
-    // Multi-file batch read (capped at 20 to bound I/O).
-    if let Some(paths_arr) = args.get("paths").and_then(|v| v.as_array()) {
-        if paths_arr.len() > 20 {
-            return Err(format!(
-                "batch read limited to 20 files (got {})",
-                paths_arr.len()
-            ));
+    let paths_arr = match args.get("paths") {
+        Some(v) => v.as_array().ok_or(
+            "paths must be an array of file paths (use single-element array for one file)",
+        )?,
+        None => {
+            return Err("missing required parameter: paths (array of file paths, use single-element array for one file)".into());
         }
+    };
 
-        let paths: Vec<PathBuf> = paths_arr
-            .iter()
-            .map(|p| {
-                p.as_str()
-                    .ok_or("paths must be an array of strings")
-                    .map(PathBuf::from)
-            })
-            .collect::<Result<_, _>>()?;
-
-        let combined = crate::read::read_batch(&paths, cache, session, edit_mode);
-        return Ok(apply_budget(combined, budget));
+    if paths_arr.is_empty() {
+        return Err("paths must contain at least one file".into());
+    }
+    if paths_arr.len() > 20 {
+        return Err(format!(
+            "batch read limited to 20 files (got {})",
+            paths_arr.len()
+        ));
     }
 
-    // Single file read
-    let path_str = args
-        .get("path")
-        .and_then(|v| v.as_str())
-        .ok_or("missing required parameter: path (or use paths for batch read)")?;
-    let path = PathBuf::from(path_str);
+    let paths: Vec<PathBuf> = paths_arr
+        .iter()
+        .map(|p| {
+            p.as_str()
+                .ok_or("paths must be an array of strings")
+                .map(PathBuf::from)
+        })
+        .collect::<Result<_, _>>()?;
+
     let section = args.get("section").and_then(|v| v.as_str());
     let sections_arr = args.get("sections").and_then(|v| v.as_array());
     let full = args
@@ -337,6 +337,23 @@ fn tool_read(
     if section.is_some() && sections_arr.is_some() {
         return Err("provide either section (single) or sections (array), not both".into());
     }
+
+    // section/sections/full only apply when reading a single file.
+    let has_single_file_args = section.is_some() || sections_arr.is_some() || full;
+    if has_single_file_args && paths.len() > 1 {
+        return Err(
+            "section, sections, and full are only valid with a single-element paths array".into(),
+        );
+    }
+
+    // Multi-file batch: per-file smart view applies, but no related-file hints
+    // (those only make sense for whole-file reads of a single target).
+    if paths.len() > 1 {
+        let combined = crate::read::read_batch(&paths, cache, session, edit_mode);
+        return Ok(apply_budget(combined, budget));
+    }
+
+    let path = paths.into_iter().next().expect("paths non-empty");
 
     // Multi-section path: bypass smart view + related-file hints (those only
     // apply to whole-file reads).
@@ -364,7 +381,7 @@ fn tool_read(
     let mut output = crate::read::read_file(&path, section, full, cache, edit_mode)
         .map_err(|e| e.to_string())?;
 
-    // Append related-file hint for outlined code files (not section reads, not batch).
+    // Append related-file hint for outlined code files (not section reads).
     if section.is_none() && crate::read::would_outline(&path) {
         let related = crate::read::imports::resolve_related_files(&path);
         if !related.is_empty() {
@@ -480,29 +497,28 @@ fn tool_files(args: &Value) -> Result<String, String> {
     let (scope, scope_warning) = resolve_scope(args);
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
 
-    let single = args.get("pattern").and_then(|v| v.as_str());
-    let patterns_arr = args.get("patterns").and_then(|v| v.as_array());
-
-    if single.is_some() && patterns_arr.is_some() {
-        return Err("provide either pattern (single) or patterns (array), not both".into());
-    }
-
-    let patterns: Vec<&str> = if let Some(arr) = patterns_arr {
-        if arr.is_empty() {
-            return Err("patterns must contain at least one glob".into());
+    let patterns_arr = match args.get("patterns") {
+        Some(v) => v.as_array().ok_or(
+            "patterns must be an array of globs (use single-element array for one pattern)",
+        )?,
+        None => {
+            return Err("missing required parameter: patterns (array of globs, use single-element array for one pattern)".into());
         }
-        if arr.len() > 20 {
-            return Err(format!(
-                "patterns limited to 20 per call (got {})",
-                arr.len()
-            ));
-        }
-        arr.iter()
-            .map(|v| v.as_str().ok_or("patterns must be an array of strings"))
-            .collect::<Result<Vec<_>, _>>()?
-    } else {
-        vec![single.ok_or("missing required parameter: pattern (or use patterns for batch)")?]
     };
+
+    if patterns_arr.is_empty() {
+        return Err("patterns must contain at least one glob".into());
+    }
+    if patterns_arr.len() > 20 {
+        return Err(format!(
+            "patterns limited to 20 per call (got {})",
+            patterns_arr.len()
+        ));
+    }
+    let patterns: Vec<&str> = patterns_arr
+        .iter()
+        .map(|v| v.as_str().ok_or("patterns must be an array of strings"))
+        .collect::<Result<Vec<_>, _>>()?;
 
     let mut blocks = Vec::with_capacity(patterns.len());
     for p in &patterns {
@@ -842,31 +858,28 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
             "description": read_desc,
             "inputSchema": {
                 "type": "object",
+                "required": ["paths"],
                 "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Absolute or relative file path to read."
-                    },
                     "paths": {
                         "type": "array",
                         "items": { "type": "string" },
                         "minItems": 1,
                         "maxItems": 20,
-                        "description": "Multiple file paths to read in one call (max 20). Each file gets independent smart handling. PREFER this over serial single-file reads — saves a turn per extra file."
+                        "description": "File paths to read in one call (max 20). ALWAYS pass every file you need in one call — never call tilth_read twice in a row. For a single file, use a one-element array: paths: [\"a.rs\"]. Each file gets independent smart handling."
                     },
                     "section": {
                         "type": "string",
-                        "description": "Line range e.g. '45-89', or heading e.g. '## Architecture'. Bypasses smart view. Use `sections` for multiple ranges."
+                        "description": "Line range e.g. '45-89', or heading e.g. '## Architecture'. Bypasses smart view. Only valid with a single-element paths array. Use `sections` for multiple ranges."
                     },
                     "sections": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Multiple ranges from the same file in one call. Each entry is a line range or heading. Emits each block in user-supplied order, separated by `─── lines X-Y ───` delimiters. Mutually exclusive with `section`. Capped at 20 ranges."
+                        "description": "Multiple ranges from the same file in one call. Each entry is a line range or heading. Only valid with a single-element paths array. Emits each block in user-supplied order, separated by `─── lines X-Y ───` delimiters. Mutually exclusive with `section`. Capped at 20 ranges."
                     },
                     "full": {
                         "type": "boolean",
                         "default": false,
-                        "description": "Force full content output, bypass smart outlining."
+                        "description": "Force full content output, bypass smart outlining. Only valid with a single-element paths array."
                     },
                     "budget": {
                         "type": "number",
@@ -877,18 +890,17 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "tilth_files",
-            "description": "Find files matching a glob pattern. Replaces find/ls/pwd and the host Glob tool — use this for all file discovery. Returns matched file paths sorted by relevance with token size estimates. Use `patterns` to run several globs in one call.",
+            "description": "Find files matching glob patterns. Replaces find/ls/pwd and the host Glob tool — use this for all file discovery. Returns matched file paths sorted by relevance with token size estimates.",
             "inputSchema": {
                 "type": "object",
+                "required": ["patterns"],
                 "properties": {
-                    "pattern": {
-                        "type": "string",
-                        "description": "Glob pattern e.g. '*' (list directory), '*.rs', 'src/**/*.ts'. Use `patterns` for multiple globs."
-                    },
                     "patterns": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Multiple glob patterns to run in one call against the same scope. Each pattern emits its own `# Glob: ...` block, separated by a blank line. Mutually exclusive with `pattern`. Capped at 20."
+                        "minItems": 1,
+                        "maxItems": 20,
+                        "description": "Glob patterns to run in one call against the same scope (max 20). ALWAYS pass every glob you need in one call — never call tilth_files twice in a row. For a single glob, use a one-element array: patterns: [\"*.rs\"]. Each pattern emits its own `# Glob: ...` block, separated by a blank line."
                     },
                     "scope": {
                         "type": "string",
@@ -1292,16 +1304,6 @@ mod tests {
     }
 
     #[test]
-    fn tool_files_pattern_and_patterns_mutually_exclusive() {
-        let args = serde_json::json!({
-            "pattern": "*.rs",
-            "patterns": ["*.rs"],
-        });
-        let err = tool_files(&args).expect_err("expected mutual-exclusion error");
-        assert!(err.contains("either pattern"), "unexpected error: {err}");
-    }
-
-    #[test]
     fn tool_files_empty_patterns_errors() {
         let args = serde_json::json!({ "patterns": [] });
         let err = tool_files(&args).expect_err("expected empty-patterns error");
@@ -1317,11 +1319,21 @@ mod tests {
     }
 
     #[test]
-    fn tool_files_missing_pattern_and_patterns_errors() {
+    fn tool_files_missing_patterns_errors() {
         let args = serde_json::json!({});
-        let err = tool_files(&args).expect_err("expected missing-pattern error");
+        let err = tool_files(&args).expect_err("expected missing-patterns error");
         assert!(
-            err.contains("missing required parameter"),
+            err.contains("missing required parameter: patterns"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn tool_files_singular_pattern_rejected() {
+        let args = serde_json::json!({ "pattern": "*.rs" });
+        let err = tool_files(&args).expect_err("singular `pattern` must be rejected");
+        assert!(
+            err.contains("missing required parameter: patterns"),
             "unexpected error: {err}"
         );
     }
@@ -1371,7 +1383,7 @@ mod tests {
             method: "tools/call".into(),
             params: serde_json::json!({
                 "name": "tilth_files",
-                "arguments": { "pattern": "*.rs" }
+                "arguments": { "patterns": ["*.rs"] }
             }),
         };
 
@@ -1392,6 +1404,68 @@ mod tests {
         assert!(
             text.contains("TILTH_TIMEOUT"),
             "error message must include TILTH_TIMEOUT hint, got: {text}"
+        );
+    }
+
+    #[test]
+    fn tool_read_singular_path_rejected() {
+        let args = serde_json::json!({ "path": "a.rs" });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let err = tool_read(&args, &cache, &session, false)
+            .expect_err("singular `path` must be rejected");
+        assert!(
+            err.contains("missing required parameter: paths"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn tool_read_paths_wrong_type_reports_type_error() {
+        // A scalar (or any non-array) value for `paths` should produce a
+        // type-specific error, not the generic "missing" message.
+        let args = serde_json::json!({ "paths": "a.rs" });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let err = tool_read(&args, &cache, &session, false)
+            .expect_err("scalar `paths` must be rejected as wrong type");
+        assert!(
+            err.contains("paths must be an array"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !err.contains("missing required parameter"),
+            "wrong-type error must not claim the param is missing: {err}"
+        );
+    }
+
+    #[test]
+    fn tool_files_patterns_wrong_type_reports_type_error() {
+        let args = serde_json::json!({ "patterns": "*.rs" });
+        let err = tool_files(&args).expect_err("scalar `patterns` must be rejected as wrong type");
+        assert!(
+            err.contains("patterns must be an array"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !err.contains("missing required parameter"),
+            "wrong-type error must not claim the param is missing: {err}"
+        );
+    }
+
+    #[test]
+    fn tool_read_section_with_multiple_paths_rejected() {
+        let args = serde_json::json!({
+            "paths": ["a.rs", "b.rs"],
+            "section": "1-10",
+        });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let err = tool_read(&args, &cache, &session, false)
+            .expect_err("section + multi-path must be rejected");
+        assert!(
+            err.contains("single-element paths array"),
+            "unexpected error: {err}"
         );
     }
 
