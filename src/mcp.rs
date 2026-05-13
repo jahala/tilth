@@ -1,10 +1,7 @@
 use std::fmt::Write as _;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
 use std::sync::Arc;
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -12,6 +9,7 @@ use serde_json::Value;
 use crate::cache::OutlineCache;
 use crate::index::bloom::BloomFilterCache;
 use crate::session::Session;
+use crate::timeout::{self, spawn_with_timeout, SpawnFailure, ThreadTracker};
 
 /// Shared dependencies passed through the request → dispatch pipeline.
 #[derive(Clone)]
@@ -19,6 +17,7 @@ pub(crate) struct Services {
     cache: Arc<OutlineCache>,
     session: Arc<Session>,
     bloom: Arc<BloomFilterCache>,
+    tracker: Arc<ThreadTracker>,
     edit_mode: bool,
 }
 
@@ -28,6 +27,7 @@ impl Services {
             cache: Arc::new(OutlineCache::new()),
             session: Arc::new(Session::new()),
             bloom: Arc::new(BloomFilterCache::new()),
+            tracker: Arc::new(ThreadTracker::new()),
             edit_mode,
         }
     }
@@ -44,25 +44,13 @@ impl Services {
         &self.bloom
     }
 
+    pub(crate) fn tracker(&self) -> &Arc<ThreadTracker> {
+        &self.tracker
+    }
+
     pub(crate) fn edit_mode(&self) -> bool {
         self.edit_mode
     }
-}
-
-/// Tracks abandoned threads (timed out but still running). Warns on stderr
-/// when accumulation exceeds threshold to help diagnose resource pressure.
-static ABANDONED_THREADS: AtomicUsize = AtomicUsize::new(0);
-const ABANDONED_THREAD_WARN: usize = 3;
-
-/// Per-request timeout for tool calls. If a tool doesn't respond within this
-/// duration, the MCP server returns a timeout error instead of hanging.
-/// Override with `TILTH_TIMEOUT` env var (seconds). Default: 90s.
-fn request_timeout() -> Duration {
-    let secs = std::env::var("TILTH_TIMEOUT")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(90);
-    Duration::from_secs(secs)
 }
 
 // Sent to the LLM via the MCP `instructions` field during initialization.
@@ -797,76 +785,61 @@ fn handle_tool_call(req: &JsonRpcRequest, services: &Services) -> JsonRpcRespons
     let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let args = params.get("arguments").unwrap_or(&Value::Null);
 
-    // Clone values needed by the worker thread
-    let tool_name_owned = tool_name.to_string();
-    let args_owned = args.clone();
-    let services_clone = services.clone();
-
-    let (tx, rx) = mpsc::channel();
-    let timeout = request_timeout();
-
-    let handle = std::thread::spawn(move || {
-        let result = dispatch_tool(&tool_name_owned, &args_owned, &services_clone);
-        let _ = tx.send(result);
-    });
-
-    let result = match rx.recv_timeout(timeout) {
-        Ok(result) => {
-            // Thread finished in time — join it to reclaim resources
-            let _ = handle.join();
-            result
-        }
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            // Thread is still running — we can't safely kill it, but we return
-            // an error to the client immediately. The thread will finish in the
-            // background and its result will be dropped.
-            //
-            // Note: we intentionally do NOT join here to avoid blocking the
-            // main loop. The thread will complete and exit on its own.
-            let abandoned = ABANDONED_THREADS.fetch_add(1, Ordering::Relaxed) + 1;
-            if abandoned >= ABANDONED_THREAD_WARN {
-                eprintln!(
-                    "tilth: warning: {abandoned} abandoned threads still running. \
-                     Consider reducing scope or increasing TILTH_TIMEOUT."
-                );
-            }
-            Err(format!(
-                "tool timed out after {}s — the operation took too long. \
-                 Try: reduce scope, use section instead of full, or set \
-                 TILTH_TIMEOUT=<seconds> to increase the limit.",
-                timeout.as_secs()
-            ))
-        }
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            // Thread panicked — the channel was dropped without sending
-            Err("tool panicked during execution".into())
-        }
+    let result = if services.tracker().is_at_cap() {
+        Err(
+            "server busy: too many prior operations still running after timeout. \
+             Wait or set TILTH_TIMEOUT=<seconds> higher."
+                .into(),
+        )
+    } else {
+        run_tool_with_timeout(services, tool_name, args, timeout::request_timeout())
     };
 
-    match result {
-        Ok(output) => JsonRpcResponse {
-            jsonrpc: "2.0",
-            id: req.id.clone(),
-            result: Some(serde_json::json!({
-                "content": [{
-                    "type": "text",
-                    "text": output
-                }]
-            })),
-            error: None,
-        },
-        Err(e) => JsonRpcResponse {
-            jsonrpc: "2.0",
-            id: req.id.clone(),
-            result: Some(serde_json::json!({
-                "content": [{
-                    "type": "text",
-                    "text": e
-                }],
-                "isError": true
-            })),
-            error: None,
-        },
+    build_tool_response(req.id.clone(), result)
+}
+
+fn run_tool_with_timeout(
+    services: &Services,
+    tool_name: &str,
+    args: &Value,
+    timeout: std::time::Duration,
+) -> Result<String, String> {
+    let services_worker = services.clone();
+    let tool_name_owned = tool_name.to_string();
+    let args_owned = args.clone();
+
+    let outcome = spawn_with_timeout(services.tracker(), timeout, move || {
+        dispatch_tool(&tool_name_owned, &args_owned, &services_worker)
+    });
+
+    match outcome {
+        Ok(inner) => inner,
+        Err(SpawnFailure::Timeout) => Err(format!(
+            "tool timed out after {}s — the operation took too long. \
+             Try: reduce scope, use section instead of full, or set \
+             TILTH_TIMEOUT=<seconds> to increase the limit.",
+            timeout.as_secs()
+        )),
+        Err(SpawnFailure::Panic) => Err("tool panicked during execution".into()),
+    }
+}
+
+fn build_tool_response(id: Option<Value>, result: Result<String, String>) -> JsonRpcResponse {
+    let (text, is_error) = match result {
+        Ok(output) => (output, false),
+        Err(e) => (e, true),
+    };
+    let mut payload = serde_json::json!({
+        "content": [{ "type": "text", "text": text }]
+    });
+    if is_error {
+        payload["isError"] = Value::Bool(true);
+    }
+    JsonRpcResponse {
+        jsonrpc: "2.0",
+        id,
+        result: Some(payload),
+        error: None,
     }
 }
 

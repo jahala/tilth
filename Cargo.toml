@@ -54,6 +54,11 @@ memmap2 = "0.9"
 # Parallelism
 rayon = "1"
 
+# Channel with select! for the timeout wrapper (sibling of crossbeam-deque/-utils
+# already pulled in transitively by rayon; gives the closer-to-Java-Future
+# ergonomics that std::sync::mpsc::recv_timeout cannot express on multiple arms).
+crossbeam-channel = "0.5"
+
 # Concurrent cache
 dashmap = "6"
 
