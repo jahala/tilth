@@ -18,6 +18,7 @@ pub mod cache;
 pub(crate) mod classify;
 pub mod diff;
 pub(crate) mod edit;
+pub(crate) mod edit_parse_check;
 pub mod error;
 pub(crate) mod format;
 pub mod index;

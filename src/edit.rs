@@ -47,6 +47,10 @@ enum EditResult {
         diff: String,
         /// Hashlined context around edit sites (existing behavior).
         context: String,
+        /// Formatted `── parse ──` block if the edit introduced new tree-sitter
+        /// `ERROR` / `MISSING` nodes. `None` when no new errors or the language
+        /// has no grammar.
+        parse: Option<String>,
     },
     /// One or more hashes didn't match current content.
     HashMismatch(String),
@@ -65,6 +69,7 @@ fn apply_edits(path: &Path, edits: &[Edit]) -> Result<EditResult, TilthError> {
         return Ok(EditResult::Applied {
             diff: String::new(),
             context: String::new(),
+            parse: None,
         });
     }
 
@@ -261,8 +266,15 @@ fn apply_edits(path: &Path, edits: &[Edit]) -> Result<EditResult, TilthError> {
 
     let diff = format_diffs(&diffs);
     let context = contexts.join("\n---\n");
+    let parse = crate::edit_parse_check::check(path, &content, &output)
+        .as_ref()
+        .map(crate::edit_parse_check::format_report);
 
-    Ok(EditResult::Applied { diff, context })
+    Ok(EditResult::Applied {
+        diff,
+        context,
+        parse,
+    })
 }
 
 /// Format per-edit diffs as compact `-`/`+` blocks with hashline anchors.
@@ -383,7 +395,11 @@ fn render_applied(
     show_diff: bool,
 ) -> Result<String, String> {
     match apply_edits(path, edits).map_err(|e| e.to_string())? {
-        EditResult::Applied { diff, context } => {
+        EditResult::Applied {
+            diff,
+            context,
+            parse,
+        } => {
             let mut output = String::new();
             if show_diff && !diff.is_empty() {
                 output.push_str(&diff);
@@ -393,6 +409,12 @@ fn render_applied(
             }
             if !context.is_empty() {
                 output.push_str(&context);
+            }
+            if let Some(parse_block) = parse {
+                if !output.is_empty() {
+                    output.push_str("\n\n");
+                }
+                output.push_str(&parse_block);
             }
             let abs_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
             let scope = crate::lang::package_root(&abs_path).map_or_else(
@@ -441,7 +463,7 @@ mod tests {
 
         let result = apply_edits(&path, &edits).unwrap();
         match result {
-            EditResult::Applied { diff, context } => {
+            EditResult::Applied { diff, context, .. } => {
                 assert!(
                     diff.contains("- 2:"),
                     "diff should have removed line: {diff}"
@@ -605,7 +627,7 @@ mod tests {
 
         let result = apply_edits(&path, &[]).unwrap();
         match result {
-            EditResult::Applied { diff, context } => {
+            EditResult::Applied { diff, context, .. } => {
                 assert!(diff.is_empty(), "diff should be empty for no edits");
                 assert!(context.is_empty(), "context should be empty for no edits");
             }
@@ -774,5 +796,114 @@ mod tests {
         assert_eq!(after, "A1\nA2\nA3\nbbb\nCCC\nddd\n");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn parse_block_set_when_edit_breaks_syntax() {
+        // Use a .rs extension so detect_file_type picks up the Rust grammar.
+        let path = std::env::temp_dir().join("tilth_edit_test_parse_break.rs");
+        std::fs::write(&path, "fn a() { 1 }\n").unwrap();
+        let h = hash_at("fn a() { 1 }\n", 1);
+
+        // Replace the line with an unbalanced version.
+        let edits = vec![Edit {
+            start_line: 1,
+            start_hash: h,
+            end_line: 1,
+            end_hash: h,
+            content: "fn a() { 1".into(),
+        }];
+
+        let result = apply_edits(&path, &edits).unwrap();
+        match result {
+            EditResult::Applied { parse, .. } => {
+                let block = parse.expect("parse block expected when edit breaks syntax");
+                assert!(
+                    block.starts_with("\u{2500}\u{2500} parse \u{2500}\u{2500}"),
+                    "missing parse header: {block}",
+                );
+            }
+            EditResult::HashMismatch(msg) => panic!("unexpected mismatch: {msg}"),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn parse_block_none_when_edit_keeps_syntax_valid() {
+        let path = std::env::temp_dir().join("tilth_edit_test_parse_clean.rs");
+        std::fs::write(&path, "fn a() { 1 }\n").unwrap();
+        let h = hash_at("fn a() { 1 }\n", 1);
+
+        let edits = vec![Edit {
+            start_line: 1,
+            start_hash: h,
+            end_line: 1,
+            end_hash: h,
+            content: "fn a() { 99 }".into(),
+        }];
+
+        let result = apply_edits(&path, &edits).unwrap();
+        match result {
+            EditResult::Applied { parse, .. } => assert!(parse.is_none()),
+            EditResult::HashMismatch(msg) => panic!("unexpected mismatch: {msg}"),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn parse_block_per_file_in_batch_independent() {
+        // Verify that in a multi-file batch, one file breaking and another
+        // staying clean each get their own parse block (or lack thereof).
+        // File 1: syntax error introduced (parse block expected).
+        let path1 = std::env::temp_dir().join("tilth_edit_test_batch1.rs");
+        std::fs::write(&path1, "fn a() { 1 }\n").unwrap();
+        let h1 = hash_at("fn a() { 1 }\n", 1);
+
+        // File 2: syntax stays valid (no parse block).
+        let path2 = std::env::temp_dir().join("tilth_edit_test_batch2.rs");
+        std::fs::write(&path2, "fn b() { 2 }\n").unwrap();
+        let h2 = hash_at("fn b() { 2 }\n", 1);
+
+        let edits1 = vec![Edit {
+            start_line: 1,
+            start_hash: h1,
+            end_line: 1,
+            end_hash: h1,
+            content: "fn a() { 1".into(), // breaks
+        }];
+
+        let edits2 = vec![Edit {
+            start_line: 1,
+            start_hash: h2,
+            end_line: 1,
+            end_hash: h2,
+            content: "fn b() { 99 }".into(), // stays clean
+        }];
+
+        let r1 = apply_edits(&path1, &edits1).unwrap();
+        let r2 = apply_edits(&path2, &edits2).unwrap();
+
+        match r1 {
+            EditResult::Applied { parse, .. } => {
+                assert!(
+                    parse.is_some(),
+                    "file 1 should have parse block when broken"
+                );
+            }
+            EditResult::HashMismatch(msg) => panic!("unexpected mismatch: {msg}"),
+        }
+
+        match r2 {
+            EditResult::Applied { parse, .. } => {
+                assert!(
+                    parse.is_none(),
+                    "file 2 should have no parse block when clean"
+                );
+            }
+            EditResult::HashMismatch(msg) => panic!("unexpected mismatch: {msg}"),
+        }
+
+        let _ = std::fs::remove_file(&path1);
+        let _ = std::fs::remove_file(&path2);
     }
 }
