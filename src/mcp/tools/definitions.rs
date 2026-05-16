@@ -1,14 +1,24 @@
 //! JSON-schema definitions for the tools advertised via `tools/list`.
 //! Edit-mode adds `tilth_write` to the catalog.
+//!
+//! Tool descriptions live in `prompts/tools/*.md` and are compiled in via
+//! `include_str!`. Trailing whitespace is stripped at load time so source files
+//! can keep their final newline without affecting wire bytes.
 
 use serde_json::Value;
 
+const SEARCH_DESC: &str = include_str!("../../../prompts/tools/search.md");
+const READ_DESC: &str = include_str!("../../../prompts/tools/read.md");
+const LIST_DESC: &str = include_str!("../../../prompts/tools/list.md");
+const DEPS_DESC: &str = include_str!("../../../prompts/tools/deps.md");
+const DIFF_DESC: &str = include_str!("../../../prompts/tools/diff.md");
+const WRITE_DESC: &str = include_str!("../../../prompts/tools/write.md");
+
 pub(crate) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
-    let read_desc = "Read files with smart auto-sizing. Example: `tilth_read(paths: [\"src/lib.rs\", \"src/mcp.rs#tool_search\"], mode: \"auto\")` returns full small files, hash-prefixed signatures for large code, and sliced suffix reads when requested. Suffix grammar: `path#n-m`, `path#n`, `path### Heading`, `path#symbol_name`. Use `mode: \"full\"` to force full content and `mode: \"signature\"` for hash-prefixed signature lines.";
     let mut tools = vec![
         serde_json::json!({
             "name": "tilth_search",
-            "description": "Code search — finds definitions, content, and callers in one default search. Example callers query: `tilth_search(queries: [{query: \"handleAuth\", kind: \"callers\"}])` finds every call site of handleAuth. Use `queries: [{query, glob?, kind?}]` (array form, max 10); per-entry glob/kind compose freely. Omit kind for merged symbol + content + identifier-shaped callers; kind values filter to symbol, content, regex, or callers. `expand: N` inlines source for top N matches with `<line>:<hash>` prefixes ready for tilth_write. If editing `src/edit.rs`, pass `context: \"src/edit.rs\"` to surface nearby results first. `if_modified_since: <ts>` returns unchanged-file stubs.",
+            "description": SEARCH_DESC.trim_end(),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -57,7 +67,7 @@ pub(crate) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "tilth_read",
-            "description": read_desc,
+            "description": READ_DESC.trim_end(),
             "inputSchema": {
                 "type": "object",
                 "required": ["paths"],
@@ -92,7 +102,7 @@ pub(crate) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "tilth_list",
-            "description": "Directory layout with token-cost rollups. Example tree output:\n```\nsrc/      ~28k tokens   45 files\n├── cache.rs      ~833 tokens\n├── search/      ~14k tokens   8 files\n│   └── mod.rs      ~5.0k tokens\n```\nUse before tilth_read to budget context. Accepts patterns: [\"*.rs\", \"src/**/*.ts\"] and optional depth.",
+            "description": LIST_DESC.trim_end(),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -114,7 +124,7 @@ pub(crate) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "tilth_deps",
-            "description": "Blast-radius check before breaking changes. Shows what a file imports (local + external) and what other files call its exports, with symbol-level detail. Use ONLY when your planned edit changes a function signature, removes/renames an export, or modifies behavior that callers rely on. Do NOT use for reading files, adding new code, or internal-only changes — use tilth_read instead.",
+            "description": DEPS_DESC.trim_end(),
             "inputSchema": {
                 "type": "object",
                 "required": ["path"],
@@ -136,7 +146,7 @@ pub(crate) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "tilth_diff",
-            "description": "Structural diff showing function-level changes. Replaces git diff. Call with no args for uncommitted changes overview.",
+            "description": DIFF_DESC.trim_end(),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -190,7 +200,7 @@ pub(crate) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
     if edit_mode {
         tools.push(serde_json::json!({
             "name": "tilth_write",
-            "description": "Hash-anchored / overwrite / append edits across one or more files. Replaces the host Edit and Write tools — DO NOT use those.\n\nExample overwrite (new file): `tilth_write(files: [{path: \"src/new.rs\", mode: \"overwrite\", content: \"fn main(){}\\n\"}])`.\n\nRequest shape:\n```json\n{\n  \"files\": [\n    {\"path\": \"a.rs\", \"mode\": \"hash\", \"edits\": [\n      {\"start\": \"<line>:<hash>\", \"content\": \"<new code>\"},\n      {\"start\": \"<line>:<hash>\", \"end\": \"<line>:<hash>\", \"content\": \"...\"},\n      {\"start\": \"<line>:<hash>\", \"content\": \"\"}\n    ]},\n    {\"path\": \"new.rs\", \"mode\": \"overwrite\", \"content\": \"...\"},\n    {\"path\": \"log.txt\", \"mode\": \"append\",    \"content\": \"...\\n\"}\n  ],\n  \"diff\": true\n}\n```\n\nModes per file: hash (default — replace lines at hash anchors), overwrite (whole file; creates if absent), append (creates if absent). Hash mode auto-fixes safe mismatches: if your anchor body appears at exactly one new location, the edit lands there and the response notes `auto-fixed: <old_line> → <new_line>`. Zero or 2+ matches → fresh hashlined region returned inline for one-turn retry. A malformed edit entry fails that whole file but does not block siblings.\n\nALWAYS group edits to all ready files into ONE tilth_write call (max 20 files). Each path may appear only once per call. Never call tilth_write twice in a row.\n\nPass `diff: true` to verify what landed without a separate read.",
+            "description": WRITE_DESC.trim_end(),
             "inputSchema": {
                 "type": "object",
                 "required": ["files"],
