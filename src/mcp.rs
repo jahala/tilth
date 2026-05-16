@@ -797,13 +797,11 @@ fn tool_edit(
         return Err(msg);
     }
 
-    for task in &tasks {
-        if let crate::edit::FileEditTask::Ready { path, .. } = task {
-            session.record_read(path);
-        }
+    let outcome = crate::edit::apply_batch(tasks, bloom, show_diff)?;
+    for path in &outcome.applied {
+        session.record_read(path);
     }
-
-    crate::edit::apply_batch(tasks, bloom, show_diff)
+    Ok(outcome.output)
 }
 
 /// Falls back to cwd when scope is invalid, with a warning message.
@@ -1416,6 +1414,47 @@ mod tests {
                 panic!("empty edits array should produce a ParseError, not Ready");
             }
         }
+    }
+
+    #[test]
+    fn tool_edit_records_read_only_for_applied_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good.txt");
+        let bad = dir.path().join("bad.txt");
+        std::fs::write(&good, "x\n").unwrap();
+        std::fs::write(&bad, "y\n").unwrap();
+        let good_hash = crate::format::line_hash(b"x");
+
+        let args = serde_json::json!({
+            "files": [
+                {
+                    "path": good.to_str().unwrap(),
+                    "edits": [{
+                        "start": format!("1:{good_hash:03x}"),
+                        "content": "X"
+                    }]
+                },
+                {
+                    "path": bad.to_str().unwrap(),
+                    "edits": [{
+                        "start": "1:fff",
+                        "content": "Y"
+                    }]
+                }
+            ]
+        });
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+
+        let out = tool_edit(&args, &session, &bloom).expect("one file should apply");
+
+        assert!(
+            out.contains("hash mismatch"),
+            "bad file should report mismatch"
+        );
+        assert_eq!(session.reads_count(), 1);
+        assert_eq!(std::fs::read_to_string(&good).unwrap(), "X\n");
+        assert_eq!(std::fs::read_to_string(&bad).unwrap(), "y\n");
     }
 
     // -- package_root fallback from subdirectory ------------------------------
