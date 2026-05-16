@@ -1,9 +1,10 @@
 //! `tilth_read` — batched file reads with smart view, suffix grammar
 //! (`#n-m` / `#n` / `#heading` / `#symbol`), mode override
-//! (`auto` / `full` / `signature`), and `if_modified_since` headers.
+//! (`auto` / `full` / `signature` / `stripped`), and `if_modified_since` headers.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use serde_json::Value;
 
@@ -56,15 +57,16 @@ pub(crate) fn tool_read(
         })
         .collect::<Result<_, _>>()?;
 
-    // `mode: auto|full|signature` overrides the implicit smart-view.
+    // `mode: auto|full|signature|stripped` overrides the implicit smart-view.
     let mode_str = args.get("mode").and_then(|v| v.as_str()).unwrap_or("auto");
-    if !matches!(mode_str, "auto" | "full" | "signature") {
+    if !matches!(mode_str, "auto" | "full" | "signature" | "stripped") {
         return Err(format!(
-            "unknown read mode: {mode_str}. Use: auto, full, signature"
+            "unknown read mode: {mode_str}. Use: auto, full, signature, stripped"
         ));
     }
     let force_full = mode_str == "full";
     let force_signature = mode_str == "signature";
+    let force_stripped = mode_str == "stripped";
 
     // if_modified_since: skip files whose mtime is <= ts (return stub).
     let since = args
@@ -86,7 +88,12 @@ pub(crate) fn tool_read(
     // Multi-file batch: per-file smart view applies, but no related-file hints
     // (those only make sense for whole-file reads of a single target).
     if paths.len() > 1 {
-        if has_any_suffix || since.is_some() || force_signature || force_full || mode_str == "auto"
+        if has_any_suffix
+            || since.is_some()
+            || force_signature
+            || force_stripped
+            || force_full
+            || mode_str == "auto"
         {
             // Per-path resolution so suffix/since/signature behave correctly.
             let mut parts: Vec<String> = Vec::with_capacity(paths.len());
@@ -107,13 +114,26 @@ pub(crate) fn tool_read(
                     crate::read::read_file(path, None, true, cache, edit_mode)
                         .unwrap_or_else(|e| format!("# {}\nerror: {}", path.display(), e))
                 } else {
-                    read_single_with_suffix(path, suffix, signature, edit_mode, cache)
+                    read_single_with_suffix(
+                        path,
+                        suffix,
+                        signature,
+                        force_stripped,
+                        edit_mode,
+                        cache,
+                    )
                 };
                 parts.push(body);
             }
             let combined = parts.join("\n\n");
-            let with_hdr = crate::mcp::iso::with_header(now, &combined);
-            return Ok(super::apply_budget(with_hdr, budget));
+            // Multi-file responses don't carry per-file view-meta — the agent
+            // can read each per-file `# path (...) [mode]` header inline.
+            return Ok(finalize_response(
+                Some(now),
+                serde_json::Map::new(),
+                combined,
+                budget,
+            ));
         }
         let combined = crate::read::read_batch(&paths, cache, session, edit_mode);
         return Ok(super::apply_budget(combined, budget));
@@ -130,31 +150,62 @@ pub(crate) fn tool_read(
     if let Some(s_ts) = since {
         if !crate::mcp::iso::file_changed_since(&path, s_ts) {
             let body = crate::mcp::iso::unchanged_stub(&path, s_ts);
-            return Ok(crate::mcp::iso::with_header(now, &body));
+            return Ok(finalize_response(
+                Some(now),
+                serde_json::Map::new(),
+                body,
+                None,
+            ));
         }
     }
 
     // Path-suffix grammar drives slicing; standalone `section`/`sections` were
-    // removed per spec AC-5.
+    // removed per spec AC-5. Both `mode=signature` and `mode=stripped` are
+    // whole-file shape modes — a suffix narrows to a specific range, so the
+    // mode flags are dropped here in favor of the explicit slice the LLM asked for.
     if !matches!(suffix, PathSuffix::None) {
         session.record_read(&path);
-        let body = read_single_with_suffix(&path, &suffix, force_signature, edit_mode, cache);
-        let out = if since.is_some() {
-            crate::mcp::iso::with_header(now, &body)
-        } else {
-            body
-        };
-        return Ok(super::apply_budget(out, budget));
+        let body =
+            read_single_with_suffix(&path, &suffix, force_signature, false, edit_mode, cache);
+        // Suffix-driven reads carry no view-meta — the LLM declared the slice.
+        // Cache token still rides along when if_modified_since was supplied.
+        return Ok(finalize_response(
+            since.map(|_| now),
+            serde_json::Map::new(),
+            body,
+            budget,
+        ));
     }
 
     session.record_read(&path);
 
-    // `mode: signature` is an outline-style read; route through outline path.
-    if force_signature || (!force_full && mode_str == "auto" && should_auto_signature(&path)) {
-        return Ok(super::apply_budget(
-            read_single_with_suffix(&path, &PathSuffix::None, true, edit_mode, cache),
-            budget,
-        ));
+    let auto_signature_promotion =
+        !force_full && !force_stripped && mode_str == "auto" && should_auto_signature(&path);
+
+    // `mode: signature` (explicit or auto-promoted) is an outline-style read.
+    if force_signature || auto_signature_promotion {
+        let (body, total_lines) = read_signature_file(&path, cache).map_err(|e| e.to_string())?;
+        let mut meta = serde_json::Map::new();
+        meta.insert("view".into(), Value::String("signature".into()));
+        meta.insert("original_line_count".into(), Value::from(total_lines));
+        // Implicit promotion from `mode=auto` advertises the escalation path.
+        // Explicit `mode=signature` doesn't — the LLM picked this view on purpose.
+        if auto_signature_promotion {
+            meta.insert("next_view".into(), Value::String("full".into()));
+        }
+        return Ok(finalize_response(None, meta, body, budget));
+    }
+
+    // `mode: stripped` is comment/log-stripped; explicit only (no auto path).
+    if force_stripped {
+        let (body, total_lines, lines_stripped) =
+            read_stripped_file(&path, cache).map_err(|e| e.to_string())?;
+        let mut meta = serde_json::Map::new();
+        meta.insert("view".into(), Value::String("stripped".into()));
+        meta.insert("original_line_count".into(), Value::from(total_lines));
+        meta.insert("lines_stripped".into(), Value::from(lines_stripped));
+        meta.insert("next_view".into(), Value::String("full".into()));
+        return Ok(finalize_response(None, meta, body, budget));
     }
 
     let mut output = crate::read::read_file(&path, None, force_full, cache, edit_mode)
@@ -174,15 +225,30 @@ pub(crate) fn tool_read(
         }
     }
 
-    Ok(super::apply_budget(output, budget))
+    // `mode=auto` on a large non-code file routes through `read_file` and
+    // emits an outline (markdown headings, JSON keys). Signal that the LLM
+    // got less than the full content so it can escalate to `mode=full`.
+    let mut meta = serde_json::Map::new();
+    if !force_full && crate::read::would_outline(&path) {
+        meta.insert("view".into(), Value::String("outline".into()));
+        if let Some(total) = count_lines(&path) {
+            meta.insert("original_line_count".into(), Value::from(total));
+        }
+        meta.insert("next_view".into(), Value::String("full".into()));
+    }
+
+    Ok(finalize_response(None, meta, output, budget))
 }
 
-/// Resolve a single path+suffix to its read output. Signature mode emits
-/// source-backed signature lines in hash-anchor format.
+/// Resolve a single path+suffix to its read output. `signature` and
+/// `stripped` are whole-file shape modes; both are honored only for
+/// `PathSuffix::None` (any explicit suffix wins). They are mutually
+/// exclusive — `signature` takes precedence if both happen to be set.
 pub(crate) fn read_single_with_suffix(
     path: &Path,
     suffix: &PathSuffix,
     signature: bool,
+    stripped: bool,
     edit_mode: bool,
     cache: &OutlineCache,
 ) -> String {
@@ -220,7 +286,13 @@ pub(crate) fn read_single_with_suffix(
         }
         PathSuffix::None => {
             if signature {
-                return read_signature_file(path, cache).unwrap_or_else(render_err);
+                // Multi-file batch path: discard the line count — view-meta is
+                // not emitted for multi-file responses.
+                return read_signature_file(path, cache).map_or_else(render_err, |(body, _)| body);
+            }
+            if stripped {
+                return read_stripped_file(path, cache)
+                    .map_or_else(render_err, |(body, _, _)| body);
             }
             crate::read::read_file(path, None, false, cache, edit_mode).unwrap_or_else(render_err)
         }
@@ -263,10 +335,50 @@ fn should_auto_signature(path: &Path) -> bool {
     crate::types::estimate_tokens(meta.len()) > crate::read::TOKEN_THRESHOLD
 }
 
+/// Cheap line count for view-meta. Returns `None` when the file can't be
+/// read; OS page cache makes the second read effectively free when a helper
+/// already touched the file moments earlier.
+fn count_lines(path: &Path) -> Option<u32> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|c| u32::try_from(c.lines().count()).unwrap_or(u32::MAX))
+}
+
+/// Apply budget to `body`, then prepend a single JSON header line that
+/// combines the optional cache token (`now`) with any view-shape `meta`
+/// fields the caller built (`view`, `original_line_count`, `next_view`,
+/// `lines_stripped`, ...). If the budget actually clipped the body, the
+/// truncation fields (`truncated`, `truncated_at_line`,
+/// `original_line_count`) are merged into the same meta object before the
+/// header is rendered so the agent only ever parses one line.
+fn finalize_response(
+    now: Option<SystemTime>,
+    mut meta: serde_json::Map<String, Value>,
+    body: String,
+    budget: Option<u64>,
+) -> String {
+    let (body_final, info) = match budget {
+        Some(b) => crate::budget::apply_with_info(&body, b),
+        None => (body, None),
+    };
+    if let Some(info) = info {
+        meta.insert("truncated".into(), Value::Bool(true));
+        meta.insert("truncated_at_line".into(), Value::from(info.at_line));
+        // Don't clobber an already-set original_line_count (the caller may have
+        // set a more accurate value from a non-budgeted source).
+        meta.entry("original_line_count")
+            .or_insert_with(|| Value::from(info.original_line_count));
+    }
+    crate::mcp::iso::with_meta_header(now, Value::Object(meta), &body_final)
+}
+
+/// Returns `(body, total_lines)` so the dispatcher can build view-meta
+/// without re-reading the file. `total_lines` is the file's raw line count
+/// before any view shaping (caller exposes it as `original_line_count`).
 fn read_signature_file(
     path: &Path,
     cache: &OutlineCache,
-) -> Result<String, crate::error::TilthError> {
+) -> Result<(String, u32), crate::error::TilthError> {
     let content = std::fs::read_to_string(path).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => crate::error::TilthError::NotFound {
             path: path.to_path_buf(),
@@ -292,7 +404,8 @@ fn read_signature_file(
         crate::types::ViewMode::Signature,
     );
     let crate::types::FileType::Code(lang) = crate::lang::detect_file_type(path) else {
-        return crate::read::read_file(path, None, false, cache, false);
+        let body = crate::read::read_file(path, None, false, cache, false)?;
+        return Ok((body, line_count));
     };
     let entries = crate::lang::outline::get_outline_entries(&content, lang);
     let lines: Vec<&str> = content.lines().collect();
@@ -301,7 +414,7 @@ fn read_signature_file(
     if body.is_empty() {
         body = crate::format::hashlines(&content, 1);
     }
-    Ok(format!("{header}\n\n{}", body.trim_end()))
+    Ok((format!("{header}\n\n{}", body.trim_end()), line_count))
 }
 
 fn render_signature_entries(
@@ -317,4 +430,80 @@ fn render_signature_entries(
         }
         render_signature_entries(&entry.children, lines, out);
     }
+}
+
+/// `mode=stripped`: whole-file read with plain comments, debug logging, and
+/// repeated blank lines removed. Doc comments and TODO/FIXME-style markers
+/// are preserved. Reuses the same `strip_noise` heuristic search uses when
+/// expanding match bodies. Rendered with original 1-indexed line numbers in
+/// a left gutter so the agent sees both surviving content and which line
+/// numbers were dropped. Hashlines are intentionally suppressed even in
+/// edit mode: stripped output is non-contiguous with the file on disk and
+/// cannot round-trip through `tilth_write`. Non-code files fall back to
+/// the default view (same escape hatch as `read_signature_file`).
+///
+/// Returns `(body, total_lines, lines_stripped)` so the dispatcher can
+/// build view-meta without re-counting.
+fn read_stripped_file(
+    path: &Path,
+    cache: &OutlineCache,
+) -> Result<(String, u32, u32), crate::error::TilthError> {
+    let content = std::fs::read_to_string(path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => crate::error::TilthError::NotFound {
+            path: path.to_path_buf(),
+            suggestion: None,
+        },
+        std::io::ErrorKind::PermissionDenied => crate::error::TilthError::PermissionDenied {
+            path: path.to_path_buf(),
+        },
+        _ => crate::error::TilthError::IoError {
+            path: path.to_path_buf(),
+            source: e,
+        },
+    })?;
+    let meta = std::fs::metadata(path).map_err(|e| crate::error::TilthError::IoError {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    let total_lines = u32::try_from(content.lines().count()).unwrap_or(u32::MAX);
+
+    // Non-code: stripped means nothing without comment syntax. Fall through
+    // to the default outline-or-full view, consistent with read_signature_file.
+    if !matches!(
+        crate::lang::detect_file_type(path),
+        crate::types::FileType::Code(_)
+    ) {
+        let body = crate::read::read_file(path, None, false, cache, false)?;
+        return Ok((body, total_lines, 0));
+    }
+
+    let skip_lines = crate::search::strip::strip_noise(&content, path, Some((1, total_lines)));
+
+    let last_line = (total_lines.max(1)) as usize;
+    let width = (last_line.ilog10() + 1) as usize;
+    let mut body = String::with_capacity(content.len());
+    let mut kept: u32 = 0;
+    for (i, line) in content.lines().enumerate() {
+        let line_num = u32::try_from(i + 1).unwrap_or(u32::MAX);
+        if skip_lines.contains(&line_num) {
+            continue;
+        }
+        let _ = writeln!(body, "{line_num:>width$}  {line}");
+        kept += 1;
+    }
+    let stripped = total_lines.saturating_sub(kept);
+    let header = crate::format::file_header(
+        path,
+        meta.len(),
+        total_lines,
+        crate::types::ViewMode::Stripped,
+    );
+    let note = format!(
+        "// stripped {stripped} of {total_lines} lines (plain comments, debug logs, blank collapse) — non-editable view"
+    );
+    Ok((
+        format!("{header}\n{note}\n\n{}", body.trim_end()),
+        total_lines,
+        stripped,
+    ))
 }

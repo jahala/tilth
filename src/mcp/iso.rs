@@ -81,11 +81,37 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 /// through `serde_json` so the producer never has to think about quote /
 /// backslash / newline escaping inside the timestamp.
 pub fn with_header(now: SystemTime, body: &str) -> String {
-    let header = serde_json::json!({ "if_modified_since": iso_ts(now) }).to_string();
-    let mut out = header;
-    out.push_str("\n\n");
-    out.push_str(body);
-    out
+    with_meta_header(Some(now), serde_json::Value::Null, body)
+}
+
+/// Wrap an output with a leading JSON header line that combines the cache
+/// token (when `now` is `Some`) with view-shape metadata (when `meta` is a
+/// JSON object). Both are merged into a single first-line object so agents
+/// pattern-match one line for all structured signals.
+///
+/// `meta` is expected to be an `Object`; any other shape (including `Null`)
+/// is treated as no extra fields. When the merged header is empty —
+/// neither timestamp nor meta provided — the body is returned unchanged
+/// so this function is a safe drop-in for paths that conditionally emit a
+/// header.
+pub fn with_meta_header(now: Option<SystemTime>, meta: serde_json::Value, body: &str) -> String {
+    let mut header = serde_json::Map::new();
+    if let Some(ts) = now {
+        header.insert(
+            "if_modified_since".into(),
+            serde_json::Value::String(iso_ts(ts)),
+        );
+    }
+    if let serde_json::Value::Object(meta_map) = meta {
+        for (k, v) in meta_map {
+            header.insert(k, v);
+        }
+    }
+    if header.is_empty() {
+        return body.to_string();
+    }
+    let header_str = serde_json::Value::Object(header).to_string();
+    format!("{header_str}\n\n{body}")
 }
 
 /// Has a file changed since `since`? Used to decide whether to return the
@@ -170,5 +196,56 @@ mod tests {
         assert!(ts.ends_with('Z'), "iso timestamp expected: {ts}");
         assert!(parse_iso_utc(ts).is_some(), "round-trips: {ts}");
         assert!(out.ends_with("body"), "body missing: {out}");
+    }
+
+    #[test]
+    fn with_meta_header_merges_cache_token_and_meta() {
+        let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let meta = serde_json::json!({"view": "outline", "original_line_count": 1500});
+        let out = with_meta_header(Some(now), meta, "body");
+        let first_line = out.lines().next().expect("at least one line");
+        let parsed: serde_json::Value =
+            serde_json::from_str(first_line).expect("first line must be valid JSON");
+        assert!(parsed.get("if_modified_since").is_some(), "{out}");
+        assert_eq!(parsed.get("view").and_then(|v| v.as_str()), Some("outline"));
+        assert_eq!(
+            parsed
+                .get("original_line_count")
+                .and_then(serde_json::Value::as_u64),
+            Some(1500)
+        );
+        assert!(out.ends_with("body"), "body trailing: {out}");
+    }
+
+    #[test]
+    fn with_meta_header_meta_only_no_timestamp() {
+        let meta = serde_json::json!({"view": "signature", "next_view": "full"});
+        let out = with_meta_header(None, meta, "body");
+        let first_line = out.lines().next().expect("at least one line");
+        let parsed: serde_json::Value =
+            serde_json::from_str(first_line).expect("first line must be valid JSON");
+        assert!(parsed.get("if_modified_since").is_none(), "no ts: {out}");
+        assert_eq!(
+            parsed.get("view").and_then(|v| v.as_str()),
+            Some("signature")
+        );
+        assert_eq!(
+            parsed.get("next_view").and_then(|v| v.as_str()),
+            Some("full")
+        );
+    }
+
+    #[test]
+    fn with_meta_header_empty_returns_bare_body() {
+        let out = with_meta_header(None, serde_json::Value::Null, "body");
+        assert_eq!(out, "body", "empty header drops the prefix entirely");
+    }
+
+    #[test]
+    fn with_meta_header_non_object_meta_treated_as_empty() {
+        // Defensive: a caller passing Value::String or similar shouldn't crash
+        // or produce malformed JSON — it just behaves as no meta.
+        let out = with_meta_header(None, serde_json::Value::String("oops".into()), "body");
+        assert_eq!(out, "body");
     }
 }

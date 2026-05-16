@@ -70,6 +70,7 @@ pub enum ViewMode {
     #[allow(dead_code)]
     Error,
     Section,
+    Stripped,
 }
 
 impl std::fmt::Display for ViewMode {
@@ -86,6 +87,7 @@ impl std::fmt::Display for ViewMode {
             Self::Binary => write!(f, "skipped"),
             Self::Error => write!(f, "error"),
             Self::Section => write!(f, "section"),
+            Self::Stripped => write!(f, "stripped"),
         }
     }
 }

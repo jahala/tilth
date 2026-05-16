@@ -2297,4 +2297,306 @@ mod tests {
             "search must still find the symbol despite the stray field: {out}"
         );
     }
+
+    // ── view-meta + mode=stripped tests ──────────────────────────────────
+    //
+    // The `_meta` channel rides on the first line as a single JSON object so
+    // agents pattern-match one line for both the cache token and shape signals.
+    // These tests cover the explicit + implicit emission cases plus the new
+    // `mode=stripped` behavior (broad strip via `strip_noise`).
+
+    /// Helper: parse the first line of a tool_read response as JSON when the
+    /// header is present. Returns `None` when the response body has no JSON
+    /// header (full content with no since/view-meta).
+    fn parse_first_line_json(out: &str) -> Option<serde_json::Value> {
+        let first = out.lines().next()?;
+        serde_json::from_str(first).ok()
+    }
+
+    /// `mode=stripped` on a code file removes plain comments + debug logs
+    /// while preserving doc comments and TODO/FIXME markers, and emits
+    /// `view: "stripped"` in the meta header along with `lines_stripped`.
+    #[test]
+    fn tool_read_stripped_mode_drops_comments_and_keeps_doc_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("strip_target.rs");
+        // `dbg!` is on the Rust debug-log strip list; `println!` is not
+        // (intentional — `println!` is often legitimate CLI output, not noise).
+        std::fs::write(
+            &p,
+            "/// Doc comment that survives.\nfn target() {\n    // plain comment that goes\n    // TODO: keep this one\n    let kept = 1;\n    dbg!(\"debug log dropped\");\n}\n",
+        )
+        .unwrap();
+        let args = serde_json::json!({
+            "paths": [p.to_str().unwrap()],
+            "mode": "stripped"
+        });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let out = tool_read(&args, &cache, &session, false).expect("stripped ok");
+
+        let meta = parse_first_line_json(&out).expect("JSON view-meta header expected");
+        assert_eq!(meta.get("view").and_then(|v| v.as_str()), Some("stripped"));
+        assert_eq!(
+            meta.get("next_view").and_then(|v| v.as_str()),
+            Some("full"),
+            "stripped is non-editable; advertise full as the escalation: {out}"
+        );
+        let lines_stripped = meta
+            .get("lines_stripped")
+            .and_then(serde_json::Value::as_u64)
+            .expect("lines_stripped must be present");
+        assert!(
+            lines_stripped >= 2,
+            "expected at least 2 lines stripped (plain comment + dbg!), got {lines_stripped}: {out}"
+        );
+
+        assert!(out.contains("[stripped]"), "header view tag: {out}");
+        assert!(
+            out.contains("Doc comment that survives"),
+            "doc comments must be kept: {out}"
+        );
+        assert!(out.contains("TODO: keep this one"), "TODOs kept: {out}");
+        assert!(out.contains("let kept = 1"), "real code kept: {out}");
+        assert!(
+            !out.contains("plain comment that goes"),
+            "plain comment must be stripped: {out}"
+        );
+        assert!(
+            !out.contains("debug log dropped"),
+            "debug log must be stripped: {out}"
+        );
+    }
+
+    /// Stripped output uses original 1-indexed line numbers in a left gutter
+    /// so the agent can see which line numbers were dropped (gaps) without
+    /// having to diff against the file.
+    #[test]
+    fn tool_read_stripped_preserves_original_line_numbers_in_gutter() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("gutter.rs");
+        std::fs::write(
+            &p,
+            "fn alpha() {}\n// stripped line 2\nfn beta() {}\n// stripped line 4\nfn gamma() {}\n",
+        )
+        .unwrap();
+        let args = serde_json::json!({
+            "paths": [p.to_str().unwrap()],
+            "mode": "stripped"
+        });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let out = tool_read(&args, &cache, &session, false).expect("stripped ok");
+        // Lines 1, 3, 5 survive; gutter shows the original numbers.
+        assert!(
+            out.contains("1  fn alpha()")
+                && out.contains("3  fn beta()")
+                && out.contains("5  fn gamma()"),
+            "expected original line numbers in gutter: {out}"
+        );
+    }
+
+    /// Hashlines must NOT appear in stripped output even when the server is
+    /// in edit mode — the line set is non-contiguous with the file on disk
+    /// and would mislead the agent into trying to anchor a write.
+    #[test]
+    fn tool_read_stripped_suppresses_hashlines_in_edit_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("nohash.rs");
+        std::fs::write(&p, "fn keep() {}\n// stripped\nfn also() {}\n").unwrap();
+        let args = serde_json::json!({
+            "paths": [p.to_str().unwrap()],
+            "mode": "stripped"
+        });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        // edit_mode = true intentionally — stripped MUST still suppress hashlines.
+        let out = tool_read(&args, &cache, &session, true).expect("stripped+edit ok");
+        // Hashline format is `<line>:<3-hex>|<content>`. Check the body has
+        // no such anchored line for our `fn keep()` content.
+        assert!(
+            !out.lines().any(
+                |l| crate::format::parse_anchor(l.split('|').next().unwrap_or("")).is_some()
+                    && l.contains("fn keep()")
+            ),
+            "no hashline anchors in stripped output: {out}"
+        );
+        assert!(
+            out.contains("non-editable view"),
+            "non-editable note expected in inline header: {out}"
+        );
+    }
+
+    /// `mode=stripped` + path suffix → suffix wins, raw range returned with no
+    /// strip pass. Suffix-takes-priority is the consistent rule across modes.
+    #[test]
+    fn tool_read_stripped_with_suffix_returns_raw_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("suffix_wins.rs");
+        std::fs::write(
+            &p,
+            "fn a() {}\n// this comment must NOT be stripped\nfn b() {}\n",
+        )
+        .unwrap();
+        let args = serde_json::json!({
+            "paths": [format!("{}#1-3", p.to_str().unwrap())],
+            "mode": "stripped"
+        });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let out = tool_read(&args, &cache, &session, false).expect("stripped+suffix ok");
+        assert!(
+            out.contains("this comment must NOT be stripped"),
+            "suffix wins; comments survive in raw slice: {out}"
+        );
+        assert!(
+            !out.contains("[stripped]"),
+            "suffix slice must use [section] header, not [stripped]: {out}"
+        );
+    }
+
+    /// Unknown mode error must mention `stripped` so agents discover the new mode.
+    #[test]
+    fn tool_read_unknown_mode_error_lists_stripped() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("x.rs");
+        std::fs::write(&p, "fn x() {}\n").unwrap();
+        let args = serde_json::json!({
+            "paths": [p.to_str().unwrap()],
+            "mode": "minified_maybe"
+        });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let err = tool_read(&args, &cache, &session, false).expect_err("unknown mode rejected");
+        assert!(err.contains("stripped"), "error must list new mode: {err}");
+    }
+
+    /// Auto-signature on large code emits `view: "signature"` and the
+    /// `next_view: "full"` escalation hint (implicit promotion).
+    #[test]
+    fn tool_read_auto_signature_emits_view_meta_with_next_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("big.rs");
+        // Push the file over the auto-signature threshold (~24KB → >6000 tokens).
+        let mut src = String::from("fn implicit_target() {}\n");
+        src.push_str(&"// padding padding padding padding padding\n".repeat(2000));
+        std::fs::write(&p, src).unwrap();
+        let args = serde_json::json!({ "paths": [p.to_str().unwrap()] });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let out = tool_read(&args, &cache, &session, false).expect("auto sig ok");
+        let meta = parse_first_line_json(&out).expect("view-meta JSON header expected");
+        assert_eq!(meta.get("view").and_then(|v| v.as_str()), Some("signature"));
+        assert_eq!(
+            meta.get("next_view").and_then(|v| v.as_str()),
+            Some("full"),
+            "auto promotion advertises escalation: {out}"
+        );
+        assert!(
+            meta.get("original_line_count")
+                .and_then(serde_json::Value::as_u64)
+                .is_some(),
+            "original_line_count required for 'showing N of M' rendering: {out}"
+        );
+    }
+
+    /// Explicit `mode=signature` emits `view: "signature"` but NOT
+    /// `next_view` — the LLM picked this view on purpose.
+    #[test]
+    fn tool_read_explicit_signature_omits_next_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("small.rs");
+        std::fs::write(&p, "fn small_target() {\n    let x = 1;\n}\n").unwrap();
+        let args = serde_json::json!({
+            "paths": [p.to_str().unwrap()],
+            "mode": "signature"
+        });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let out = tool_read(&args, &cache, &session, false).expect("explicit sig ok");
+        let meta = parse_first_line_json(&out).expect("view-meta JSON header expected");
+        assert_eq!(meta.get("view").and_then(|v| v.as_str()), Some("signature"));
+        assert!(
+            meta.get("next_view").is_none(),
+            "explicit signature must not nag with next_view: {out}"
+        );
+    }
+
+    /// `mode=auto` on a small code file returns full content and emits NO
+    /// view-meta JSON header (the LLM has everything; no signal needed).
+    #[test]
+    fn tool_read_auto_small_code_omits_view_meta_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("tiny.rs");
+        std::fs::write(&p, "fn tiny() {\n    let body = 1;\n}\n").unwrap();
+        let args = serde_json::json!({ "paths": [p.to_str().unwrap()] });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let out = tool_read(&args, &cache, &session, false).expect("auto small ok");
+        // First line must NOT be a JSON header — the file's `# path` markdown header should lead.
+        let first = out.lines().next().expect("at least one line");
+        assert!(
+            !first.starts_with('{'),
+            "small full reads must not emit a JSON header: {out}"
+        );
+    }
+
+    /// Auto-outline on a large markdown emits `view: "outline"` + `next_view`.
+    #[test]
+    fn tool_read_auto_large_markdown_emits_outline_view_meta() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("big.md");
+        let mut src = String::from("# Title\n\n## Section A\n\n");
+        src.push_str(&"Lorem ipsum padding line.\n".repeat(2000));
+        std::fs::write(&p, src).unwrap();
+        let args = serde_json::json!({ "paths": [p.to_str().unwrap()] });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let out = tool_read(&args, &cache, &session, false).expect("auto large md ok");
+        let meta = parse_first_line_json(&out).expect("view-meta JSON header expected");
+        assert_eq!(meta.get("view").and_then(|v| v.as_str()), Some("outline"));
+        assert_eq!(meta.get("next_view").and_then(|v| v.as_str()), Some("full"));
+    }
+
+    /// Budget truncation surfaces `truncated`, `truncated_at_line`, and
+    /// `original_line_count` in the view-meta header so the host can render
+    /// a "showing 1–N of M lines" hint without re-reading the file.
+    #[test]
+    fn tool_read_budget_truncation_emits_meta_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("clip.rs");
+        // Many small functions separated by blank lines — `apply()` prefers
+        // `\n\n` boundaries when truncating, so we need internal blank lines
+        // for it to find a non-zero cut point.
+        let mut src = String::new();
+        for i in 0..100 {
+            src.push_str(&format!("fn f{i}() {{\n    let l = {i};\n}}\n\n"));
+        }
+        std::fs::write(&p, src).unwrap();
+        let args = serde_json::json!({
+            "paths": [p.to_str().unwrap()],
+            "budget": 400
+        });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let out = tool_read(&args, &cache, &session, false).expect("budget read ok");
+        let meta = parse_first_line_json(&out).expect("view-meta JSON header expected");
+        assert_eq!(
+            meta.get("truncated").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "budget cut must set truncated=true: {out}"
+        );
+        let at_line = meta
+            .get("truncated_at_line")
+            .and_then(serde_json::Value::as_u64)
+            .expect("truncated_at_line missing");
+        let total = meta
+            .get("original_line_count")
+            .and_then(serde_json::Value::as_u64)
+            .expect("original_line_count missing");
+        assert!(
+            at_line >= 2 && at_line < total,
+            "N inside (1, M): at_line={at_line}, M={total}: {out}"
+        );
+    }
 }

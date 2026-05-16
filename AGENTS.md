@@ -4,7 +4,7 @@ tilth — AST-aware code intelligence MCP server.
 
 Four tools, all batch-capable via array inputs:
   • tilth_search — find by symbol/content/regex/callers (merged by default)
-  • tilth_read   — load files with smart auto-sizing (full / signature / preview)
+  • tilth_read   — load files with smart auto-sizing (full / signature / stripped / preview)
   • tilth_list   — directory layout with token-cost rollups
   • tilth_write  — hash-anchored / overwrite / append; tolerates stale anchor hashes
 
