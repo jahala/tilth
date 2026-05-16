@@ -528,7 +528,15 @@ fn tool_search(
                 1 => {
                     session.record_search(queries[0]);
                     crate::search::search_symbol_expanded(
-                        queries[0], &scope, cache, session, bloom, expand, context, glob,
+                        queries[0],
+                        &scope,
+                        cache,
+                        session,
+                        bloom,
+                        expand,
+                        context,
+                        glob,
+                        crate::search::symbol::SymbolMode::Strict,
                     )
                 }
                 2..=5 => {
@@ -536,7 +544,15 @@ fn tool_search(
                         session.record_search(q);
                     }
                     crate::search::search_multi_symbol_expanded(
-                        &queries, &scope, cache, session, bloom, expand, context, glob,
+                        &queries,
+                        &scope,
+                        cache,
+                        session,
+                        bloom,
+                        expand,
+                        context,
+                        glob,
+                        crate::search::symbol::SymbolMode::Strict,
                     )
                 }
                 _ => {
