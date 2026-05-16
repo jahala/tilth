@@ -90,6 +90,7 @@ pub(crate) fn walker(scope: &Path, glob: Option<&str>) -> Result<ignore::WalkPar
     let mut builder = WalkBuilder::new(scope);
     builder
         .follow_links(true)
+        .same_file_system(true) // Stop at mount boundaries (NFS, external volumes).
         .hidden(false)
         .git_ignore(false)
         .git_global(false)
@@ -826,6 +827,7 @@ fn find_basename_fallback(scope: &Path, query_lower: &str) -> Option<PathBuf> {
 
     let walker = ignore::WalkBuilder::new(scope)
         .follow_links(true)
+        .same_file_system(true) // Stop at mount boundaries (NFS, external volumes).
         .hidden(true)
         .git_ignore(true)
         .max_depth(Some(6))
