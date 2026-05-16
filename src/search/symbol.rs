@@ -26,6 +26,14 @@ const EARLY_QUIT_THRESHOLD_DEFINITIONS: usize = 50;
 /// Stop walking once we have this many raw usage matches.
 const EARLY_QUIT_THRESHOLD_USAGES: usize = MAX_MATCHES * 3;
 
+/// Match-count cap when `--full` is set. Generous but bounded so a `tilth
+/// foo --full` on a huge repo can't blow up output.
+const FULL_MAX_MATCHES: usize = 100;
+/// Walker early-quit threshold when `--full` is set. Proportional to
+/// `FULL_MAX_MATCHES` the same way the default thresholds are.
+const FULL_EARLY_QUIT_USAGES: usize = FULL_MAX_MATCHES * 3;
+const FULL_EARLY_QUIT_DEFINITIONS: usize = FULL_MAX_MATCHES * 3;
+
 /// Display-side stratum: 0 = code def, 1 = doc-heading def, 2 = usage. Used
 /// as a stable sort key after `rank::sort` so the `MAX_MATCHES` cap can't drop
 /// real code defs in favor of markdown-heading defs of the same query.
@@ -39,12 +47,32 @@ fn stratum_for_display(m: &Match) -> u8 {
 
 /// Symbol search: find definitions via tree-sitter, usages via ripgrep, concurrently.
 /// Merge results, deduplicate, definitions first.
+///
+/// `full` controls the truncation cap and walker early-quit thresholds:
+/// `false` (default) uses the tight defaults that keep agent token budgets
+/// in check; `true` raises both caps so interactive `--full` callers see
+/// every match instead of "... and N more matches."
 pub fn search(
     query: &str,
     scope: &Path,
     context: Option<&Path>,
     glob: Option<&str>,
+    full: bool,
 ) -> Result<SearchResult, TilthError> {
+    let (max_matches, def_threshold, usage_threshold) = if full {
+        (
+            FULL_MAX_MATCHES,
+            FULL_EARLY_QUIT_DEFINITIONS,
+            FULL_EARLY_QUIT_USAGES,
+        )
+    } else {
+        (
+            MAX_MATCHES,
+            EARLY_QUIT_THRESHOLD_DEFINITIONS,
+            EARLY_QUIT_THRESHOLD_USAGES,
+        )
+    };
+
     // Compile regex once, share across both arms
     let word_pattern = format!(r"\b{}\b", regex_syntax::escape(query));
     let matcher = RegexMatcher::new(&word_pattern).map_err(|e| TilthError::InvalidQuery {
@@ -53,8 +81,8 @@ pub fn search(
     })?;
 
     let (defs, usages) = rayon::join(
-        || find_definitions(query, scope, glob),
-        || find_usages(query, &matcher, scope, glob),
+        || find_definitions(query, scope, glob, def_threshold),
+        || find_usages(query, &matcher, scope, glob, usage_threshold),
     );
 
     let defs = defs?;
@@ -103,7 +131,7 @@ pub fn search(
         }
     };
 
-    merged.truncate(MAX_MATCHES);
+    merged.truncate(max_matches);
 
     Ok(SearchResult {
         query: query.to_string(),
@@ -128,6 +156,7 @@ fn find_definitions(
     query: &str,
     scope: &Path,
     glob: Option<&str>,
+    early_quit_threshold: usize,
 ) -> Result<Vec<Match>, TilthError> {
     let matches: Mutex<Vec<Match>> = Mutex::new(Vec::new());
     // Relaxed is correct: walker.run() joins all threads before we read the final value.
@@ -143,7 +172,7 @@ fn find_definitions(
 
         Box::new(move |entry| {
             // Early termination: enough definitions found
-            if found_count.load(Ordering::Relaxed) >= EARLY_QUIT_THRESHOLD_DEFINITIONS {
+            if found_count.load(Ordering::Relaxed) >= early_quit_threshold {
                 return ignore::WalkState::Quit;
             }
 
@@ -481,6 +510,7 @@ fn find_usages(
     matcher: &RegexMatcher,
     scope: &Path,
     glob: Option<&str>,
+    early_quit_threshold: usize,
 ) -> Result<Vec<Match>, TilthError> {
     let matches: Mutex<Vec<Match>> = Mutex::new(Vec::new());
     // Relaxed: same reasoning as find_definitions — approximate early-quit, joined before read
@@ -494,7 +524,7 @@ fn find_usages(
 
         Box::new(move |entry| {
             // Early termination: enough usages found
-            if found_count.load(Ordering::Relaxed) >= EARLY_QUIT_THRESHOLD_USAGES {
+            if found_count.load(Ordering::Relaxed) >= early_quit_threshold {
                 return ignore::WalkState::Quit;
             }
 
@@ -1283,6 +1313,40 @@ Body to end.
             matches.iter().all(|m| m.def_weight >= 60),
             "displayed slice after cap must be all code defs, got {:?}",
             matches.iter().map(|m| m.def_weight).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn full_flag_raises_match_cap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let scope = dir.path();
+
+        // Create 15 Rust files each defining WidelyUsedThing.
+        for i in 0..15 {
+            let path = scope.join(format!("file_{i:02}.rs"));
+            std::fs::write(&path, format!("pub fn WidelyUsedThing() {{}}\n")).expect("write");
+        }
+
+        let result_default =
+            search("WidelyUsedThing", scope, None, None, false).expect("search default");
+        let result_full = search("WidelyUsedThing", scope, None, None, true).expect("search full");
+
+        // Default cap is 10 — should not exceed it.
+        assert!(
+            result_default.matches.len() <= 10,
+            "default: expected ≤10 matches, got {}",
+            result_default.matches.len()
+        );
+        // Full cap is 100 — all 15 definitions should be visible.
+        assert!(
+            result_full.matches.len() > 10,
+            "full: expected >10 matches, got {}",
+            result_full.matches.len()
+        );
+        // total_found is measured pre-truncation and should be equal.
+        assert_eq!(
+            result_default.total_found, result_full.total_found,
+            "total_found must be the same regardless of full flag"
         );
     }
 }

@@ -172,7 +172,13 @@ pub fn analyze_deps(
 
     let mut used_by = if searched_count > 0 {
         let symbols_set: HashSet<String> = all_names.iter().cloned().collect();
-        let raw_matches = find_callers_batch(&symbols_set, scope, bloom, None)?;
+        let raw_matches = find_callers_batch(
+            &symbols_set,
+            scope,
+            bloom,
+            None,
+            crate::search::callers::BATCH_EARLY_QUIT,
+        )?;
 
         // Group by file path
         let mut by_file: HashMap<PathBuf, Vec<(String, String, u32)>> = HashMap::new();

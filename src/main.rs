@@ -284,7 +284,14 @@ fn main() {
 
     // Callers mode
     if cli.callers {
-        let result = tilth::run_callers(&query, &scope, expand, cli.budget, cli.glob.as_deref());
+        let result = tilth::run_callers(
+            &query,
+            &scope,
+            expand,
+            cli.budget,
+            cli.glob.as_deref(),
+            cli.full,
+        );
         emit_result(result, &query, cli.json, is_tty);
         return;
     }
@@ -321,6 +328,7 @@ fn main() {
             expand,
             cli.glob.as_deref(),
             &cache,
+            cli.full,
         )
     } else if full {
         tilth::run_full(

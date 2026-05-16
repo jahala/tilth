@@ -13,6 +13,8 @@ use grep_searcher::Searcher;
 
 const MAX_MATCHES: usize = 10;
 const EARLY_QUIT_THRESHOLD: usize = MAX_MATCHES * 3;
+const FULL_MAX_MATCHES: usize = 100;
+const FULL_EARLY_QUIT_THRESHOLD: usize = FULL_MAX_MATCHES * 3;
 const MAX_SEARCH_FILE_SIZE: u64 = 500_000;
 
 /// Content search using ripgrep crates. Literal by default, regex if `is_regex`.
@@ -22,7 +24,13 @@ pub fn search(
     is_regex: bool,
     context: Option<&Path>,
     glob: Option<&str>,
+    full: bool,
 ) -> Result<SearchResult, TilthError> {
+    let (max_matches, early_quit) = if full {
+        (FULL_MAX_MATCHES, FULL_EARLY_QUIT_THRESHOLD)
+    } else {
+        (MAX_MATCHES, EARLY_QUIT_THRESHOLD)
+    };
     let matcher = if is_regex {
         RegexMatcher::new(pattern)
     } else {
@@ -46,7 +54,7 @@ pub fn search(
         let total_found = &total_found;
 
         Box::new(move |entry| {
-            if total_found.load(Ordering::Relaxed) >= EARLY_QUIT_THRESHOLD {
+            if total_found.load(Ordering::Relaxed) >= early_quit {
                 return ignore::WalkState::Quit;
             }
 
@@ -129,7 +137,7 @@ pub fn search(
                 all.extend(file_matches);
             }
 
-            if total_found.load(Ordering::Relaxed) >= EARLY_QUIT_THRESHOLD {
+            if total_found.load(Ordering::Relaxed) >= early_quit {
                 ignore::WalkState::Quit
             } else {
                 ignore::WalkState::Continue
@@ -143,7 +151,7 @@ pub fn search(
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     rank::sort(&mut all_matches, pattern, scope, context);
-    all_matches.truncate(MAX_MATCHES);
+    all_matches.truncate(max_matches);
 
     Ok(SearchResult {
         query: pattern.to_string(),

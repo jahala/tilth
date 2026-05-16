@@ -45,6 +45,11 @@ struct ExpandedCtx {
     session: session::Session,
     bloom: index::bloom::BloomFilterCache,
     expand: usize,
+    /// Raises the search match cap (10 → 100). Driven by the explicit `--full`
+    /// flag, NOT by `full = !is_tty`. Piped invocation must preserve the
+    /// concise outline — see the `piped_invocation_does_not_auto_expand`
+    /// pin in `main.rs` for the larger design rule this enforces.
+    full_search: bool,
 }
 
 /// The single public API. Everything flows through here:
@@ -57,10 +62,22 @@ pub fn run(
     glob: Option<&str>,
     cache: &OutlineCache,
 ) -> Result<String, TilthError> {
-    run_inner(query, scope, section, budget_tokens, false, 0, glob, cache)
+    run_inner(
+        query,
+        scope,
+        section,
+        budget_tokens,
+        false,
+        0,
+        glob,
+        cache,
+        false,
+    )
 }
 
 /// Full variant — forces full file output, bypassing smart views.
+/// `full_file` covers piped-stdout promotion too; search cap bump never
+/// applies on this path (no expansion = no `run_query_expanded`).
 pub fn run_full(
     query: &str,
     scope: &Path,
@@ -69,10 +86,24 @@ pub fn run_full(
     glob: Option<&str>,
     cache: &OutlineCache,
 ) -> Result<String, TilthError> {
-    run_inner(query, scope, section, budget_tokens, true, 0, glob, cache)
+    run_inner(
+        query,
+        scope,
+        section,
+        budget_tokens,
+        true,
+        0,
+        glob,
+        cache,
+        false,
+    )
 }
 
 /// Run with expanded search — inline source for top N matches.
+/// `full` controls full-file display for `FilePath` queries (driven by
+/// `cli.full || !is_tty`). `cli_full` is the *parsed* `--full` flag and
+/// alone gates the search match-cap bump; piped invocation must not raise
+/// the cap (see `piped_invocation_does_not_auto_expand` pin).
 pub fn run_expanded(
     query: &str,
     scope: &Path,
@@ -82,6 +113,7 @@ pub fn run_expanded(
     expand: usize,
     glob: Option<&str>,
     cache: &OutlineCache,
+    cli_full: bool,
 ) -> Result<String, TilthError> {
     run_inner(
         query,
@@ -92,6 +124,7 @@ pub fn run_expanded(
         expand,
         glob,
         cache,
+        cli_full,
     )
 }
 
@@ -102,11 +135,12 @@ pub fn run_callers(
     expand: usize,
     budget_tokens: Option<u64>,
     glob: Option<&str>,
+    full: bool,
 ) -> Result<String, TilthError> {
     let bloom = index::bloom::BloomFilterCache::new();
     let expand = if expand > 0 { expand } else { 2 };
     let output =
-        search::callers::search_callers_expanded(target, scope, &bloom, expand, None, glob)?;
+        search::callers::search_callers_expanded(target, scope, &bloom, expand, None, glob, full)?;
     match budget_tokens {
         Some(b) => Ok(budget::apply(&output, b)),
         None => Ok(output),
@@ -134,6 +168,7 @@ fn run_inner(
     expand: usize,
     glob: Option<&str>,
     cache: &OutlineCache,
+    cli_full: bool,
 ) -> Result<String, TilthError> {
     let query_type = classify(query, scope);
 
@@ -166,7 +201,7 @@ fn run_inner(
             let bloom = index::bloom::BloomFilterCache::new();
             let expand = if expand > 0 { expand } else { 2 };
             let output = search::search_multi_symbol_expanded(
-                &parts, scope, cache, &session, &bloom, expand, None, glob,
+                &parts, scope, cache, &session, &bloom, expand, None, glob, cli_full,
             )?;
             return match budget_tokens {
                 Some(b) => Ok(budget::apply(&output, b)),
@@ -199,6 +234,7 @@ fn run_inner(
                 session: session::Session::new(),
                 bloom: index::bloom::BloomFilterCache::new(),
                 expand,
+                full_search: cli_full,
             };
             run_query_expanded(&query_type, scope, cache, &ctx, glob)?
         }
@@ -230,6 +266,7 @@ fn run_query_expanded(
             ctx.expand,
             None,
             glob,
+            ctx.full_search,
         ),
         QueryType::Concept(text) if text.contains(' ') => search::search_content_expanded(
             text,
@@ -239,6 +276,7 @@ fn run_query_expanded(
             ctx.expand,
             None,
             glob,
+            ctx.full_search,
         ),
         // Single-word Concept and Fallthrough share the same expanded path:
         // both go straight to symbol_expanded, intentionally bypassing the
@@ -253,6 +291,7 @@ fn run_query_expanded(
             ctx.expand,
             None,
             glob,
+            ctx.full_search,
         ),
         QueryType::Content(text) => search::search_content_expanded(
             text,
@@ -262,6 +301,7 @@ fn run_query_expanded(
             ctx.expand,
             None,
             glob,
+            ctx.full_search,
         ),
         QueryType::Regex(pattern) => search::search_regex_expanded(
             pattern,
@@ -271,6 +311,7 @@ fn run_query_expanded(
             ctx.expand,
             None,
             glob,
+            ctx.full_search,
         ),
         // FilePath/Glob never reach here (gated by use_expanded)
         QueryType::FilePath(_) | QueryType::Glob(_) => {
