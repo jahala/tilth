@@ -1,0 +1,27 @@
+name: Feature request
+description: A thing tilth doesn't do yet, that you wish it did.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do that tilth gets in the way of?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed shape
+      description: What would the command, flag, or tool call look like? Rough is fine.
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other ways to solve this, and why they're worse.
+    validations:
+      required: false
