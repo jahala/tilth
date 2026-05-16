@@ -6,12 +6,14 @@ use std::fs;
 use std::path::Path;
 
 use memmap2::Mmap;
+use rayon::prelude::*;
 
 use crate::cache::OutlineCache;
 use crate::error::TilthError;
 use crate::format;
 use crate::lang::detect_file_type;
 use crate::lang::outline::{heading_level, heading_text, parse_markdown};
+use crate::session::Session;
 use crate::types::{estimate_tokens, FileType, ViewMode};
 
 pub(crate) const TOKEN_THRESHOLD: u64 = 6_000;
@@ -26,6 +28,26 @@ fn full_read_size_cap() -> u64 {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(2_000_000)
+}
+
+/// Read many files in parallel using the same smart-view rules as [`read_file`].
+pub(crate) fn read_batch(
+    paths: &[std::path::PathBuf],
+    cache: &OutlineCache,
+    session: &Session,
+    edit_mode: bool,
+) -> String {
+    let results: Vec<String> = paths
+        .par_iter()
+        .map(|path| {
+            session.record_read(path);
+            match read_file(path, None, false, cache, edit_mode) {
+                Ok(output) => output,
+                Err(e) => format!("# {} — error: {}", path.display(), e),
+            }
+        })
+        .collect();
+    results.join("\n\n")
 }
 
 /// Main entry point for read mode. Routes through the decision tree.
@@ -411,6 +433,7 @@ pub fn read_ranges(path: &Path, ranges: &[&str], edit_mode: bool) -> Result<Stri
     Ok(out)
 }
 
+#[allow(dead_code)]
 /// Like [`read_ranges`], but with a strict shared token budget across all
 /// sections.
 ///
