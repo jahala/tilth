@@ -275,7 +275,6 @@ pub fn search_callers_expanded(
     scope: &Path,
     bloom: &crate::index::bloom::BloomFilterCache,
     expand: usize,
-    context: Option<&Path>,
     glob: Option<&str>,
 ) -> Result<String, TilthError> {
     let single: HashSet<String> = std::iter::once(target.to_string()).collect();
@@ -287,9 +286,9 @@ pub fn search_callers_expanded(
         return Ok(no_callers_message(target, scope, target_seen, glob));
     }
 
-    // Sort by relevance (context file first, then by proximity)
+    // Sort by path proximity
     let mut sorted_callers = callers;
-    rank_callers(&mut sorted_callers, scope, context);
+    rank_callers(&mut sorted_callers, scope);
 
     let total = sorted_callers.len();
 
@@ -463,19 +462,9 @@ fn no_callers_message(target: &str, scope: &Path, target_seen: bool, glob: Optio
     )
 }
 
-/// Simple ranking: context file first, then by path length (proximity heuristic).
-fn rank_callers(callers: &mut [CallerMatch], scope: &Path, context: Option<&Path>) {
+/// Rank callers by path proximity to the scope root.
+fn rank_callers(callers: &mut [CallerMatch], scope: &Path) {
     callers.sort_by(|a, b| {
-        // Context file wins
-        if let Some(ctx) = context {
-            match (a.path == ctx, b.path == ctx) {
-                (true, false) => return std::cmp::Ordering::Less,
-                (false, true) => return std::cmp::Ordering::Greater,
-                _ => {}
-            }
-        }
-
-        // Shorter paths (more similar to scope) rank higher
         let a_rel = a.path.strip_prefix(scope).unwrap_or(&a.path);
         let b_rel = b.path.strip_prefix(scope).unwrap_or(&b.path);
         a_rel

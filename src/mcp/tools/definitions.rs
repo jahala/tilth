@@ -47,10 +47,6 @@ pub(crate) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "default": 2,
                         "description": "Number of top matches to expand with full source code. Definitions show the full function/class body. Usages show ±10 context lines."
                     },
-                    "context": {
-                        "type": "string",
-                        "description": "Path to the file the agent is currently editing. Boosts ranking of matches in the same directory or package."
-                    },
                     "budget": {
                         "type": "number",
                         "description": "Max tokens in response."

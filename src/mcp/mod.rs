@@ -1343,8 +1343,8 @@ mod tests {
         let bloom = Arc::new(BloomFilterCache::new());
         let out = tool_search(&args, &cache, &session, &bloom, false).expect("queries form");
         assert!(
-            out.contains("Results as of"),
-            "expected Results header: {out}"
+            out.contains("\"if_modified_since\""),
+            "expected JSON cache-token header: {out}"
         );
         assert!(
             out.contains("query: build_instructions"),
@@ -1558,7 +1558,10 @@ mod tests {
             !out.contains("contents you should NOT see"),
             "body must not leak on unchanged stub: {out}"
         );
-        assert!(out.contains("Results as of"), "header missing: {out}");
+        assert!(
+            out.contains("\"if_modified_since\""),
+            "JSON cache-token header missing: {out}"
+        );
     }
 
     /// `tool_read` with `if_modified_since` in the past (epoch) returns the
@@ -1871,7 +1874,10 @@ mod tests {
         let session = Session::new();
         let bloom = Arc::new(BloomFilterCache::new());
         let out = tool_search(&args, &cache, &session, &bloom, false).expect("search ok");
-        assert!(out.contains("Results as of"), "header missing: {out}");
+        assert!(
+            out.contains("\"if_modified_since\""),
+            "JSON cache-token header missing: {out}"
+        );
         assert!(out.contains("unchanged"), "stub missing: {out}");
         assert!(
             !out.contains("secret body text"),
@@ -2062,6 +2068,90 @@ mod tests {
         );
     }
 
+    /// Realistic agent-retry: the file has shifted so the anchor body lives
+    /// at a new line, while the agent's claimed line now holds different
+    /// content. `capture_hash_original` reads the body from the CURRENT
+    /// file at the agent's claimed line, so the captured body is whatever
+    /// has shifted INTO that slot — never the body the agent intended. The
+    /// auto-fix can't recover the original body from a 12-bit hash alone,
+    /// so this scenario does not produce `auto-fixed: <old> → <new>`. The
+    /// response instead surfaces a fresh hashlined region so the agent can
+    /// retry in one turn. This test documents the actual contract so a
+    /// future design change (per-session file snapshot, body in the
+    /// request, …) that adds genuine relocation flips a red flag.
+    #[test]
+    fn tool_write_auto_fix_shift_returns_fresh_region_not_relocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("shift.txt");
+
+        use std::fmt::Write as _;
+
+        // C0: TARGET_BODY_TOKEN at line 10.
+        let mut c0 = String::new();
+        for i in 1..=9 {
+            let _ = writeln!(c0, "orig{i}");
+        }
+        c0.push_str("TARGET_BODY_TOKEN\n");
+        c0.push_str("after\n");
+        std::fs::write(&p, &c0).unwrap();
+
+        // Anchor captured from C0 — line 10 hashes the target line.
+        let anchor = anchor_for(&c0, 10);
+
+        // C1: insert 5 blank lines above the target so it now lives at 15.
+        let mut c1 = String::new();
+        for i in 1..=9 {
+            let _ = writeln!(c1, "orig{i}");
+        }
+        for _ in 0..5 {
+            c1.push('\n');
+        }
+        c1.push_str("TARGET_BODY_TOKEN\n");
+        c1.push_str("after\n");
+        std::fs::write(&p, &c1).unwrap();
+
+        let args = serde_json::json!({
+            "scope": dir.path().to_str().unwrap(),
+            "files": [{
+                "path": p.to_str().unwrap(),
+                "mode": "hash",
+                "edits": [{ "start": anchor, "content": "REPLACED" }]
+            }]
+        });
+        let (session, bloom) = edit_services();
+        let out = tool_write(&args, &session, &bloom).expect("response renders");
+
+        // Hash mismatch must surface — agent's hash is stale against C1.
+        assert!(
+            out.contains("hash mismatch"),
+            "shifted file must trip the hash mismatch path: {out}"
+        );
+        // The auto-fix probe must run …
+        assert!(
+            out.contains("── auto-fix probe ──"),
+            "probe block must run even though it can't recover the old body: {out}"
+        );
+        // … but a body-relocation auto-fix is impossible without the
+        // original body, so the verbatim signal must NOT fire.
+        assert!(
+            !out.contains("auto-fixed: 10 → 15"),
+            "auto-fix must not pretend to relocate when the captured body is post-shift: {out}"
+        );
+        // Instead a fresh hashlined region is returned for the agent to
+        // retry in one turn (per the prompt's narrower claim).
+        assert!(
+            out.contains("fresh region"),
+            "shifted-body retry must surface a fresh hashlined region: {out}"
+        );
+        // The file content is left untouched — the edit did NOT silently
+        // land on the wrong line.
+        let after = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(
+            after, c1,
+            "file must be unchanged when auto-fix cannot recover"
+        );
+    }
+
     /// Security: overwrite/append outside the configured scope is refused.
     #[test]
     fn tool_write_overwrite_outside_scope_refused() {
@@ -2086,6 +2176,125 @@ mod tests {
             !target.exists(),
             "file outside scope must not be written: {}",
             target.display()
+        );
+    }
+
+    // ── F1 hardening: the JSON cache-token must stand alone on the first
+    // line so a trivial JSON-line parse pulls the field. The prose-header
+    // baseline was 0 / 2,042 round-trips; the integration regression here
+    // is "response shape changed but the field is no longer parseable."
+    #[test]
+    fn tool_search_first_line_is_parseable_cache_token_json() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn handleAuth() {}\n").unwrap();
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "queries": [{"query": "handleAuth"}],
+            "scope": dir.path().to_str().unwrap()
+        });
+        let out = tool_search(&args, &cache, &session, &bloom, false).expect("search ok");
+        let first = out.lines().next().expect("response has a first line");
+        let parsed: serde_json::Value =
+            serde_json::from_str(first).expect("first line must be valid one-line JSON");
+        let ts = parsed
+            .get("if_modified_since")
+            .and_then(|v| v.as_str())
+            .expect("if_modified_since field present");
+        assert!(
+            crate::mcp::iso::parse_iso_utc(ts).is_some(),
+            "ts must round-trip through parse_iso_utc: {ts}"
+        );
+    }
+
+    // ── F3 hardening: zero-match search emits the new empty header with the
+    // three counts and the per-kind hint, end-to-end through tool_search.
+    // The unit tests in src/format.rs cover the helper in isolation; this
+    // proves the wiring from search.rs → format_search_result actually
+    // routes through the empty path on real walker results.
+    #[test]
+    fn tool_search_zero_matches_emits_empty_header_with_kind_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("only.rs"),
+            "fn unrelated() {}\n", // nothing here will match "zZxQyN_no_such_symbol"
+        )
+        .unwrap();
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "queries": [{"query": "zZxQyN_no_such_symbol", "kind": "content"}],
+            "scope": dir.path().to_str().unwrap()
+        });
+        let out = tool_search(&args, &cache, &session, &bloom, false).expect("search ok");
+        assert!(out.contains("0 matches"), "empty header missing: {out}");
+        assert!(
+            out.contains("Files matched glob:"),
+            "files matched count missing: {out}"
+        );
+        assert!(
+            out.contains("Files searched:"),
+            "files searched count missing: {out}"
+        );
+        assert!(out.contains("Content hits:"), "hits count missing: {out}");
+        // kind=content ⇒ literal-content hint (split from regex per Copilot review).
+        assert!(
+            out.contains("no content matches"),
+            "content-kind hint missing: {out}"
+        );
+    }
+
+    // ── F3 hardening: glob that excludes every file emits the dedicated
+    // glob-mismatch hint, regardless of the requested kind. This is the
+    // dispatch-table row most likely to silently regress if a future
+    // refactor stops populating files_matched_glob.
+    #[test]
+    fn tool_search_glob_excludes_everything_emits_glob_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn anything() {}\n").unwrap();
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        // Glob matches nothing in the scope → files_matched_glob == 0.
+        let args = serde_json::json!({
+            "queries": [{"query": "anything", "kind": "symbol", "glob": "*.bogus_ext_does_not_exist"}],
+            "scope": dir.path().to_str().unwrap()
+        });
+        let out = tool_search(&args, &cache, &session, &bloom, false).expect("search ok");
+        assert!(out.contains("0 matches"), "empty header missing: {out}");
+        assert!(
+            out.contains("Files matched glob: 0"),
+            "glob-mismatch count must be zero: {out}"
+        );
+        assert!(
+            out.contains("glob matched no files"),
+            "glob-zero hint must override the kind hint: {out}"
+        );
+    }
+
+    // ── F5 hardening: a request that still carries the dropped `context`
+    // field must NOT error. Old agents have the parameter cached in their
+    // tool spec; tolerating it silently is the documented contract (the
+    // F5 verifier says "or is silently ignored — implementer's call").
+    #[test]
+    fn tool_search_tolerates_stray_context_field() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn handleAuth() {}\n").unwrap();
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "queries": [{"query": "handleAuth"}],
+            "scope": dir.path().to_str().unwrap(),
+            "context": "src/old.rs"
+        });
+        let out = tool_search(&args, &cache, &session, &bloom, false)
+            .expect("stray context must not fail the request");
+        assert!(
+            out.contains("handleAuth"),
+            "search must still find the symbol despite the stray field: {out}"
         );
     }
 }

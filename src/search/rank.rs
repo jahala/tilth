@@ -1,5 +1,4 @@
-use std::collections::HashMap;
-use std::path::{Component, Path, PathBuf};
+use std::path::Path;
 use std::time::SystemTime;
 
 use crate::types::{is_test_file, Match};
@@ -19,38 +18,13 @@ const VENDOR_DIRS: &[&str] = &[
 ];
 
 /// Sort matches by score (highest first). Deterministic: same inputs, same order.
-/// When `context` is provided, matches near the context file are boosted.
-pub fn sort(matches: &mut [Match], query: &str, scope: &Path, context: Option<&Path>) {
-    // Pre-compute context's package root once (same for entire batch)
-    let ctx_parent = context.and_then(|c| c.parent());
-    let ctx_pkg_root = context
-        .and_then(package_root)
-        .map(std::path::Path::to_path_buf);
-
-    // Cache package roots for match paths — avoids repeated stat walks
-    let mut pkg_cache: HashMap<PathBuf, Option<PathBuf>> = HashMap::new();
+pub fn sort(matches: &mut [Match], query: &str, scope: &Path) {
     // Capture now once so the sort comparator does not call SystemTime::now() O(n log n) times.
     let now = SystemTime::now();
 
     matches.sort_by(|a, b| {
-        let sa = score(
-            a,
-            query,
-            scope,
-            ctx_parent,
-            ctx_pkg_root.as_ref(),
-            &mut pkg_cache,
-            now,
-        );
-        let sb = score(
-            b,
-            query,
-            scope,
-            ctx_parent,
-            ctx_pkg_root.as_ref(),
-            &mut pkg_cache,
-            now,
-        );
+        let sa = score(a, query, scope, now);
+        let sb = score(b, query, scope, now);
         sb.cmp(&sa)
             .then_with(|| a.path.cmp(&b.path))
             .then_with(|| a.line.cmp(&b.line))
@@ -59,15 +33,7 @@ pub fn sort(matches: &mut [Match], query: &str, scope: &Path, context: Option<&P
 
 /// Ranking function. Each match gets a score — no floating point, no randomness.
 /// All boosts are positive (added), all penalties are positive (subtracted).
-fn score(
-    m: &Match,
-    query: &str,
-    scope: &Path,
-    ctx_parent: Option<&Path>,
-    ctx_pkg_root: Option<&PathBuf>,
-    pkg_cache: &mut HashMap<PathBuf, Option<PathBuf>>,
-    now: SystemTime,
-) -> i32 {
+fn score(m: &Match, query: &str, scope: &Path, now: SystemTime) -> i32 {
     let mut s = 0i32;
 
     if m.is_definition {
@@ -85,11 +51,6 @@ fn score(
 
     if m.file_lines > 0 && m.file_lines < 200 {
         s += 50;
-    }
-
-    // Context-aware boosts
-    if ctx_parent.is_some() || ctx_pkg_root.is_some() {
-        s += context_proximity(&m.path, ctx_parent, ctx_pkg_root, pkg_cache);
     }
 
     s += basename_boost(&m.path, query);
@@ -157,43 +118,6 @@ fn scope_proximity(path: &Path, scope: &Path) -> u32 {
     let rel = path.strip_prefix(scope).unwrap_or(path);
     let depth = rel.components().count();
     200u32.saturating_sub(depth as u32 * 20)
-}
-
-/// Context-aware proximity boost with cached package roots.
-fn context_proximity(
-    match_path: &Path,
-    ctx_parent: Option<&Path>,
-    ctx_pkg_root: Option<&PathBuf>,
-    pkg_cache: &mut HashMap<PathBuf, Option<PathBuf>>,
-) -> i32 {
-    let mut score = 0;
-
-    // Same directory as context file
-    if let Some(cp) = ctx_parent {
-        if match_path.parent() == Some(cp) {
-            score += 100;
-        } else if shared_prefix_depth(cp, match_path.parent().unwrap_or(match_path)) >= 2 {
-            score += 40;
-        }
-    }
-
-    // Same package root (cached)
-    if let Some(cp_root) = ctx_pkg_root {
-        let match_dir = match match_path.parent() {
-            Some(d) => d.to_path_buf(),
-            None => return score,
-        };
-        let match_root = pkg_cache
-            .entry(match_dir)
-            .or_insert_with_key(|dir| package_root(dir).map(std::path::Path::to_path_buf));
-        if let Some(ref mr) = match_root {
-            if mr == cp_root {
-                score += 75;
-            }
-        }
-    }
-
-    score
 }
 
 fn definition_name_boost(m: &Match, query: &str) -> i32 {
@@ -410,19 +334,6 @@ fn looks_like_test_query(query: &str) -> bool {
     q.contains("test") || q.contains("spec") || q.starts_with("should")
 }
 
-fn shared_prefix_depth(a: &Path, b: &Path) -> usize {
-    a.components()
-        .filter(|c| matches!(c, Component::Normal(_)))
-        .zip(b.components().filter(|c| matches!(c, Component::Normal(_))))
-        .take_while(|(l, r)| l == r)
-        .count()
-}
-
-/// Re-export from lang module to keep rank.rs self-contained.
-fn package_root(path: &Path) -> Option<&Path> {
-    crate::lang::package_root(path)
-}
-
 /// Check if path contains a vendor directory component.
 fn is_vendor_path(path: &Path) -> bool {
     path.components().any(|c| {
@@ -481,7 +392,7 @@ mod tests {
             ),
         ];
 
-        sort(&mut matches, "handleAuth", &scope, None);
+        sort(&mut matches, "handleAuth", &scope);
 
         assert!(matches[0].is_definition);
         assert_eq!(matches[0].def_name.as_deref(), Some("handleAuth"));
@@ -505,33 +416,9 @@ mod tests {
             ),
         ];
 
-        sort(&mut matches, "handleAuth", &scope, None);
+        sort(&mut matches, "handleAuth", &scope);
 
         assert_eq!(matches[0].path, PathBuf::from("/repo/src/auth.ts"));
-    }
-
-    #[test]
-    fn prefers_same_subtree_as_context() {
-        let scope = PathBuf::from("/repo/src");
-        let context = PathBuf::from("/repo/src/auth/controller.rs");
-        let mut matches = vec![
-            make_match(
-                "/repo/src/payments/service.rs",
-                "pub fn handleAuth() {",
-                true,
-                Some("handleAuth"),
-            ),
-            make_match(
-                "/repo/src/auth/service.rs",
-                "pub fn handleAuth() {",
-                true,
-                Some("handleAuth"),
-            ),
-        ];
-
-        sort(&mut matches, "handleAuth", &scope, Some(&context));
-
-        assert_eq!(matches[0].path, PathBuf::from("/repo/src/auth/service.rs"));
     }
 
     #[test]
@@ -552,7 +439,7 @@ mod tests {
             ),
         ];
 
-        sort(&mut matches, "handleAuth", &scope, None);
+        sort(&mut matches, "handleAuth", &scope);
 
         assert_eq!(matches[0].path, PathBuf::from("/repo/src/public/auth.ts"));
     }
@@ -575,7 +462,7 @@ mod tests {
             ),
         ];
 
-        sort(&mut matches, "handleAuth", &scope, None);
+        sort(&mut matches, "handleAuth", &scope);
 
         assert_eq!(matches[0].path, PathBuf::from("/repo/src/auth.ts"));
     }
@@ -598,7 +485,7 @@ mod tests {
             ),
         ];
 
-        sort(&mut matches, "thinking", &scope, None);
+        sort(&mut matches, "thinking", &scope);
 
         assert!(
             matches[0].path.to_string_lossy().contains("thinking.go"),
@@ -625,7 +512,7 @@ mod tests {
             ),
         ];
 
-        sort(&mut matches, "alias", &scope, None);
+        sort(&mut matches, "alias", &scope);
 
         assert!(
             matches[0].path.to_string_lossy().contains("model_mapping"),

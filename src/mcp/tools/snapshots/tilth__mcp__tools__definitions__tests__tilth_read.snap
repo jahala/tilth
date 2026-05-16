@@ -2,6 +2,10 @@
 source: src/mcp/tools/definitions.rs
 expression: desc
 ---
+ALWAYS group every file you need into ONE tilth_read call via paths: [...]. Never call tilth_read twice in a row.
+
 Read files with smart auto-sizing. **Defaults are tuned — omit `mode` unless you specifically need to force a size.** Example: `tilth_read(paths: ["src/lib.rs", "src/mcp.rs#tool_search"])` returns full small files, hash-prefixed signatures for large code, and sliced suffix reads when requested. Suffix grammar: `path#n-m`, `path#n`, `path### Heading`, `path#symbol_name`. Use `mode: "full"` to force full content and `mode: "signature"` for hash-prefixed signature lines.
 
 Output format: each line is prefixed `<line>:<3-hex-hash>|<content>`, e.g. `42:a1b|let x = 1;`. The hash anchors the line to its current content — copy the `<line>:<3-hex-hash>` portion (everything before `|`) into tilth_write `start`/`end` anchors for a drift-safe edit. Ignore the prefix when reading; resume after the `|`.
+
+Responses lead with `{"if_modified_since": "<ts>"}` — pass that exact ts in your next `tilth_read` call's `if_modified_since` to get `(unchanged @ <ts>)` stubs for files that haven't changed.

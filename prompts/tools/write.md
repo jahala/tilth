@@ -18,7 +18,16 @@ Request shape:
 }
 ```
 
-Modes per file: hash (default — replace lines at hash anchors), overwrite (whole file; creates if absent), append (creates if absent). Hash mode auto-fixes safe mismatches: if your anchor body appears at exactly one new location, the edit lands there and the response notes `auto-fixed: <old_line> → <new_line>`. Zero or 2+ matches → fresh hashlined region returned inline for one-turn retry. A malformed edit entry fails that whole file but does not block siblings.
+Anchor grammar — only the `<line>:<hash>` prefix, no body, no pipe, no bare line:
+
+```text
+WRONG: "20:7ae|    def create_run("    do NOT include the body
+WRONG: "20"                             hash is required
+WRONG: "20:7ae|"                        drop the trailing pipe
+RIGHT: "20:7ae"
+```
+
+Modes per file: hash (default — replace lines at hash anchors), overwrite (whole file; creates if absent), append (creates if absent). Hash mode tolerates a stale anchor hash: if the line at your claimed `<line>` still holds the same content you read (byte-exact, hash drifted only because the line was re-hashed), the edit re-applies and the response notes `auto-fixed: <line> → <line>`. Any other mismatch — line has different content, file has shifted, body genuinely moved — returns a fresh hashlined region inline for one-turn retry rather than guessing at a relocation. A malformed edit entry fails that whole file but does not block siblings.
 
 ALWAYS group edits to all ready files into ONE tilth_write call (max 20 files). Each path may appear only once per call. Never call tilth_write twice in a row.
 

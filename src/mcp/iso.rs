@@ -1,4 +1,4 @@
-//! ISO-8601-ish UTC timestamp helpers for `Results as of …` headers and
+//! ISO-8601-ish UTC timestamp helpers for the JSON cache-token header and
 //! `if_modified_since` handling. Avoids pulling chrono — uses Howard
 //! Hinnant's date algorithms for proleptic Gregorian conversion.
 
@@ -6,13 +6,11 @@ use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Render `"Results as of <RFC3339-ish>"` header for the response.
-pub fn results_header(ts: SystemTime) -> String {
+/// Render the bare `YYYY-MM-DDTHH:MM:SSZ` string. Callers wrap this into
+/// the JSON cache-token line or whatever surface they need.
+pub fn iso_ts(ts: SystemTime) -> String {
     let secs = ts.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
-    // Minimal ISO-8601-ish formatter avoids pulling chrono. Format: YYYY-MM-DDTHH:MM:SSZ
-    // Approximate via UTC seconds — good enough for ranking/caching.
-    let datetime = format_iso_utc(secs);
-    format!("Results as of {datetime}")
+    format_iso_utc(secs)
 }
 
 /// Parse an RFC-3339-ish timestamp `YYYY-MM-DDTHH:MM:SSZ` back to `SystemTime`.
@@ -77,9 +75,14 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (y, m, d)
 }
 
-/// Wrap an output with a `Results as of <ts>` header line.
+/// Wrap an output with a leading JSON cache-token line. The first line is
+/// a single JSON object so agents can pattern-match on the structured field
+/// without parsing prose; the rest is the payload body. Encoding goes
+/// through `serde_json` so the producer never has to think about quote /
+/// backslash / newline escaping inside the timestamp.
 pub fn with_header(now: SystemTime, body: &str) -> String {
-    let mut out = results_header(now);
+    let header = serde_json::json!({ "if_modified_since": iso_ts(now) }).to_string();
+    let mut out = header;
     out.push_str("\n\n");
     out.push_str(body);
     out
@@ -96,11 +99,7 @@ pub fn file_changed_since(path: &Path, since: SystemTime) -> bool {
 
 /// `(unchanged @ <ts>)` stub for a single path.
 pub fn unchanged_stub(path: &Path, since: SystemTime) -> String {
-    format!(
-        "# {} (unchanged @ {})",
-        path.display(),
-        results_header(since).trim_start_matches("Results as of ")
-    )
+    format!("# {} (unchanged @ {})", path.display(), iso_ts(since))
 }
 
 #[cfg(test)]
@@ -158,10 +157,18 @@ mod tests {
     }
 
     #[test]
-    fn with_header_prefixes_results_as_of() {
+    fn with_header_prefixes_json_cache_token() {
         let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
         let out = with_header(now, "body");
-        assert!(out.starts_with("Results as of "), "header missing: {out}");
+        let first_line = out.lines().next().expect("at least one line");
+        let parsed: serde_json::Value =
+            serde_json::from_str(first_line).expect("first line must be valid JSON");
+        let ts = parsed
+            .get("if_modified_since")
+            .and_then(|v| v.as_str())
+            .expect("if_modified_since field present");
+        assert!(ts.ends_with('Z'), "iso timestamp expected: {ts}");
+        assert!(parse_iso_utc(ts).is_some(), "round-trips: {ts}");
         assert!(out.ends_with("body"), "body missing: {out}");
     }
 }

@@ -1,3 +1,5 @@
+ALWAYS group every pattern you need into ONE tilth_list call via patterns: [...]. Never call tilth_list twice in a row.
+
 Directory layout with token-cost rollups. Example tree output:
 ```text
 src/      ~28k tokens   45 files

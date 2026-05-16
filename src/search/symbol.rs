@@ -60,7 +60,6 @@ pub enum SymbolMode {
 pub fn search(
     query: &str,
     scope: &Path,
-    context: Option<&Path>,
     glob: Option<&str>,
     mode: SymbolMode,
 ) -> Result<SearchResult, TilthError> {
@@ -98,7 +97,7 @@ pub fn search(
     let total = merged.len();
     let usage_count = total - def_count;
 
-    rank::sort(&mut merged, query, scope, context);
+    rank::sort(&mut merged, query, scope);
 
     // Stratify so the cap can't drop a real code definition in favor of a
     // markdown-heading "definition" of the same query. Stable within each
@@ -1054,7 +1053,7 @@ end
 
         // SymbolMode::Strict: only the class definition line
         let strict_result =
-            super::search("Foo", tmp.path(), None, None, super::SymbolMode::Strict).unwrap();
+            super::search("Foo", tmp.path(), None, super::SymbolMode::Strict).unwrap();
         assert_eq!(
             strict_result.matches.len(),
             1,
@@ -1072,8 +1071,7 @@ end
         assert!(strict_result.matches[0].is_definition);
 
         // SymbolMode::Any: comment (line 1) + definition (line 2) + usage (line 5).
-        let any_result =
-            super::search("Foo", tmp.path(), None, None, super::SymbolMode::Any).unwrap();
+        let any_result = super::search("Foo", tmp.path(), None, super::SymbolMode::Any).unwrap();
         let any_lines: Vec<(u32, bool)> = any_result
             .matches
             .iter()

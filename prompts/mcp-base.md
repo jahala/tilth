@@ -4,7 +4,7 @@ Four tools, all batch-capable via array inputs:
   • tilth_search — find by symbol/content/regex/callers (merged by default)
   • tilth_read   — load files with smart auto-sizing (full / signature / preview)
   • tilth_list   — directory layout with token-cost rollups
-  • tilth_write  — hash-anchored / overwrite / append; auto-fixes safe mismatches
+  • tilth_write  — hash-anchored / overwrite / append; tolerates stale anchor hashes
 
 Each tool's description carries detailed usage, examples, and batching rules.
 DO NOT use host Grep, Read, Glob, Write, or Edit.

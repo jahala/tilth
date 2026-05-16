@@ -131,8 +131,7 @@ pub fn run_callers(
 ) -> Result<String, TilthError> {
     let bloom = index::bloom::BloomFilterCache::new();
     let expand = if expand > 0 { expand } else { 2 };
-    let output =
-        search::callers::search_callers_expanded(target, scope, &bloom, expand, None, glob)?;
+    let output = search::callers::search_callers_expanded(target, scope, &bloom, expand, glob)?;
     match budget_tokens {
         Some(b) => Ok(budget::apply(&output, b)),
         None => Ok(output),
@@ -193,7 +192,7 @@ fn run_inner(
             let bloom = index::bloom::BloomFilterCache::new();
             let expand = if expand > 0 { expand } else { 2 };
             let output = search::search_multi_symbol_expanded(
-                &parts, scope, cache, &session, &bloom, expand, None, glob, mode,
+                &parts, scope, cache, &session, &bloom, expand, glob, mode,
             )?;
             return match budget_tokens {
                 Some(b) => Ok(budget::apply(&output, b)),
@@ -256,19 +255,12 @@ fn run_query_expanded(
             &ctx.session,
             &ctx.bloom,
             ctx.expand,
-            None,
             glob,
             mode,
         ),
-        QueryType::Concept(text) if text.contains(' ') => search::search_content_expanded(
-            text,
-            scope,
-            cache,
-            &ctx.session,
-            ctx.expand,
-            None,
-            glob,
-        ),
+        QueryType::Concept(text) if text.contains(' ') => {
+            search::search_content_expanded(text, scope, cache, &ctx.session, ctx.expand, glob)
+        }
         // Single-word Concept and Fallthrough share the same expanded path:
         // both go straight to symbol_expanded, intentionally bypassing the
         // definitions>0 / content fallback cascade in single_query_search.
@@ -280,28 +272,15 @@ fn run_query_expanded(
             &ctx.session,
             &ctx.bloom,
             ctx.expand,
-            None,
             glob,
             search::symbol::SymbolMode::Any,
         ),
-        QueryType::Content(text) => search::search_content_expanded(
-            text,
-            scope,
-            cache,
-            &ctx.session,
-            ctx.expand,
-            None,
-            glob,
-        ),
-        QueryType::Regex(pattern) => search::search_regex_expanded(
-            pattern,
-            scope,
-            cache,
-            &ctx.session,
-            ctx.expand,
-            None,
-            glob,
-        ),
+        QueryType::Content(text) => {
+            search::search_content_expanded(text, scope, cache, &ctx.session, ctx.expand, glob)
+        }
+        QueryType::Regex(pattern) => {
+            search::search_regex_expanded(pattern, scope, cache, &ctx.session, ctx.expand, glob)
+        }
         // FilePath/Glob never reach here (gated by use_expanded)
         QueryType::FilePath(_) | QueryType::Glob(_) => {
             unreachable!("non-search query type in expanded path")

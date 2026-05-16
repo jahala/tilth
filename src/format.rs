@@ -42,6 +42,61 @@ pub fn search_header(
     format!("# Search: \"{query}\" in {} — {parts}", scope.display())
 }
 
+/// Which search-kind produced a zero-result response. Determines which hint
+/// the empty-result header surfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmptyHint {
+    Symbol,
+    Content,
+    Regex,
+    /// Callers search has its own zero-result formatter
+    /// (`callers::no_callers_message`) with richer differentiation. This
+    /// variant exists so the dispatch table stays exhaustive and unit-testable
+    /// in case the empty-result rendering is unified later.
+    #[allow(dead_code)]
+    Callers,
+    Merged,
+}
+
+/// Emit the zero-result search header with three counts and a hint chosen
+/// from the dispatch table:
+///
+/// * `files_matched_glob == 0` → `glob matched no files — broaden glob or check path`
+/// * `Symbol` → `no symbols matched; try kind: content or check spelling`
+/// * `Content` / `Regex` → `regex matched zero content; try kind: symbol or a broader pattern`
+/// * `Callers` → `no callers found — re-check the symbol name; consider kind: symbol to verify it exists`
+/// * `Merged` → `no matches in any mode — re-check the query and glob`
+pub fn search_empty_header(
+    query: &str,
+    scope: &Path,
+    files_matched_glob: usize,
+    files_searched: usize,
+    content_hits: usize,
+    kind: EmptyHint,
+) -> String {
+    let hint = if files_matched_glob == 0 {
+        "glob matched no files — broaden glob or check path"
+    } else {
+        match kind {
+            EmptyHint::Symbol => "no symbols matched; try kind: content or check spelling",
+            EmptyHint::Content => "no content matches; try kind: symbol or a broader pattern",
+            EmptyHint::Regex => "regex matched zero content; try kind: symbol or a broader pattern",
+            EmptyHint::Callers => {
+                "no callers found — re-check the symbol name; consider kind: symbol to verify it exists"
+            }
+            EmptyHint::Merged => "no matches in any mode — re-check the query and glob",
+        }
+    };
+    format!(
+        "# Search: \"{query}\" in {scope_disp} — 0 matches\n  \
+         Files matched glob: {files_matched_glob}\n  \
+         Files searched:     {files_searched}\n  \
+         Content hits:       {content_hits}\n  \
+         Hint: {hint}",
+        scope_disp = scope.display()
+    )
+}
+
 /// Human-readable file size. Integer math only — no floats.
 fn format_size(bytes: u64) -> String {
     match bytes {
@@ -114,4 +169,75 @@ pub(crate) fn rel(path: &Path, scope: &Path) -> String {
         .unwrap_or(path)
         .display()
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn scope() -> PathBuf {
+        PathBuf::from("/repo")
+    }
+
+    #[test]
+    fn empty_header_glob_zero_overrides_kind() {
+        // files_matched_glob == 0 wins regardless of kind.
+        let out = search_empty_header("foo", &scope(), 0, 0, 0, EmptyHint::Symbol);
+        assert!(out.contains("0 matches"), "{out}");
+        assert!(out.contains("Files matched glob: 0"), "{out}");
+        assert!(
+            out.contains("glob matched no files — broaden glob or check path"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn empty_header_symbol_branch() {
+        let out = search_empty_header("Foo", &scope(), 47, 47, 0, EmptyHint::Symbol);
+        assert!(
+            out.contains("no symbols matched; try kind: content or check spelling"),
+            "{out}"
+        );
+        assert!(out.contains("Files searched:     47"), "{out}");
+    }
+
+    #[test]
+    fn empty_header_content_branch() {
+        let out = search_empty_header("foo", &scope(), 47, 47, 0, EmptyHint::Content);
+        assert!(
+            out.contains("no content matches; try kind: symbol or a broader pattern"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn empty_header_regex_branch() {
+        // Regex collapses to the same hint as Content per spec.
+        let out = search_empty_header("foo.*bar", &scope(), 47, 47, 0, EmptyHint::Regex);
+        assert!(
+            out.contains("regex matched zero content; try kind: symbol or a broader pattern"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn empty_header_callers_branch() {
+        let out = search_empty_header("Foo", &scope(), 47, 47, 0, EmptyHint::Callers);
+        assert!(
+            out.contains(
+                "no callers found — re-check the symbol name; consider kind: symbol to verify it exists"
+            ),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn empty_header_merged_branch() {
+        let out = search_empty_header("foo", &scope(), 47, 47, 0, EmptyHint::Merged);
+        assert!(
+            out.contains("no matches in any mode — re-check the query and glob"),
+            "{out}"
+        );
+    }
 }

@@ -58,7 +58,7 @@ pub(crate) fn tool_search(
             if let Some(kind) = kind {
                 sub.insert("kind".into(), Value::String(kind.to_string()));
             }
-            for k in ["expand", "context", "scope", "budget", "if_modified_since"] {
+            for k in ["expand", "scope", "budget", "if_modified_since"] {
                 if let Some(v) = args.get(k) {
                     sub.insert(k.into(), v.clone());
                 }
@@ -99,11 +99,6 @@ fn tool_search_single(
         .get("expand")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(2) as usize;
-    let context_path = args
-        .get("context")
-        .and_then(|v| v.as_str())
-        .map(PathBuf::from);
-    let context = context_path.as_deref();
     let glob = args.get("glob").and_then(|v| v.as_str());
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
 
@@ -111,7 +106,7 @@ fn tool_search_single(
         None | Some("any") => {
             session.record_search(query);
             search_merged_default(
-                query, &scope, cache, session, bloom, expand, context, glob, edit_mode,
+                query, &scope, cache, session, bloom, expand, glob, edit_mode,
             )
         }
         Some("symbol") => {
@@ -127,8 +122,7 @@ fn tool_search_single(
                 1 => {
                     session.record_search(queries[0]);
                     crate::search::search_symbol_expanded_mode(
-                        queries[0], &scope, cache, session, bloom, expand, context, glob, mode,
-                        edit_mode,
+                        queries[0], &scope, cache, session, bloom, expand, glob, mode, edit_mode,
                     )
                 }
                 2..=5 => {
@@ -136,8 +130,7 @@ fn tool_search_single(
                         session.record_search(q);
                     }
                     crate::search::search_multi_symbol_expanded_mode(
-                        &queries, &scope, cache, session, bloom, expand, context, glob, mode,
-                        edit_mode,
+                        &queries, &scope, cache, session, bloom, expand, glob, mode, edit_mode,
                     )
                 }
                 _ => {
@@ -151,20 +144,18 @@ fn tool_search_single(
         Some("content") => {
             session.record_search(query);
             crate::search::search_content_expanded_mode(
-                query, &scope, cache, session, expand, context, glob, edit_mode,
+                query, &scope, cache, session, expand, glob, edit_mode,
             )
         }
         Some("regex") => {
             session.record_search(query);
             crate::search::search_regex_expanded_mode(
-                query, &scope, cache, session, expand, context, glob, edit_mode,
+                query, &scope, cache, session, expand, glob, edit_mode,
             )
         }
         Some("callers") => {
             session.record_search(query);
-            crate::search::callers::search_callers_expanded(
-                query, &scope, bloom, expand, context, glob,
-            )
+            crate::search::callers::search_callers_expanded(query, &scope, bloom, expand, glob)
         }
         Some(kind) => {
             return Err(format!(
@@ -187,7 +178,6 @@ fn search_merged_default(
     session: &Session,
     bloom: &Arc<BloomFilterCache>,
     expand: usize,
-    context: Option<&Path>,
     glob: Option<&str>,
     edit_mode: bool,
 ) -> Result<String, crate::error::TilthError> {
@@ -203,7 +193,6 @@ fn search_merged_default(
             session,
             bloom,
             expand,
-            context,
             glob,
             SymbolMode::Strict,
             edit_mode,
@@ -212,15 +201,13 @@ fn search_merged_default(
     sections.push(format!(
         "## content results\n\n{}",
         crate::search::search_content_expanded_mode(
-            query, scope, cache, session, expand, context, glob, edit_mode,
+            query, scope, cache, session, expand, glob, edit_mode,
         )?
     ));
     if crate::classify::is_identifier(query) {
         sections.push(format!(
             "## caller results\n\n{}",
-            crate::search::callers::search_callers_expanded(
-                query, scope, bloom, expand, context, glob,
-            )?
+            crate::search::callers::search_callers_expanded(query, scope, bloom, expand, glob)?
         ));
     }
     Ok(sections.join("\n\n---\n\n"))
