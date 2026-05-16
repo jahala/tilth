@@ -58,6 +58,7 @@ pub(crate) fn package_root(path: &Path) -> Option<&Path> {
         "build.gradle",
         "build.sbt",
         "mix.exs",
+        "composer.json", // PHP / Laravel
     ];
     let mut dir = path;
     loop {
