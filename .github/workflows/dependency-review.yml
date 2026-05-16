@@ -1,0 +1,22 @@
+# Dependency Review — gates PRs that introduce vulnerable or
+# disallowed-license dependencies. Public repos: free.
+# Private repos: requires GitHub Advanced Security.
+# See: https://github.com/actions/dependency-review-action
+name: dependency review
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: moderate
+          comment-summary-in-pr: on-failure

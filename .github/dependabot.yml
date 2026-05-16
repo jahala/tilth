@@ -1,0 +1,33 @@
+# Dependabot configuration — version updates only.
+# See: https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+#
+# Ecosystems present in tilth:
+#   - cargo  (root Cargo.toml, the main crate)
+#   - npm    (npm/package.json, the download-proxy wrapper)
+#   - github-actions (workflow action versions)
+# Python under benchmark/ is CI-helper evaluation code — no top-level manifest, so skipped.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      actions-minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: npm
+    directory: /npm
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
