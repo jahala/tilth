@@ -164,7 +164,9 @@ fn yaml_outline(content: &str, max_lines: usize) -> String {
 }
 
 fn toml_outline(content: &str, max_lines: usize) -> String {
-    let value: toml::Value = match content.parse() {
+    // toml 1.1: `Value::from_str` (via `content.parse()`) parses a single value
+    // and rejects further content. `toml::from_str` parses the full document.
+    let value: toml::Value = match toml::from_str(content) {
         Ok(v) => v,
         Err(e) => return format!("[parse error: {e}]"),
     };
@@ -221,4 +223,94 @@ fn key_value_outline(content: &str, max_lines: usize) -> String {
         .take(max_lines)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins the contract that `toml::Value` exposes `Table` and `Array` enum
+    /// variants and that top-level tables render as `[section]` headers. If a
+    /// future `toml` bump renames either variant, this test fails at compile
+    /// time (the variant doesn't exist) or behavior time (output is empty),
+    /// instead of silently producing blank outlines for every TOML file tilth
+    /// reads.
+    #[test]
+    fn toml_outline_section_headers_and_variants() {
+        let content = "\
+[package]
+name = \"demo\"
+version = \"0.1.0\"
+
+[dependencies]
+serde = \"1\"
+tokio = { version = \"1\", features = [\"full\"] }
+
+[features]
+default = [\"std\"]
+";
+        let out = toml_outline(content, 100);
+        assert!(
+            out.contains("[package]"),
+            "missing [package] header:\n{out}"
+        );
+        assert!(
+            out.contains("[dependencies]"),
+            "missing [dependencies] header:\n{out}"
+        );
+        assert!(
+            out.contains("[features]"),
+            "missing [features] header:\n{out}"
+        );
+        assert!(
+            out.contains("name: \"demo\""),
+            "missing scalar key under section:\n{out}"
+        );
+    }
+
+    /// Tables beyond `max_depth` collapse to a key-count summary rather than
+    /// expanding inline. Guards the depth-control path that uses
+    /// `toml::Value::Table(inner)` in two arms — if a future bump merges them
+    /// or changes the inner shape, the collapsed-summary format breaks first.
+    #[test]
+    fn toml_outline_deep_tables_collapse() {
+        let content = "\
+[a]
+[a.b]
+[a.b.c]
+key = \"deep\"
+";
+        // max_depth in toml_outline is hard-coded to 2; `[a.b.c]` is depth 3.
+        let out = toml_outline(content, 100);
+        // The collapsed form names the key-count of the inner table.
+        assert!(
+            out.contains("{") && out.contains("keys}"),
+            "deep table should collapse to key-count summary:\n{out}"
+        );
+    }
+
+    /// Arrays render with item count, not their contents. Pins the
+    /// `Value::Array` arm.
+    #[test]
+    fn toml_outline_arrays_show_item_count() {
+        let content = "\
+[build]
+features = [\"a\", \"b\", \"c\", \"d\"]
+";
+        let out = toml_outline(content, 100);
+        assert!(
+            out.contains("features: [4 items]"),
+            "array should render as item count, got:\n{out}"
+        );
+    }
+
+    /// Parse errors produce a structured marker rather than a panic.
+    #[test]
+    fn toml_outline_parse_error_is_caught() {
+        let out = toml_outline("this is not = valid toml [[[ at all", 10);
+        assert!(
+            out.starts_with("[parse error:"),
+            "malformed TOML should surface as parse error marker, got:\n{out}"
+        );
+    }
 }
