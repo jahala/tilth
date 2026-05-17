@@ -9,7 +9,7 @@ use crate::session::Session;
 /// Parse one `files[]` entry. Parse errors are deferred onto the task so a
 /// malformed entry surfaces as a per-file failure instead of aborting the
 /// whole batch.
-pub(crate) fn parse_file_edit(index: usize, val: &Value) -> crate::edit::FileEditTask {
+pub(in crate::mcp) fn parse_file_edit(index: usize, val: &Value) -> crate::edit::FileEditTask {
     use crate::edit::FileEditTask;
 
     let Some(path_str) = val.get("path").and_then(|v| v.as_str()) else {
@@ -78,7 +78,7 @@ fn parse_edit_entry(i: usize, e: &Value) -> Result<crate::edit::Edit, String> {
     })
 }
 
-pub(crate) fn tool_edit(
+pub(in crate::mcp) fn tool_edit(
     args: &Value,
     session: &Session,
     bloom: &Arc<BloomFilterCache>,
@@ -123,4 +123,27 @@ pub(crate) fn tool_edit(
     }
 
     crate::edit::apply_batch(tasks, bloom, show_diff)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_file_edit_rejects_empty_edits_array() {
+        // Schema says minItems: 1, but schema validation is advisory — enforce
+        // at runtime so a client that bypasses the schema can't silently get
+        // a no-op success.
+        let val = serde_json::json!({ "path": "noop.txt", "edits": [] });
+        let task = parse_file_edit(0, &val);
+        match task {
+            crate::edit::FileEditTask::ParseError { label, msg } => {
+                assert_eq!(label, "noop.txt");
+                assert!(msg.contains("empty"), "unexpected msg: {msg}");
+            }
+            crate::edit::FileEditTask::Ready { .. } => {
+                panic!("empty edits array should produce a ParseError, not Ready");
+            }
+        }
+    }
 }

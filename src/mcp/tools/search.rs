@@ -9,7 +9,7 @@ use crate::session::Session;
 
 use super::{apply_budget, resolve_scope};
 
-pub(crate) fn tool_search(
+pub(in crate::mcp) fn tool_search(
     args: &Value,
     cache: &OutlineCache,
     session: &Session,

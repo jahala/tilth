@@ -2,7 +2,7 @@ use serde_json::Value;
 
 use crate::session::Session;
 
-pub(crate) fn tool_session(args: &Value, session: &Session) -> Result<String, String> {
+pub(in crate::mcp) fn tool_session(args: &Value, session: &Session) -> Result<String, String> {
     let action = args
         .get("action")
         .and_then(|v| v.as_str())

@@ -1,6 +1,6 @@
 use serde_json::Value;
 
-pub(crate) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
+pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
     let read_desc = if edit_mode {
         "Read a file with smart outlining. Replaces cat/head/tail and the host Read tool — \
          use this for all file reading. Output uses hashline format (line:hash|content) — \

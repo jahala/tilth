@@ -7,7 +7,10 @@ use crate::index::bloom::BloomFilterCache;
 
 use super::resolve_scope;
 
-pub(crate) fn tool_deps(args: &Value, bloom: &Arc<BloomFilterCache>) -> Result<String, String> {
+pub(in crate::mcp) fn tool_deps(
+    args: &Value,
+    bloom: &Arc<BloomFilterCache>,
+) -> Result<String, String> {
     let path_str = args
         .get("path")
         .and_then(|v| v.as_str())

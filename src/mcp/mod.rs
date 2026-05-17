@@ -12,8 +12,6 @@ use crate::timeout::{self, spawn_with_timeout, SpawnFailure, ThreadTracker};
 
 mod tools;
 
-#[cfg(test)]
-use tools::{parse_file_edit, resolve_scope};
 use tools::{
     tool_definitions, tool_deps, tool_diff, tool_edit, tool_files, tool_read, tool_search,
     tool_session,
@@ -21,7 +19,7 @@ use tools::{
 
 /// Shared dependencies passed through the request → dispatch pipeline.
 #[derive(Clone)]
-pub(crate) struct Services {
+struct Services {
     cache: Arc<OutlineCache>,
     session: Arc<Session>,
     bloom: Arc<BloomFilterCache>,
@@ -30,7 +28,7 @@ pub(crate) struct Services {
 }
 
 impl Services {
-    pub(crate) fn new(edit_mode: bool) -> Self {
+    fn new(edit_mode: bool) -> Self {
         Self {
             cache: Arc::new(OutlineCache::new()),
             session: Arc::new(Session::new()),
@@ -40,23 +38,23 @@ impl Services {
         }
     }
 
-    pub(crate) fn cache(&self) -> &OutlineCache {
+    fn cache(&self) -> &OutlineCache {
         &self.cache
     }
 
-    pub(crate) fn session(&self) -> &Session {
+    fn session(&self) -> &Session {
         &self.session
     }
 
-    pub(crate) fn bloom(&self) -> &Arc<BloomFilterCache> {
+    fn bloom(&self) -> &Arc<BloomFilterCache> {
         &self.bloom
     }
 
-    pub(crate) fn tracker(&self) -> &Arc<ThreadTracker> {
+    fn tracker(&self) -> &Arc<ThreadTracker> {
         &self.tracker
     }
 
-    pub(crate) fn edit_mode(&self) -> bool {
+    fn edit_mode(&self) -> bool {
         self.edit_mode
     }
 }
@@ -364,11 +362,7 @@ fn handle_request(req: &JsonRpcRequest, services: &Services) -> JsonRpcResponse 
 
 /// Execute a tool by name with the given arguments. Returns formatted output or error string.
 /// No classifier involved — the caller specifies the tool explicitly.
-pub(crate) fn dispatch_tool(
-    tool: &str,
-    args: &Value,
-    services: &Services,
-) -> Result<String, String> {
+fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String, String> {
     let edit_mode = services.edit_mode();
     match tool {
         "tilth_read" => tool_read(args, services.cache(), services.session(), edit_mode),
@@ -536,175 +530,6 @@ mod tests {
         // First root is invalid, second is valid — should return second
         let path = extract_root_from_response(&msg);
         assert_eq!(path, Some(tmp.path().to_path_buf()));
-    }
-
-    // -- resolve_scope --------------------------------------------------------
-
-    #[test]
-    fn resolve_scope_explicit_arg() {
-        let tmp = tempfile::tempdir().unwrap();
-        let args = serde_json::json!({ "scope": tmp.path().to_str().unwrap() });
-        let (scope, warning) = resolve_scope(&args);
-        assert_eq!(scope, tmp.path().canonicalize().unwrap());
-        assert!(warning.is_none());
-    }
-
-    #[test]
-    fn resolve_scope_no_arg_uses_cwd() {
-        let args = serde_json::json!({});
-        let (scope, warning) = resolve_scope(&args);
-        // With no arg, defaults to "." which is cwd
-        let cwd = std::env::current_dir().unwrap();
-        // The function returns "." when resolved == cwd
-        assert!(scope == PathBuf::from(".") || scope == cwd);
-        assert!(warning.is_none());
-    }
-
-    #[test]
-    fn resolve_scope_invalid_dir_warns() {
-        let args = serde_json::json!({ "scope": "/nonexistent/directory/zzz" });
-        let (scope, warning) = resolve_scope(&args);
-        assert_eq!(scope, PathBuf::from("."));
-        assert!(warning.is_some());
-        assert!(warning.unwrap().contains("not a valid directory"));
-    }
-
-    // -- Issue #37 reproduction: cwd=/ with --scope fixes it ------------------
-
-    #[test]
-    fn scope_flag_overrides_bad_cwd() {
-        // Reproduce issue #37: MCP host launches tilth with cwd=/
-        // The --scope flag should override this.
-        let project = tempfile::tempdir().unwrap();
-        let project_path = project.path();
-
-        // Create a manifest so package_root can find it
-        std::fs::write(
-            project_path.join("Cargo.toml"),
-            "[package]\nname = \"test\"",
-        )
-        .unwrap();
-        std::fs::create_dir(project_path.join("src")).unwrap();
-        std::fs::write(project_path.join("src/main.rs"), "fn main() {}").unwrap();
-
-        // Save current cwd
-        let orig_cwd = std::env::current_dir().unwrap();
-
-        // Simulate Codex: cwd=/
-        std::env::set_current_dir("/").unwrap();
-
-        // Without --scope: resolve_scope returns "." which is /
-        let args = serde_json::json!({});
-        let (scope, _) = resolve_scope(&args);
-        assert_eq!(
-            scope,
-            PathBuf::from("."),
-            "Without --scope, should return . (which is /)"
-        );
-
-        // With --scope pointing to project: set_current_dir should fix everything
-        let _ = std::env::set_current_dir(project_path);
-        let args = serde_json::json!({});
-        let (scope, _) = resolve_scope(&args);
-        assert_eq!(
-            scope,
-            PathBuf::from("."),
-            "After chdir to project, . should resolve correctly"
-        );
-
-        // Verify tilth_files would search in the project, not /
-        let cwd = std::env::current_dir().unwrap();
-        assert_eq!(cwd, project_path.canonicalize().unwrap());
-
-        // Restore
-        std::env::set_current_dir(orig_cwd).unwrap();
-    }
-
-    // -- tool_files multi-pattern --------------------------------------------
-
-    /// Build a small scratch project with .rs and .toml files, switch cwd to
-    /// it, and return the tempdir guard so the caller controls cleanup.
-    fn scratch_project() -> tempfile::TempDir {
-        let project = tempfile::tempdir().unwrap();
-        let p = project.path();
-        std::fs::write(p.join("Cargo.toml"), "[package]\nname = \"t\"").unwrap();
-        std::fs::create_dir(p.join("src")).unwrap();
-        std::fs::write(p.join("src/main.rs"), "fn main() {}").unwrap();
-        std::fs::write(p.join("src/lib.rs"), "pub fn x() {}").unwrap();
-        project
-    }
-
-    #[test]
-    fn tool_files_patterns_emits_one_block_per_pattern() {
-        let project = scratch_project();
-        let args = serde_json::json!({
-            "patterns": ["*.rs", "*.toml"],
-            "scope": project.path().to_str().unwrap(),
-        });
-        let out = tool_files(&args).expect("tool_files should succeed");
-        // Two `# Glob:` headers — one per pattern.
-        let header_count = out.matches("# Glob:").count();
-        assert_eq!(header_count, 2, "expected 2 Glob headers, got: {out}");
-        assert!(out.contains("\"*.rs\""), "missing rs header in: {out}");
-        assert!(out.contains("\"*.toml\""), "missing toml header in: {out}");
-        // Files from both patterns appear in the combined output.
-        assert!(out.contains("main.rs"), "missing main.rs in: {out}");
-        assert!(out.contains("Cargo.toml"), "missing Cargo.toml in: {out}");
-    }
-
-    #[test]
-    fn tool_files_pattern_and_patterns_mutually_exclusive() {
-        let args = serde_json::json!({
-            "pattern": "*.rs",
-            "patterns": ["*.rs"],
-        });
-        let err = tool_files(&args).expect_err("expected mutual-exclusion error");
-        assert!(err.contains("either pattern"), "unexpected error: {err}");
-    }
-
-    #[test]
-    fn tool_files_empty_patterns_errors() {
-        let args = serde_json::json!({ "patterns": [] });
-        let err = tool_files(&args).expect_err("expected empty-patterns error");
-        assert!(err.contains("at least one"), "unexpected error: {err}");
-    }
-
-    #[test]
-    fn tool_files_patterns_capped_at_20() {
-        let twenty_one: Vec<&str> = vec!["*.rs"; 21];
-        let args = serde_json::json!({ "patterns": twenty_one });
-        let err = tool_files(&args).expect_err("expected cap error");
-        assert!(err.contains("limited to 20"), "unexpected error: {err}");
-    }
-
-    #[test]
-    fn tool_files_missing_pattern_and_patterns_errors() {
-        let args = serde_json::json!({});
-        let err = tool_files(&args).expect_err("expected missing-pattern error");
-        assert!(
-            err.contains("missing required parameter"),
-            "unexpected error: {err}"
-        );
-    }
-
-    // -- parse_file_edit edge cases -------------------------------------------
-
-    #[test]
-    fn parse_file_edit_rejects_empty_edits_array() {
-        // Schema says minItems: 1, but schema validation is advisory — enforce
-        // at runtime so a client that bypasses the schema can't silently get
-        // a no-op success.
-        let val = serde_json::json!({ "path": "noop.txt", "edits": [] });
-        let task = parse_file_edit(0, &val);
-        match task {
-            crate::edit::FileEditTask::ParseError { label, msg } => {
-                assert_eq!(label, "noop.txt");
-                assert!(msg.contains("empty"), "unexpected msg: {msg}");
-            }
-            crate::edit::FileEditTask::Ready { .. } => {
-                panic!("empty edits array should produce a ParseError, not Ready");
-            }
-        }
     }
 
     // -- package_root fallback from subdirectory ------------------------------

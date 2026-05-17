@@ -8,7 +8,7 @@ use crate::session::Session;
 
 use super::apply_budget;
 
-pub(crate) fn tool_read(
+pub(in crate::mcp) fn tool_read(
     args: &Value,
     cache: &OutlineCache,
     session: &Session,
