@@ -1,0 +1,42 @@
+name: Bug report
+description: Something tilth does wrong, or differently than the docs say.
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did tilth do, and what did you expect instead?
+      placeholder: |
+        Expected: ...
+        Actual:   ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction
+      description: Minimal steps or commands. A short repo or a paste is fine.
+      placeholder: |
+        1. `tilth foo --bar`
+        2. Look at the output
+      render: shell
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: tilth version
+      placeholder: "Output of `tilth --version`"
+    validations:
+      required: true
+
+  - type: input
+    id: env
+    attributes:
+      label: Environment
+      placeholder: "macOS 15.3, Rust 1.84, fish 3.7 — whatever is relevant"
+    validations:
+      required: false
