@@ -528,7 +528,7 @@ fn tool_search(
                 1 => {
                     session.record_search(queries[0]);
                     crate::search::search_symbol_expanded(
-                        queries[0], &scope, cache, session, bloom, expand, context, glob,
+                        queries[0], &scope, cache, session, bloom, expand, context, glob, false,
                     )
                 }
                 2..=5 => {
@@ -536,7 +536,7 @@ fn tool_search(
                         session.record_search(q);
                     }
                     crate::search::search_multi_symbol_expanded(
-                        &queries, &scope, cache, session, bloom, expand, context, glob,
+                        &queries, &scope, cache, session, bloom, expand, context, glob, false,
                     )
                 }
                 _ => {
@@ -550,19 +550,19 @@ fn tool_search(
         "content" => {
             session.record_search(query);
             crate::search::search_content_expanded(
-                query, &scope, cache, session, expand, context, glob,
+                query, &scope, cache, session, expand, context, glob, false,
             )
         }
         "regex" => {
             session.record_search(query);
-            let result = crate::search::content::search(query, &scope, true, context, glob)
+            let result = crate::search::content::search(query, &scope, true, context, glob, false)
                 .map_err(|e| e.to_string())?;
             crate::search::format_raw_result(&result, cache)
         }
         "callers" => {
             session.record_search(query);
             crate::search::callers::search_callers_expanded(
-                query, &scope, bloom, expand, context, glob,
+                query, &scope, bloom, expand, context, glob, false,
             )
         }
         _ => {

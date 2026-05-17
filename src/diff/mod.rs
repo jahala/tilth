@@ -405,7 +405,13 @@ fn compute_blast(overlays: &[FileOverlay]) -> Vec<String> {
     let scope = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let bloom = crate::index::bloom::BloomFilterCache::new();
 
-    match crate::search::callers::find_callers_batch(&sig_changed, &scope, &bloom, None) {
+    match crate::search::callers::find_callers_batch(
+        &sig_changed,
+        &scope,
+        &bloom,
+        None,
+        crate::search::callers::BATCH_EARLY_QUIT,
+    ) {
         Ok(matches) => {
             let mut counts: std::collections::HashMap<String, usize> =
                 std::collections::HashMap::new();
