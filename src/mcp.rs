@@ -96,10 +96,10 @@ tilth_files: Find files by glob pattern. Replaces find, ls, pwd, and the host Gl
 tilth_deps: Blast-radius check — what imports this file and what it imports.\n\
   Use ONLY before renaming, removing, or changing an export's signature.\n\
 \n\
-tilth_grok: One-call structural understanding — def + signature + doc + callees + callers + siblings + tests.\n\
+tilth_grok: Everything structural about a symbol in one call — def + body + signature + doc + callees + callers + siblings + tests.\n\
   Usage: tilth_grok(target: \"parse_unified_diff\"). Also accepts \"src/file.rs:7\" or \"Type::method\".\n\
   scope: narrow when the name is ambiguous. full: widen caps from 5/5/8/8 to 50/30/30/30.\n\
-  Use INSTEAD OF the search → expand → search-callers chain when you need to understand one symbol.\n\
+  Use ONLY for \"understand this symbol\" questions — replaces the search → expand → callers chain.\n\
   DO NOT use for concept search (use tilth_search) or reading file contents (use tilth_read).\n\
 \n\
 tilth_diff: Structural diff — shows what changed at function level. Replaces Bash(git diff).\n\
