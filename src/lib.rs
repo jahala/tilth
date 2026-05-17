@@ -45,11 +45,8 @@ pub mod __fuzz {
 
     /// Wrapper: `strip_noise` is `pub(crate)`, so we re-export via a function
     /// rather than `pub use` (which Rust forbids for less-visible items).
-    pub fn strip_noise(
-        content: &str,
-        path: &Path,
-        def_range: Option<(u32, u32)>,
-    ) -> HashSet<u32> {
+    #[must_use]
+    pub fn strip_noise(content: &str, path: &Path, def_range: Option<(u32, u32)>) -> HashSet<u32> {
         crate::search::strip::strip_noise(content, path, def_range)
     }
 
