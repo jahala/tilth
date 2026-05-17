@@ -406,9 +406,10 @@ pub fn grok(
 
 /// Slice the target's source body out of `content`. Caps at `max_lines` total
 /// — when the body is longer, keeps the first 2/3 and last 1/3, separated by
-/// an elided-line marker. Returns "" on degenerate ranges.
+/// an elided-line marker. Returns "" on degenerate ranges or `max_lines == 0`
+/// (used by callers that want to suppress the body section entirely).
 fn slice_body(content: &str, start_line: u32, end_line: u32, max_lines: usize) -> String {
-    if start_line == 0 || end_line < start_line {
+    if start_line == 0 || end_line < start_line || max_lines == 0 {
         return String::new();
     }
     let start_idx = (start_line as usize).saturating_sub(1);
@@ -1183,6 +1184,13 @@ pub fn target() {
     fn slice_body_handles_degenerate_range() {
         assert_eq!(slice_body("anything", 0, 5, 60), "");
         assert_eq!(slice_body("anything", 5, 3, 60), "");
+    }
+
+    #[test]
+    fn slice_body_zero_cap_suppresses_body() {
+        // max_lines=0 = caller wants to suppress the body section entirely.
+        // Without this guard, the function would emit just the elision marker.
+        assert_eq!(slice_body("a\nb\nc", 1, 3, 0), "");
     }
 
     #[test]
