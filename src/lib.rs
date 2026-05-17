@@ -32,6 +32,34 @@ pub(crate) mod session;
 pub(crate) mod timeout;
 pub(crate) mod types;
 
+/// Re-exports for the fuzz harness. Not stable; do not depend on this.
+/// Items here are only `pub` so `fuzz/fuzz_targets/*.rs` can reach them
+/// without us widening the rest of the crate's pub(crate) surface.
+#[doc(hidden)]
+pub mod __fuzz {
+    use std::collections::HashSet;
+    use std::path::Path;
+
+    pub use crate::read::outline::code::outline;
+    pub use crate::types::Lang;
+
+    /// Wrapper: `strip_noise` is `pub(crate)`, so we re-export via a function
+    /// rather than `pub use` (which Rust forbids for less-visible items).
+    pub fn strip_noise(
+        content: &str,
+        path: &Path,
+        def_range: Option<(u32, u32)>,
+    ) -> HashSet<u32> {
+        crate::search::strip::strip_noise(content, path, def_range)
+    }
+
+    /// Wrapper: same pattern for `parse_unified_diff`.
+    /// Returns unit because the fuzz target doesn't introspect the result.
+    pub fn parse_unified_diff(raw: &str) {
+        let _ = crate::diff::parse::parse_unified_diff(raw);
+    }
+}
+
 use std::path::Path;
 
 use cache::OutlineCache;
