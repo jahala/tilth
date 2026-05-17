@@ -13,9 +13,10 @@ class RipgrepTraitImplementorsTask(Task):
     @property
     def prompt(self) -> str:
         return (
-            "Find the `Matcher` trait definition in the matcher crate. "
-            "Then find all types that implement this trait. For each implementor, "
-            "show where it is defined and what crate it lives in."
+            "Find the `Matcher` trait definition in the matcher crate, and list "
+            "its required methods (the ones an implementor must provide, like "
+            "`find_at`). Then find all types that implement this trait. For each "
+            "implementor, show where it is defined and what crate it lives in."
         )
 
     @property
