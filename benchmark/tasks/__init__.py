@@ -56,6 +56,11 @@ from .express_diff_tasks import ExpressDiffMultiMutationTask
 from .fastapi_diff_tasks import FastAPIDiffWhichCommitTask
 from .ripgrep_diff_tasks import RipgrepDiffMisdirectedErrorTask
 from .gin_diff_tasks import GinDiffComprehensionTask
+from .grok_tasks import (
+    GrokLineIterTask,
+    GrokDependsTask,
+    GrokContextNextTask,
+)
 
 TASKS = {
     # Synthetic repo tasks
@@ -106,4 +111,8 @@ TASKS = {
     "fastapi_diff_which_commit": FastAPIDiffWhichCommitTask(),
     "rg_diff_misdirected_error": RipgrepDiffMisdirectedErrorTask(),
     "gin_diff_comprehension": GinDiffComprehensionTask(),
+    # grok-targeted "understand this symbol" tasks
+    "grok_lineiter": GrokLineIterTask(),
+    "grok_depends": GrokDependsTask(),
+    "grok_context_next": GrokContextNextTask(),
 }
