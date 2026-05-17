@@ -30,6 +30,11 @@ impl Session {
         self.record_dir(path);
     }
 
+    #[cfg(test)]
+    pub fn reads_count(&self) -> usize {
+        self.reads.load(Ordering::Relaxed)
+    }
+
     pub fn record_search(&self, query: &str) {
         self.searches.fetch_add(1, Ordering::Relaxed);
         let mut syms = self

@@ -1,0 +1,5 @@
+---
+source: src/mcp/tools/definitions.rs
+expression: desc
+---
+Blast-radius check before breaking changes. Shows what a file imports (local + external) and what other files call its exports, with symbol-level detail. Use ONLY when your planned edit changes a function signature, removes/renames an export, or modifies behavior that callers rely on. Do NOT use for reading files, adding new code, or internal-only changes — use tilth_read instead.

@@ -37,6 +37,17 @@ fn stratum_for_display(m: &Match) -> u8 {
     }
 }
 
+/// Result shape for symbol search.
+///
+/// `Strict` returns declarations only: tree-sitter definitions where supported,
+/// with keyword and markdown-heading fallbacks. `Any` adds word-boundary usage
+/// matches alongside those declarations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymbolMode {
+    Strict,
+    Any,
+}
+
 /// Symbol search: find definitions via tree-sitter, usages via ripgrep, concurrently.
 /// Merge results, deduplicate, definitions first.
 pub fn search(
@@ -44,21 +55,24 @@ pub fn search(
     scope: &Path,
     context: Option<&Path>,
     glob: Option<&str>,
+    mode: SymbolMode,
 ) -> Result<SearchResult, TilthError> {
-    // Compile regex once, share across both arms
-    let word_pattern = format!(r"\b{}\b", regex_syntax::escape(query));
-    let matcher = RegexMatcher::new(&word_pattern).map_err(|e| TilthError::InvalidQuery {
-        query: query.to_string(),
-        reason: e.to_string(),
-    })?;
-
-    let (defs, usages) = rayon::join(
-        || find_definitions(query, scope, glob),
-        || find_usages(query, &matcher, scope, glob),
-    );
-
-    let defs = defs?;
-    let usages = usages?;
+    let (defs, usages) = match mode {
+        SymbolMode::Strict => (find_definitions(query, scope, glob)?, Vec::new()),
+        SymbolMode::Any => {
+            let word_pattern = format!(r"\b{}\b", regex_syntax::escape(query));
+            let matcher =
+                RegexMatcher::new(&word_pattern).map_err(|e| TilthError::InvalidQuery {
+                    query: query.to_string(),
+                    reason: e.to_string(),
+                })?;
+            let (defs, usages) = rayon::join(
+                || find_definitions(query, scope, glob),
+                || find_usages(query, &matcher, scope, glob),
+            );
+            (defs?, usages?)
+        }
+    };
 
     // Deduplicate: remove usage matches that overlap with definition matches.
     // Linear scan — max ~30 defs from EARLY_QUIT_THRESHOLD, no allocation needed.
@@ -779,6 +793,45 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::time::SystemTime;
+
+    #[test]
+    fn strict_mode_drops_comment_and_usage_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test_strict.py");
+        std::fs::write(&path, "# class Foo\nclass Foo:\n    pass\n\nfoo = Foo()\n").unwrap();
+
+        let strict = search("Foo", tmp.path(), None, None, SymbolMode::Strict).unwrap();
+        assert_eq!(
+            strict.matches.len(),
+            1,
+            "strict mode should return only the definition, got {:?}",
+            strict
+                .matches
+                .iter()
+                .map(|m| (m.line, &m.text))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(strict.matches[0].line, 2);
+        assert!(strict.matches[0].is_definition);
+
+        let any = search("Foo", tmp.path(), None, None, SymbolMode::Any).unwrap();
+        let lines: Vec<(u32, bool)> = any
+            .matches
+            .iter()
+            .map(|m| (m.line, m.is_definition))
+            .collect();
+        assert_eq!(
+            any.matches.len(),
+            3,
+            "any mode should include comment, definition, and usage, got {lines:?}"
+        );
+        assert!(
+            lines.contains(&(1, false)),
+            "missing comment hit: {lines:?}"
+        );
+        assert!(lines.contains(&(2, true)), "missing definition: {lines:?}");
+        assert!(lines.contains(&(5, false)), "missing usage: {lines:?}");
+    }
 
     #[test]
     fn rust_definitions_detected() {

@@ -90,6 +90,7 @@ terminal_size = "0.4"
 
 
 [dev-dependencies]
+insta = "1"
 tempfile = "3"
 
 [profile.release]

@@ -2,8 +2,24 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 
-use clap::{CommandFactory, Parser};
+use clap::{CommandFactory, Parser, ValueEnum};
 use clap_complete::Shell;
+use tilth::SymbolMode;
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum CliKind {
+    Symbol,
+    Any,
+}
+
+impl From<CliKind> for SymbolMode {
+    fn from(k: CliKind) -> Self {
+        match k {
+            CliKind::Symbol => SymbolMode::Strict,
+            CliKind::Any => SymbolMode::Any,
+        }
+    }
+}
 
 /// tilth — Tree-sitter indexed lookups, smart code reading for AI agents.
 /// One tool replaces `read_file`, grep, glob, `ast_grep`, and find.
@@ -68,6 +84,11 @@ struct Cli {
     /// File pattern filter (e.g. "*.rs", "!*.test.ts", "*.{go,rs}").
     #[arg(long)]
     glob: Option<String>,
+
+    /// Symbol-search mode. `symbol` (default): declarations only. `any`: also
+    /// include word-boundary usage matches in comments, strings, and call sites.
+    #[arg(long, value_enum, default_value_t = CliKind::Symbol)]
+    kind: CliKind,
 
     /// Find all callers of a symbol.
     #[arg(long, conflicts_with_all = ["deps", "map", "edit"])]
@@ -311,6 +332,7 @@ fn main() {
         return;
     }
 
+    let mode = SymbolMode::from(cli.kind);
     let result = if expand > 0 {
         tilth::run_expanded(
             &query,
@@ -321,6 +343,7 @@ fn main() {
             expand,
             cli.glob.as_deref(),
             &cache,
+            mode,
         )
     } else if full {
         tilth::run_full(
@@ -330,6 +353,7 @@ fn main() {
             cli.budget,
             cli.glob.as_deref(),
             &cache,
+            mode,
         )
     } else {
         tilth::run(
@@ -339,6 +363,7 @@ fn main() {
             cli.budget,
             cli.glob.as_deref(),
             &cache,
+            mode,
         )
     };
 

@@ -58,6 +58,7 @@ pub enum FileType {
 pub enum ViewMode {
     Full,
     Outline,
+    Signature,
     Keys,
     #[allow(dead_code)]
     HeadTail,
@@ -69,6 +70,7 @@ pub enum ViewMode {
     #[allow(dead_code)]
     Error,
     Section,
+    Stripped,
 }
 
 impl std::fmt::Display for ViewMode {
@@ -76,6 +78,7 @@ impl std::fmt::Display for ViewMode {
         match self {
             Self::Full => write!(f, "full"),
             Self::Outline => write!(f, "outline"),
+            Self::Signature => write!(f, "signature"),
             Self::Keys => write!(f, "keys"),
             Self::HeadTail => write!(f, "head+tail"),
             Self::Empty => write!(f, "empty"),
@@ -84,6 +87,7 @@ impl std::fmt::Display for ViewMode {
             Self::Binary => write!(f, "skipped"),
             Self::Error => write!(f, "error"),
             Self::Section => write!(f, "section"),
+            Self::Stripped => write!(f, "stripped"),
         }
     }
 }

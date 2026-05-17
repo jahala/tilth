@@ -1,0 +1,18 @@
+{
+  "default": true,
+  "first-line-h1": false,
+  "line-length": false,
+  "no-inline-html": false,
+  "no-bare-urls": false,
+  "no-multiple-blanks": { "maximum": 2 },
+  "no-trailing-punctuation": false,
+  "emphasis-style": "consistent",
+  "ul-style": "consistent",
+  "ul-indent": { "indent": 2 },
+  "code-block-style": "consistent",
+  "code-fence-style": "consistent",
+  "blanks-around-headings": { "lines_above": 0, "lines_below": 0 },
+  "blanks-around-lists": false,
+  "blanks-around-fences": false,
+  "no-multiple-spaces": false
+}

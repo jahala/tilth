@@ -18,6 +18,7 @@ pub mod cache;
 pub(crate) mod classify;
 pub mod diff;
 pub(crate) mod edit;
+pub(crate) mod edit_parse_check;
 pub mod error;
 pub(crate) mod format;
 pub mod index;
@@ -28,6 +29,7 @@ pub mod mcp;
 pub mod overview;
 pub(crate) mod read;
 pub(crate) mod search;
+pub use search::symbol::SymbolMode;
 pub(crate) mod session;
 pub(crate) mod timeout;
 pub(crate) mod types;
@@ -56,8 +58,19 @@ pub fn run(
     budget_tokens: Option<u64>,
     glob: Option<&str>,
     cache: &OutlineCache,
+    mode: SymbolMode,
 ) -> Result<String, TilthError> {
-    run_inner(query, scope, section, budget_tokens, false, 0, glob, cache)
+    run_inner(
+        query,
+        scope,
+        section,
+        budget_tokens,
+        false,
+        0,
+        glob,
+        cache,
+        mode,
+    )
 }
 
 /// Full variant — forces full file output, bypassing smart views.
@@ -68,8 +81,19 @@ pub fn run_full(
     budget_tokens: Option<u64>,
     glob: Option<&str>,
     cache: &OutlineCache,
+    mode: SymbolMode,
 ) -> Result<String, TilthError> {
-    run_inner(query, scope, section, budget_tokens, true, 0, glob, cache)
+    run_inner(
+        query,
+        scope,
+        section,
+        budget_tokens,
+        true,
+        0,
+        glob,
+        cache,
+        mode,
+    )
 }
 
 /// Run with expanded search — inline source for top N matches.
@@ -82,6 +106,7 @@ pub fn run_expanded(
     expand: usize,
     glob: Option<&str>,
     cache: &OutlineCache,
+    mode: SymbolMode,
 ) -> Result<String, TilthError> {
     run_inner(
         query,
@@ -92,6 +117,7 @@ pub fn run_expanded(
         expand,
         glob,
         cache,
+        mode,
     )
 }
 
@@ -134,6 +160,7 @@ fn run_inner(
     expand: usize,
     glob: Option<&str>,
     cache: &OutlineCache,
+    mode: SymbolMode,
 ) -> Result<String, TilthError> {
     let query_type = classify(query, scope);
 
@@ -166,7 +193,7 @@ fn run_inner(
             let bloom = index::bloom::BloomFilterCache::new();
             let expand = if expand > 0 { expand } else { 2 };
             let output = search::search_multi_symbol_expanded(
-                &parts, scope, cache, &session, &bloom, expand, None, glob,
+                &parts, scope, cache, &session, &bloom, expand, None, glob, mode,
             )?;
             return match budget_tokens {
                 Some(b) => Ok(budget::apply(&output, b)),
@@ -200,9 +227,9 @@ fn run_inner(
                 bloom: index::bloom::BloomFilterCache::new(),
                 expand,
             };
-            run_query_expanded(&query_type, scope, cache, &ctx, glob)?
+            run_query_expanded(&query_type, scope, cache, &ctx, glob, mode)?
         }
-        _ => run_query_basic(&query_type, scope, cache, glob)?,
+        _ => run_query_basic(&query_type, scope, cache, glob, mode)?,
     };
 
     match budget_tokens {
@@ -219,6 +246,7 @@ fn run_query_expanded(
     cache: &OutlineCache,
     ctx: &ExpandedCtx,
     glob: Option<&str>,
+    mode: SymbolMode,
 ) -> Result<String, TilthError> {
     match query_type {
         QueryType::Symbol(name) => search::search_symbol_expanded(
@@ -230,6 +258,7 @@ fn run_query_expanded(
             ctx.expand,
             None,
             glob,
+            mode,
         ),
         QueryType::Concept(text) if text.contains(' ') => search::search_content_expanded(
             text,
@@ -253,6 +282,7 @@ fn run_query_expanded(
             ctx.expand,
             None,
             glob,
+            SymbolMode::Any,
         ),
         QueryType::Content(text) => search::search_content_expanded(
             text,
@@ -286,9 +316,10 @@ fn run_query_basic(
     scope: &Path,
     cache: &OutlineCache,
     glob: Option<&str>,
+    mode: SymbolMode,
 ) -> Result<String, TilthError> {
     match query_type {
-        QueryType::Symbol(name) => search::search_symbol(name, scope, cache, glob),
+        QueryType::Symbol(name) => search::search_symbol(name, scope, cache, glob, mode),
         QueryType::Concept(text) if text.contains(' ') => {
             multi_word_concept_search(text, scope, cache, glob)
         }
@@ -321,7 +352,7 @@ fn single_query_search(
     prefer_definitions: bool,
     glob: Option<&str>,
 ) -> Result<String, error::TilthError> {
-    let sym_result = search::search_symbol_raw(text, scope, glob)?;
+    let sym_result = search::search_symbol_raw(text, scope, glob, SymbolMode::Any)?;
     let accept_sym = if prefer_definitions {
         sym_result.definitions > 0
     } else {

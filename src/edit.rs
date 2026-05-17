@@ -49,6 +49,8 @@ enum EditResult {
         diff: String,
         /// Hashlined context around edit sites (existing behavior).
         context: String,
+        /// New parser errors introduced by the edit, if any.
+        parse: Option<String>,
     },
     /// One or more hashes didn't match current content.
     HashMismatch(String),
@@ -67,6 +69,7 @@ fn apply_edits(path: &Path, edits: &[Edit]) -> Result<EditResult, TilthError> {
         return Ok(EditResult::Applied {
             diff: String::new(),
             context: String::new(),
+            parse: None,
         });
     }
 
@@ -263,8 +266,15 @@ fn apply_edits(path: &Path, edits: &[Edit]) -> Result<EditResult, TilthError> {
 
     let diff = format_diffs(&diffs);
     let context = contexts.join("\n---\n");
+    let parse = crate::edit_parse_check::check(path, &content, &output)
+        .as_ref()
+        .map(crate::edit_parse_check::format_report);
 
-    Ok(EditResult::Applied { diff, context })
+    Ok(EditResult::Applied {
+        diff,
+        context,
+        parse,
+    })
 }
 
 /// Format per-edit diffs as compact `-`/`+` blocks with hashline anchors.
@@ -350,6 +360,12 @@ pub(crate) fn detect_duplicate_paths(tasks: &[FileEditTask]) -> Option<String> {
     None
 }
 
+#[derive(Debug)]
+pub struct BatchOutcome {
+    pub output: String,
+    pub applied: Vec<PathBuf>,
+}
+
 /// Apply a batch of file edits in parallel.
 ///
 /// Each task is processed independently — a hash mismatch, parse error, or
@@ -365,45 +381,55 @@ pub fn apply_batch(
     tasks: Vec<FileEditTask>,
     bloom: &Arc<BloomFilterCache>,
     show_diff: bool,
-) -> Result<String, String> {
+) -> Result<BatchOutcome, String> {
     if let Some(msg) = detect_duplicate_paths(&tasks) {
         return Err(msg);
     }
 
     let bloom: &BloomFilterCache = bloom;
-    let outcomes: Vec<(String, bool)> = tasks
+    let outcomes: Vec<(String, Option<PathBuf>)> = tasks
         .into_par_iter()
         .map(|task| apply_one(task, bloom, show_diff))
         .collect();
 
-    let any_success = outcomes.iter().any(|(_, ok)| *ok);
+    let applied: Vec<PathBuf> = outcomes
+        .iter()
+        .filter_map(|(_, path)| path.clone())
+        .collect();
     let combined = outcomes
         .into_iter()
         .map(|(s, _)| s)
         .collect::<Vec<_>>()
         .join("\n\n---\n\n");
 
-    if any_success {
-        Ok(combined)
-    } else {
+    if applied.is_empty() {
         Err(combined)
+    } else {
+        Ok(BatchOutcome {
+            output: combined,
+            applied,
+        })
     }
 }
 
-/// Process one task into a `(section, success)` tuple. Kept separate so the
-/// parallel closure stays trivial and per-file logic is testable in isolation.
-fn apply_one(task: FileEditTask, bloom: &BloomFilterCache, show_diff: bool) -> (String, bool) {
+/// Process one task into a `(section, applied_path)` tuple. Kept separate so
+/// the parallel closure stays trivial and per-file logic is testable in isolation.
+fn apply_one(
+    task: FileEditTask,
+    bloom: &BloomFilterCache,
+    show_diff: bool,
+) -> (String, Option<PathBuf>) {
     let (path, edits) = match task {
         FileEditTask::ParseError { label, msg } => {
-            return (format!("## {label}\nerror: {msg}"), false);
+            return (format!("## {label}\nerror: {msg}"), None);
         }
         FileEditTask::Ready { path, edits } => (path, edits),
     };
     let header = format!("## {}", path.display());
     match render_applied(&path, &edits, bloom, show_diff) {
-        Ok(body) if body.is_empty() => (header, true),
-        Ok(body) => (format!("{header}\n{body}"), true),
-        Err(msg) => (format!("{header}\n{msg}"), false),
+        Ok(body) if body.is_empty() => (header, Some(path)),
+        Ok(body) => (format!("{header}\n{body}"), Some(path)),
+        Err(msg) => (format!("{header}\n{msg}"), None),
     }
 }
 
@@ -414,7 +440,11 @@ fn render_applied(
     show_diff: bool,
 ) -> Result<String, String> {
     match apply_edits(path, edits).map_err(|e| e.to_string())? {
-        EditResult::Applied { diff, context } => {
+        EditResult::Applied {
+            diff,
+            context,
+            parse,
+        } => {
             let mut output = String::new();
             if show_diff && !diff.is_empty() {
                 output.push_str(&diff);
@@ -424,6 +454,12 @@ fn render_applied(
             }
             if !context.is_empty() {
                 output.push_str(&context);
+            }
+            if let Some(parse) = parse {
+                if !output.is_empty() {
+                    output.push_str("\n\n");
+                }
+                output.push_str(&parse);
             }
             let abs_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
             let scope = crate::lang::package_root(&abs_path).map_or_else(
@@ -472,7 +508,7 @@ mod tests {
 
         let result = apply_edits(&path, &edits).unwrap();
         match result {
-            EditResult::Applied { diff, context } => {
+            EditResult::Applied { diff, context, .. } => {
                 assert!(
                     diff.contains("- 2:"),
                     "diff should have removed line: {diff}"
@@ -636,7 +672,7 @@ mod tests {
 
         let result = apply_edits(&path, &[]).unwrap();
         match result {
-            EditResult::Applied { diff, context } => {
+            EditResult::Applied { diff, context, .. } => {
                 assert!(diff.is_empty(), "diff should be empty for no edits");
                 assert!(context.is_empty(), "context should be empty for no edits");
             }
@@ -807,6 +843,63 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[test]
+    fn parse_block_set_when_edit_breaks_syntax() {
+        let content = "fn main() { 1 }\n";
+        let path = write_temp("parse_broken.rs", content);
+        let h = hash_at(content, 1);
+
+        let edits = vec![Edit {
+            start_line: 1,
+            start_hash: h,
+            end_line: 1,
+            end_hash: h,
+            content: "fn main() { 1 ".into(),
+        }];
+
+        let result = apply_edits(&path, &edits).unwrap();
+        match result {
+            EditResult::Applied { parse, .. } => {
+                let parse = parse.expect("broken Rust edit should report parse errors");
+                assert!(
+                    parse.contains("── parse ──"),
+                    "missing parse block: {parse}"
+                );
+            }
+            EditResult::HashMismatch(msg) => panic!("unexpected mismatch: {msg}"),
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn parse_block_none_when_edit_keeps_syntax_valid() {
+        let content = "fn main() { 1 }\n";
+        let path = write_temp("parse_clean.rs", content);
+        let h = hash_at(content, 1);
+
+        let edits = vec![Edit {
+            start_line: 1,
+            start_hash: h,
+            end_line: 1,
+            end_hash: h,
+            content: "fn main() { 2 }".into(),
+        }];
+
+        let result = apply_edits(&path, &edits).unwrap();
+        match result {
+            EditResult::Applied { parse, .. } => {
+                assert!(
+                    parse.is_none(),
+                    "clean Rust edit should not report parse errors"
+                );
+            }
+            EditResult::HashMismatch(msg) => panic!("unexpected mismatch: {msg}"),
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     // ----------------------------------------------------------------- batch
 
     fn ready_task(path: PathBuf, edits: Vec<Edit>) -> FileEditTask {
@@ -850,7 +943,9 @@ mod tests {
             ),
         ];
 
-        let out = apply_batch(tasks, &fresh_bloom(), false).expect("batch should succeed");
+        let outcome = apply_batch(tasks, &fresh_bloom(), false).expect("batch should succeed");
+        let out = outcome.output;
+        assert_eq!(outcome.applied, vec![a.clone(), b.clone()]);
         assert!(out.contains(&format!("## {}", a.display())));
         assert!(out.contains(&format!("## {}", b.display())));
         assert_eq!(std::fs::read_to_string(&a).unwrap(), "AAA\nbbb\n");
@@ -890,7 +985,9 @@ mod tests {
             ),
         ];
 
-        let out = apply_batch(tasks, &fresh_bloom(), false).expect("good half succeeded");
+        let outcome = apply_batch(tasks, &fresh_bloom(), false).expect("good half succeeded");
+        let out = outcome.output;
+        assert_eq!(outcome.applied, vec![good.clone()]);
         assert!(out.contains("hash mismatch"), "bad file reports mismatch");
         assert!(out.contains(&format!("## {}", bad.display())));
         // good file actually got written
@@ -922,6 +1019,46 @@ mod tests {
     }
 
     #[test]
+    fn parse_block_per_file_in_batch_independent() {
+        let dir = tempfile::tempdir().unwrap();
+        let broken = dir.path().join("broken.rs");
+        let clean = dir.path().join("clean.rs");
+        std::fs::write(&broken, "fn broken() { 1 }\n").unwrap();
+        std::fs::write(&clean, "fn clean() { 1 }\n").unwrap();
+        let broken_hash = hash_at("fn broken() { 1 }\n", 1);
+        let clean_hash = hash_at("fn clean() { 1 }\n", 1);
+
+        let tasks = vec![
+            ready_task(
+                broken.clone(),
+                vec![Edit {
+                    start_line: 1,
+                    start_hash: broken_hash,
+                    end_line: 1,
+                    end_hash: broken_hash,
+                    content: "fn broken() { 1 ".into(),
+                }],
+            ),
+            ready_task(
+                clean.clone(),
+                vec![Edit {
+                    start_line: 1,
+                    start_hash: clean_hash,
+                    end_line: 1,
+                    end_hash: clean_hash,
+                    content: "fn clean() { 2 }".into(),
+                }],
+            ),
+        ];
+
+        let outcome = apply_batch(tasks, &fresh_bloom(), false).expect("both files applied");
+        assert_eq!(outcome.applied, vec![broken.clone(), clean.clone()]);
+        assert!(outcome.output.contains(&format!("## {}", broken.display())));
+        assert!(outcome.output.contains(&format!("## {}", clean.display())));
+        assert_eq!(outcome.output.matches("── parse ──").count(), 1);
+    }
+
+    #[test]
     fn batch_parse_error_surfaces_per_file() {
         let dir = tempfile::tempdir().unwrap();
         let good = dir.path().join("g.txt");
@@ -945,8 +1082,10 @@ mod tests {
             },
         ];
 
-        let out =
+        let outcome =
             apply_batch(tasks, &fresh_bloom(), false).expect("good half kept the batch alive");
+        let out = outcome.output;
+        assert_eq!(outcome.applied, vec![good.clone()]);
         assert!(out.contains("## files[1]"));
         assert!(out.contains("error: missing 'edits' array"));
         assert_eq!(std::fs::read_to_string(&good).unwrap(), "K\n");

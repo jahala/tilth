@@ -42,6 +42,48 @@ pub fn search_header(
     format!("# Search: \"{query}\" in {} — {parts}", scope.display())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmptyHint {
+    Symbol,
+    Content,
+    Regex,
+    #[allow(dead_code)]
+    Callers,
+    #[allow(dead_code)]
+    Merged,
+}
+
+pub fn search_empty_header(
+    query: &str,
+    scope: &Path,
+    files_matched_glob: usize,
+    files_searched: usize,
+    content_hits: usize,
+    kind: EmptyHint,
+) -> String {
+    let hint = if files_matched_glob == 0 {
+        "glob matched no files — broaden glob or check path"
+    } else {
+        match kind {
+            EmptyHint::Symbol => "no symbols matched; try kind: content or check spelling",
+            EmptyHint::Content => "no content matches; try kind: symbol or a broader pattern",
+            EmptyHint::Regex => "regex matched zero content; try kind: symbol or a broader pattern",
+            EmptyHint::Callers => {
+                "no callers found — re-check the symbol name; consider kind: symbol to verify it exists"
+            }
+            EmptyHint::Merged => "no matches in any mode — re-check the query and glob",
+        }
+    };
+    format!(
+        "# Search: \"{query}\" in {scope_disp} — 0 matches\n  \
+         Files matched glob: {files_matched_glob}\n  \
+         Files searched:     {files_searched}\n  \
+         Content hits:       {content_hits}\n  \
+         Hint: {hint}",
+        scope_disp = scope.display()
+    )
+}
+
 /// Human-readable file size. Integer math only — no floats.
 fn format_size(bytes: u64) -> String {
     match bytes {
