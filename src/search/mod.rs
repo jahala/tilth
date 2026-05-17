@@ -5,6 +5,7 @@ pub mod content;
 pub mod deps;
 pub mod facets;
 pub mod glob;
+pub mod grok;
 pub mod rank;
 pub mod siblings;
 pub mod strip;
