@@ -339,19 +339,48 @@ pub(crate) fn normalize_path_key(path: &Path) -> String {
 /// Lexical-only path normalization: skip `CurDir`, walk `ParentDir`
 /// against the component stack, leave the rest in order. Does not touch
 /// the filesystem or `current_dir()`, so it's deterministic under
-/// parallel tests. Two paths that resolve to the same logical target
-/// produce the same string — `foo.rs` and `./foo.rs` both become
-/// `foo.rs`; `a/../b.rs` and `b.rs` both become `b.rs`.
+/// parallel tests.
+///
+/// `ParentDir` handling depends on what's already on the stack:
+///   * If the last component is a real (`Normal`) name, pop it —
+///     `a/../b.rs` collapses to `b.rs`.
+///   * If the stack is empty or only contains `..` markers AND the path
+///     is relative, push `..` — `../foo.rs` stays `../foo.rs` (else it
+///     would collapse to `foo.rs`, which is a different file on disk).
+///   * If absolute and at root, `..` is a no-op (Linux semantics:
+///     `/.. == /`).
+///
+/// The result is that two paths produce the same key iff they refer to
+/// the same logical target through the lexical lens — `foo.rs` and
+/// `./foo.rs` collide; `a/../b.rs` and `b.rs` collide; **`../foo.rs`
+/// and `foo.rs` do NOT collide** (different parent dirs).
 fn lexical_normalize(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
+    let mut is_absolute = false;
     for component in path.components() {
         match component {
-            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+            Component::Prefix(_) | Component::RootDir => {
+                is_absolute = true;
+                out.push(component.as_os_str());
+            }
+            Component::Normal(_) => {
                 out.push(component.as_os_str());
             }
             Component::CurDir => {}
             Component::ParentDir => {
-                out.pop();
+                // Only pop if the tail is a real path segment we can
+                // logically descend out of.
+                let last_is_normal = out
+                    .components()
+                    .next_back()
+                    .is_some_and(|c| matches!(c, Component::Normal(_)));
+                if last_is_normal {
+                    out.pop();
+                } else if !is_absolute {
+                    // Preserve unresolved `..` in relative paths.
+                    out.push("..");
+                }
+                // Absolute path with `..` at root → no-op.
             }
         }
     }
@@ -1068,6 +1097,35 @@ mod tests {
         assert_eq!(
             lexical_normalize(Path::new("/abs/./foo.rs")),
             PathBuf::from("/abs/foo.rs")
+        );
+        assert_eq!(
+            lexical_normalize(Path::new("/foo/../bar.rs")),
+            PathBuf::from("/bar.rs")
+        );
+        // `..` at absolute root is a no-op (Linux: /.. == /).
+        assert_eq!(lexical_normalize(Path::new("/..")), PathBuf::from("/"));
+    }
+
+    /// `../foo.rs` and `foo.rs` refer to DIFFERENT files (one in parent
+    /// dir, one in cwd). The dedup must NOT collide them. Tests the
+    /// fix to v1 of `lexical_normalize` which mistakenly popped at empty
+    /// stack and collapsed `../foo.rs` → `foo.rs`.
+    #[test]
+    fn lexical_normalize_preserves_unresolved_parentdir() {
+        assert_eq!(
+            lexical_normalize(Path::new("../foo.rs")),
+            PathBuf::from("../foo.rs")
+        );
+        // Multi-level: foo/bar/../../../baz.rs → ../baz.rs
+        // (foo → +foo, bar → +bar, .. → pop bar, .. → pop foo, .. → push .., baz.rs → +baz.rs)
+        assert_eq!(
+            lexical_normalize(Path::new("foo/bar/../../../baz.rs")),
+            PathBuf::from("../baz.rs")
+        );
+        // ../foo.rs and foo.rs must NOT produce equal keys.
+        assert_ne!(
+            normalize_path_key(Path::new("../foo.rs")),
+            normalize_path_key(Path::new("foo.rs"))
         );
     }
 
