@@ -1060,14 +1060,14 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "tilth_grok",
-            "description": "Grok a symbol in one call — returns definition, signature, doc, internal/external callees, callers, sibling defs, and tests. Replaces the search→expand→search-callers chain for 'understand this thing' questions. Target accepts: bare name (`parse_unified_diff`), path:line (`src/diff/parse.rs:7`), or qualified name (`Type::method`). DO NOT use for searching by concept (use tilth_search) or reading file contents (use tilth_read).",
+            "description": "Get everything structural about a symbol in one call — definition, body, signature, doc, callees, callers, siblings, tests. Use ONLY for 'understand this symbol' questions. Do NOT use for concept search (use tilth_search) or reading file contents (use tilth_read).",
             "inputSchema": {
                 "type": "object",
                 "required": ["target"],
                 "properties": {
                     "target": {
                         "type": "string",
-                        "description": "Symbol name, path:line, or qualified name (Type::method)."
+                        "description": "Symbol name, e.g. 'parse_unified_diff'. Also accepts 'src/diff/parse.rs:7' or 'Type::method'."
                     },
                     "scope": {
                         "type": "string",

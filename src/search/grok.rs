@@ -214,6 +214,9 @@ pub struct GrokCaps {
     pub max_callers: usize,
     pub max_siblings: usize,
     pub max_tests: usize,
+    /// Maximum lines of the target's own body to inline. Longer bodies are
+    /// elided in the middle. Set to 0 to suppress the body entirely.
+    pub max_body_lines: usize,
 }
 
 impl Default for GrokCaps {
@@ -223,6 +226,7 @@ impl Default for GrokCaps {
             max_callers: 5,
             max_siblings: 8,
             max_tests: 8,
+            max_body_lines: 60,
         }
     }
 }
@@ -236,6 +240,7 @@ impl GrokCaps {
             max_callers: 50,
             max_siblings: 30,
             max_tests: 30,
+            max_body_lines: 200,
         }
     }
 }
@@ -265,6 +270,11 @@ pub struct TestMatch {
 #[derive(Debug)]
 pub struct GrokResult {
     pub target: ResolvedTarget,
+    /// The target's own source body, sliced from the file. Empty when the
+    /// body span is degenerate (`start_line > end_line`) or when the target
+    /// resolution didn't surface a real outline entry. Stored as a string
+    /// so the formatter can wrap it in a fenced block without re-reading.
+    pub body: String,
     pub callees_internal: Vec<ResolvedCallee>,
     pub callees_external: Vec<String>,
     pub callers: Vec<CallerMatch>,
@@ -292,6 +302,12 @@ pub fn grok(
 ) -> Result<GrokResult, TilthError> {
     let (target, content, lang) = resolve_with_source(target_spec, scope)?;
     let entries = get_outline_entries(&content, lang);
+    let body = slice_body(
+        &content,
+        target.start_line,
+        target.end_line,
+        caps.max_body_lines,
+    );
 
     // --- Callees -----------------------------------------------------------
     let callee_names =
@@ -374,6 +390,7 @@ pub fn grok(
 
     Ok(GrokResult {
         target,
+        body,
         callees_internal,
         callees_external,
         callers,
@@ -385,6 +402,46 @@ pub fn grok(
         total_siblings,
         total_tests,
     })
+}
+
+/// Slice the target's source body out of `content`. Caps at `max_lines` total
+/// — when the body is longer, keeps the first 2/3 and last 1/3, separated by
+/// an elided-line marker. Returns "" on degenerate ranges.
+fn slice_body(content: &str, start_line: u32, end_line: u32, max_lines: usize) -> String {
+    if start_line == 0 || end_line < start_line {
+        return String::new();
+    }
+    let start_idx = (start_line as usize).saturating_sub(1);
+    let end_idx = end_line as usize;
+    let lines: Vec<&str> = content
+        .lines()
+        .skip(start_idx)
+        .take(end_idx.saturating_sub(start_idx))
+        .collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+    if lines.len() <= max_lines {
+        return lines.join("\n");
+    }
+    let head_n = max_lines.saturating_mul(2) / 3;
+    let tail_n = max_lines.saturating_sub(head_n);
+    let elided = lines.len() - head_n - tail_n;
+    let mut out = String::with_capacity(content.len() / 4);
+    for line in &lines[..head_n] {
+        out.push_str(line);
+        out.push('\n');
+    }
+    let _ = writeln!(
+        out,
+        "... ({elided} lines elided — use tilth_read for full body)"
+    );
+    for line in &lines[lines.len() - tail_n..] {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.pop(); // strip trailing newline
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -433,6 +490,16 @@ pub fn format_grok(result: &GrokResult, scope: &Path) -> String {
         if !first.is_empty() {
             out.push_str("\n## doc\n");
             out.push_str(first);
+            out.push('\n');
+        }
+    }
+
+    // Body — the target's own source. Skipped when empty (degenerate range)
+    // or when caps suppressed it.
+    if !result.body.is_empty() {
+        out.push_str("\n## body\n");
+        out.push_str(&result.body);
+        if !result.body.ends_with('\n') {
             out.push('\n');
         }
     }
@@ -1034,6 +1101,7 @@ pub fn target() {
         };
         let result = GrokResult {
             target,
+            body: String::new(),
             callees_internal: Vec::new(),
             callees_external: Vec::new(),
             callers: Vec::new(),
@@ -1064,6 +1132,7 @@ pub fn target() {
         // Manually construct a result where callers count > total displayed.
         let result = GrokResult {
             target,
+            body: String::new(),
             callees_internal: Vec::new(),
             callees_external: Vec::new(),
             callers: Vec::new(),
@@ -1083,6 +1152,72 @@ pub fn target() {
         };
         let out = format_grok(&result, Path::new("."));
         assert!(out.contains("... and 16 more"));
+    }
+
+    // -- slice_body --------------------------------------------------------
+
+    #[test]
+    fn slice_body_returns_full_body_when_under_cap() {
+        let content = "fn foo() {\n    let x = 1;\n    x + 1\n}\n";
+        // start_line=1, end_line=4, cap=60 → full body
+        let body = slice_body(content, 1, 4, 60);
+        assert_eq!(body, "fn foo() {\n    let x = 1;\n    x + 1\n}");
+    }
+
+    #[test]
+    fn slice_body_elides_long_bodies() {
+        let lines: Vec<String> = (1..=30).map(|i| format!("line {i}")).collect();
+        let content = lines.join("\n");
+        let body = slice_body(&content, 1, 30, 9);
+        // head_n = 9 * 2 / 3 = 6, tail_n = 3, elided = 30 - 6 - 3 = 21
+        assert!(body.contains("line 1\n"));
+        assert!(body.contains("line 6\n"));
+        assert!(body.contains("21 lines elided"));
+        assert!(body.contains("line 28\n"));
+        assert!(body.contains("line 30"));
+        assert!(!body.contains("line 7\n"), "head must stop at line 6");
+        assert!(!body.contains("line 27\n"), "tail must start at line 28");
+    }
+
+    #[test]
+    fn slice_body_handles_degenerate_range() {
+        assert_eq!(slice_body("anything", 0, 5, 60), "");
+        assert_eq!(slice_body("anything", 5, 3, 60), "");
+    }
+
+    #[test]
+    fn slice_body_clamps_when_end_past_eof() {
+        let content = "a\nb\nc";
+        // Asking for lines 1..=10 against a 3-line file → should still return what exists.
+        let body = slice_body(content, 1, 10, 60);
+        assert_eq!(body, "a\nb\nc");
+    }
+
+    // -- grok body integration --------------------------------------------
+
+    #[test]
+    fn grok_includes_target_body() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = "\
+pub fn target_fn() -> u32 {
+    let x = 42;
+    x + 1
+}
+";
+        write_fixture(tmp.path(), "src/lib.rs", lib);
+        let bloom = BloomFilterCache::default();
+        let result = grok("target_fn", tmp.path(), &bloom, GrokCaps::default()).unwrap();
+        assert!(
+            result.body.contains("let x = 42"),
+            "body should contain target source, got {:?}",
+            result.body
+        );
+        let rendered = format_grok(&result, tmp.path());
+        assert!(
+            rendered.contains("## body"),
+            "format must surface body section"
+        );
+        assert!(rendered.contains("let x = 42"));
     }
 
     #[test]
@@ -1110,6 +1245,7 @@ fn h() {}
             max_callers: 5,
             max_siblings: 2,
             max_tests: 8,
+            max_body_lines: 60,
         };
         let result = grok("target", tmp.path(), &bloom, caps).unwrap();
         assert_eq!(result.callees_internal.len(), 3, "callees capped");
