@@ -96,6 +96,12 @@ tilth_files: Find files by glob pattern. Replaces find, ls, pwd, and the host Gl
 tilth_deps: Blast-radius check — what imports this file and what it imports.\n\
   Use ONLY before renaming, removing, or changing an export's signature.\n\
 \n\
+tilth_grok: One-call structural understanding — def + signature + doc + callees + callers + siblings + tests.\n\
+  Usage: tilth_grok(target: \"parse_unified_diff\"). Also accepts \"src/file.rs:7\" or \"Type::method\".\n\
+  scope: narrow when the name is ambiguous. full: widen caps from 5/5/8/8 to 50/30/30/30.\n\
+  Use INSTEAD OF the search → expand → search-callers chain when you need to understand one symbol.\n\
+  DO NOT use for concept search (use tilth_search) or reading file contents (use tilth_read).\n\
+\n\
 tilth_diff: Structural diff — shows what changed at function level. Replaces Bash(git diff).\n\
   Usage: tilth_diff(source: \"HEAD~1\") for last commit. No args = uncommitted changes.\n\
   scope: \"file.rs\" or \"file.rs:fn_name\". log: \"HEAD~5..HEAD\" for per-commit summaries.\n\
@@ -371,6 +377,7 @@ pub(crate) fn dispatch_tool(
         "tilth_search" => tool_search(args, services.cache(), services.session(), services.bloom()),
         "tilth_files" => tool_files(args),
         "tilth_deps" => tool_deps(args, services.bloom()),
+        "tilth_grok" => tool_grok(args, services.bloom()),
         "tilth_diff" => tool_diff(args),
         "tilth_session" => tool_session(args, services.session()),
         "tilth_edit" if edit_mode => tool_edit(args, services.session(), services.bloom()),
@@ -638,6 +645,26 @@ fn tool_deps(args: &Value, bloom: &Arc<BloomFilterCache>) -> Result<String, Stri
         &scope,
         budget,
     ));
+    Ok(output)
+}
+
+fn tool_grok(args: &Value, bloom: &Arc<BloomFilterCache>) -> Result<String, String> {
+    let target = args
+        .get("target")
+        .and_then(|v| v.as_str())
+        .ok_or("missing required parameter: target")?;
+    let (scope, scope_warning) = resolve_scope(args);
+    let full = args.get("full").and_then(Value::as_bool).unwrap_or(false);
+    let caps = if full {
+        crate::search::grok::GrokCaps::full()
+    } else {
+        crate::search::grok::GrokCaps::default()
+    };
+
+    let result =
+        crate::search::grok::grok(target, &scope, bloom, caps).map_err(|e| e.to_string())?;
+    let mut output = scope_warning.unwrap_or_default();
+    output.push_str(&crate::search::grok::format_grok(&result, &scope));
     Ok(output)
 }
 
@@ -1027,6 +1054,29 @@ fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     "budget": {
                         "type": "number",
                         "description": "Max tokens. Truncates 'Used by' first."
+                    }
+                }
+            }
+        }),
+        serde_json::json!({
+            "name": "tilth_grok",
+            "description": "Grok a symbol in one call — returns definition, signature, doc, internal/external callees, callers, sibling defs, and tests. Replaces the search→expand→search-callers chain for 'understand this thing' questions. Target accepts: bare name (`parse_unified_diff`), path:line (`src/diff/parse.rs:7`), or qualified name (`Type::method`). DO NOT use for searching by concept (use tilth_search) or reading file contents (use tilth_read).",
+            "inputSchema": {
+                "type": "object",
+                "required": ["target"],
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "Symbol name, path:line, or qualified name (Type::method)."
+                    },
+                    "scope": {
+                        "type": "string",
+                        "description": "Subdirectory to narrow the search. Default: project root."
+                    },
+                    "full": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Widen caps: 50 callers, 30 callees, 30 siblings, 30 tests (default 5/5/8/8)."
                     }
                 }
             }
