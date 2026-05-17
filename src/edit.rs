@@ -357,6 +357,10 @@ pub(crate) fn normalize_path_key(path: &Path) -> String {
 fn lexical_normalize(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     let mut is_absolute = false;
+    // Count of `Normal` segments currently on the stack. Lets us decide
+    // in O(1) whether `..` can pop something real (vs. needing to be
+    // preserved as an unresolved `..` in a relative path).
+    let mut normal_count: usize = 0;
     for component in path.components() {
         match component {
             Component::Prefix(_) | Component::RootDir => {
@@ -365,17 +369,13 @@ fn lexical_normalize(path: &Path) -> PathBuf {
             }
             Component::Normal(_) => {
                 out.push(component.as_os_str());
+                normal_count += 1;
             }
             Component::CurDir => {}
             Component::ParentDir => {
-                // Only pop if the tail is a real path segment we can
-                // logically descend out of.
-                let last_is_normal = out
-                    .components()
-                    .next_back()
-                    .is_some_and(|c| matches!(c, Component::Normal(_)));
-                if last_is_normal {
+                if normal_count > 0 {
                     out.pop();
+                    normal_count -= 1;
                 } else if !is_absolute {
                     // Preserve unresolved `..` in relative paths.
                     out.push("..");
