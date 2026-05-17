@@ -1,0 +1,68 @@
+# Nightly fuzzing — runs each cargo-fuzz target for 5 min, surfaces findings
+# as workflow artifacts + a comment on the latest commit. Does NOT block PR
+# merges; this is exploratory testing on top of the regular unit-test gate.
+#
+# Targets and their input surfaces are documented in fuzz/fuzz_targets/*.rs.
+# Corpus is cached across runs so coverage accumulates over weeks.
+name: fuzz
+
+on:
+  schedule:
+    # 03:15 UTC daily — quiet hours for github runners
+    - cron: "15 3 * * *"
+  workflow_dispatch:
+    inputs:
+      duration_seconds:
+        description: "Per-target fuzz duration (seconds)"
+        required: false
+        default: "300"
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [outline, strip, diff_parse]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6
+
+      - name: Install nightly Rust
+        run: rustup toolchain install nightly --profile minimal --component rust-src
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Cache fuzz corpus
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # ratchet:actions/cache@v5
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
+
+      - name: Run ${{ matrix.target }}
+        run: |
+          DURATION="${{ github.event.inputs.duration_seconds || '300' }}"
+          cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time="$DURATION"
+
+      - name: Upload findings on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # ratchet:actions/upload-artifact@v7
+        with:
+          name: fuzz-${{ matrix.target }}-findings
+          path: |
+            fuzz/artifacts/${{ matrix.target }}/
+            fuzz/corpus/${{ matrix.target }}/
+          retention-days: 30
+
+      - name: Upload corpus
+        if: success()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # ratchet:actions/upload-artifact@v7
+        with:
+          name: fuzz-${{ matrix.target }}-corpus
+          path: fuzz/corpus/${{ matrix.target }}/
+          retention-days: 14

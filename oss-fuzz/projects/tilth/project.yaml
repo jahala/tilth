@@ -1,0 +1,10 @@
+homepage: "https://github.com/jahala/tilth"
+language: rust
+primary_contact: "jahala@gmail.com"
+auto_ccs:
+  - "jahala@gmail.com"
+main_repo: "https://github.com/jahala/tilth"
+sanitizers:
+  - address
+fuzzing_engines:
+  - libfuzzer

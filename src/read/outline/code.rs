@@ -3,6 +3,7 @@ use crate::types::{Lang, OutlineEntry, OutlineKind};
 
 /// Generate a code outline using tree-sitter. Walks top-level AST nodes,
 /// emitting signatures without bodies.
+#[must_use]
 pub fn outline(content: &str, lang: Lang, max_lines: usize) -> String {
     let Some(language) = outline_language(lang) else {
         return fallback_outline(content, max_lines);
