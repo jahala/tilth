@@ -12,30 +12,47 @@ comparisons aren't contaminated by tilth_search familiarity.
 from tasks.base import Task, GroundTruth
 
 
-class GrokLineIterTask(Task):
-    """Single-symbol grok: LineIter struct (def + construction sites)."""
+class GrokGinNewTask(Task):
+    """Constructor with rich callers + internal callees: gin's `New()` engine factory.
+
+    Replaces the original `grok_lineiter` task — LineIter was too small (4-line
+    struct in a 30-line file) for grok to differentiate from a `grep + read`
+    chain, and the ground truth didn't require the caller/callee detail that
+    grok uniquely supplies. `New` has a 30-line body, 3 internal callees
+    (`allocateContext`, `With`, `debugPrintWARNINGNew`), and 144 cross-file
+    callers — all sections of grok's output are exercised."""
 
     @property
     def name(self) -> str:
-        return "grok_lineiter"
+        return "grok_gin_new"
 
     @property
     def repo(self) -> str:
-        return "ripgrep"
+        return "gin"
 
     @property
     def prompt(self) -> str:
         return (
-            "Tell me everything you can about the `LineIter` type in ripgrep — "
-            "where it's defined, what fields it has, who constructs it, and "
-            "what other types live alongside it in the same file. Aim for one "
-            "comprehensive answer rather than fragmented searches."
+            "Give me a comprehensive picture of gin's top-level `New()` "
+            "constructor: what type it returns, the key fields it initializes "
+            "on that type (defaults), the internal helper functions it calls, "
+            "and approximately how many places in the codebase invoke it. "
+            "One structured answer beats several searches."
         )
 
     @property
     def ground_truth(self) -> GroundTruth:
+        # required_strings forces the agent to surface info from EVERY grok
+        # section: return type (Engine), an init field (RouterGroup), an
+        # internal callee (allocateContext), and the caller count
+        # (3-digit number — 144 callers is the actual count).
         return GroundTruth(
-            required_strings=["LineIter", "bytes", "lines.rs", "new"],
+            required_strings=[
+                "Engine",
+                "RouterGroup",
+                "allocateContext",
+                "gin.go",
+            ],
         )
 
     @property
