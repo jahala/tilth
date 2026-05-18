@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""
-Benchmark analysis and report generation.
+"""Benchmark analysis and report generation.
 
-Reads JSONL results from run.py and generates a markdown report
-with context efficiency metrics and comparisons.
+Reads JSONL results from run.py and emits a markdown report:
+  1. Header — file · models · modes · tasks · tilth version
+  2. TL;DR — paired baseline/tilth comparison (skipped if single-mode)
+  3. Per model — paired metrics broken down by model
+  4. Per task — paired metrics + cost breakdown + per-turn sparklines per task
+  5. Tool usage — current placeholder; reworked with adoption % in #284
+  6. Run metadata — footer with source, versions, totals
 """
 
 import argparse
@@ -12,445 +16,561 @@ import sys
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from statistics import median, mean, stdev
+from statistics import median
 
 
-# Anthropic Claude pricing (per million tokens)
+# Anthropic Claude pricing — USD per million tokens.
 PRICING = {
-    "cache_creation": 3.75,  # $3.75 per MTok
-    "cache_read": 0.30,      # $0.30 per MTok
-    "output": 15.00,         # $15.00 per MTok
-    "input": 3.00,           # $3.00 per MTok
+    "cache_creation": 3.75,
+    "cache_read": 0.30,
+    "output": 15.00,
+    "input": 3.00,
 }
 
+# |Δ| ≥ this is treated as a Notable change: bolded in tables, flagged in summaries.
+COST_REGRESSION_THRESHOLD_PCT = 5.0
 
-def compute_cost_breakdown(run: dict) -> dict[str, float]:
-    """Compute cost breakdown by token category."""
-    return {
-        "cache_creation_cost": run.get("cache_creation_tokens", 0) * PRICING["cache_creation"] / 1_000_000,
-        "cache_read_cost": run.get("cache_read_tokens", 0) * PRICING["cache_read"] / 1_000_000,
-        "output_cost": run.get("output_tokens", 0) * PRICING["output"] / 1_000_000,
-        "input_cost": run.get("input_tokens", 0) * PRICING["input"] / 1_000_000,
-    }
+# Sparkline ramp; index 0 is the lowest value, last is the highest.
+SPARKLINE_CHARS = " ▁▂▃▄▅▆▇█"
 
 
-def format_cost_breakdown(costs: dict[str, float], indent: str = "  ") -> str:
-    """Format cost breakdown as single line."""
-    parts = [
-        f"cache_create=${costs['cache_creation_cost']:.3f}",
-        f"cache_read=${costs['cache_read_cost']:.3f}",
-        f"output=${costs['output_cost']:.3f}",
-        f"input=${costs['input_cost']:.3f}",
-    ]
-    return f"{indent}{' '.join(parts)}"
+# ---------------------------------------------------------------------------
+# Pure metric helpers — each takes a list of runs, returns a number or None.
+# Failures are excluded from per-correct averages (a failure didn't actually
+# reach the answer, so averaging its cost would inflate baseline efficiency).
+# ---------------------------------------------------------------------------
 
 
-def format_cost_delta(baseline_costs: dict[str, float], tilth_costs: dict[str, float], indent: str = "  ") -> str:
-    """Format cost delta breakdown."""
-    deltas = {
-        "cache_creation": tilth_costs['cache_creation_cost'] - baseline_costs['cache_creation_cost'],
-        "cache_read": tilth_costs['cache_read_cost'] - baseline_costs['cache_read_cost'],
-        "output": tilth_costs['output_cost'] - baseline_costs['output_cost'],
-        "input": tilth_costs['input_cost'] - baseline_costs['input_cost'],
-    }
-    parts = [
-        f"Δcache_create={'+' if deltas['cache_creation'] >= 0 else ''}${deltas['cache_creation']:.3f}",
-        f"Δcache_read={'+' if deltas['cache_read'] >= 0 else ''}${deltas['cache_read']:.3f}",
-        f"Δoutput={'+' if deltas['output'] >= 0 else ''}${deltas['output']:.3f}",
-        f"Δinput={'+' if deltas['input'] >= 0 else ''}${deltas['input']:.3f}",
-    ]
-    return f"{indent}{' '.join(parts)}"
+def correct_runs(runs):
+    return [r for r in runs if r.get("correct")]
 
 
-def load_results(path: Path) -> list[dict]:
-    """Load JSONL results file."""
-    results = []
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                results.append(json.loads(line))
-    return results
+def accuracy(runs):
+    """(correct_count, total) — total includes failures."""
+    return sum(1 for r in runs if r.get("correct")), len(runs)
 
 
-def group_by(results: list[dict], *keys: str) -> dict:
-    """Group results by specified keys."""
+def cost_per_correct(runs):
+    cr = correct_runs(runs)
+    if not cr:
+        return None
+    return sum(r.get("total_cost_usd", 0.0) for r in cr) / len(cr)
+
+
+def tokens_per_correct(runs):
+    """Mean context_tokens (input + cache_creation + cache_read) for correct runs."""
+    cr = correct_runs(runs)
+    if not cr:
+        return None
+    return int(sum(r.get("context_tokens", 0) for r in cr) / len(cr))
+
+
+def turns_per_correct(runs):
+    cr = correct_runs(runs)
+    if not cr:
+        return None
+    return sum(r.get("num_turns", 0) for r in cr) / len(cr)
+
+
+# ---------------------------------------------------------------------------
+# Grouping / lookup primitives
+# ---------------------------------------------------------------------------
+
+
+def group_by_keys(runs, *keys):
+    """Partition runs into cells keyed by the named fields."""
     groups = defaultdict(list)
-    for result in results:
-        # Skip error entries that don't have all required fields
-        if "error" in result:
-            continue
-        key = tuple(result.get(k) for k in keys)
-        groups[key].append(result)
+    for r in runs:
+        groups[tuple(r.get(k) for k in keys)].append(r)
     return dict(groups)
 
 
-def compute_stats(values: list) -> dict:
-    """Compute statistics for a list of values."""
-    if not values:
-        return {
-            "median": 0,
-            "mean": 0,
-            "stdev": 0,
-            "min": 0,
-            "max": 0,
-        }
+def find_median_run(runs, key):
+    """Pick the run whose value for `key` is the median of the group.
 
-    return {
-        "median": median(values),
-        "mean": mean(values),
-        "stdev": stdev(values) if len(values) > 1 else 0,
-        "min": min(values),
-        "max": max(values),
-    }
-
-
-def ascii_sparkline(values: list[int]) -> str:
-    """Generate ASCII sparkline from values."""
-    if not values:
-        return ""
-
-    if max(values) == min(values):
-        return "▄" * len(values)
-
-    chars = " ▁▂▃▄▅▆▇█"
-    lo, hi = min(values), max(values)
-    return "".join(
-        chars[min(int((v - lo) / (hi - lo) * 8), 8)]
-        for v in values
-    )
-
-
-def format_delta(baseline_val: float, tilth_val: float) -> str:
-    """Format delta as percentage change."""
-    if baseline_val == 0:
-        return "—"
-    pct_change = ((tilth_val - baseline_val) / baseline_val) * 100
-    sign = "+" if pct_change > 0 else ""
-    return f"{sign}{pct_change:.0f}%"
-
-
-def find_median_run(runs: list[dict], metric: str) -> dict:
-    """Find the run with median value for given metric."""
+    Returns {} for an empty list. Used to anchor per-task sparklines and cost
+    breakdowns to a single representative run rather than a synthetic average.
+    """
     if not runs:
         return {}
-    sorted_runs = sorted(runs, key=lambda r: r.get(metric, 0))
-    return sorted_runs[len(sorted_runs) // 2]
+    ordered = sorted(runs, key=lambda r: r.get(key, 0))
+    return ordered[len(ordered) // 2]
 
 
-def merge_tool_calls(runs: list[dict]) -> dict[str, float]:
-    """Merge tool_calls dicts from multiple runs and compute median counts."""
-    # Collect all tool names
-    all_tools = set()
-    for run in runs:
-        if "tool_calls" in run:
-            all_tools.update(run["tool_calls"].keys())
-
-    # Compute median count for each tool
-    result = {}
-    for tool in all_tools:
-        counts = [run.get("tool_calls", {}).get(tool, 0) for run in runs]
-        result[tool] = median(counts)
-
-    return result
+# ---------------------------------------------------------------------------
+# Formatting helpers
+# ---------------------------------------------------------------------------
 
 
-def generate_report(results: list[dict]) -> str:
-    """Generate markdown report from results."""
-    if not results:
-        return "# Error\n\nNo valid results found in file.\n"
+def fmt_money(value):
+    return "—" if value is None else f"${value:.4f}"
 
-    # Filter out error entries
-    valid_results = [r for r in results if "error" not in r]
-    error_count = len(results) - len(valid_results)
 
-    if not valid_results:
-        return f"# Error\n\nAll {len(results)} runs failed.\n"
+def fmt_int(value):
+    return "—" if value is None else f"{value:,}"
 
-    # Extract metadata
-    models = sorted(set(r["model"] for r in valid_results))
-    tasks = sorted(set(r["task"] for r in valid_results))
-    modes = sorted(set(r["mode"] for r in valid_results))
-    repos = sorted(set(r.get("repo", "synthetic") for r in valid_results))
-    max_rep = max(r["repetition"] for r in valid_results)
-    num_reps = max_rep + 1
 
-    # Build header
+def fmt_float(value, precision=2):
+    return "—" if value is None else f"{value:.{precision}f}"
+
+
+def fmt_pct_delta(baseline, tilth, bold_threshold=COST_REGRESSION_THRESHOLD_PCT):
+    """% change baseline→tilth. Bold when |Δ| ≥ threshold."""
+    if baseline is None or tilth is None or baseline == 0:
+        return "—"
+    delta = (tilth - baseline) / baseline * 100
+    sign = "+" if delta >= 0 else ""
+    text = f"{sign}{delta:.0f}%"
+    return f"**{text}**" if abs(delta) >= bold_threshold else text
+
+
+def markdown_table(headers, rows):
     lines = [
-        "# tilth Benchmark Results",
-        "",
-        f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        "",
-        f"**Runs:** {len(valid_results)} valid",
+        "| " + " | ".join(headers) + " |",
+        "|" + "|".join("---" for _ in headers) + "|",
     ]
-
-    if error_count > 0:
-        lines.append(f" ({error_count} errors)")
-
-    lines.extend([
-        f" | **Models:** {', '.join(models)} | **Repos:** {', '.join(repos)} | **Reps:** {num_reps}",
-        "",
-        "## Context Efficiency",
-        "",
-        "The primary metric. Context tokens (input + cached) represent the actual context processed each turn. This compounds because each turn re-sends conversation history.",
-        "",
-        "### Per-task comparison",
-        "",
-    ])
-
-    # Group by task
-    task_groups = group_by(valid_results, "task")
-
-    for task_name in tasks:
-        task_results = task_groups.get((task_name,), [])
-        if not task_results:
-            continue
-
-        lines.append(f"#### {task_name}")
-        lines.append("")
-
-        # Show repo for the task
-        task_repo = task_results[0].get("repo", "synthetic") if task_results else "synthetic"
-        if task_repo != "synthetic":
-            lines.append(f"*Repo: {task_repo}*")
-            lines.append("")
-
-        # Group by mode
-        mode_groups = group_by(task_results, "mode")
-
-        # Check if we have both baseline and tilth
-        has_baseline = ("baseline",) in mode_groups
-        has_tilth = ("tilth",) in mode_groups
-
-        if has_baseline and has_tilth:
-            baseline_runs = mode_groups[("baseline",)]
-            tilth_runs = mode_groups[("tilth",)]
-
-            # Compute stats
-            metrics = [
-                ("Context tokens", "context_tokens"),
-                ("Output tokens", "output_tokens"),
-                ("Turns", "num_turns"),
-                ("Tool calls", "num_tool_calls"),
-                ("Cost USD", "total_cost_usd"),
-                ("Duration ms", "duration_ms"),
-            ]
-
-            lines.append("| Metric | baseline | tilth | delta |")
-            lines.append("|--------|----------|-------|-------|")
-
-            for label, key in metrics:
-                baseline_stats = compute_stats([r[key] for r in baseline_runs])
-                tilth_stats = compute_stats([r[key] for r in tilth_runs])
-                delta = format_delta(baseline_stats["median"], tilth_stats["median"])
-
-                if key == "total_cost_usd":
-                    baseline_fmt = f"${baseline_stats['median']:.4f}"
-                    tilth_fmt = f"${tilth_stats['median']:.4f}"
-                else:
-                    baseline_fmt = f"{baseline_stats['median']:.0f}"
-                    tilth_fmt = f"{tilth_stats['median']:.0f}"
-
-                lines.append(f"| {label} (median) | {baseline_fmt} | {tilth_fmt} | {delta} |")
-
-            # Correctness
-            baseline_correct = sum(1 for r in baseline_runs if r["correct"])
-            tilth_correct = sum(1 for r in tilth_runs if r["correct"])
-            baseline_pct = (baseline_correct / len(baseline_runs)) * 100
-            tilth_pct = (tilth_correct / len(tilth_runs)) * 100
-
-            lines.append(f"| Correctness | {baseline_pct:.0f}% | {tilth_pct:.0f}% | — |")
-            lines.append("")
-
-            # Cost breakdown
-            baseline_median_run_cost = find_median_run(baseline_runs, "total_cost_usd")
-            tilth_median_run_cost = find_median_run(tilth_runs, "total_cost_usd")
-
-            baseline_costs = compute_cost_breakdown(baseline_median_run_cost)
-            tilth_costs = compute_cost_breakdown(tilth_median_run_cost)
-
-            baseline_total = baseline_median_run_cost.get("total_cost_usd", 0.0)
-            tilth_total = tilth_median_run_cost.get("total_cost_usd", 0.0)
-            total_delta = tilth_total - baseline_total
-
-            baseline_turns = baseline_median_run_cost.get("num_turns", 0)
-            tilth_turns = tilth_median_run_cost.get("num_turns", 0)
-            turns_delta = tilth_turns - baseline_turns
-
-            baseline_correct_str = "correct" if baseline_median_run_cost.get("correct", False) else "incorrect"
-            tilth_correct_str = "correct" if tilth_median_run_cost.get("correct", False) else "incorrect"
-
-            lines.append("**Cost breakdown (median run):**")
-            lines.append("")
-            lines.append(f"  baseline: {baseline_turns} turns, ${baseline_total:.2f}, {baseline_correct_str}")
-            lines.append(format_cost_breakdown(baseline_costs))
-            lines.append(f"  tilth:    {tilth_turns} turns, ${tilth_total:.2f}, {tilth_correct_str}")
-            lines.append(format_cost_breakdown(tilth_costs))
-            lines.append(f"  delta:    {'+' if turns_delta >= 0 else ''}{turns_delta} turns, {'+' if total_delta >= 0 else ''}${total_delta:.2f}")
-            lines.append(format_cost_delta(baseline_costs, tilth_costs))
-            lines.append("")
-
-            # Per-turn sparklines
-            baseline_median_run = find_median_run(baseline_runs, "context_tokens")
-            tilth_median_run = find_median_run(tilth_runs, "context_tokens")
-
-            baseline_per_turn = baseline_median_run.get("per_turn_context_tokens", [])
-            tilth_per_turn = tilth_median_run.get("per_turn_context_tokens", [])
-
-            if baseline_per_turn and tilth_per_turn:
-                lines.append("**Per-turn context tokens (median run):**")
-                lines.append("")
-                baseline_spark = ascii_sparkline(baseline_per_turn)
-                tilth_spark = ascii_sparkline(tilth_per_turn)
-                baseline_range = f"{min(baseline_per_turn):,} → {max(baseline_per_turn):,}"
-                tilth_range = f"{min(tilth_per_turn):,} → {max(tilth_per_turn):,}"
-                lines.append(f"  baseline: {baseline_spark} ({baseline_range})")
-                lines.append(f"  tilth:    {tilth_spark} ({tilth_range})")
-                lines.append("")
-
-            # Tool breakdown
-            baseline_tools = merge_tool_calls(baseline_runs)
-            tilth_tools = merge_tool_calls(tilth_runs)
-
-            if baseline_tools or tilth_tools:
-                lines.append("**Tool breakdown (median counts):**")
-                lines.append("")
-                if baseline_tools:
-                    tool_strs = [f"{name}={count:.0f}" for name, count in baseline_tools.items()]
-                    lines.append(f"  baseline: {', '.join(tool_strs)}")
-                if tilth_tools:
-                    tool_strs = [f"{name}={count:.0f}" for name, count in tilth_tools.items()]
-                    lines.append(f"  tilth:    {', '.join(tool_strs)}")
-                lines.append("")
-
-        else:
-            # Only one mode available
-            for mode_name in modes:
-                mode_results = mode_groups.get((mode_name,), [])
-                if not mode_results:
-                    continue
-
-                lines.append(f"**Mode: {mode_name}**")
-                lines.append("")
-                lines.append("| Metric | Median |")
-                lines.append("|--------|--------|")
-
-                metrics = [
-                    ("Context tokens", "context_tokens"),
-                    ("Output tokens", "output_tokens"),
-                    ("Turns", "num_turns"),
-                    ("Tool calls", "num_tool_calls"),
-                    ("Cost USD", "total_cost_usd"),
-                    ("Duration ms", "duration_ms"),
-                ]
-
-                for label, key in metrics:
-                    stats = compute_stats([r[key] for r in mode_results])
-                    if key == "total_cost_usd":
-                        val_fmt = f"${stats['median']:.4f}"
-                    else:
-                        val_fmt = f"{stats['median']:.0f}"
-                    lines.append(f"| {label} | {val_fmt} |")
-
-                correct = sum(1 for r in mode_results if r["correct"])
-                pct = (correct / len(mode_results)) * 100
-                lines.append(f"| Correctness | {pct:.0f}% |")
-                lines.append("")
-
-        lines.append("")
-
-    # Summary section (only if we have both modes)
-    baseline_all = [r for r in valid_results if r["mode"] == "baseline"]
-    tilth_all = [r for r in valid_results if r["mode"] == "tilth"]
-
-    if baseline_all and tilth_all:
-        lines.append("## Summary")
-        lines.append("")
-        lines.append("Averaged across all tasks (median of medians):")
-        lines.append("")
-        lines.append("| Metric | baseline | tilth | Improvement |")
-        lines.append("|--------|----------|-------|-------------|")
-
-        # Compute median-of-medians for each metric
-        metrics = [
-            ("Context tokens", "context_tokens"),
-            ("Turns", "num_turns"),
-            ("Tool calls", "num_tool_calls"),
-            ("Cost USD", "total_cost_usd"),
-        ]
-
-        for label, key in metrics:
-            # Group baseline/tilth by task, compute median for each task, then median of those
-            baseline_by_task = group_by(baseline_all, "task")
-            tilth_by_task = group_by(tilth_all, "task")
-
-            baseline_medians = [
-                compute_stats([r[key] for r in runs])["median"]
-                for runs in baseline_by_task.values()
-            ]
-            tilth_medians = [
-                compute_stats([r[key] for r in runs])["median"]
-                for runs in tilth_by_task.values()
-            ]
-
-            if baseline_medians and tilth_medians:
-                baseline_val = median(baseline_medians)
-                tilth_val = median(tilth_medians)
-                improvement = format_delta(baseline_val, tilth_val)
-
-                if key == "total_cost_usd":
-                    baseline_fmt = f"${baseline_val:.4f}"
-                    tilth_fmt = f"${tilth_val:.4f}"
-                else:
-                    baseline_fmt = f"{baseline_val:.0f}"
-                    tilth_fmt = f"{tilth_val:.0f}"
-
-                lines.append(f"| {label} | {baseline_fmt} | {tilth_fmt} | {improvement} |")
-
-        lines.append("")
-
+    for row in rows:
+        lines.append("| " + " | ".join(str(c) for c in row) + " |")
     return "\n".join(lines)
 
 
+def sparkline(values):
+    if not values:
+        return ""
+    lo, hi = min(values), max(values)
+    if lo == hi:
+        return SPARKLINE_CHARS[-1] * len(values)
+    span = hi - lo
+    last_idx = len(SPARKLINE_CHARS) - 1
+    return "".join(
+        SPARKLINE_CHARS[min(int((v - lo) / span * last_idx), last_idx)] for v in values
+    )
+
+
+# ---------------------------------------------------------------------------
+# Cost breakdown by token category
+# ---------------------------------------------------------------------------
+
+
+def cost_breakdown(run):
+    """Per-category USD cost for a single run."""
+    return {
+        category: run.get(f"{category}_tokens", 0) * price / 1_000_000
+        for category, price in PRICING.items()
+    }
+
+
+def cost_breakdown_line(run):
+    cb = cost_breakdown(run)
+    return (
+        f"cache_create=${cb['cache_creation']:.3f} "
+        f"cache_read=${cb['cache_read']:.3f} "
+        f"output=${cb['output']:.3f} "
+        f"input=${cb['input']:.3f}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Section builders — each returns a markdown string, or None to skip the section.
+# ---------------------------------------------------------------------------
+
+
+def section_header(runs, source_path, error_count):
+    models = sorted({r["model"] for r in runs})
+    modes = sorted({r["mode"] for r in runs})
+    tasks = sorted({r["task"] for r in runs})
+    tilth_versions = sorted({r["tilth_version"] for r in runs if r.get("tilth_version")})
+    version_str = ", ".join(tilth_versions) if tilth_versions else "—"
+
+    fname = Path(source_path).name if source_path else "(stdin)"
+    meta = (
+        f"_{len(runs)} runs · models: {', '.join(models)} · "
+        f"modes: {', '.join(modes)} · {len(tasks)} tasks · tilth: {version_str}_"
+    )
+    if error_count > 0:
+        meta += f" _· {error_count} errors_"
+    return f"# tilth bench: {fname}\n{meta}"
+
+
+def find_accuracy_regressions(runs):
+    """List (task, model) cells where tilth correctness ratio < baseline's.
+
+    Each entry carries enough detail to render a one-line summary in the
+    warning banner. Cells without both modes are skipped (no comparison
+    possible).
+    """
+    cells = group_by_keys(runs, "task", "model")
+    regressions = []
+    for (task, model), cell_runs in cells.items():
+        baseline = [r for r in cell_runs if r["mode"] == "baseline"]
+        tilth = [r for r in cell_runs if r["mode"] == "tilth"]
+        if not baseline or not tilth:
+            continue
+        b_correct, b_total = accuracy(baseline)
+        t_correct, t_total = accuracy(tilth)
+        if not b_total or not t_total:
+            continue
+        if (t_correct / t_total) < (b_correct / b_total):
+            regressions.append({
+                "task": task,
+                "model": model,
+                "baseline_correct": b_correct,
+                "baseline_total": b_total,
+                "tilth_correct": t_correct,
+                "tilth_total": t_total,
+            })
+    return regressions
+
+
+def find_cost_regressions(runs):
+    """List (task, model) cells where tilth cost-per-correct exceeds baseline's
+    by COST_REGRESSION_THRESHOLD_PCT or more. Cells without correct runs in
+    either mode are skipped — there's no per-correct cost to compare.
+    """
+    cells = group_by_keys(runs, "task", "model")
+    regressions = []
+    for (task, model), cell_runs in cells.items():
+        baseline = [r for r in cell_runs if r["mode"] == "baseline"]
+        tilth = [r for r in cell_runs if r["mode"] == "tilth"]
+        b_cost = cost_per_correct(baseline)
+        t_cost = cost_per_correct(tilth)
+        if b_cost is None or t_cost is None or b_cost == 0:
+            continue
+        delta_pct = (t_cost - b_cost) / b_cost * 100
+        if delta_pct >= COST_REGRESSION_THRESHOLD_PCT:
+            regressions.append({
+                "task": task,
+                "model": model,
+                "baseline_cost": b_cost,
+                "tilth_cost": t_cost,
+                "delta_pct": delta_pct,
+            })
+    return regressions
+
+
+def find_best_worst_gain(runs):
+    """Find (task, model) cells with the most negative and most positive cost Δ.
+
+    A cell is eligible only if both modes have ≥1 correct run. Returns
+    (best_pair, best_delta_pct, worst_pair, worst_delta_pct), or four Nones
+    when no eligible cells exist.
+    """
+    cells = group_by_keys(runs, "task", "model")
+    deltas = []
+    for (task, model), cell_runs in cells.items():
+        baseline = [r for r in cell_runs if r["mode"] == "baseline"]
+        tilth = [r for r in cell_runs if r["mode"] == "tilth"]
+        b_cost = cost_per_correct(baseline)
+        t_cost = cost_per_correct(tilth)
+        if b_cost is None or t_cost is None or b_cost == 0:
+            continue
+        deltas.append(((task, model), (t_cost - b_cost) / b_cost * 100))
+    if not deltas:
+        return None, None, None, None
+    deltas.sort(key=lambda x: x[1])
+    return deltas[0][0], deltas[0][1], deltas[-1][0], deltas[-1][1]
+
+
+def _fmt_gain_cell(pair, delta):
+    """Format a best/worst gain cell — task · model + bolded percent."""
+    if pair is None:
+        return "—", "—"
+    text = f"{pair[0]} · {pair[1]}"
+    sign = "+" if delta >= 0 else ""
+    delta_text = f"{sign}{delta:.0f}% cost"
+    if abs(delta) >= COST_REGRESSION_THRESHOLD_PCT:
+        delta_text = f"**{delta_text}**"
+    return text, delta_text
+
+
+def section_regression_banner(runs):
+    """Blockquoted warning above TL;DR listing every accuracy regression.
+
+    Accuracy regressions are hard-fail signals: any (task, model) cell where
+    tilth scored fewer correct runs than baseline deserves a top-of-report
+    callout, regardless of how much cost it saved.
+
+    Returns None when accuracy held across every paired cell.
+    """
+    regressions = find_accuracy_regressions(runs)
+    if not regressions:
+        return None
+    noun = "regression" if len(regressions) == 1 else "regressions"
+    lines = [
+        f"> **{len(regressions)} accuracy {noun}** — tilth scored lower than baseline:",
+        ">",
+    ]
+    for r in regressions:
+        b_pct = r["baseline_correct"] / r["baseline_total"] * 100
+        t_pct = r["tilth_correct"] / r["tilth_total"] * 100
+        lines.append(
+            f"> - `{r['task']}` · {r['model']}: "
+            f"baseline {r['baseline_correct']}/{r['baseline_total']} ({b_pct:.0f}%) "
+            f"→ tilth {r['tilth_correct']}/{r['tilth_total']} ({t_pct:.0f}%)"
+        )
+    return "\n".join(lines)
+
+
+def section_notable_cost_regressions(runs):
+    """Diagnostic list of cells where tilth costs ≥ threshold% more than baseline.
+
+    Lower-priority than the accuracy banner — these are informational, not
+    hard-fail. Sorted worst-first so the most expensive cells lead.
+
+    Returns None when no cells exceed the threshold.
+    """
+    regressions = find_cost_regressions(runs)
+    if not regressions:
+        return None
+    regressions.sort(key=lambda r: -r["delta_pct"])
+    lines = [
+        "## Notable cost regressions",
+        f"_Cells where tilth costs ≥{COST_REGRESSION_THRESHOLD_PCT:.0f}% more than baseline._\n",
+    ]
+    for r in regressions:
+        lines.append(
+            f"- `{r['task']}` · {r['model']}: "
+            f"{fmt_money(r['baseline_cost'])} → {fmt_money(r['tilth_cost'])} "
+            f"(**+{r['delta_pct']:.0f}%**)"
+        )
+    return "\n".join(lines)
+
+
+def section_tldr(runs):
+    """TL;DR markdown table; None if the file isn't a paired baseline/tilth comparison."""
+    baseline = [r for r in runs if r["mode"] == "baseline"]
+    tilth = [r for r in runs if r["mode"] == "tilth"]
+    if not baseline or not tilth:
+        return None
+
+    b_correct, b_total = accuracy(baseline)
+    t_correct, t_total = accuracy(tilth)
+    b_cost, t_cost = cost_per_correct(baseline), cost_per_correct(tilth)
+    b_tok, t_tok = tokens_per_correct(baseline), tokens_per_correct(tilth)
+    b_turn, t_turn = turns_per_correct(baseline), turns_per_correct(tilth)
+
+    correct_delta = "no regressions"
+    if t_total and b_total and (t_correct / t_total) < (b_correct / b_total):
+        correct_delta = "**regression** (see Failures)"
+
+    best_pair, best_d, worst_pair, worst_d = find_best_worst_gain(runs)
+    best_text, best_delta = _fmt_gain_cell(best_pair, best_d)
+    worst_text, worst_delta = _fmt_gain_cell(worst_pair, worst_d)
+
+    rows = [
+        ["Correct", f"{b_correct}/{b_total}", f"{t_correct}/{t_total}", correct_delta],
+        ["Cost per correct answer", fmt_money(b_cost), fmt_money(t_cost), fmt_pct_delta(b_cost, t_cost)],
+        ["Tokens per correct answer", fmt_int(b_tok), fmt_int(t_tok), fmt_pct_delta(b_tok, t_tok)],
+        ["Turns per correct answer", fmt_float(b_turn), fmt_float(t_turn), fmt_pct_delta(b_turn, t_turn)],
+        ["Best gain", "—", best_text, best_delta],
+        ["Worst gain", "—", worst_text, worst_delta],
+    ]
+    return "## TL;DR\n\n" + markdown_table(["Headline", "baseline", "tilth", "Δ"], rows)
+
+
+def section_per_model(runs):
+    """One row per model that has both modes. Skipped entirely if no paired model."""
+    rows = []
+    for model in sorted({r["model"] for r in runs}):
+        m_runs = [r for r in runs if r["model"] == model]
+        baseline = [r for r in m_runs if r["mode"] == "baseline"]
+        tilth = [r for r in m_runs if r["mode"] == "tilth"]
+        if not baseline or not tilth:
+            continue
+        b_correct, b_total = accuracy(baseline)
+        t_correct, t_total = accuracy(tilth)
+        b_cost, t_cost = cost_per_correct(baseline), cost_per_correct(tilth)
+        b_tok, t_tok = tokens_per_correct(baseline), tokens_per_correct(tilth)
+        b_turn, t_turn = turns_per_correct(baseline), turns_per_correct(tilth)
+        rows.append([
+            model,
+            f"{b_correct}/{b_total} → {t_correct}/{t_total}",
+            f"{fmt_money(b_cost)} → {fmt_money(t_cost)}",
+            fmt_pct_delta(b_cost, t_cost),
+            f"{fmt_int(b_tok)} → {fmt_int(t_tok)}",
+            fmt_pct_delta(b_tok, t_tok),
+            f"{fmt_float(b_turn)} → {fmt_float(t_turn)}",
+            fmt_pct_delta(b_turn, t_turn),
+        ])
+    if not rows:
+        return None
+    headers = [
+        "Model", "n correct",
+        "cost (B → T)", "Δ cost",
+        "tokens (B → T)", "Δ tok",
+        "turns (B → T)", "Δ turns",
+    ]
+    return "## Per model\n\n" + markdown_table(headers, rows)
+
+
+def _per_task_paired_block(task_runs):
+    """Render the metric table + cost breakdown + sparklines for a paired task."""
+    baseline = [r for r in task_runs if r["mode"] == "baseline"]
+    tilth = [r for r in task_runs if r["mode"] == "tilth"]
+    b_correct, b_total = accuracy(baseline)
+    t_correct, t_total = accuracy(tilth)
+    b_cost, t_cost = cost_per_correct(baseline), cost_per_correct(tilth)
+    b_tok, t_tok = tokens_per_correct(baseline), tokens_per_correct(tilth)
+    b_turn, t_turn = turns_per_correct(baseline), turns_per_correct(tilth)
+    b_calls = sum(r.get("num_tool_calls", 0) for r in baseline) / len(baseline)
+    t_calls = sum(r.get("num_tool_calls", 0) for r in tilth) / len(tilth)
+
+    rows = [
+        ["Correct", f"{b_correct}/{b_total}", f"{t_correct}/{t_total}", "—"],
+        ["Cost per correct", fmt_money(b_cost), fmt_money(t_cost), fmt_pct_delta(b_cost, t_cost)],
+        ["Tokens per correct", fmt_int(b_tok), fmt_int(t_tok), fmt_pct_delta(b_tok, t_tok)],
+        ["Turns per correct", fmt_float(b_turn), fmt_float(t_turn), fmt_pct_delta(b_turn, t_turn)],
+        ["Tool calls (mean)", fmt_float(b_calls), fmt_float(t_calls), fmt_pct_delta(b_calls, t_calls)],
+    ]
+    parts = [markdown_table(["Metric", "baseline", "tilth", "Δ"], rows)]
+
+    b_med_cost = find_median_run(baseline, "total_cost_usd")
+    t_med_cost = find_median_run(tilth, "total_cost_usd")
+    if b_med_cost and t_med_cost:
+        parts.append("\n**Cost breakdown (median run):**\n")
+        parts.append(
+            f"  baseline ({b_med_cost.get('num_turns', '?')} turns): "
+            + cost_breakdown_line(b_med_cost)
+        )
+        parts.append(
+            f"  tilth    ({t_med_cost.get('num_turns', '?')} turns): "
+            + cost_breakdown_line(t_med_cost)
+        )
+
+    b_med_ctx = find_median_run(baseline, "context_tokens")
+    t_med_ctx = find_median_run(tilth, "context_tokens")
+    b_pt = b_med_ctx.get("per_turn_context_tokens", [])
+    t_pt = t_med_ctx.get("per_turn_context_tokens", [])
+    if b_pt or t_pt:
+        parts.append("\n**Per-turn context tokens (median run):**\n")
+        if b_pt:
+            parts.append(f"  baseline: {sparkline(b_pt)} ({min(b_pt):,} → {max(b_pt):,})")
+        if t_pt:
+            parts.append(f"  tilth:    {sparkline(t_pt)} ({min(t_pt):,} → {max(t_pt):,})")
+
+    return "\n".join(parts)
+
+
+def _per_task_single_mode_block(task_runs):
+    """Render a single-mode task summary. Used when only one mode ran the task."""
+    mode = task_runs[0]["mode"]
+    c, t = accuracy(task_runs)
+    rows = [
+        ["Correct", f"{c}/{t}"],
+        ["Cost per correct", fmt_money(cost_per_correct(task_runs))],
+        ["Tokens per correct", fmt_int(tokens_per_correct(task_runs))],
+        ["Turns per correct", fmt_float(turns_per_correct(task_runs))],
+    ]
+    return f"_mode: {mode}_\n\n" + markdown_table(["Metric", "value"], rows)
+
+
+def section_per_task(runs):
+    tasks = sorted({r["task"] for r in runs})
+    parts = ["## Per task"]
+    for task in tasks:
+        task_runs = [r for r in runs if r["task"] == task]
+        parts.append(f"\n### {task}")
+        repo = task_runs[0].get("repo")
+        if repo and repo != "synthetic":
+            parts.append(f"_repo: {repo}_\n")
+        baseline = [r for r in task_runs if r["mode"] == "baseline"]
+        tilth = [r for r in task_runs if r["mode"] == "tilth"]
+        if baseline and tilth:
+            parts.append(_per_task_paired_block(task_runs))
+        else:
+            parts.append(_per_task_single_mode_block(task_runs))
+    return "\n".join(parts)
+
+
+def section_tool_usage(runs):
+    """Placeholder: median count per tool, per (mode × model). #284 reworks this with adoption %."""
+    cells = group_by_keys(runs, "mode", "model")
+    parts = [
+        "## Tool usage",
+        "_(median count per tool; #284 reworks to surface adoption % as the primary metric)_\n",
+    ]
+    for cell_key in sorted(cells.keys()):
+        mode, model = cell_key
+        cell_runs = cells[cell_key]
+        all_names = set()
+        for run in cell_runs:
+            all_names.update(run.get("tool_calls", {}).keys())
+        medians = {
+            name: median([run.get("tool_calls", {}).get(name, 0) for run in cell_runs])
+            for name in all_names
+        }
+        tools_str = ", ".join(
+            f"{name}={count:.0f}"
+            for name, count in sorted(medians.items(), key=lambda kv: -kv[1])
+            if count > 0
+        ) or "—"
+        parts.append(f"  {mode}/{model} ({len(cell_runs)} runs): {tools_str}")
+    return "\n".join(parts)
+
+
+def section_metadata(runs, source_path):
+    parts = ["## Run metadata"]
+    if source_path:
+        parts.append(f"- source: `{source_path}`")
+    tilth_versions = sorted({r["tilth_version"] for r in runs if r.get("tilth_version")})
+    parts.append(f"- tilth versions: {', '.join(tilth_versions) if tilth_versions else '—'}")
+    parts.append(f"- total runs: {len(runs)}")
+    parts.append(f"- total cost (all runs): ${sum(r.get('total_cost_usd', 0) for r in runs):.2f}")
+    total_ms = sum(r.get("duration_ms", 0) for r in runs)
+    if total_ms:
+        parts.append(f"- total duration: {total_ms / 1000 / 60:.1f} min")
+    parts.append(f"- generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Top-level orchestration
+# ---------------------------------------------------------------------------
+
+
+def filter_valid(runs):
+    """Split into (valid, error_count). A row is invalid if it has an `error`
+    field set by the runner, or lacks the `correct` field we need to score it."""
+    valid = [r for r in runs if "error" not in r and "correct" in r]
+    return valid, len(runs) - len(valid)
+
+
+def generate_report(runs, source_path=None):
+    valid, error_count = filter_valid(runs)
+    if not valid:
+        return f"# Error\n\nNo valid runs found ({len(runs)} total, {error_count} errors)."
+
+    sections = [
+        section_header(valid, source_path, error_count),
+        section_regression_banner(valid),
+        section_tldr(valid),
+        section_per_model(valid),
+        section_per_task(valid),
+        section_notable_cost_regressions(valid),
+        section_tool_usage(valid),
+        section_metadata(valid, source_path),
+    ]
+    return "\n\n".join(s for s in sections if s)
+
+
+def load_results(path):
+    with open(path) as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
 def main():
-    parser = argparse.ArgumentParser(
-        description="Analyze benchmark results and generate report",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python analyze.py results/benchmark_20260212_150000.jsonl
-  python analyze.py results/benchmark_20260212_150000.jsonl -o report.md
-        """,
-    )
-
-    parser.add_argument(
-        "results_file",
-        type=Path,
-        help="Path to JSONL results file from run.py",
-    )
-    parser.add_argument(
-        "-o", "--output",
-        type=Path,
-        help="Output path for markdown report (default: print to stdout)",
-    )
-
+    parser = argparse.ArgumentParser(description="Analyze benchmark results")
+    parser.add_argument("results_file", type=Path)
+    parser.add_argument("-o", "--output", type=Path)
     args = parser.parse_args()
 
-    # Validate input file
     if not args.results_file.exists():
         print(f"ERROR: File not found: {args.results_file}", file=sys.stderr)
         sys.exit(1)
 
-    # Load and analyze
-    try:
-        results = load_results(args.results_file)
-    except Exception as e:
-        print(f"ERROR: Failed to load results: {e}", file=sys.stderr)
-        sys.exit(1)
+    runs = load_results(args.results_file)
+    report = generate_report(runs, source_path=str(args.results_file))
 
-    report = generate_report(results)
-
-    # Output
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(report)
