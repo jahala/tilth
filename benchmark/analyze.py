@@ -13,7 +13,7 @@ Reads JSONL results from run.py and emits a markdown report:
 import argparse
 import json
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
 from statistics import median
@@ -32,6 +32,13 @@ COST_REGRESSION_THRESHOLD_PCT = 5.0
 
 # Sparkline ramp; index 0 is the lowest value, last is the highest.
 SPARKLINE_CHARS = " ▁▂▃▄▅▆▇█"
+
+# Failure-log result_text excerpt length. Long enough to surface the agent's
+# concluding sentence; short enough not to drown the report.
+FAILURE_PREVIEW_CHARS = 200
+
+# Top-N most common consecutive-tool-pair patterns to list per (mode, model).
+SEQUENCE_TOP_N = 2
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +318,45 @@ def section_regression_banner(runs):
     return "\n".join(lines)
 
 
+def section_failures(runs):
+    """Detail every failed run: reason, repro command, result-text preview.
+
+    Sorted by (task, model, mode, rep) so failures of the same cell cluster.
+    Returns None when every run succeeded — the section disappears entirely
+    rather than rendering a 'no failures' placeholder.
+    """
+    failures = [r for r in runs if not r.get("correct")]
+    if not failures:
+        return None
+    failures.sort(key=lambda r: (r["task"], r["model"], r["mode"], r.get("repetition", 0)))
+
+    parts = [f"## Failures ({len(failures)})"]
+    for f in failures:
+        task = f["task"]
+        model = f["model"]
+        mode = f["mode"]
+        rep = f.get("repetition", "?")
+        reason = f.get("correctness_reason") or "—"
+        repro = (
+            f"python3 benchmark/run.py "
+            f"--models {model} --reps 1 "
+            f"--tasks {task} --modes {mode}"
+        )
+        preview = (f.get("result_text") or "").strip().replace("\n", " ")
+        if len(preview) > FAILURE_PREVIEW_CHARS:
+            preview = preview[:FAILURE_PREVIEW_CHARS].rstrip() + "…"
+        elif not preview:
+            preview = "_(no result_text captured)_"
+
+        parts.append(
+            f"\n### `{task}` · {model} · {mode} · rep {rep}\n\n"
+            f"**Reason:** {reason}\n\n"
+            f"**Repro:**\n```\n{repro}\n```\n\n"
+            f"**Result preview:** {preview}"
+        )
+    return "\n".join(parts)
+
+
 def section_notable_cost_regressions(runs):
     """Diagnostic list of cells where tilth costs ≥ threshold% more than baseline.
 
@@ -482,30 +528,92 @@ def section_per_task(runs):
     return "\n".join(parts)
 
 
+def tool_adoption_stats(cell_runs):
+    """For each tool invoked at least once in this cell, return adoption + median + max.
+
+    Adoption is the primary metric (% of runs that touched the tool at all).
+    median count surfaces sequence-length signal — agents leaning on a tool.
+    max ceilings the heaviest single run. Tools with zero adoption are dropped:
+    a row of zeros for an unused tool is noise.
+    """
+    n_runs = len(cell_runs)
+    all_names = set()
+    for run in cell_runs:
+        all_names.update(run.get("tool_calls", {}).keys())
+    stats = {}
+    for name in all_names:
+        counts = [run.get("tool_calls", {}).get(name, 0) for run in cell_runs]
+        adoption_pct = 100 * sum(1 for c in counts if c > 0) / n_runs
+        if adoption_pct == 0:
+            continue
+        stats[name] = {
+            "adoption": adoption_pct,
+            "median": median(counts),
+            "max": max(counts),
+        }
+    return stats
+
+
+def sequence_patterns(cell_runs, top_n=SEQUENCE_TOP_N):
+    """Top-N most common consecutive tool-name pairs across the cell's runs.
+
+    Aggregates pair counts over *all* runs in the cell — a run that runs
+    `search → read → search → read` contributes two `search → read` pairs.
+    Returns list of ((tool_a, tool_b), count) tuples sorted by frequency.
+
+    Empty when no tool_sequence data exists (early Feb files lack the field).
+    """
+    pairs = Counter()
+    for run in cell_runs:
+        seq = run.get("tool_sequence") or []
+        names = [step.get("name") for step in seq if isinstance(step, dict) and step.get("name")]
+        for i in range(len(names) - 1):
+            pairs[(names[i], names[i + 1])] += 1
+    return pairs.most_common(top_n)
+
+
 def section_tool_usage(runs):
-    """Placeholder: median count per tool, per (mode × model). #284 reworks this with adoption %."""
+    """Per (mode × model): tool adoption table + top sequence patterns.
+
+    Cells with no tool usage at all are skipped (some early MCP-less runs
+    may carry empty tool_calls). Section returns None if no cell has any
+    tool data — keeps the report tight on minimal-input files.
+    """
     cells = group_by_keys(runs, "mode", "model")
-    parts = [
-        "## Tool usage",
-        "_(median count per tool; #284 reworks to surface adoption % as the primary metric)_\n",
-    ]
+    parts = []
     for cell_key in sorted(cells.keys()):
         mode, model = cell_key
         cell_runs = cells[cell_key]
-        all_names = set()
-        for run in cell_runs:
-            all_names.update(run.get("tool_calls", {}).keys())
-        medians = {
-            name: median([run.get("tool_calls", {}).get(name, 0) for run in cell_runs])
-            for name in all_names
-        }
-        tools_str = ", ".join(
-            f"{name}={count:.0f}"
-            for name, count in sorted(medians.items(), key=lambda kv: -kv[1])
-            if count > 0
-        ) or "—"
-        parts.append(f"  {mode}/{model} ({len(cell_runs)} runs): {tools_str}")
-    return "\n".join(parts)
+        n_runs = len(cell_runs)
+        stats = tool_adoption_stats(cell_runs)
+        if not stats:
+            continue
+
+        ordered = sorted(stats.items(), key=lambda kv: (-kv[1]["adoption"], -kv[1]["median"]))
+        rows = [
+            [
+                f"`{name}`",
+                f"{s['adoption']:.0f}%",
+                f"{s['median']:.0f}",
+                f"{s['max']}",
+            ]
+            for name, s in ordered
+        ]
+        parts.append(f"\n### {mode}/{model} ({n_runs} runs)\n")
+        parts.append(markdown_table(["Tool", "adoption", "median count", "max"], rows))
+
+        patterns = sequence_patterns(cell_runs)
+        if patterns:
+            parts.append("\n**Top sequence patterns:**\n")
+            for (tool_a, tool_b), count in patterns:
+                avg_per_run = count / n_runs
+                parts.append(
+                    f"- `{tool_a}` → `{tool_b}`: "
+                    f"{count} occurrences (avg {avg_per_run:.1f}/run)"
+                )
+    if not parts:
+        return None
+    return "## Tool usage" + "\n".join(parts)
 
 
 def section_metadata(runs, source_path):
@@ -546,6 +654,7 @@ def generate_report(runs, source_path=None):
         section_tldr(valid),
         section_per_model(valid),
         section_per_task(valid),
+        section_failures(valid),
         section_notable_cost_regressions(valid),
         section_tool_usage(valid),
         section_metadata(valid, source_path),
