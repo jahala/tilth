@@ -753,8 +753,29 @@ def build_summary_data(runs, source_path=None):
 
 
 def load_results(path):
+    """Parse a JSONL file, skipping lines that fail to decode.
+
+    Some historical JSONLs contain corrupt lines — usually a runner that
+    forgot to escape a newline inside a long `result_text` string. We surface
+    the count via the metadata error-row tally rather than crashing the
+    report on otherwise-good neighbors.
+    """
+    results = []
+    bad_lines = 0
     with open(path) as f:
-        return [json.loads(line) for line in f if line.strip()]
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                results.append(json.loads(line))
+            except json.JSONDecodeError:
+                bad_lines += 1
+    if bad_lines:
+        # Inject a synthetic error-marker row so the header surfaces the count
+        # via the standard error_count path (no special-case rendering needed).
+        results.extend([{"error": "json decode failed"}] * bad_lines)
+    return results
 
 
 def main():
