@@ -43,15 +43,18 @@ class GrokGinNewTask(Task):
     @property
     def ground_truth(self) -> GroundTruth:
         # required_strings forces the agent to surface info from EVERY grok
-        # section: return type (Engine), an init field (RouterGroup), an
-        # internal callee (allocateContext), and the caller count
-        # (3-digit number — 144 callers is the actual count).
+        # section: return type (Engine — body), an init field (RouterGroup —
+        # body), an internal callee (allocateContext — callees), and the
+        # canonical caller (Default — callers; also a sibling in gin.go).
+        # We don't require the file name "gin.go" itself because an otherwise-
+        # correct answer can legitimately describe the constructor without
+        # reciting the file path.
         return GroundTruth(
             required_strings=[
                 "Engine",
                 "RouterGroup",
                 "allocateContext",
-                "gin.go",
+                "Default",
             ],
         )
 
