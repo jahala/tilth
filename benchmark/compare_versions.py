@@ -1,148 +1,284 @@
 #!/usr/bin/env python3
-"""
-Compare old tilth (built-in tools) vs new tilth (MCP-only) exploration patterns.
-"""
+"""Compare two benchmark JSONL files — useful for before/after a tilth release.
 
+Imports the same metric helpers as analyze.py so the diff cannot drift from
+the per-file report. Default output is markdown; --json emits the same shape
+as a machine-readable dict.
+
+Comparison scope:
+  - Aggregate per-mode metrics (cost/tokens/turns per correct answer)
+  - Per (task, model) cells present in both files: cost delta, accuracy delta
+  - Tasks only in old or only in new (surface-shift indicator)
+  - Accuracy regressions / improvements
+"""
+from __future__ import annotations
+
+import argparse
 import json
+import sys
 from pathlib import Path
-from typing import Dict, List
 
-def parse_jsonl(file_path: str) -> List[Dict]:
-    """Parse JSONL file and return list of run results."""
-    results = []
-    with open(file_path, 'r') as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                results.append(json.loads(line))
-    return results
+from analyze import (
+    COST_REGRESSION_THRESHOLD_PCT,
+    accuracy,
+    build_summary_data,
+    cost_per_correct,
+    fmt_money,
+    fmt_pct_delta,
+    group_by_keys,
+    load_results,
+    markdown_table,
+    tokens_per_correct,
+    turns_per_correct,
+)
 
-def main():
-    results_dir = Path("/Users/flysikring/conductor/workspaces/tilth/almaty/benchmark/results")
 
-    old_file = results_dir / "benchmark_20260213_131246.jsonl"
-    new_file = results_dir / "benchmark_20260213_135039.jsonl"
+def _delta_pct(old, new):
+    """Return percent change old→new, or None when either side is None or old is 0."""
+    if old is None or new is None or old == 0:
+        return None
+    return (new - old) / old * 100
 
-    old_runs = parse_jsonl(str(old_file))
-    new_runs = parse_jsonl(str(new_file))
 
-    # Filter to valid runs only
-    old_runs = [r for r in old_runs if 'error' not in r]
-    new_runs = [r for r in new_runs if 'error' not in r]
+def compare_summaries(old, new):
+    """Diff two build_summary_data outputs into a structured delta dict."""
+    old_tldr = old.get("tldr")
+    new_tldr = new.get("tldr")
 
-    print("="*80)
-    print("OLD TILTH (with built-in tools) vs NEW TILTH (MCP-only)")
-    print("="*80)
+    tldr_delta = None
+    if old_tldr and new_tldr:
+        tldr_delta = {}
+        for mode in ("baseline", "tilth"):
+            old_m = old_tldr[mode]
+            new_m = new_tldr[mode]
+            tldr_delta[mode] = {
+                "cost_per_correct": {
+                    "old": old_m["cost_per_correct"],
+                    "new": new_m["cost_per_correct"],
+                    "delta_pct": _delta_pct(old_m["cost_per_correct"], new_m["cost_per_correct"]),
+                },
+                "tokens_per_correct": {
+                    "old": old_m["tokens_per_correct"],
+                    "new": new_m["tokens_per_correct"],
+                    "delta_pct": _delta_pct(old_m["tokens_per_correct"], new_m["tokens_per_correct"]),
+                },
+                "turns_per_correct": {
+                    "old": old_m["turns_per_correct"],
+                    "new": new_m["turns_per_correct"],
+                    "delta_pct": _delta_pct(old_m["turns_per_correct"], new_m["turns_per_correct"]),
+                },
+                "correct": {"old": old_m["correct"], "new": new_m["correct"]},
+                "total": {"old": old_m["total"], "new": new_m["total"]},
+            }
 
-    print(f"\nOld file: {old_file.name}")
-    print(f"New file: {new_file.name}")
+    return {
+        "old_file": old.get("metadata", {}).get("source"),
+        "new_file": new.get("metadata", {}).get("source"),
+        "old_tilth_versions": old.get("metadata", {}).get("tilth_versions", []),
+        "new_tilth_versions": new.get("metadata", {}).get("tilth_versions", []),
+        "tldr_delta": tldr_delta,
+    }
 
-    # Group by task and mode
-    def group_by_task_mode(runs):
-        groups = {}
-        for r in runs:
-            key = (r['task'], r['mode'])
-            if key not in groups:
-                groups[key] = []
-            groups[key].append(r)
-        return groups
 
-    old_groups = group_by_task_mode(old_runs)
-    new_groups = group_by_task_mode(new_runs)
+def _cell_summary(runs):
+    """Compact stats for a (task, model, mode) cell."""
+    c, t = accuracy(runs)
+    return {
+        "correct": c,
+        "total": t,
+        "cost_per_correct": cost_per_correct(runs),
+        "tokens_per_correct": tokens_per_correct(runs),
+        "turns_per_correct": turns_per_correct(runs),
+    }
 
-    # Compare tilth runs only
-    print("\n" + "="*80)
-    print("TILTH MODE COMPARISON (Old built-in vs New MCP-only)")
-    print("="*80)
 
-    all_tasks = sorted(set(k[0] for k in old_groups.keys() if k[1] == 'tilth'))
+def compare_cells(old_runs, new_runs):
+    """Per (task, model, mode) cell diff. Returns dict with:
+      - common: cells in both files, with old/new/delta
+      - old_only: cells absent from new file
+      - new_only: cells absent from old file
+    Cells with no correct runs in either side are still listed (their cost_delta_pct is None).
+    """
+    old_cells = group_by_keys(old_runs, "task", "model", "mode")
+    new_cells = group_by_keys(new_runs, "task", "model", "mode")
 
-    for task in all_tasks:
-        old_tilth = old_groups.get((task, 'tilth'), [])
-        new_tilth = new_groups.get((task, 'tilth'), [])
+    common_keys = sorted(old_cells.keys() & new_cells.keys())
+    old_only = sorted(old_cells.keys() - new_cells.keys())
+    new_only = sorted(new_cells.keys() - old_cells.keys())
 
-        if old_tilth and new_tilth:
-            print(f"\n{'='*80}")
-            print(f"Task: {task}")
-            print(f"{'='*80}")
+    common = []
+    for key in common_keys:
+        task, model, mode = key
+        old_summary = _cell_summary(old_cells[key])
+        new_summary = _cell_summary(new_cells[key])
+        common.append({
+            "task": task,
+            "model": model,
+            "mode": mode,
+            "old": old_summary,
+            "new": new_summary,
+            "cost_delta_pct": _delta_pct(
+                old_summary["cost_per_correct"], new_summary["cost_per_correct"]
+            ),
+            "accuracy_delta": (
+                (new_summary["correct"] / new_summary["total"] if new_summary["total"] else 0)
+                - (old_summary["correct"] / old_summary["total"] if old_summary["total"] else 0)
+            ),
+        })
 
-            for old, new in zip(old_tilth, new_tilth):
-                print(f"\nOLD (built-in): {old.get('tilth_version', 'unknown')}")
-                print(f"  Turns: {old['num_turns']}, Tool calls: {old['num_tool_calls']}")
-                print(f"  Tools: {old['tool_calls']}")
-                print(f"  Correct: {old['correct']}")
+    return {
+        "common": common,
+        "old_only": [{"task": t, "model": m, "mode": md} for (t, m, md) in old_only],
+        "new_only": [{"task": t, "model": m, "mode": md} for (t, m, md) in new_only],
+    }
 
-                print(f"\nNEW (MCP-only): {new.get('tilth_version', 'unknown')}")
-                print(f"  Turns: {new['num_turns']}, Tool calls: {new['num_tool_calls']}")
-                print(f"  Tools: {new['tool_calls']}")
-                print(f"  Correct: {new['correct']}")
 
-                # Calculate differences
-                turn_delta = new['num_turns'] - old['num_turns']
-                tool_delta = new['num_tool_calls'] - old['num_tool_calls']
-
-                print(f"\nDELTA:")
-                print(f"  Turns: {turn_delta:+d} ({'more' if turn_delta > 0 else 'fewer' if turn_delta < 0 else 'same'})")
-                print(f"  Tool calls: {tool_delta:+d} ({'more' if tool_delta > 0 else 'fewer' if tool_delta < 0 else 'same'})")
-                print(f"  Correctness: {'same' if old['correct'] == new['correct'] else 'CHANGED'}")
-
-    # Summary statistics
-    print("\n" + "="*80)
-    print("SUMMARY STATISTICS")
-    print("="*80)
-
-    old_tilth_runs = [r for r in old_runs if r['mode'] == 'tilth' and r['model'] == 'sonnet']
-    new_tilth_runs = [r for r in new_runs if r['mode'] == 'tilth' and r['model'] == 'sonnet']
-
-    def avg(runs, key):
-        values = [r[key] for r in runs if key in r]
-        return sum(values) / len(values) if values else 0
-
-    print(f"\n{'Metric':<30} {'Old (built-in)':>20} {'New (MCP-only)':>20} {'Delta':>15}")
-    print("-" * 90)
-
-    metrics = [
-        ('num_turns', 'Avg turns'),
-        ('num_tool_calls', 'Avg tool calls'),
+def render_markdown(diff, cells):
+    """Render the diff + cell comparison as a markdown report."""
+    old_ver = (
+        f" ({', '.join(diff['old_tilth_versions'])})" if diff["old_tilth_versions"] else ""
+    )
+    new_ver = (
+        f" ({', '.join(diff['new_tilth_versions'])})" if diff["new_tilth_versions"] else ""
+    )
+    parts = [
+        "# tilth bench comparison",
+        f"_old:_ `{diff['old_file']}`{old_ver} → _new:_ `{diff['new_file']}`{new_ver}",
     ]
 
-    for key, label in metrics:
-        old_avg = avg(old_tilth_runs, key)
-        new_avg = avg(new_tilth_runs, key)
-        delta = new_avg - old_avg
-        print(f"{label:<30} {old_avg:>20.2f} {new_avg:>20.2f} {delta:>15.2f}")
+    # Aggregate TL;DR delta
+    if diff["tldr_delta"]:
+        parts.append("\n## Aggregate TL;DR delta\n")
+        for mode in ("baseline", "tilth"):
+            block = diff["tldr_delta"][mode]
+            parts.append(f"\n### {mode}\n")
+            rows = []
+            for metric_key, label, fmt in (
+                ("cost_per_correct", "Cost per correct", fmt_money),
+                ("tokens_per_correct", "Tokens per correct", lambda v: "—" if v is None else f"{v:,}"),
+                ("turns_per_correct", "Turns per correct", lambda v: "—" if v is None else f"{v:.2f}"),
+            ):
+                m = block[metric_key]
+                rows.append([
+                    label,
+                    fmt(m["old"]),
+                    fmt(m["new"]),
+                    fmt_pct_delta(m["old"], m["new"]),
+                ])
+            rows.append([
+                "Correct",
+                f"{block['correct']['old']}/{block['total']['old']}",
+                f"{block['correct']['new']}/{block['total']['new']}",
+                "—",
+            ])
+            parts.append(markdown_table(["Metric", "old", "new", "Δ"], rows))
 
-    # Correctness comparison
-    old_correct = sum(1 for r in old_tilth_runs if r.get('correct'))
-    new_correct = sum(1 for r in new_tilth_runs if r.get('correct'))
+    # Per-cell improvements / regressions
+    if cells["common"]:
+        with_cost = [c for c in cells["common"] if c["cost_delta_pct"] is not None]
+        improvements = sorted(
+            [c for c in with_cost if c["cost_delta_pct"] <= -COST_REGRESSION_THRESHOLD_PCT],
+            key=lambda c: c["cost_delta_pct"],
+        )
+        regressions = sorted(
+            [c for c in with_cost if c["cost_delta_pct"] >= COST_REGRESSION_THRESHOLD_PCT],
+            key=lambda c: -c["cost_delta_pct"],
+        )
 
-    print(f"\n{'Correctness':<30} {old_correct}/{len(old_tilth_runs):>18} {new_correct}/{len(new_tilth_runs):>18} {new_correct - old_correct:>15}")
+        if improvements:
+            parts.append(f"\n## Improvements ({len(improvements)})")
+            parts.append(f"_Cells where new is ≥{COST_REGRESSION_THRESHOLD_PCT:.0f}% cheaper per correct answer._\n")
+            for c in improvements:
+                parts.append(
+                    f"- `{c['task']}` · {c['model']} · {c['mode']}: "
+                    f"{fmt_money(c['old']['cost_per_correct'])} → "
+                    f"{fmt_money(c['new']['cost_per_correct'])} "
+                    f"(**{c['cost_delta_pct']:+.0f}%**)"
+                )
 
-    # Tool mix comparison
-    print("\n" + "="*80)
-    print("TOOL MIX ANALYSIS")
-    print("="*80)
+        if regressions:
+            parts.append(f"\n## Regressions ({len(regressions)})")
+            parts.append(f"_Cells where new is ≥{COST_REGRESSION_THRESHOLD_PCT:.0f}% more expensive per correct answer._\n")
+            for c in regressions:
+                parts.append(
+                    f"- `{c['task']}` · {c['model']} · {c['mode']}: "
+                    f"{fmt_money(c['old']['cost_per_correct'])} → "
+                    f"{fmt_money(c['new']['cost_per_correct'])} "
+                    f"(**{c['cost_delta_pct']:+.0f}%**)"
+                )
 
-    def count_tools(runs):
-        tool_counts = {}
-        for r in runs:
-            for tool, count in r.get('tool_calls', {}).items():
-                tool_counts[tool] = tool_counts.get(tool, 0) + count
-        return tool_counts
+        accuracy_shifts = [
+            c for c in cells["common"]
+            if abs(c["accuracy_delta"]) > 0.01  # >1 percentage-point shift
+        ]
+        if accuracy_shifts:
+            parts.append(f"\n## Accuracy shifts ({len(accuracy_shifts)})\n")
+            for c in sorted(accuracy_shifts, key=lambda x: x["accuracy_delta"]):
+                old_pct = (
+                    c["old"]["correct"] / c["old"]["total"] * 100 if c["old"]["total"] else 0
+                )
+                new_pct = (
+                    c["new"]["correct"] / c["new"]["total"] * 100 if c["new"]["total"] else 0
+                )
+                parts.append(
+                    f"- `{c['task']}` · {c['model']} · {c['mode']}: "
+                    f"{c['old']['correct']}/{c['old']['total']} ({old_pct:.0f}%) → "
+                    f"{c['new']['correct']}/{c['new']['total']} ({new_pct:.0f}%)"
+                )
 
-    old_tools = count_tools(old_tilth_runs)
-    new_tools = count_tools(new_tilth_runs)
+    if cells["old_only"]:
+        parts.append(f"\n## Tasks only in old ({len(cells['old_only'])})\n")
+        for c in cells["old_only"]:
+            parts.append(f"- `{c['task']}` · {c['model']} · {c['mode']}")
+    if cells["new_only"]:
+        parts.append(f"\n## Tasks only in new ({len(cells['new_only'])})\n")
+        for c in cells["new_only"]:
+            parts.append(f"- `{c['task']}` · {c['model']} · {c['mode']}")
 
-    all_tools = sorted(set(list(old_tools.keys()) + list(new_tools.keys())))
+    return "\n".join(parts)
 
-    print(f"\n{'Tool':<40} {'Old':>15} {'New':>15} {'Delta':>15}")
-    print("-" * 90)
 
-    for tool in all_tools:
-        old_count = old_tools.get(tool, 0)
-        new_count = new_tools.get(tool, 0)
-        delta = new_count - old_count
-        print(f"{tool:<40} {old_count:>15} {new_count:>15} {delta:>15}")
+def main():
+    parser = argparse.ArgumentParser(
+        description="Compare two benchmark JSONL files",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("old", type=Path, help="Older / baseline JSONL")
+    parser.add_argument("new", type=Path, help="Newer / candidate JSONL")
+    parser.add_argument("--json", action="store_true", help="Emit JSON instead of markdown")
+    parser.add_argument("-o", "--output", type=Path)
+    args = parser.parse_args()
+
+    for path in (args.old, args.new):
+        if not path.exists():
+            print(f"ERROR: File not found: {path}", file=sys.stderr)
+            sys.exit(1)
+
+    old_runs = load_results(args.old)
+    new_runs = load_results(args.new)
+
+    # Filter to valid runs for the cell comparison (the summary builder
+    # already drops invalid rows internally).
+    old_valid = [r for r in old_runs if "error" not in r and "correct" in r]
+    new_valid = [r for r in new_runs if "error" not in r and "correct" in r]
+
+    old_summary = build_summary_data(old_runs, source_path=str(args.old))
+    new_summary = build_summary_data(new_runs, source_path=str(args.new))
+    diff = compare_summaries(old_summary, new_summary)
+    cells = compare_cells(old_valid, new_valid)
+
+    if args.json:
+        output = json.dumps({"diff": diff, "cells": cells}, indent=2)
+    else:
+        output = render_markdown(diff, cells)
+
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(output)
+        print(f"Comparison written to: {args.output}")
+    else:
+        print(output)
+
 
 if __name__ == "__main__":
     main()

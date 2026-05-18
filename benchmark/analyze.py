@@ -662,6 +662,96 @@ def generate_report(runs, source_path=None):
     return "\n\n".join(s for s in sections if s)
 
 
+def _mode_summary(mode_runs):
+    """Per-mode summary block used by build_summary_data."""
+    correct, total = accuracy(mode_runs)
+    return {
+        "correct": correct,
+        "total": total,
+        "cost_per_correct": cost_per_correct(mode_runs),
+        "tokens_per_correct": tokens_per_correct(mode_runs),
+        "turns_per_correct": turns_per_correct(mode_runs),
+    }
+
+
+def build_summary_data(runs, source_path=None):
+    """Machine-readable summary that mirrors the markdown report.
+
+    Both renderers (markdown via generate_report, JSON via this function)
+    consume the same metric helpers, so the two representations cannot
+    drift. The shape is documented in benchmark/README.md.
+    """
+    valid, error_count = filter_valid(runs)
+
+    metadata = {
+        "source": Path(source_path).name if source_path else None,
+        "valid_runs": len(valid),
+        "error_runs": error_count,
+        "models": sorted({r["model"] for r in valid}),
+        "modes": sorted({r["mode"] for r in valid}),
+        "tasks": sorted({r["task"] for r in valid}),
+        "tilth_versions": sorted({r["tilth_version"] for r in valid if r.get("tilth_version")}),
+        "total_cost_usd": sum(r.get("total_cost_usd", 0) for r in valid),
+        "total_duration_min": sum(r.get("duration_ms", 0) for r in valid) / 1000 / 60,
+        "generated": datetime.now().isoformat(timespec="seconds"),
+    }
+
+    baseline = [r for r in valid if r["mode"] == "baseline"]
+    tilth = [r for r in valid if r["mode"] == "tilth"]
+
+    tldr = None
+    if baseline and tilth:
+        best_pair, best_d, worst_pair, worst_d = find_best_worst_gain(valid)
+        tldr = {
+            "baseline": _mode_summary(baseline),
+            "tilth": _mode_summary(tilth),
+            "best_gain": (
+                {"task": best_pair[0], "model": best_pair[1], "cost_delta_pct": best_d}
+                if best_pair else None
+            ),
+            "worst_gain": (
+                {"task": worst_pair[0], "model": worst_pair[1], "cost_delta_pct": worst_d}
+                if worst_pair else None
+            ),
+        }
+
+    per_model = []
+    for model in sorted({r["model"] for r in valid}):
+        m_runs = [r for r in valid if r["model"] == model]
+        m_base = [r for r in m_runs if r["mode"] == "baseline"]
+        m_tilth = [r for r in m_runs if r["mode"] == "tilth"]
+        if not m_base or not m_tilth:
+            continue
+        per_model.append({
+            "model": model,
+            "baseline": _mode_summary(m_base),
+            "tilth": _mode_summary(m_tilth),
+        })
+
+    failures = []
+    failed_runs = sorted(
+        [r for r in valid if not r.get("correct")],
+        key=lambda r: (r["task"], r["model"], r["mode"], r.get("repetition", 0)),
+    )
+    for f in failed_runs:
+        failures.append({
+            "task": f["task"],
+            "model": f["model"],
+            "mode": f["mode"],
+            "rep": f.get("repetition"),
+            "correctness_reason": f.get("correctness_reason"),
+        })
+
+    return {
+        "metadata": metadata,
+        "tldr": tldr,
+        "per_model": per_model,
+        "accuracy_regressions": find_accuracy_regressions(valid),
+        "cost_regressions": find_cost_regressions(valid),
+        "failures": failures,
+    }
+
+
 def load_results(path):
     with open(path) as f:
         return [json.loads(line) for line in f if line.strip()]
@@ -671,6 +761,11 @@ def main():
     parser = argparse.ArgumentParser(description="Analyze benchmark results")
     parser.add_argument("results_file", type=Path)
     parser.add_argument("-o", "--output", type=Path)
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON instead of markdown.",
+    )
     args = parser.parse_args()
 
     if not args.results_file.exists():
@@ -678,14 +773,18 @@ def main():
         sys.exit(1)
 
     runs = load_results(args.results_file)
-    report = generate_report(runs, source_path=str(args.results_file))
+    if args.json:
+        data = build_summary_data(runs, source_path=str(args.results_file))
+        output = json.dumps(data, indent=2)
+    else:
+        output = generate_report(runs, source_path=str(args.results_file))
 
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(report)
+        args.output.write_text(output)
         print(f"Report written to: {args.output}")
     else:
-        print(report)
+        print(output)
 
 
 if __name__ == "__main__":
