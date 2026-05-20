@@ -184,6 +184,21 @@ pub fn run_deps(
     Ok(search::deps::format_deps(&result, scope, budget_usize))
 }
 
+/// Grok a symbol: return def + doc + callees + callers + siblings + tests in one call.
+///
+/// `target_spec` accepts a bare symbol name (`parse_unified_diff`), a path:line
+/// pair (`src/diff/parse.rs:7`), or a `Type::method` reference.
+pub fn run_grok(target_spec: &str, scope: &Path, full: bool) -> Result<String, TilthError> {
+    let bloom = index::bloom::BloomFilterCache::new();
+    let caps = if full {
+        search::grok::GrokCaps::full()
+    } else {
+        search::grok::GrokCaps::default()
+    };
+    let result = search::grok::grok(target_spec, scope, &bloom, caps)?;
+    Ok(search::grok::format_grok(&result, scope))
+}
+
 fn run_inner(
     query: &str,
     scope: &Path,

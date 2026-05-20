@@ -13,8 +13,8 @@ use crate::timeout::{self, spawn_with_timeout, SpawnFailure, ThreadTracker};
 mod tools;
 
 use tools::{
-    tool_definitions, tool_deps, tool_diff, tool_edit, tool_files, tool_read, tool_search,
-    tool_session,
+    tool_definitions, tool_deps, tool_diff, tool_edit, tool_files, tool_grok, tool_read,
+    tool_search, tool_session,
 };
 
 /// Shared dependencies passed through the request → dispatch pipeline.
@@ -299,6 +299,7 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
         "tilth_search" => tool_search(args, services.cache(), services.session(), services.bloom()),
         "tilth_files" => tool_files(args),
         "tilth_deps" => tool_deps(args, services.bloom()),
+        "tilth_grok" => tool_grok(args, services.bloom()),
         "tilth_diff" => tool_diff(args),
         "tilth_session" => tool_session(args, services.session()),
         "tilth_edit" if edit_mode => tool_edit(args, services.session(), services.bloom()),
@@ -496,8 +497,8 @@ mod tests {
     fn server_instructions_byte_lock() {
         assert_eq!(
             SERVER_INSTRUCTIONS.len(),
-            2952,
-            "SERVER_INSTRUCTIONS byte count drifted from refactor baseline"
+            3466,
+            "SERVER_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(SERVER_INSTRUCTIONS
             .starts_with("tilth — code intelligence MCP server. Replaces grep, cat, find, ls"));
@@ -510,6 +511,10 @@ mod tests {
         assert!(SERVER_INSTRUCTIONS.contains("For multi-symbol lookup, separate each with a comma"));
         assert!(SERVER_INSTRUCTIONS
             .contains("Re-expanding a previously shown definition returns [shown earlier]"));
+        assert!(
+            SERVER_INSTRUCTIONS.contains("tilth_grok: Everything structural about a symbol"),
+            "tilth_grok description must remain in SERVER_INSTRUCTIONS"
+        );
     }
 
     #[test]

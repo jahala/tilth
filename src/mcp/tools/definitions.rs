@@ -144,6 +144,29 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
             }
         }),
         serde_json::json!({
+            "name": "tilth_grok",
+            "description": "Get everything structural about a symbol in one call — definition, body, signature, doc, callees, callers, siblings, tests. Use ONLY for 'understand this symbol' questions. Do NOT use for concept search (use tilth_search) or reading file contents (use tilth_read).",
+            "inputSchema": {
+                "type": "object",
+                "required": ["target"],
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "Symbol name, e.g. 'parse_unified_diff'. Also accepts 'src/diff/parse.rs:7' or 'Type::method'."
+                    },
+                    "scope": {
+                        "type": "string",
+                        "description": "Subdirectory to narrow the search. Default: project root."
+                    },
+                    "full": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Widen caps: 50 callers, 30 callees, 30 siblings, 30 tests (default 5/5/8/8)."
+                    }
+                }
+            }
+        }),
+        serde_json::json!({
             "name": "tilth_diff",
             "description": "Structural diff showing function-level changes. Replaces git diff. Call with no args for uncommitted changes overview.",
             "inputSchema": {
