@@ -60,88 +60,12 @@ impl Services {
 }
 
 // Sent to the LLM via the MCP `instructions` field during initialization.
-// Keeps the strategic guidance from AGENTS.md available to any host.
-const SERVER_INSTRUCTIONS: &str = "\
-tilth — code intelligence MCP server. Replaces grep, cat, find, ls with AST-aware equivalents.\n\
-\n\
-To explore code, always search first. tilth_search finds definitions, usages, and file locations in one call.\n\
-Usage: tilth_search(query: \"handleRequest\").\n\
-tilth_files is ONLY for listing directory contents when you have no symbol or text to search for.\n\
-DO NOT use Read if content is already shown in expanded search results.\n\
-DO NOT use Grep, Read, or Glob. Always use the better tools tilth_search (grep), tilth_read (read), tilth_files (glob).\n\
-\n\
-tilth_search: Search code — finds definitions, usages, and text. Replaces grep/rg for all code search.\n\
-  For multi-symbol lookup, separate each with a comma \"symbol1,symbol2\" (max 5).\n\
-  kind: \"symbol\" (default) | \"content\" (strings/comments) | \"callers\" (call sites)\n\
-  expand (default 2): inline full source for top matches.\n\
-  context: path to file being edited — boosts nearby results.\n\
-  glob: file pattern filter — \"*.rs\" (whitelist), \"!*.test.ts\" (exclude).\n\
-  Output per match:\n\
-    ## <path>:<start>-<end> [definition|usage|impl]\n\
-    <outline context>\n\
-    <expanded source block>\n\
-    ── calls ──\n\
-      <name>  <path>:<start>-<end>  <signature>\n\
-    ── siblings ──\n\
-      <name>  <path>:<start>-<end>  <signature>\n\
-  Re-expanding a previously shown definition returns [shown earlier].\n\
-\n\
-tilth_read: Read file content with smart outlining. Replaces cat/head/tail.\n\
-  Small files → full content. Large files → structural outline.\n\
-  section: \"<start>-<end>\" or \"<heading text>\"\n\
-  sections: array of ranges/headings — multiple slices from the same file in one call.\n\
-  paths: read multiple files in one call.\n\
-  Output:\n\
-    <line_number> │ <content>                  ← full/section mode\n\
-    [<start>-<end>]  <symbol name>             ← outline mode\n\
-\n\
-tilth_files: Find files by glob pattern. Replaces find, ls, pwd, and the host Glob tool.\n\
-  patterns: run multiple globs in one call (e.g. patterns: [\"*.rs\", \"*.toml\"]).\n\
-  Output: <path>  (~<token_count> tokens).\n\
-\n\
-tilth_deps: Blast-radius check — what imports this file and what it imports.\n\
-  Use ONLY before renaming, removing, or changing an export's signature.\n\
-\n\
-tilth_grok: Everything structural about a symbol in one call — def + body + signature + doc + callees + callers + siblings + tests.\n\
-  Usage: tilth_grok(target: \"parse_unified_diff\"). Also accepts \"src/file.rs:7\" or \"Type::method\".\n\
-  scope: narrow when the name is ambiguous. full: widen caps from 5/5/8/8 to 50/30/30/30.\n\
-  Use ONLY for \"understand this symbol\" questions — replaces the search → expand → callers chain.\n\
-  DO NOT use for concept search (use tilth_search) or reading file contents (use tilth_read).\n\
-\n\
-tilth_diff: Structural diff — shows what changed at function level. Replaces Bash(git diff).\n\
-  Usage: tilth_diff(source: \"HEAD~1\") for last commit. No args = uncommitted changes.\n\
-  scope: \"file.rs\" or \"file.rs:fn_name\". log: \"HEAD~5..HEAD\" for per-commit summaries.\n\
-  search: filter to lines matching a term. blast: true to show callers of changed signatures.\n\
-  Output: [+] added, [-] deleted, [~] body changed, [~:sig] signature changed.\n\
-  DO NOT use Bash(git diff) or Bash(git log --patch). Use tilth_diff instead.\n\
-\n\
-To search code, use tilth_search instead of Grep or Bash(grep/rg).\n\
-To read files, use tilth_read instead of Read or Bash(cat).\n\
-To find files, use tilth_files instead of Glob or Bash(find/ls).\n\
-To check what changed, use tilth_diff instead of Bash(git diff/git log).\n\
-DO NOT re-read files already shown in expanded search results.";
-
-const EDIT_MODE_EXTRA: &str = "\n\
-\n\
-tilth_edit: Batch edit one or more files using hash-anchored lines. Replaces the host Edit tool.\n\
-  ALWAYS group edits to multiple files into ONE tilth_edit call (max 20 files). Never call tilth_edit twice in a row.\n\
-  tilth_read → copy anchors (<line>:<hash>) (BOTH line and hash required) → pass to tilth_edit.\n\
-  tilth_search does NOT provide hashes — you MUST tilth_read the file or section first.\n\
-  Shape: {\"files\": [{\"path\": \"a.rs\", \"edits\": [...]}, {\"path\": \"b.rs\", \"edits\": [...]}]}\n\
-  Single file: {\"files\": [{\"path\": \"a.rs\", \"edits\": [{\"start\": \"<line>:<hash>\", \"content\": \"<new code>\"}]}]}\n\
-  Edit forms inside `edits`:\n\
-    Single line: {\"start\": \"<line>:<hash>\", \"content\": \"<new code>\"}\n\
-    Range:       {\"start\": \"<line>:<hash>\", \"end\": \"<line>:<hash>\", \"content\": \"...\"}\n\
-    Delete:      {\"start\": \"<line>:<hash>\", \"content\": \"\"}\n\
-  Per-file results: each file is processed independently. A hash mismatch on one file does NOT block the others.\n\
-  isError is false whenever ≥1 file succeeded — always scan the per-file `## <path>` sections for failures rather than trusting the top-level status.\n\
-  Hash mismatch → file changed, re-read THAT file and retry it (other files in the batch already applied).\n\
-  A parse error on one edit invalidates ALL edits for that file (none applied); retry the whole file's edits after fixing the malformed entry.\n\
-  Each file path may appear at most once per call — group all edits for a file under its single entry.\n\
-  Large files: tilth_read shows outline — use section to get hashlined content.\n\
-  Pass diff: true to see a compact before/after diff per file.\n\
-  After editing a function signature, tilth_edit shows callers that may need updating.\n\
-DO NOT use the host Edit tool. Use tilth_edit for all edits.";
+// The strings live in prompts/mcp-base.md and prompts/mcp-edit.md so they can
+// be versioned and rendered as Markdown. AGENTS.md is regenerated from the
+// same files via scripts/regen-agents-md.sh, keeping the human-facing copy in
+// lockstep with what MCP hosts receive in the `instructions` field.
+const SERVER_INSTRUCTIONS: &str = include_str!("../../prompts/mcp-base.md");
+const EDIT_MODE_EXTRA: &str = include_str!("../../prompts/mcp-edit.md");
 
 /// MCP server over stdio. When `edit_mode` is true, exposes `tilth_edit` and
 /// switches `tilth_read` to hashline output format.
@@ -560,5 +484,67 @@ mod tests {
         let root_canon = root.unwrap().canonicalize().unwrap();
         let expected_canon = project_path.canonicalize().unwrap();
         assert_eq!(root_canon, expected_canon);
+    }
+
+    // -- prompt extraction byte locks ------------------------------------------
+    //
+    // These tests pin the MCP `instructions` strings to their pre-refactor byte
+    // shapes so the prompts/*.md extraction is provably a no-op. They flag
+    // future drift loudly: any prompt edit must update both the markdown source
+    // and the assertions below.
+
+    #[test]
+    fn server_instructions_byte_lock() {
+        assert_eq!(
+            SERVER_INSTRUCTIONS.len(),
+            3466,
+            "SERVER_INSTRUCTIONS byte count drifted from baseline"
+        );
+        assert!(SERVER_INSTRUCTIONS
+            .starts_with("tilth — code intelligence MCP server. Replaces grep, cat, find, ls"));
+        assert!(SERVER_INSTRUCTIONS
+            .ends_with("DO NOT re-read files already shown in expanded search results."));
+        assert!(
+            !SERVER_INSTRUCTIONS.contains("\n\n\n"),
+            "SERVER_INSTRUCTIONS must not introduce triple newlines (likely a trailing-newline drift in prompts/mcp-base.md)"
+        );
+        assert!(SERVER_INSTRUCTIONS.contains("For multi-symbol lookup, separate each with a comma"));
+        assert!(SERVER_INSTRUCTIONS
+            .contains("Re-expanding a previously shown definition returns [shown earlier]"));
+        assert!(
+            SERVER_INSTRUCTIONS.contains("tilth_grok: Everything structural about a symbol"),
+            "tilth_grok description must remain in SERVER_INSTRUCTIONS"
+        );
+    }
+
+    #[test]
+    fn edit_mode_extra_byte_lock() {
+        assert_eq!(
+            EDIT_MODE_EXTRA.len(),
+            1724,
+            "EDIT_MODE_EXTRA byte count drifted from refactor baseline"
+        );
+        assert!(
+            EDIT_MODE_EXTRA.starts_with("\n\ntilth_edit: Batch edit"),
+            "EDIT_MODE_EXTRA must keep its leading blank-line separator so format!(\"{{S}}{{E}}\") emits one blank line between sections"
+        );
+        assert!(EDIT_MODE_EXTRA
+            .ends_with("DO NOT use the host Edit tool. Use tilth_edit for all edits."));
+        assert!(
+            !EDIT_MODE_EXTRA.contains("\n\n\n"),
+            "EDIT_MODE_EXTRA must not introduce triple newlines"
+        );
+        assert!(EDIT_MODE_EXTRA.contains("(BOTH line and hash required)"));
+    }
+
+    #[test]
+    fn instructions_compose_with_single_blank_line_between_sections() {
+        // Pre-refactor: format!("{S}{E}") relied on EDIT_MODE_EXTRA's leading
+        // "\n\n" to produce one blank line between the base and edit sections.
+        // This asserts the composition still has that shape.
+        let combined = format!("{SERVER_INSTRUCTIONS}{EDIT_MODE_EXTRA}");
+        assert!(combined.contains(
+            "DO NOT re-read files already shown in expanded search results.\n\ntilth_edit: Batch edit"
+        ));
     }
 }

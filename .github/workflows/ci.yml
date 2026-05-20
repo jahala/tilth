@@ -23,3 +23,17 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy -- -D warnings
       - run: cargo test
+
+  markdown:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6
+      - uses: nosborn/github-action-markdown-cli@9b5e871c11cc0649c5ac2526af22e23525fa344d # ratchet:nosborn/github-action-markdown-cli@v3.3.0
+        with:
+          files: prompts/ AGENTS.md
+          config_file: .markdownlint.json
+      - name: AGENTS.md is regenerated from prompts/
+        # Re-running the regen script must be a no-op. If AGENTS.md drifts from
+        # prompts/*.md (someone edited the markdown but forgot to re-run the
+        # script), this step fails and surfaces the missing regen in the PR.
+        run: bash ./scripts/regen-agents-md.sh && git diff --exit-code AGENTS.md
