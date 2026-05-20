@@ -68,7 +68,8 @@ Edit forms inside `edits`:
 Single line: {"start": "<line>:<hash>", "content": "<new code>"}
 Range:       {"start": "<line>:<hash>", "end": "<line>:<hash>", "content": "..."}
 Delete:      {"start": "<line>:<hash>", "content": ""}
-Per-file results: each file is processed independently. A hash mismatch on one file does NOT block the others.
+Creating a new file: {"path": "new.rs", "create": true, "content": "<full file body>"} — `create` and `content` at file level, NOT inside `edits`. Fails atomically if the file exists. Parent dirs auto-created. To modify an existing file, use `edits` with hash anchors instead.
+Per-file results: each file is processed independently. A hash mismatch or create-already-exists on one file does NOT block the others.
 isError is false whenever ≥1 file succeeded — always scan the per-file `## <path>` sections for failures rather than trusting the top-level status.
 Hash mismatch → file changed, re-read THAT file and retry it (other files in the batch already applied).
 A parse error on one edit invalidates ALL edits for that file (none applied); retry the whole file's edits after fixing the malformed entry.

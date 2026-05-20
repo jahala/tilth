@@ -1,5 +1,6 @@
 use std::fmt::Write as _;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -22,9 +23,13 @@ pub struct Edit {
 /// One file's worth of work for a batch `tilth_edit`. Parse errors are deferred
 /// onto the task so a malformed entry surfaces as a per-file failure instead of
 /// aborting the whole batch.
+///
+/// `Create` is structurally separate from `Ready` because creating a file has
+/// no anchor-and-replace semantics — there's no existing content to hash.
 #[derive(Debug)]
 pub enum FileEditTask {
     Ready { path: PathBuf, edits: Vec<Edit> },
+    Create { path: PathBuf, content: String },
     ParseError { label: String, msg: String },
 }
 
@@ -267,6 +272,71 @@ fn apply_edits(path: &Path, edits: &[Edit]) -> Result<EditResult, TilthError> {
     Ok(EditResult::Applied { diff, context })
 }
 
+/// Create a new file with the given content.
+///
+/// Atomic via `OpenOptions::create_new(true)` (OS-level `O_CREAT|O_EXCL`) — if
+/// the file already exists the OS rejects the open before any bytes are
+/// written, eliminating the read-then-write TOCTOU window. Two concurrent
+/// callers racing the same path produce exactly one winner; the other gets a
+/// clean `AlreadyExists` error.
+///
+/// Parent directories are auto-created with `fs::create_dir_all`, which is
+/// idempotent if the directory already exists.
+///
+/// Returns an `EditResult::Applied` with:
+///   - `diff`: a single-line `[+]` marker so the per-file response makes the
+///     create operation visible. Not a multi-line `+` block because the whole
+///     file is new — the agent gets the full content via `context` instead.
+///   - `context`: hashlined content of the new file, so the agent can drive a
+///     follow-up `tilth_edit` against the file without first calling
+///     `tilth_read`.
+fn create_file(path: &Path, content: &str) -> Result<EditResult, TilthError> {
+    // Auto-create parent dirs. `parent()` of `"new.rs"` is `Some("")`, which
+    // `create_dir_all` would error on, so skip when empty.
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|e| TilthError::IoError {
+                path: parent.to_path_buf(),
+                source: e,
+            })?;
+        }
+    }
+
+    // Atomic O_CREAT|O_EXCL — fails loudly with ErrorKind::AlreadyExists if
+    // the file already exists. No silent overwrite. On Linux/macOS this is
+    // O_EXCL semantics (does NOT follow symlinks — a symlink at `path` causes
+    // EEXIST, mapped to AlreadyExists); on Windows it's CREATE_NEW with the
+    // same atomicity.
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::AlreadyExists => TilthError::AlreadyExists {
+                path: path.to_path_buf(),
+            },
+            std::io::ErrorKind::PermissionDenied => TilthError::PermissionDenied {
+                path: path.to_path_buf(),
+            },
+            _ => TilthError::IoError {
+                path: path.to_path_buf(),
+                source: e,
+            },
+        })?;
+
+    file.write_all(content.as_bytes())
+        .map_err(|e| TilthError::IoError {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+
+    let context = crate::format::hashlines(content, 1);
+    Ok(EditResult::Applied {
+        diff: "[+] (file created)".into(),
+        context,
+    })
+}
+
 /// Format per-edit diffs as compact `-`/`+` blocks with hashline anchors.
 fn format_diffs(diffs: &[EditDiff]) -> String {
     if diffs.is_empty() {
@@ -395,13 +465,15 @@ pub(crate) fn detect_duplicate_paths(tasks: &[FileEditTask]) -> Option<String> {
     use std::collections::HashSet;
     let mut seen: HashSet<String> = HashSet::new();
     for task in tasks {
-        if let FileEditTask::Ready { path, .. } = task {
-            if !seen.insert(normalize_path_key(path)) {
-                return Some(format!(
-                    "duplicate file path in batch: {} — group all edits for a file under one entry",
-                    path.display()
-                ));
-            }
+        let path = match task {
+            FileEditTask::Ready { path, .. } | FileEditTask::Create { path, .. } => path,
+            FileEditTask::ParseError { .. } => continue,
+        };
+        if !seen.insert(normalize_path_key(path)) {
+            return Some(format!(
+                "duplicate file path in batch: {} — group all edits for a file under one entry",
+                path.display()
+            ));
         }
     }
     None
@@ -416,8 +488,9 @@ pub(crate) fn detect_duplicate_paths(tasks: &[FileEditTask]) -> Option<String> {
 /// matches the input `tasks` — rayon's `par_iter().collect()` preserves
 /// index order even though execution order is not deterministic.
 ///
-/// Rejects the whole batch up front when two `Ready` tasks resolve to the
-/// same canonical path so workers cannot race writes against the same file.
+/// Rejects the whole batch up front when two tasks (Ready or Create)
+/// resolve to the same canonical path so workers cannot race writes against
+/// the same file.
 pub fn apply_batch(
     tasks: Vec<FileEditTask>,
     bloom: &Arc<BloomFilterCache>,
@@ -450,17 +523,55 @@ pub fn apply_batch(
 /// Process one task into a `(section, success)` tuple. Kept separate so the
 /// parallel closure stays trivial and per-file logic is testable in isolation.
 fn apply_one(task: FileEditTask, bloom: &BloomFilterCache, show_diff: bool) -> (String, bool) {
-    let (path, edits) = match task {
-        FileEditTask::ParseError { label, msg } => {
-            return (format!("## {label}\nerror: {msg}"), false);
+    match task {
+        FileEditTask::ParseError { label, msg } => (format!("## {label}\nerror: {msg}"), false),
+        FileEditTask::Ready { path, edits } => {
+            let header = format!("## {}", path.display());
+            match render_applied(&path, &edits, bloom, show_diff) {
+                Ok(body) if body.is_empty() => (header, true),
+                Ok(body) => (format!("{header}\n{body}"), true),
+                Err(msg) => (format!("{header}\n{msg}"), false),
+            }
         }
-        FileEditTask::Ready { path, edits } => (path, edits),
-    };
-    let header = format!("## {}", path.display());
-    match render_applied(&path, &edits, bloom, show_diff) {
-        Ok(body) if body.is_empty() => (header, true),
-        Ok(body) => (format!("{header}\n{body}"), true),
-        Err(msg) => (format!("{header}\n{msg}"), false),
+        FileEditTask::Create { path, content } => {
+            let header = format!("## {}", path.display());
+            match render_created(&path, &content, show_diff) {
+                Ok(body) if body.is_empty() => (header, true),
+                Ok(body) => (format!("{header}\n{body}"), true),
+                Err(msg) => (format!("{header}\n{msg}"), false),
+            }
+        }
+    }
+}
+
+/// Wrap [`create_file`] with the same `(diff?, context)` rendering as
+/// [`render_applied`] so the per-file Markdown section reads consistently
+/// across edit and create operations.
+///
+/// The `[+] (file created)` marker is emitted unconditionally — unlike
+/// `render_applied`'s diff (gated on `show_diff`), the create marker is the
+/// only confirmation the operation ran. An empty-content (`touch`) create
+/// would otherwise produce a header-only response indistinguishable from a
+/// no-op.
+///
+/// No blast-radius check: a brand-new file has no existing callers to
+/// inform. [`render_applied`] runs blast-radius after applying anchor edits;
+/// the equivalent for Create is a no-op by construction.
+fn render_created(path: &Path, content: &str, show_diff: bool) -> Result<String, String> {
+    match create_file(path, content).map_err(|e| e.to_string())? {
+        EditResult::Applied { diff, context } => {
+            let mut output = String::new();
+            output.push_str(&diff);
+            if !content.is_empty() {
+                output.push('\n');
+                output.push_str(&context);
+            }
+            let _ = show_diff; // Marker is unconditional; flag is accepted for API symmetry.
+            Ok(output)
+        }
+        EditResult::HashMismatch(_) => {
+            unreachable!("create_file never returns HashMismatch — there are no hashes to mismatch")
+        }
     }
 }
 
@@ -1171,5 +1282,238 @@ mod tests {
         assert!(err.contains("duplicate file path"), "unexpected: {err}");
         // File must be untouched — no worker ran.
         assert_eq!(std::fs::read_to_string(&a).unwrap(), "x\n");
+    }
+
+    // ── create_file ────────────────────────────────────────────────────────
+
+    #[test]
+    fn create_file_writes_content_to_new_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new.rs");
+        let content = "fn main() {}\n";
+
+        let result = create_file(&path, content).expect("create should succeed");
+        match result {
+            EditResult::Applied { diff, context } => {
+                assert!(diff.contains("[+]"), "diff should mark create: {diff}");
+                assert!(
+                    context.contains("|fn main() {}"),
+                    "context must hashline the new content: {context}"
+                );
+            }
+            EditResult::HashMismatch(_) => panic!("create cannot produce HashMismatch"),
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+    }
+
+    #[test]
+    fn create_file_fails_when_path_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("exists.rs");
+        std::fs::write(&path, "original").unwrap();
+
+        let err =
+            create_file(&path, "overwrite attempt").expect_err("create on existing path must fail");
+        assert!(
+            matches!(err, TilthError::AlreadyExists { .. }),
+            "expected AlreadyExists, got: {err:?}"
+        );
+        // Original content untouched.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "original");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn create_file_fails_when_path_is_dangling_symlink() {
+        // On Linux/macOS, O_CREAT|O_EXCL does NOT follow symlinks — a symlink
+        // at the target path causes EEXIST (the symlink itself exists). The
+        // error surfaces as AlreadyExists, matching the regular-file collision
+        // case so the agent gets a consistent typed error.
+        let dir = tempfile::tempdir().unwrap();
+        let dangling_target = dir.path().join("does_not_exist.rs");
+        let symlink_path = dir.path().join("link.rs");
+        std::os::unix::fs::symlink(&dangling_target, &symlink_path).unwrap();
+
+        let err = create_file(&symlink_path, "via dangling symlink")
+            .expect_err("create through dangling symlink must fail atomically");
+        assert!(
+            matches!(err, TilthError::AlreadyExists { .. }),
+            "expected AlreadyExists for dangling symlink, got: {err:?}"
+        );
+        // The dangling target must not have been created.
+        assert!(!dangling_target.exists());
+    }
+
+    #[test]
+    fn create_file_creates_parent_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a/b/c/deep.rs");
+        assert!(
+            !path.parent().unwrap().exists(),
+            "parent must not pre-exist"
+        );
+
+        create_file(&path, "deep\n").expect("create should auto-mkdir");
+        assert!(path.exists());
+        assert!(path.parent().unwrap().is_dir());
+    }
+
+    #[test]
+    fn create_file_accepts_empty_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("touched");
+
+        create_file(&path, "").expect("empty content = touch");
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.len(), 0);
+    }
+
+    #[test]
+    fn create_file_returns_hashlined_output_for_followup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("followup.rs");
+        let content = "line one\nline two\n";
+
+        let result = create_file(&path, content).expect("create should succeed");
+        let context = match result {
+            EditResult::Applied { context, .. } => context,
+            EditResult::HashMismatch(_) => panic!("unreachable"),
+        };
+
+        // The hashlined context must contain anchors that an immediate
+        // follow-up tilth_edit could parse via format::parse_anchor.
+        let first_line = context.lines().next().expect("at least one hashline");
+        let anchor_end = first_line
+            .find('|')
+            .expect("hashline format is `<n>:<hash>|<content>`");
+        let anchor = &first_line[..anchor_end];
+        let (line_num, hash) = format::parse_anchor(anchor)
+            .expect("create's context must be parseable as an edit anchor");
+        assert_eq!(line_num, 1, "first hashline starts at line 1");
+        assert_eq!(hash, format::line_hash(b"line one"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn create_file_rejects_permission_denied_as_typed_error() {
+        // Verifies the io::Error → TilthError mapping: PermissionDenied
+        // ErrorKind becomes TilthError::PermissionDenied (not IoError).
+        // Induces real PermissionDenied via chmod inside a tempdir — Unix-only
+        // because Windows' permission model is not chmod-based.
+        let dir = tempfile::tempdir().unwrap();
+        let readonly_dir = dir.path().join("ro");
+        std::fs::create_dir(&readonly_dir).unwrap();
+        let mut perms = std::fs::metadata(&readonly_dir).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o555);
+        std::fs::set_permissions(&readonly_dir, perms).unwrap();
+
+        let path = readonly_dir.join("blocked.rs");
+        let err = create_file(&path, "x").expect_err("readonly parent must reject");
+        assert!(
+            matches!(err, TilthError::PermissionDenied { .. }),
+            "expected PermissionDenied, got: {err:?}"
+        );
+
+        // Restore perms so the tempdir cleanup can remove the directory.
+        let mut perms = std::fs::metadata(&readonly_dir).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&readonly_dir, perms).unwrap();
+    }
+
+    // ── apply_batch integration with Create ───────────────────────────────
+
+    #[test]
+    fn batch_mixes_create_and_replace_in_one_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("existing.txt");
+        std::fs::write(&existing, "old\n").unwrap();
+        let h = hash_at("old\n", 1);
+
+        let new_path = dir.path().join("new.txt");
+
+        let tasks = vec![
+            ready_task(
+                existing.clone(),
+                vec![Edit {
+                    start_line: 1,
+                    start_hash: h,
+                    end_line: 1,
+                    end_hash: h,
+                    content: "NEW".into(),
+                }],
+            ),
+            FileEditTask::Create {
+                path: new_path.clone(),
+                content: "created\n".into(),
+            },
+        ];
+
+        let output = apply_batch(tasks, &fresh_bloom(), false)
+            .expect("mixed batch should succeed when both files succeed");
+        assert!(output.contains("existing.txt"));
+        assert!(output.contains("new.txt"));
+        assert_eq!(std::fs::read_to_string(&existing).unwrap(), "NEW\n");
+        assert_eq!(std::fs::read_to_string(&new_path).unwrap(), "created\n");
+    }
+
+    #[test]
+    fn batch_continues_when_one_create_already_exists() {
+        // Best-effort semantic: a create that fails because the file exists
+        // must not block sibling files in the same batch.
+        let dir = tempfile::tempdir().unwrap();
+        let preexisting = dir.path().join("collision.txt");
+        std::fs::write(&preexisting, "original\n").unwrap();
+
+        let fresh = dir.path().join("ok.txt");
+
+        let tasks = vec![
+            FileEditTask::Create {
+                path: preexisting.clone(),
+                content: "would overwrite".into(),
+            },
+            FileEditTask::Create {
+                path: fresh.clone(),
+                content: "this one succeeds\n".into(),
+            },
+        ];
+
+        let output = apply_batch(tasks, &fresh_bloom(), false)
+            .expect("at least one success should yield Ok");
+        // First file: original untouched.
+        assert_eq!(std::fs::read_to_string(&preexisting).unwrap(), "original\n");
+        // Second file: created.
+        assert_eq!(
+            std::fs::read_to_string(&fresh).unwrap(),
+            "this one succeeds\n"
+        );
+        // Per-file sections must mention both paths.
+        assert!(output.contains("collision.txt"));
+        assert!(output.contains("ok.txt"));
+    }
+
+    #[test]
+    fn duplicate_create_paths_rejected_before_dispatch() {
+        // The dedup gate must cover Create variants — racing two creates of
+        // the same path inside one batch would otherwise rely on O_EXCL's
+        // arbitration, and the loser's error message would be confusing.
+        // Reject the whole batch up front instead.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("twice.rs");
+
+        let tasks = vec![
+            FileEditTask::Create {
+                path: path.clone(),
+                content: "first".into(),
+            },
+            FileEditTask::Create {
+                path: path.clone(),
+                content: "second".into(),
+            },
+        ];
+
+        let err = apply_batch(tasks, &fresh_bloom(), false)
+            .expect_err("duplicate Create paths must reject");
+        assert!(err.contains("duplicate file path"), "unexpected: {err}");
+        assert!(!path.exists(), "no worker should have run");
     }
 }

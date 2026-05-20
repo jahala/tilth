@@ -222,7 +222,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
     if edit_mode {
         tools.push(serde_json::json!({
             "name": "tilth_edit",
-            "description": "Batch edit one or more files in one call using hashline anchors from tilth_read. ALWAYS group edits to multiple files into a single tilth_edit call — never call tilth_edit twice in a row. Each file is processed independently (best-effort): a hash mismatch on one file does not block the others; results are reported per file. Partial success returns isError: false — scan the per-file `## <path>` sections for failures rather than trusting the top-level status. A parse error on one edit invalidates ALL edits for that file (none applied); retry the whole file after fixing the malformed entry. Each file path may appear at most once per call. Max 20 files per call.",
+            "description": "Batch edit one or more files in one call. Two shapes per file entry, mutually exclusive: (1) modify existing file via hashline anchors from tilth_read, OR (2) create a new file with `create: true` + `content`. ALWAYS group edits to multiple files into a single tilth_edit call — never call tilth_edit twice in a row. Each file is processed independently (best-effort): a hash mismatch or create-already-exists error on one file does not block the others; results are reported per file. Partial success returns isError: false — scan the per-file `## <path>` sections for failures rather than trusting the top-level status. A parse error on one edit invalidates ALL edits for that file (none applied); retry the whole file after fixing the malformed entry. Each file path may appear at most once per call. Max 20 files per call.",
             "inputSchema": {
                 "type": "object",
                 "required": ["files"],
@@ -231,19 +231,19 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "type": "array",
                         "minItems": 1,
                         "maxItems": 20,
-                        "description": "One entry per file. Use a single-element array for a single-file edit. Each path must be unique within the call.",
+                        "description": "One entry per file. Use a single-element array for a single-file edit. Each path must be unique within the call. Each entry has one of two shapes: edit (path + edits) or create (path + create: true + content).",
                         "items": {
                             "type": "object",
-                            "required": ["path", "edits"],
+                            "required": ["path"],
                             "properties": {
                                 "path": {
                                     "type": "string",
-                                    "description": "Absolute or relative file path to edit."
+                                    "description": "Absolute or relative file path."
                                 },
                                 "edits": {
                                     "type": "array",
                                     "minItems": 1,
-                                    "description": "Edit operations for this file, applied atomically per file.",
+                                    "description": "Edit shape: anchor-based modifications to an existing file. Applied atomically per file. Mutually exclusive with create+content.",
                                     "items": {
                                         "type": "object",
                                         "required": ["start", "content"],
@@ -262,6 +262,15 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                                             }
                                         }
                                     }
+                                },
+                                "create": {
+                                    "type": "boolean",
+                                    "default": false,
+                                    "description": "Create shape: set true to create a new file at `path`. Requires `content`, forbids `edits`. Fails atomically (no overwrite) if the file already exists. Parent directories are auto-created."
+                                },
+                                "content": {
+                                    "type": "string",
+                                    "description": "Full file body for create shape. Used only when `create: true`. Empty string creates an empty file (touch)."
                                 }
                             }
                         }

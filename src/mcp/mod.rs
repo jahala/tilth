@@ -521,8 +521,8 @@ mod tests {
     fn edit_mode_extra_byte_lock() {
         assert_eq!(
             EDIT_MODE_EXTRA.len(),
-            1724,
-            "EDIT_MODE_EXTRA byte count drifted from refactor baseline"
+            2028,
+            "EDIT_MODE_EXTRA byte count drifted from baseline"
         );
         assert!(
             EDIT_MODE_EXTRA.starts_with("\n\ntilth_edit: Batch edit"),
@@ -535,6 +535,10 @@ mod tests {
             "EDIT_MODE_EXTRA must not introduce triple newlines"
         );
         assert!(EDIT_MODE_EXTRA.contains("(BOTH line and hash required)"));
+        assert!(
+            EDIT_MODE_EXTRA.contains("Creating a new file:"),
+            "tilth_edit `create: true` documentation must remain in EDIT_MODE_EXTRA"
+        );
     }
 
     #[test]
