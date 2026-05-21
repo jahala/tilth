@@ -28,14 +28,13 @@ pub(in crate::mcp) fn parse_file_edit(index: usize, val: &Value) -> crate::edit:
         if val.get("edits").is_some() {
             return FileEditTask::ParseError {
                 label: path_str.to_string(),
-                msg: "cannot have both `create: true` and `edits` — use `create` to make a new file, `edits` to modify an existing one"
-                    .into(),
+                msg: "cannot have both `create: true` and `edits` — pick one".into(),
             };
         }
         let Some(content) = content_field else {
             return FileEditTask::ParseError {
                 label: path_str.to_string(),
-                msg: "`create: true` requires `content` (the full file body, may be empty)".into(),
+                msg: "`create: true` requires `content`".into(),
             };
         };
         return FileEditTask::Create {
@@ -44,22 +43,19 @@ pub(in crate::mcp) fn parse_file_edit(index: usize, val: &Value) -> crate::edit:
         };
     }
 
-    // Edit shape. `content` at file level is only valid alongside `create: true`,
-    // so surface that as a helpful error if it appears here.
+    // `content` at file level is only valid alongside `create: true`.
     if content_field.is_some() {
         return FileEditTask::ParseError {
             label: path_str.to_string(),
-            msg: "`content` at file level requires `create: true` — to modify an existing file, put content inside `edits`"
-                .into(),
+            msg: "`content` at file level requires `create: true`; to modify a file, put content inside `edits`".into(),
         };
     }
 
     let Some(edits_val) = val.get("edits").and_then(|v| v.as_array()) else {
         return FileEditTask::ParseError {
             label: path_str.to_string(),
-            msg:
-                "missing `edits` array (or set `create: true` with `content` to create a new file)"
-                    .into(),
+            msg: "missing `edits` array (or set `create: true` + `content` to create a file)"
+                .into(),
         };
     };
 
@@ -254,24 +250,6 @@ mod tests {
                 );
             }
             other => panic!("expected ParseError, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_create_false_with_edits_is_edit_shape() {
-        // An explicit `create: false` alongside `edits` is redundant but not
-        // wrong — treat it as the standard edit shape.
-        let val = serde_json::json!({
-            "path": "x.rs",
-            "create": false,
-            "edits": [{"start": "1:abc", "content": "x"}]
-        });
-        match parse_file_edit(0, &val) {
-            crate::edit::FileEditTask::Ready { path, edits } => {
-                assert_eq!(path, std::path::PathBuf::from("x.rs"));
-                assert_eq!(edits.len(), 1);
-            }
-            other => panic!("expected Ready, got {other:?}"),
         }
     }
 

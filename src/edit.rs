@@ -274,25 +274,17 @@ fn apply_edits(path: &Path, edits: &[Edit]) -> Result<EditResult, TilthError> {
 
 /// Create a new file with the given content.
 ///
-/// Atomic via `OpenOptions::create_new(true)` (OS-level `O_CREAT|O_EXCL`) — if
-/// the file already exists the OS rejects the open before any bytes are
-/// written, eliminating the read-then-write TOCTOU window. Two concurrent
-/// callers racing the same path produce exactly one winner; the other gets a
-/// clean `AlreadyExists` error.
+/// Atomic via `OpenOptions::create_new(true)` — `O_CREAT|O_EXCL` on
+/// Linux/macOS (does NOT follow symlinks), `CREATE_NEW` on Windows. Eliminates
+/// the read-then-write TOCTOU window and arbitrates concurrent creates of the
+/// same path: one wins, the other gets `AlreadyExists`. Parent directories are
+/// auto-created (`fs::create_dir_all` is idempotent).
 ///
-/// Parent directories are auto-created with `fs::create_dir_all`, which is
-/// idempotent if the directory already exists.
-///
-/// Returns an `EditResult::Applied` with:
-///   - `diff`: a single-line `[+]` marker so the per-file response makes the
-///     create operation visible. Not a multi-line `+` block because the whole
-///     file is new — the agent gets the full content via `context` instead.
-///   - `context`: hashlined content of the new file, so the agent can drive a
-///     follow-up `tilth_edit` against the file without first calling
-///     `tilth_read`.
+/// Returns `EditResult::Applied { diff, context }` where `diff` is a single
+/// `[+] (file created)` marker and `context` is the hashlined new file — the
+/// agent can immediately drive a follow-up `tilth_edit` without re-reading.
 fn create_file(path: &Path, content: &str) -> Result<EditResult, TilthError> {
-    // Auto-create parent dirs. `parent()` of `"new.rs"` is `Some("")`, which
-    // `create_dir_all` would error on, so skip when empty.
+    // Skip when parent is `""` (path like `"new.rs"`) — create_dir_all errors on empty.
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent).map_err(|e| TilthError::IoError {
@@ -302,11 +294,6 @@ fn create_file(path: &Path, content: &str) -> Result<EditResult, TilthError> {
         }
     }
 
-    // Atomic O_CREAT|O_EXCL — fails loudly with ErrorKind::AlreadyExists if
-    // the file already exists. No silent overwrite. On Linux/macOS this is
-    // O_EXCL semantics (does NOT follow symlinks — a symlink at `path` causes
-    // EEXIST, mapped to AlreadyExists); on Windows it's CREATE_NEW with the
-    // same atomicity.
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -535,7 +522,7 @@ fn apply_one(task: FileEditTask, bloom: &BloomFilterCache, show_diff: bool) -> (
         }
         FileEditTask::Create { path, content } => {
             let header = format!("## {}", path.display());
-            match render_created(&path, &content, show_diff) {
+            match render_created(&path, &content) {
                 Ok(body) if body.is_empty() => (header, true),
                 Ok(body) => (format!("{header}\n{body}"), true),
                 Err(msg) => (format!("{header}\n{msg}"), false),
@@ -544,33 +531,22 @@ fn apply_one(task: FileEditTask, bloom: &BloomFilterCache, show_diff: bool) -> (
     }
 }
 
-/// Wrap [`create_file`] with the same `(diff?, context)` rendering as
-/// [`render_applied`] so the per-file Markdown section reads consistently
-/// across edit and create operations.
-///
-/// The `[+] (file created)` marker is emitted unconditionally — unlike
-/// `render_applied`'s diff (gated on `show_diff`), the create marker is the
-/// only confirmation the operation ran. An empty-content (`touch`) create
-/// would otherwise produce a header-only response indistinguishable from a
-/// no-op.
-///
-/// No blast-radius check: a brand-new file has no existing callers to
-/// inform. [`render_applied`] runs blast-radius after applying anchor edits;
-/// the equivalent for Create is a no-op by construction.
-fn render_created(path: &Path, content: &str, show_diff: bool) -> Result<String, String> {
+/// Render a create as the same Markdown shape as an edit. The `[+] (file
+/// created)` marker is unconditional — an empty-content (touch) create would
+/// otherwise produce a header-only response indistinguishable from a no-op.
+/// No blast-radius check: a brand-new file has no existing callers.
+fn render_created(path: &Path, content: &str) -> Result<String, String> {
     match create_file(path, content).map_err(|e| e.to_string())? {
         EditResult::Applied { diff, context } => {
-            let mut output = String::new();
-            output.push_str(&diff);
+            let mut output = diff;
             if !content.is_empty() {
                 output.push('\n');
                 output.push_str(&context);
             }
-            let _ = show_diff; // Marker is unconditional; flag is accepted for API symmetry.
             Ok(output)
         }
         EditResult::HashMismatch(_) => {
-            unreachable!("create_file never returns HashMismatch — there are no hashes to mismatch")
+            unreachable!("create_file never returns HashMismatch")
         }
     }
 }
@@ -1325,10 +1301,8 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn create_file_fails_when_path_is_dangling_symlink() {
-        // On Linux/macOS, O_CREAT|O_EXCL does NOT follow symlinks — a symlink
-        // at the target path causes EEXIST (the symlink itself exists). The
-        // error surfaces as AlreadyExists, matching the regular-file collision
-        // case so the agent gets a consistent typed error.
+        // O_EXCL does not follow symlinks — a symlink at the target causes
+        // EEXIST and maps to AlreadyExists, never silently writing the target.
         let dir = tempfile::tempdir().unwrap();
         let dangling_target = dir.path().join("does_not_exist.rs");
         let symlink_path = dir.path().join("link.rs");
@@ -1340,7 +1314,6 @@ mod tests {
             matches!(err, TilthError::AlreadyExists { .. }),
             "expected AlreadyExists for dangling symlink, got: {err:?}"
         );
-        // The dangling target must not have been created.
         assert!(!dangling_target.exists());
     }
 
