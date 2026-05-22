@@ -11,7 +11,7 @@ use crate::lang::detect_file_type;
 use crate::lang::outline::{extract_import_source, get_outline_entries};
 use crate::read::imports::{is_external, is_import_line, resolve_related_files_with_content};
 use crate::search::callees::{extract_callee_names, resolve_callees};
-use crate::search::callers::find_callers_batch_default;
+use crate::search::callers::find_callers_batch;
 use crate::types::{FileType, OutlineKind};
 
 /// Maximum number of exported symbols to search for in the reverse direction.
@@ -172,7 +172,13 @@ pub fn analyze_deps(
 
     let mut used_by = if searched_count > 0 {
         let symbols_set: HashSet<String> = all_names.iter().cloned().collect();
-        let raw_matches = find_callers_batch_default(&symbols_set, scope, bloom, None)?;
+        let raw_matches = find_callers_batch(
+            &symbols_set,
+            scope,
+            bloom,
+            None,
+            crate::search::callers::BATCH_EARLY_QUIT,
+        )?;
 
         // Group by file path
         let mut by_file: HashMap<PathBuf, Vec<(String, String, u32)>> = HashMap::new();

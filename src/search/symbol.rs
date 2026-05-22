@@ -20,13 +20,19 @@ use grep_regex::RegexMatcher;
 use grep_searcher::sinks::UTF8;
 use grep_searcher::Searcher;
 
-use super::{FULL_EARLY_QUIT_THRESHOLD, FULL_MAX_MATCHES};
-
 const MAX_MATCHES: usize = 10;
 /// Stop walking once we have this many raw definition matches.
 const EARLY_QUIT_THRESHOLD_DEFINITIONS: usize = 50;
 /// Stop walking once we have this many raw usage matches.
 const EARLY_QUIT_THRESHOLD_USAGES: usize = MAX_MATCHES * 3;
+
+/// Match-count cap when `--full` is set. Generous but bounded so a `tilth
+/// foo --full` on a huge repo can't blow up output.
+const FULL_MAX_MATCHES: usize = 100;
+/// Walker early-quit threshold when `--full` is set. Proportional to
+/// `FULL_MAX_MATCHES` the same way the default thresholds are.
+const FULL_EARLY_QUIT_USAGES: usize = FULL_MAX_MATCHES * 3;
+const FULL_EARLY_QUIT_DEFINITIONS: usize = FULL_MAX_MATCHES * 3;
 
 /// Display-side stratum: 0 = code def, 1 = doc-heading def, 2 = usage. Used
 /// as a stable sort key after `rank::sort` so the `MAX_MATCHES` cap can't drop
@@ -39,63 +45,48 @@ fn stratum_for_display(m: &Match) -> u8 {
     }
 }
 
-/// Result shape for `search` — mirrors the MCP `kind` knob.
-///
-/// `Strict` returns only declarations (the `kind="symbol"` surface):
-/// tree-sitter AST nodes where supported, with keyword-heuristic and
-/// markdown-heading fallbacks for code without grammars and for docs.
-/// No comment or string hits.
-///
-/// `Any` adds word-boundary usage matches alongside the strict
-/// declarations — usage call-sites plus comment/string mentions
-/// (the `kind="any"` surface).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SymbolMode {
-    Strict,
-    Any,
-}
-
 /// Symbol search: find definitions via tree-sitter, usages via ripgrep, concurrently.
 /// Merge results, deduplicate, definitions first.
-/// `SymbolMode::Strict` skips the usage scan entirely; `SymbolMode::Any` adds
-/// word-boundary usage matches alongside the definitions.
+///
+/// `full` controls the truncation cap and walker early-quit thresholds:
+/// `false` (default) uses the tight defaults that keep agent token budgets
+/// in check; `true` raises both caps so interactive `--full` callers see
+/// every match instead of "... and N more matches."
 pub fn search(
     query: &str,
     scope: &Path,
+    context: Option<&Path>,
     glob: Option<&str>,
-    mode: SymbolMode,
     full: bool,
 ) -> Result<SearchResult, TilthError> {
-    let (def_quit, usage_quit, cap) = if full {
+    let (max_matches, def_threshold, usage_threshold) = if full {
         (
-            FULL_EARLY_QUIT_THRESHOLD,
-            FULL_EARLY_QUIT_THRESHOLD,
             FULL_MAX_MATCHES,
+            FULL_EARLY_QUIT_DEFINITIONS,
+            FULL_EARLY_QUIT_USAGES,
         )
     } else {
         (
+            MAX_MATCHES,
             EARLY_QUIT_THRESHOLD_DEFINITIONS,
             EARLY_QUIT_THRESHOLD_USAGES,
-            MAX_MATCHES,
         )
     };
 
-    let (defs, usages) = match mode {
-        SymbolMode::Strict => (find_definitions(query, scope, glob, def_quit)?, Vec::new()),
-        SymbolMode::Any => {
-            let word_pattern = format!(r"\b{}\b", regex_syntax::escape(query));
-            let matcher =
-                RegexMatcher::new(&word_pattern).map_err(|e| TilthError::InvalidQuery {
-                    query: query.to_string(),
-                    reason: e.to_string(),
-                })?;
-            let (defs, usages) = rayon::join(
-                || find_definitions(query, scope, glob, def_quit),
-                || find_usages(query, &matcher, scope, glob, usage_quit),
-            );
-            (defs?, usages?)
-        }
-    };
+    // Compile regex once, share across both arms
+    let word_pattern = format!(r"\b{}\b", regex_syntax::escape(query));
+    let matcher = RegexMatcher::new(&word_pattern).map_err(|e| TilthError::InvalidQuery {
+        query: query.to_string(),
+        reason: e.to_string(),
+    })?;
+
+    let (defs, usages) = rayon::join(
+        || find_definitions(query, scope, glob, def_threshold),
+        || find_usages(query, &matcher, scope, glob, usage_threshold),
+    );
+
+    let defs = defs?;
+    let usages = usages?;
 
     // Deduplicate: remove usage matches that overlap with definition matches.
     // Linear scan — max ~30 defs from EARLY_QUIT_THRESHOLD, no allocation needed.
@@ -114,7 +105,7 @@ pub fn search(
     let total = merged.len();
     let usage_count = total - def_count;
 
-    rank::sort(&mut merged, query, scope);
+    rank::sort(&mut merged, query, scope, context);
 
     // Stratify so the cap can't drop a real code definition in favor of a
     // markdown-heading "definition" of the same query. Stable within each
@@ -140,7 +131,7 @@ pub fn search(
         }
     };
 
-    merged.truncate(cap);
+    merged.truncate(max_matches);
 
     Ok(SearchResult {
         query: query.to_string(),
@@ -1063,60 +1054,6 @@ end
     }
 
     #[test]
-    fn strict_mode_drops_comment_and_usage_matches() {
-        // Python fixture: comment hit, real definition, and a variable usage
-        let py_code = "# class Foo\nclass Foo:\n    pass\n\nfoo = Foo()\n";
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("test_strict.py");
-        std::fs::write(&path, py_code).unwrap();
-
-        // SymbolMode::Strict: only the class definition line
-        let strict_result =
-            super::search("Foo", tmp.path(), None, super::SymbolMode::Strict, false).unwrap();
-        assert_eq!(
-            strict_result.matches.len(),
-            1,
-            "strict mode should return exactly 1 match (the definition), got: {:?}",
-            strict_result
-                .matches
-                .iter()
-                .map(|m| (m.line, &m.text))
-                .collect::<Vec<_>>()
-        );
-        assert_eq!(
-            strict_result.matches[0].line, 2,
-            "match should be the class definition line"
-        );
-        assert!(strict_result.matches[0].is_definition);
-
-        // SymbolMode::Any: comment (line 1) + definition (line 2) + usage (line 5).
-        let any_result =
-            super::search("Foo", tmp.path(), None, super::SymbolMode::Any, false).unwrap();
-        let any_lines: Vec<(u32, bool)> = any_result
-            .matches
-            .iter()
-            .map(|m| (m.line, m.is_definition))
-            .collect();
-        assert_eq!(
-            any_result.matches.len(),
-            3,
-            "SymbolMode::Any should return exactly 3 matches (comment + def + usage), got: {any_lines:?}"
-        );
-        assert!(
-            any_lines.contains(&(2, true)),
-            "Any should include the class definition at line 2, got: {any_lines:?}"
-        );
-        assert!(
-            any_lines.contains(&(1, false)),
-            "Any should include the comment hit at line 1, got: {any_lines:?}"
-        );
-        assert!(
-            any_lines.contains(&(5, false)),
-            "Any should include the usage at line 5, got: {any_lines:?}"
-        );
-    }
-
-    #[test]
     fn elixir_delegate_and_nested_modules() {
         let code = r#"defmodule Outer do
   defdelegate count(list), to: Enum
@@ -1379,67 +1316,37 @@ Body to end.
         );
     }
 
-    /// `--full` raises the match cap from 10 → 100 and proportionally raises
-    /// the walker early-quit thresholds. Seeds 15 files, each defining a
-    /// distinct `WidelyUsedThing` so all 15 are real definitions. With
-    /// `full=false` the cap stays at 10; with `full=true` it lifts above 10.
-    /// `total_found` is computed pre-truncation and matches in both arms.
     #[test]
     fn full_flag_raises_match_cap() {
-        let tmp = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let scope = dir.path();
+
+        // Create 15 Rust files each defining WidelyUsedThing.
         for i in 0..15 {
-            let path = tmp.path().join(format!("file_{i}.rs"));
-            std::fs::write(&path, "pub fn WidelyUsedThing() {}\n").unwrap();
+            let path = scope.join(format!("file_{i:02}.rs"));
+            std::fs::write(&path, format!("pub fn WidelyUsedThing() {{}}\n")).expect("write");
         }
 
-        let default_result = super::search(
-            "WidelyUsedThing",
-            tmp.path(),
-            None,
-            super::SymbolMode::Strict,
-            false,
-        )
-        .unwrap();
-        assert!(
-            default_result.matches.len() <= 10,
-            "default cap should keep matches <= 10, got {}",
-            default_result.matches.len()
-        );
-        // Pre-truncation invariant: total_found reflects all 15 hits even though
-        // matches.len() was capped at 10. A future regression that wires the cap
-        // before total accounting would collapse this gap.
-        assert!(
-            default_result.total_found >= 15,
-            "total_found should reflect pre-truncation count, got {} (expected >= 15)",
-            default_result.total_found
-        );
-        assert!(
-            default_result.total_found > default_result.matches.len(),
-            "total_found must exceed matches.len() in the truncated default case: total={} displayed={}",
-            default_result.total_found,
-            default_result.matches.len()
-        );
+        let result_default =
+            search("WidelyUsedThing", scope, None, None, false).expect("search default");
+        let result_full = search("WidelyUsedThing", scope, None, None, true).expect("search full");
 
-        let full_result = super::search(
-            "WidelyUsedThing",
-            tmp.path(),
-            None,
-            super::SymbolMode::Strict,
-            true,
-        )
-        .unwrap();
+        // Default cap is 10 — should not exceed it.
         assert!(
-            full_result.matches.len() > 10,
-            "full=true should raise the cap above 10, got {}",
-            full_result.matches.len()
+            result_default.matches.len() <= 10,
+            "default: expected ≤10 matches, got {}",
+            result_default.matches.len()
         );
-
-        // total_found is pre-truncation; both arms must agree on it (modulo
-        // walker early-quit, which only matters once results exceed the
-        // raised threshold — 15 < 300, so they agree exactly here).
+        // Full cap is 100 — all 15 definitions should be visible.
+        assert!(
+            result_full.matches.len() > 10,
+            "full: expected >10 matches, got {}",
+            result_full.matches.len()
+        );
+        // total_found is measured pre-truncation and should be equal.
         assert_eq!(
-            default_result.total_found, full_result.total_found,
-            "total_found should match pre-truncation across both arms"
+            result_default.total_found, result_full.total_found,
+            "total_found must be the same regardless of full flag"
         );
     }
 }

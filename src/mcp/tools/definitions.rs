@@ -1,51 +1,52 @@
-//! JSON-schema definitions for the tools advertised via `tools/list`.
-//! Edit-mode adds `tilth_write` to the catalog.
-//!
-//! Tool descriptions live in `prompts/tools/*.md` and are embedded at compile
-//! time via `include_str!`. Each call to `tool_definitions()` runs `.trim_end()`
-//! per description, so source files can keep their final newline without
-//! affecting wire bytes.
-
 use serde_json::Value;
 
-const SEARCH_DESC: &str = include_str!("../../../prompts/tools/search.md");
-const READ_DESC: &str = include_str!("../../../prompts/tools/read.md");
-const LIST_DESC: &str = include_str!("../../../prompts/tools/list.md");
-const DEPS_DESC: &str = include_str!("../../../prompts/tools/deps.md");
-const DIFF_DESC: &str = include_str!("../../../prompts/tools/diff.md");
-const WRITE_DESC: &str = include_str!("../../../prompts/tools/write.md");
-
-pub(crate) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
+pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
+    let read_desc = if edit_mode {
+        "Read a file with smart outlining. Replaces cat/head/tail and the host Read tool — \
+         use this for all file reading. Output uses hashline format (line:hash|content) — \
+         the line:hash anchors are required by tilth_edit. Small files return full hashlined content. \
+         Large files return a structural outline (no hashlines); use `section` to get hashlined \
+         content for the lines you want to edit. Use `sections` to grab several disjoint slices \
+         from the same file in one call. Use `full` to force complete content. \
+         Use `paths` to read multiple files in one call."
+    } else {
+        "Read a file with smart outlining. Replaces cat/head/tail and the host Read tool — \
+         use this for all file reading. Small files return full content. Large files return \
+         a structural outline (functions, classes, imports) so you see the shape without \
+         consuming your context window. Use `section` to read a specific line range or heading. \
+         Use `sections` to grab several disjoint slices from the same file in one call. \
+         Use `full` to force complete content. Use `paths` to read multiple files in one call."
+    };
     let mut tools = vec![
         serde_json::json!({
             "name": "tilth_search",
-            "description": SEARCH_DESC.trim_end(),
+            "description": "Search for symbols, text, or regex patterns in code. Replaces grep/rg and the host Grep tool — use this for all code search. Symbol search returns definitions first (via tree-sitter AST), then usages, with full source code inlined for top matches. Content search finds literal text. Regex search supports full regex patterns. For cross-file tracing, pass comma-separated symbol names (max 5).",
             "inputSchema": {
                 "type": "object",
+                "required": ["query"],
                 "properties": {
-                    "queries": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "required": ["query"],
-                            "properties": {
-                                "query": {"type": "string"},
-                                "glob": {"type": "string"},
-                                "kind": {"type": "string", "enum": ["symbol", "content", "regex", "callers"]}
-                            }
-                        },
-                        "minItems": 1,
-                        "maxItems": 10,
-                        "description": "Array of query objects. Each entry runs independently and results are concatenated under `## query: <q>` headers."
+                    "query": {
+                        "type": "string",
+                        "description": "Symbol name, text string, or regex pattern to search for. e.g. 'resolve_dependencies' or 'ServeHTTP,Next' for multi-symbol lookup."
                     },
                     "scope": {
                         "type": "string",
                         "description": "Only use scope to search a specific subdirectory. DO NOT USE scope if you want to search the current working directory (initial search)."
                     },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["symbol", "content", "regex", "callers"],
+                        "default": "symbol",
+                        "description": "Search type. symbol: structural definitions + usages. content: literal text. regex: regex pattern. callers: find all call sites of a symbol."
+                    },
                     "expand": {
                         "type": "number",
                         "default": 2,
                         "description": "Number of top matches to expand with full source code. Definitions show the full function/class body. Usages show ±10 context lines."
+                    },
+                    "context": {
+                        "type": "string",
+                        "description": "Path to the file the agent is currently editing. Boosts ranking of matches in the same directory or package."
                     },
                     "budget": {
                         "type": "number",
@@ -54,41 +55,38 @@ pub(crate) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     "glob": {
                         "type": "string",
                         "description": "File pattern filter. Whitelist: \"*.rs\" (only Rust files). Exclude: \"!*.test.ts\" (skip test files). Brace expansion: \"*.{go,rs}\" (Go and Rust). Path patterns: \"src/**/*.ts\"."
-                    },
-                    "if_modified_since": {
-                        "type": "string",
-                        "description": "ISO-8601 timestamp. Files with mtime ≤ this value return as `(unchanged @ <ts>)` stubs instead of bodies."
                     }
                 }
             }
         }),
         serde_json::json!({
             "name": "tilth_read",
-            "description": READ_DESC.trim_end(),
+            "description": read_desc,
             "inputSchema": {
                 "type": "object",
-                "required": ["paths"],
                 "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute or relative file path to read."
+                    },
                     "paths": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "minItems": 1,
-                        "maxItems": 20,
-                        "description": "File paths (max 20). Suffix grammar on each path: `path#n-m` (line range), `path#n` (from line n), `path### Heading` (markdown heading), `path#symbol_name` (code symbol). Example: paths: [\"src/foo.rs#do_thing\", \"README.md#10-40\"]. Singular `path: \"...\"` is also accepted for one-file reads."
+                        "description": "Multiple file paths to read in one call. Each file gets independent smart handling. Saves round-trips vs multiple single reads."
                     },
-                    "path": {
+                    "section": {
                         "type": "string",
-                        "description": "Singular form (transitional). Prefer paths: [...]."
+                        "description": "Line range e.g. '45-89', or heading e.g. '## Architecture'. Bypasses smart view. Use `sections` for multiple ranges."
                     },
-                    "mode": {
-                        "type": "string",
-                        "enum": ["auto", "full", "signature"],
-                        "default": "auto",
-                        "description": "Defaults to `auto` — omit unless you need to override smart-sizing. auto: small files return full; large code returns signature lines with `<line>:<hash>` prefixes; large markdown returns headings + preview. full forces full content. signature forces outline."
+                    "sections": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Multiple ranges from the same file in one call. Each entry is a line range or heading. Emits each block in user-supplied order, separated by `─── lines X-Y ───` delimiters. Mutually exclusive with `section`. Capped at 20 ranges."
                     },
-                    "if_modified_since": {
-                        "type": "string",
-                        "description": "ISO-8601 timestamp. Files unchanged since this return `(unchanged @ <ts>)` stubs."
+                    "full": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Force full content output, bypass smart outlining."
                     },
                     "budget": {
                         "type": "number",
@@ -98,30 +96,34 @@ pub(crate) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
             }
         }),
         serde_json::json!({
-            "name": "tilth_list",
-            "description": LIST_DESC.trim_end(),
+            "name": "tilth_files",
+            "description": "Find files matching a glob pattern. Replaces find/ls/pwd and the host Glob tool — use this for all file discovery. Returns matched file paths sorted by relevance with token size estimates. Use `patterns` to run several globs in one call.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Glob pattern e.g. '*' (list directory), '*.rs', 'src/**/*.ts'. Use `patterns` for multiple globs."
+                    },
                     "patterns": {
                         "type": "array",
-                        "items": {"type": "string"},
-                        "minItems": 1,
-                        "maxItems": 20,
-                        "description": "Glob patterns (max 20). e.g. [\"*.rs\", \"src/**/*.ts\"]. Always an array."
+                        "items": { "type": "string" },
+                        "description": "Multiple glob patterns to run in one call against the same scope. Each pattern emits its own `# Glob: ...` block, separated by a blank line. Mutually exclusive with `pattern`. Capped at 20."
                     },
-                    "depth": {
+                    "scope": {
+                        "type": "string",
+                        "description": "Only use scope to list a specific subdirectory. DO NOT USE scope if you want to list the current working directory."
+                    },
+                    "budget": {
                         "type": "number",
-                        "description": "Cap directory depth (1 = top-level only)."
-                    },
-                    "scope": {"type": "string"},
-                    "budget": {"type": "number"}
+                        "description": "Max tokens in response."
+                    }
                 }
             }
         }),
         serde_json::json!({
             "name": "tilth_deps",
-            "description": DEPS_DESC.trim_end(),
+            "description": "Blast-radius check before breaking changes. Shows what a file imports (local + external) and what other files call its exports, with symbol-level detail. Use ONLY when your planned edit changes a function signature, removes/renames an export, or modifies behavior that callers rely on. Do NOT use for reading files, adding new code, or internal-only changes — use tilth_read instead.",
             "inputSchema": {
                 "type": "object",
                 "required": ["path"],
@@ -142,8 +144,31 @@ pub(crate) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
             }
         }),
         serde_json::json!({
+            "name": "tilth_grok",
+            "description": "Get everything structural about a symbol in one call — definition, body, signature, doc, callees, callers, siblings, tests. Use ONLY for 'understand this symbol' questions. Do NOT use for concept search (use tilth_search) or reading file contents (use tilth_read).",
+            "inputSchema": {
+                "type": "object",
+                "required": ["target"],
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "Symbol name, e.g. 'parse_unified_diff'. Also accepts 'src/diff/parse.rs:7' or 'Type::method'."
+                    },
+                    "scope": {
+                        "type": "string",
+                        "description": "Subdirectory to narrow the search. Default: project root."
+                    },
+                    "full": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Widen caps: 50 callers, 30 callees, 30 siblings, 30 tests (default 5/5/8/8)."
+                    }
+                }
+            }
+        }),
+        serde_json::json!({
             "name": "tilth_diff",
-            "description": DIFF_DESC.trim_end(),
+            "description": "Structural diff showing function-level changes. Replaces git diff. Call with no args for uncommitted changes overview.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -196,43 +221,47 @@ pub(crate) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
 
     if edit_mode {
         tools.push(serde_json::json!({
-            "name": "tilth_write",
-            "description": WRITE_DESC.trim_end(),
+            "name": "tilth_edit",
+            "description": "Batch edit one or more files in one call using hashline anchors from tilth_read. ALWAYS group edits to multiple files into a single tilth_edit call — never call tilth_edit twice in a row. Each file is processed independently (best-effort): a hash mismatch on one file does not block the others; results are reported per file. Partial success returns isError: false — scan the per-file `## <path>` sections for failures rather than trusting the top-level status. A parse error on one edit invalidates ALL edits for that file (none applied); retry the whole file after fixing the malformed entry. Each file path may appear at most once per call. Max 20 files per call.",
             "inputSchema": {
                 "type": "object",
                 "required": ["files"],
                 "properties": {
                     "files": {
                         "type": "array",
-                        "description": "Required — array of {path, mode, edits|content}. Even single-file edits use this array.",
                         "minItems": 1,
                         "maxItems": 20,
+                        "description": "One entry per file. Use a single-element array for a single-file edit. Each path must be unique within the call.",
                         "items": {
                             "type": "object",
-                            "required": ["path"],
+                            "required": ["path", "edits"],
                             "properties": {
-                                "path": {"type": "string"},
-                                "mode": {
+                                "path": {
                                     "type": "string",
-                                    "enum": ["hash", "overwrite", "append"],
-                                    "default": "hash"
+                                    "description": "Absolute or relative file path to edit."
                                 },
                                 "edits": {
                                     "type": "array",
-                                    "description": "Required when mode=hash. Each: {start: '<line>:<hash>', end?: '<line>:<hash>', content: '...'}",
+                                    "minItems": 1,
+                                    "description": "Edit operations for this file, applied atomically per file.",
                                     "items": {
                                         "type": "object",
                                         "required": ["start", "content"],
                                         "properties": {
-                                            "start": {"type": "string"},
-                                            "end": {"type": "string"},
-                                            "content": {"type": "string"}
+                                            "start": {
+                                                "type": "string",
+                                                "description": "Start anchor: 'line:hash' (e.g. '42:a3f'). Hash from tilth_read hashline output."
+                                            },
+                                            "end": {
+                                                "type": "string",
+                                                "description": "End anchor: 'line:hash'. If omitted, replaces only the start line."
+                                            },
+                                            "content": {
+                                                "type": "string",
+                                                "description": "Replacement text (can be multi-line). Empty string to delete the line(s)."
+                                            }
                                         }
                                     }
-                                },
-                                "content": {
-                                    "type": "string",
-                                    "description": "Required when mode=overwrite or mode=append. Full file content / append payload."
                                 }
                             }
                         }
@@ -240,7 +269,7 @@ pub(crate) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     "diff": {
                         "type": "boolean",
                         "default": false,
-                        "description": "Include per-file before/after diff in the response."
+                        "description": "Set true to include a compact diff of changes in the response per file."
                     }
                 }
             }
@@ -248,26 +277,4 @@ pub(crate) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
     }
 
     tools
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Byte-pins every externalized tool description against its snapshot in
-    /// `src/mcp/tools/snapshots/`. Any change to `prompts/tools/*.md` requires
-    /// running `cargo insta review` and committing the updated `.snap` file —
-    /// making prompt drift (intentional or accidental) visible in PR review.
-    #[test]
-    fn tool_descriptions_are_pinned() {
-        let tools = tool_definitions(true);
-        assert_eq!(tools.len(), 6, "edit mode should advertise all 6 tools");
-        for tool in &tools {
-            let name = tool["name"].as_str().expect("tool has name");
-            let desc = tool["description"]
-                .as_str()
-                .unwrap_or_else(|| panic!("{name}: description must be a string"));
-            insta::assert_snapshot!(name, desc);
-        }
-    }
 }

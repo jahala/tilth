@@ -1,8 +1,6 @@
-//! `tilth_diff` — structural diff between two refs / patches / sources.
-
 use serde_json::Value;
 
-pub(crate) fn tool_diff(args: &Value) -> Result<String, String> {
+pub(in crate::mcp) fn tool_diff(args: &Value) -> Result<String, String> {
     let source = args.get("source").and_then(|v| v.as_str());
     let scope = args.get("scope").and_then(|v| v.as_str());
     let a = args.get("a").and_then(|v| v.as_str());

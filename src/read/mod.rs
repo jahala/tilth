@@ -394,30 +394,6 @@ struct Block {
 /// ranges are honored verbatim, not coalesced or sorted. Any invalid
 /// range fails the whole call.
 pub fn read_ranges(path: &Path, ranges: &[&str], edit_mode: bool) -> Result<String, TilthError> {
-    let (blocks, total_bytes, total_lines) = collect_blocks(path, ranges, edit_mode)?;
-    let header = format::file_header(path, total_bytes, total_lines, ViewMode::Section);
-
-    if blocks.len() == 1 {
-        let b = &blocks[0];
-        return Ok(format!("{header}\n\n{}", b.text));
-    }
-
-    let mut out = String::with_capacity(header.len() + total_bytes as usize + blocks.len() * 32);
-    out.push_str(&header);
-    for b in &blocks {
-        let _ = write!(out, "\n\n─── lines {}-{} ───\n", b.start, b.end);
-        out.push_str(&b.text);
-    }
-    Ok(out)
-}
-
-/// Shared block-resolver for the multi-section reader. Returns the blocks
-/// in input order plus running totals for the file header.
-fn collect_blocks(
-    path: &Path,
-    ranges: &[&str],
-    edit_mode: bool,
-) -> Result<(Vec<Block>, u64, u32), TilthError> {
     if ranges.is_empty() {
         return Err(TilthError::InvalidQuery {
             query: String::new(),
@@ -435,6 +411,7 @@ fn collect_blocks(
     })?;
     let buf = &mmap[..];
 
+    // Find line offsets once — shared across all ranges.
     let mut line_offsets: Vec<usize> = vec![0];
     for pos in memchr::memchr_iter(b'\n', buf) {
         line_offsets.push(pos + 1);
@@ -476,7 +453,20 @@ fn collect_blocks(
         });
     }
 
-    Ok((blocks, total_bytes, total_lines))
+    let header = format::file_header(path, total_bytes, total_lines, ViewMode::Section);
+
+    if blocks.len() == 1 {
+        let b = &blocks[0];
+        return Ok(format!("{header}\n\n{}", b.text));
+    }
+
+    let mut out = String::with_capacity(header.len() + total_bytes as usize + blocks.len() * 32);
+    out.push_str(&header);
+    for b in &blocks {
+        let _ = write!(out, "\n\n─── lines {}-{} ───\n", b.start, b.end);
+        out.push_str(&b.text);
+    }
+    Ok(out)
 }
 
 /// Parse "45-89" into (45, 89). 1-indexed.
@@ -559,7 +549,7 @@ fn suggest_similar(path: &Path) -> Option<String> {
 /// Wraps `strsim::levenshtein`, which iterates `.chars()` so a single CJK
 /// or emoji glyph counts as one edit unit (not 3-4 bytes). Used by both
 /// filename suggestion (`suggest_similar`) and heading suggestion
-/// (`collect_atx_headings`).
+/// (`suggest_headings`).
 fn edit_distance(a: &str, b: &str) -> usize {
     strsim::levenshtein(a, b)
 }
@@ -773,7 +763,8 @@ mod tests {
 
     /// Filename and heading suggestion rely on Unicode-scalar-level edit
     /// distance, not byte-level — locks in the contract `strsim::levenshtein`
-    /// provides via its char-iterating wrapper.
+    /// provides via its char-iterating wrapper. If `strsim` ever switches
+    /// to a byte-level distance, this test fails loudly.
     #[test]
     fn edit_distance_is_unicode_aware() {
         // 设置 (Settings) and 設定 (Configuration) — different chars,

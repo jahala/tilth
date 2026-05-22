@@ -5,6 +5,7 @@ pub mod content;
 pub mod deps;
 pub mod facets;
 pub mod glob;
+pub mod grok;
 pub mod rank;
 pub mod siblings;
 pub mod strip;
@@ -31,15 +32,6 @@ use crate::session::Session;
 use crate::types::{estimate_tokens, FileType, Match, SearchResult};
 
 use crate::format::rel;
-
-/// Match-count cap when `--full` is set. Generous but bounded so a
-/// `tilth foo --full` on a huge repo can't blow up output. Shared by the
-/// symbol, content, and callers search arms so they stay in lock-step.
-pub(crate) const FULL_MAX_MATCHES: usize = 100;
-
-/// Walker early-quit threshold when `--full` is set. Proportional to
-/// `FULL_MAX_MATCHES` the same way the default thresholds are.
-pub(crate) const FULL_EARLY_QUIT_THRESHOLD: usize = FULL_MAX_MATCHES * 3;
 
 // Directories that are always skipped — build artifacts, dependencies, VCS internals.
 // We skip these explicitly instead of relying on .gitignore so that locally-relevant
@@ -85,72 +77,6 @@ const EXPAND_FULL_FILE_THRESHOLD: u64 = 800;
 /// section)" so the user knows to expand for the rest.
 const MARKDOWN_PREVIEW_MAX_LINES: usize = 40;
 
-/// Upper bound on file size searched by content/regex/symbol walkers. Files
-/// larger than this skip on stat alone — tree-sitter and ripgrep should not
-/// spend cycles on minified bundles or generated lockfiles. Shared so
-/// `content::search` and `count_files_for_empty` stay aligned.
-pub(crate) const MAX_SEARCH_FILE_SIZE: u64 = 500_000;
-
-/// Stat-only file filter used before searching: drop files whose names mark
-/// them as minified (`.min.js`, `app-min.css`) or whose size exceeds the
-/// search cap. `content::search` layers a heavier byte-content minified
-/// detector on top once it has the file bytes; this helper is the cheap
-/// shared subset that `count_files_for_empty` can call without reading.
-pub(crate) fn passes_stat_filter(path: &Path) -> bool {
-    if path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(crate::lang::detection::is_minified_by_name)
-    {
-        return false;
-    }
-    if let Ok(meta) = std::fs::metadata(path) {
-        if meta.len() > MAX_SEARCH_FILE_SIZE {
-            return false;
-        }
-    }
-    true
-}
-
-/// Files-matched-glob and files-searched counts for the empty-result header.
-/// Re-walks the scope with the same glob the search used, applying the same
-/// stat-only skip rules as `content::search`. Only runs when matches is
-/// empty, so the extra walk is rare on hot paths.
-fn count_files_for_empty(scope: &Path, glob: Option<&str>) -> (usize, usize) {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    let Ok(walker) = walker(scope, glob) else {
-        return (0, 0);
-    };
-    let files_matched_glob = AtomicUsize::new(0);
-    let files_searched = AtomicUsize::new(0);
-
-    walker.run(|| {
-        let files_matched_glob = &files_matched_glob;
-        let files_searched = &files_searched;
-        Box::new(move |entry| {
-            let Ok(entry) = entry else {
-                return ignore::WalkState::Continue;
-            };
-            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
-                return ignore::WalkState::Continue;
-            }
-            files_matched_glob.fetch_add(1, Ordering::Relaxed);
-
-            if !passes_stat_filter(entry.path()) {
-                return ignore::WalkState::Continue;
-            }
-            files_searched.fetch_add(1, Ordering::Relaxed);
-            ignore::WalkState::Continue
-        })
-    });
-
-    (
-        files_matched_glob.load(Ordering::Relaxed),
-        files_searched.load(Ordering::Relaxed),
-    )
-}
-
 /// Build a parallel directory walker that searches ALL files except known junk directories.
 /// Does NOT respect .gitignore — ensures gitignored but locally-relevant files are found.
 /// When `glob` is Some, applies a file-pattern override (whitelist or negation).
@@ -165,6 +91,7 @@ pub(crate) fn walker(scope: &Path, glob: Option<&str>) -> Result<ignore::WalkPar
     let mut builder = WalkBuilder::new(scope);
     builder
         .follow_links(true)
+        .same_file_system(true) // Stop at mount boundaries (NFS, external volumes).
         .hidden(false)
         .git_ignore(false)
         .git_global(false)
@@ -227,23 +154,12 @@ pub fn search_symbol(
     scope: &Path,
     cache: &OutlineCache,
     glob: Option<&str>,
-    mode: symbol::SymbolMode,
 ) -> Result<String, TilthError> {
-    let result = symbol::search(query, scope, glob, mode, false)?;
+    let result = symbol::search(query, scope, None, glob, false)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
-    format_search_result(
-        &result,
-        cache,
-        None,
-        &bloom,
-        0,
-        false,
-        format::EmptyHint::Symbol,
-        glob,
-    )
+    format_search_result(&result, cache, None, &bloom, 0)
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn search_symbol_expanded(
     query: &str,
     scope: &Path,
@@ -251,63 +167,14 @@ pub fn search_symbol_expanded(
     session: &Session,
     bloom: &crate::index::bloom::BloomFilterCache,
     expand: usize,
+    context: Option<&Path>,
     glob: Option<&str>,
-    mode: symbol::SymbolMode,
     full: bool,
 ) -> Result<String, TilthError> {
-    search_symbol_expanded_mode(
-        query, scope, cache, session, bloom, expand, glob, mode, false, full,
-    )
+    let result = symbol::search(query, scope, context, glob, full)?;
+    format_search_result(&result, cache, Some(session), bloom, expand)
 }
 
-/// Edit-mode-aware variant: expanded source lines carry `<line>:<hash>` prefixes
-/// when `edit_mode` is true, so the agent can pipe directly into `tilth_write`
-/// hash-mode without a follow-up `tilth_read`.
-#[allow(clippy::too_many_arguments)]
-pub fn search_symbol_expanded_mode(
-    query: &str,
-    scope: &Path,
-    cache: &OutlineCache,
-    session: &Session,
-    bloom: &crate::index::bloom::BloomFilterCache,
-    expand: usize,
-    glob: Option<&str>,
-    mode: symbol::SymbolMode,
-    edit_mode: bool,
-    full: bool,
-) -> Result<String, TilthError> {
-    let result = symbol::search(query, scope, glob, mode, full)?;
-    format_search_result(
-        &result,
-        cache,
-        Some(session),
-        bloom,
-        expand,
-        edit_mode,
-        format::EmptyHint::Symbol,
-        glob,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn search_multi_symbol_expanded_mode(
-    queries: &[&str],
-    scope: &Path,
-    cache: &OutlineCache,
-    session: &Session,
-    bloom: &crate::index::bloom::BloomFilterCache,
-    expand: usize,
-    glob: Option<&str>,
-    mode: symbol::SymbolMode,
-    edit_mode: bool,
-    full: bool,
-) -> Result<String, TilthError> {
-    multi_symbol_inner(
-        queries, scope, cache, session, bloom, expand, glob, mode, edit_mode, full,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
 pub fn search_multi_symbol_expanded(
     queries: &[&str],
     scope: &Path,
@@ -315,26 +182,8 @@ pub fn search_multi_symbol_expanded(
     session: &Session,
     bloom: &crate::index::bloom::BloomFilterCache,
     expand: usize,
+    context: Option<&Path>,
     glob: Option<&str>,
-    mode: symbol::SymbolMode,
-    full: bool,
-) -> Result<String, TilthError> {
-    multi_symbol_inner(
-        queries, scope, cache, session, bloom, expand, glob, mode, false, full,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn multi_symbol_inner(
-    queries: &[&str],
-    scope: &Path,
-    cache: &OutlineCache,
-    session: &Session,
-    bloom: &crate::index::bloom::BloomFilterCache,
-    expand: usize,
-    glob: Option<&str>,
-    mode: symbol::SymbolMode,
-    edit_mode: bool,
     full: bool,
 ) -> Result<String, TilthError> {
     // Shared expand budget: at least 1 slot per query, or explicit expand if higher.
@@ -346,26 +195,9 @@ fn multi_symbol_inner(
     };
     let mut expanded_files = HashSet::new();
     let mut sections = Vec::with_capacity(queries.len());
-    // Walker counts for the empty-header path are invariant across queries —
-    // same scope, same glob. Compute lazily on the first zero-match query
-    // and reuse for the rest of the batch.
-    let mut empty_stats: Option<(usize, usize)> = None;
 
     for query in queries {
-        let result = symbol::search(query, scope, glob, mode, full)?;
-        if result.matches.is_empty() {
-            let (files_matched_glob, files_searched) =
-                *empty_stats.get_or_insert_with(|| count_files_for_empty(scope, glob));
-            sections.push(format::search_empty_header(
-                &result.query,
-                &result.scope,
-                files_matched_glob,
-                files_searched,
-                result.total_found,
-                format::EmptyHint::Symbol,
-            ));
-            continue;
-        }
+        let result = symbol::search(query, scope, context, glob, full)?;
         let mut out = format::search_header(
             &result.query,
             &result.scope,
@@ -382,7 +214,6 @@ fn multi_symbol_inner(
             &mut expand_remaining,
             &mut expanded_files,
             &mut out,
-            edit_mode,
         );
         if result.total_found > result.matches.len() {
             let omitted = result.total_found - result.matches.len();
@@ -404,14 +235,9 @@ pub fn search_content(
     glob: Option<&str>,
 ) -> Result<String, TilthError> {
     let (pattern, is_regex) = parse_pattern(query);
-    let result = content::search(pattern, scope, is_regex, glob, false)?;
+    let result = content::search(pattern, scope, is_regex, None, glob, false)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
-    let kind = if is_regex {
-        format::EmptyHint::Regex
-    } else {
-        format::EmptyHint::Content
-    };
-    format_search_result(&result, cache, None, &bloom, 0, false, kind, glob)
+    format_search_result(&result, cache, None, &bloom, 0)
 }
 
 pub fn search_regex(
@@ -420,18 +246,9 @@ pub fn search_regex(
     cache: &OutlineCache,
     glob: Option<&str>,
 ) -> Result<String, TilthError> {
-    let result = content::search(pattern, scope, true, glob, false)?;
+    let result = content::search(pattern, scope, true, None, glob, false)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
-    format_search_result(
-        &result,
-        cache,
-        None,
-        &bloom,
-        0,
-        false,
-        format::EmptyHint::Regex,
-        glob,
-    )
+    format_search_result(&result, cache, None, &bloom, 0)
 }
 
 pub fn search_content_expanded(
@@ -440,41 +257,14 @@ pub fn search_content_expanded(
     cache: &OutlineCache,
     session: &Session,
     expand: usize,
+    context: Option<&Path>,
     glob: Option<&str>,
-    full: bool,
-) -> Result<String, TilthError> {
-    search_content_expanded_mode(query, scope, cache, session, expand, glob, false, full)
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn search_content_expanded_mode(
-    query: &str,
-    scope: &Path,
-    cache: &OutlineCache,
-    session: &Session,
-    expand: usize,
-    glob: Option<&str>,
-    edit_mode: bool,
     full: bool,
 ) -> Result<String, TilthError> {
     let (pattern, is_regex) = parse_pattern(query);
-    let result = content::search(pattern, scope, is_regex, glob, full)?;
+    let result = content::search(pattern, scope, is_regex, context, glob, full)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
-    let kind = if is_regex {
-        format::EmptyHint::Regex
-    } else {
-        format::EmptyHint::Content
-    };
-    format_search_result(
-        &result,
-        cache,
-        Some(session),
-        &bloom,
-        expand,
-        edit_mode,
-        kind,
-        glob,
-    )
+    format_search_result(&result, cache, Some(session), &bloom, expand)
 }
 
 /// Expanded regex search — takes raw pattern, no slash wrapping needed.
@@ -484,35 +274,13 @@ pub fn search_regex_expanded(
     cache: &OutlineCache,
     session: &Session,
     expand: usize,
+    context: Option<&Path>,
     glob: Option<&str>,
     full: bool,
 ) -> Result<String, TilthError> {
-    search_regex_expanded_mode(pattern, scope, cache, session, expand, glob, false, full)
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn search_regex_expanded_mode(
-    pattern: &str,
-    scope: &Path,
-    cache: &OutlineCache,
-    session: &Session,
-    expand: usize,
-    glob: Option<&str>,
-    edit_mode: bool,
-    full: bool,
-) -> Result<String, TilthError> {
-    let result = content::search(pattern, scope, true, glob, full)?;
+    let result = content::search(pattern, scope, true, context, glob, full)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
-    format_search_result(
-        &result,
-        cache,
-        Some(session),
-        &bloom,
-        expand,
-        edit_mode,
-        format::EmptyHint::Regex,
-        glob,
-    )
+    format_search_result(&result, cache, Some(session), &bloom, expand)
 }
 
 /// Raw symbol search — returns structured result for programmatic inspection.
@@ -520,9 +288,8 @@ pub fn search_symbol_raw(
     query: &str,
     scope: &Path,
     glob: Option<&str>,
-    mode: symbol::SymbolMode,
 ) -> Result<SearchResult, TilthError> {
-    symbol::search(query, scope, glob, mode, false)
+    symbol::search(query, scope, None, glob, false)
 }
 
 /// Raw content search — returns structured result for programmatic inspection.
@@ -532,7 +299,7 @@ pub fn search_content_raw(
     glob: Option<&str>,
 ) -> Result<SearchResult, TilthError> {
     let (pattern, is_regex) = parse_pattern(query);
-    content::search(pattern, scope, is_regex, glob, false)
+    content::search(pattern, scope, is_regex, None, glob, false)
 }
 
 /// Raw regex search — returns structured result for programmatic inspection.
@@ -541,7 +308,7 @@ pub fn search_regex_raw(
     scope: &Path,
     glob: Option<&str>,
 ) -> Result<SearchResult, TilthError> {
-    content::search(pattern, scope, true, glob, false)
+    content::search(pattern, scope, true, None, glob, false)
 }
 
 /// Format a raw search result (symbol or content — both use the same pipeline).
@@ -550,16 +317,7 @@ pub fn format_raw_result(
     cache: &OutlineCache,
 ) -> Result<String, TilthError> {
     let bloom = crate::index::bloom::BloomFilterCache::new();
-    format_search_result(
-        result,
-        cache,
-        None,
-        &bloom,
-        0,
-        false,
-        format::EmptyHint::Merged,
-        None,
-    )
+    format_search_result(result, cache, None, &bloom, 0)
 }
 
 pub fn search_glob(pattern: &str, scope: &Path) -> Result<String, TilthError> {
@@ -592,7 +350,6 @@ fn write_hidden_tail(out: &mut String, shown: usize, total: usize, kind: &str) {
 /// Format match entries with optional expansion.
 /// Groups consecutive usage matches in the same enclosing function to reduce token noise.
 /// Shared expand state enables cross-query dedup in multi-symbol search.
-#[allow(clippy::too_many_arguments)]
 fn format_matches(
     matches: &[Match],
     scope: &Path,
@@ -602,7 +359,6 @@ fn format_matches(
     expand_remaining: &mut usize,
     expanded_files: &mut HashSet<PathBuf>,
     out: &mut String,
-    edit_mode: bool,
 ) {
     // Multi-file: one expand per unique file. Single-file: sequential per-match.
     // expanded_files may contain entries from prior queries (cross-query dedup).
@@ -627,7 +383,6 @@ fn format_matches(
                 expanded_files,
                 multi_file,
                 out,
-                edit_mode,
             );
         } else {
             // Multiple usages collapsed into one entry
@@ -751,7 +506,6 @@ fn format_line_list(lines: &[u32]) -> String {
 }
 
 /// Format a single match entry (unchanged from original behavior).
-#[allow(clippy::too_many_arguments)]
 fn format_single_match(
     m: &Match,
     scope: &Path,
@@ -762,7 +516,6 @@ fn format_single_match(
     expanded_files: &mut HashSet<PathBuf>,
     multi_file: bool,
     out: &mut String,
-    edit_mode: bool,
 ) {
     let kind = if m.impl_target.is_some() {
         "impl"
@@ -871,7 +624,7 @@ fn format_single_match(
         } else {
             let skip = multi_file && expanded_files.contains(&m.path);
             if !skip {
-                if let Some((code, content)) = expand_match(m, scope, edit_mode) {
+                if let Some((code, content)) = expand_match(m, scope) {
                     if m.is_definition && m.def_range.is_some() {
                         if let Some(s) = session {
                             s.record_expand(&m.path, m.line);
@@ -1079,6 +832,7 @@ fn find_basename_fallback(scope: &Path, query_lower: &str) -> Option<PathBuf> {
 
     let walker = ignore::WalkBuilder::new(scope)
         .follow_links(true)
+        .same_file_system(true) // Stop at mount boundaries (NFS, external volumes).
         .hidden(true)
         .git_ignore(true)
         .max_depth(Some(6))
@@ -1156,28 +910,13 @@ fn basename_file_outline(
     ))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn format_search_result(
     result: &SearchResult,
     cache: &OutlineCache,
     session: Option<&Session>,
     bloom: &crate::index::bloom::BloomFilterCache,
     expand: usize,
-    edit_mode: bool,
-    kind: format::EmptyHint,
-    glob: Option<&str>,
 ) -> Result<String, TilthError> {
-    if result.matches.is_empty() {
-        let (files_matched_glob, files_searched) = count_files_for_empty(&result.scope, glob);
-        return Ok(format::search_empty_header(
-            &result.query,
-            &result.scope,
-            files_matched_glob,
-            files_searched,
-            result.total_found,
-            kind,
-        ));
-    }
     let header = format::search_header(
         &result.query,
         &result.scope,
@@ -1222,7 +961,6 @@ fn format_search_result(
                 &mut expand_remaining,
                 &mut expanded_files,
                 &mut out,
-                edit_mode,
             );
             write_hidden_tail(
                 &mut out,
@@ -1247,7 +985,6 @@ fn format_search_result(
                 &mut expand_remaining,
                 &mut expanded_files,
                 &mut out,
-                edit_mode,
             );
             write_hidden_tail(
                 &mut out,
@@ -1291,7 +1028,6 @@ fn format_search_result(
                 &mut expand_remaining,
                 &mut expanded_files,
                 &mut out,
-                edit_mode,
             );
             write_hidden_tail(
                 &mut out,
@@ -1316,7 +1052,6 @@ fn format_search_result(
                 &mut expand_remaining,
                 &mut expanded_files,
                 &mut out,
-                edit_mode,
             );
             write_hidden_tail(
                 &mut out,
@@ -1336,7 +1071,6 @@ fn format_search_result(
             &mut expand_remaining,
             &mut expanded_files,
             &mut out,
-            edit_mode,
         );
 
         // Global hidden-tail only on the linear path. The faceted path emits
@@ -1368,7 +1102,7 @@ fn format_search_result(
 ///
 /// For definitions: use tree-sitter node range (`def_range`).
 /// For usages: ±10 lines around the match.
-fn expand_match(m: &Match, scope: &Path, edit_mode: bool) -> Option<(String, String)> {
+fn expand_match(m: &Match, scope: &Path) -> Option<(String, String)> {
     let content = fs::read_to_string(&m.path).ok()?;
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len() as u32;
@@ -1426,12 +1160,7 @@ fn expand_match(m: &Match, scope: &Path, edit_mode: bool) -> Option<(String, Str
                 continue;
             }
 
-            if edit_mode {
-                let hash = crate::format::line_hash(line.as_bytes());
-                let _ = write!(out, "\n{i}:{hash:03x}|{line}");
-            } else {
-                let _ = write!(out, "\n{i:>4} │ {line}");
-            }
+            let _ = write!(out, "\n{i:>4} │ {line}");
             prev_blank = is_blank;
         }
     }
@@ -1840,10 +1569,11 @@ mod tests {
     #[test]
     fn content_search_glob_restricts_results() {
         let scope = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let all = content::search("TilthError", &scope, false, None, false).expect("search failed");
-        let rs_only = content::search("TilthError", &scope, false, Some("*.rs"), false)
+        let all =
+            content::search("TilthError", &scope, false, None, None, false).expect("search failed");
+        let rs_only = content::search("TilthError", &scope, false, None, Some("*.rs"), false)
             .expect("search with glob failed");
-        let toml_only = content::search("TilthError", &scope, false, Some("*.toml"), false)
+        let toml_only = content::search("TilthError", &scope, false, None, Some("*.toml"), false)
             .expect("search with toml glob failed");
 
         assert!(all.total_found > 0, "unfiltered should find TilthError");
@@ -1865,22 +1595,10 @@ mod tests {
     #[test]
     fn symbol_search_glob_restricts_results() {
         let scope = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let rs_result = symbol::search(
-            "walker",
-            &scope,
-            Some("*.rs"),
-            symbol::SymbolMode::Any,
-            false,
-        )
-        .expect("symbol search failed");
-        let toml_result = symbol::search(
-            "walker",
-            &scope,
-            Some("*.toml"),
-            symbol::SymbolMode::Any,
-            false,
-        )
-        .expect("symbol search with toml failed");
+        let rs_result = symbol::search("walker", &scope, None, Some("*.rs"), false)
+            .expect("symbol search failed");
+        let toml_result = symbol::search("walker", &scope, None, Some("*.toml"), false)
+            .expect("symbol search with toml failed");
 
         assert!(rs_result.total_found > 0, "*.rs should find 'walker'");
         assert_eq!(
@@ -1903,11 +1621,22 @@ mod tests {
         let bloom = crate::index::bloom::BloomFilterCache::new();
         let single: std::collections::HashSet<String> =
             std::iter::once("walker".to_string()).collect();
-        let rs_callers = callers::find_callers_batch_default(&single, &scope, &bloom, Some("*.rs"))
-            .expect("callers failed");
-        let toml_callers =
-            callers::find_callers_batch_default(&single, &scope, &bloom, Some("*.toml"))
-                .expect("callers toml failed");
+        let rs_callers = callers::find_callers_batch(
+            &single,
+            &scope,
+            &bloom,
+            Some("*.rs"),
+            callers::BATCH_EARLY_QUIT,
+        )
+        .expect("callers failed");
+        let toml_callers = callers::find_callers_batch(
+            &single,
+            &scope,
+            &bloom,
+            Some("*.toml"),
+            callers::BATCH_EARLY_QUIT,
+        )
+        .expect("callers toml failed");
 
         assert!(
             !rs_callers.is_empty(),
@@ -2019,8 +1748,15 @@ mod tests {
         #[cfg(windows)]
         std::os::windows::fs::symlink_dir(&real_dir, tmp.path().join("linked")).unwrap();
 
-        let result =
-            content::search("unique_symlink_test_symbol", tmp.path(), false, None, false).unwrap();
+        let result = content::search(
+            "unique_symlink_test_symbol",
+            tmp.path(),
+            false,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
         // Should find the symbol in both real/api.rs and linked/api.rs
         assert!(
             result.total_found >= 2,
@@ -2176,7 +1912,6 @@ mod tests {
             &mut expanded_files,
             false,
             &mut out,
-            false,
         );
 
         assert!(
@@ -2255,7 +1990,6 @@ mod tests {
             &mut expanded_files,
             false,
             &mut out,
-            false,
         );
 
         assert!(
@@ -2314,7 +2048,6 @@ mod tests {
             &mut expanded_files,
             false,
             &mut out,
-            false,
         );
 
         // Cap is 40 lines; expect 60 - 40 = 20 truncated.
@@ -2388,7 +2121,6 @@ mod tests {
             &mut expanded_files,
             false,
             &mut out,
-            false,
         );
 
         // Body lines beyond the cap must still be trimmed.

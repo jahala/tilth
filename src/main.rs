@@ -2,27 +2,8 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 
-use clap::{CommandFactory, Parser, ValueEnum};
+use clap::{CommandFactory, Parser};
 use clap_complete::Shell;
-use tilth::SymbolMode;
-
-/// Symbol-search mode for the CLI. Mirrors the MCP `kind` knob: `symbol`
-/// returns AST/heading-detected declarations only; `any` also includes
-/// word-boundary usage hits (comments, strings, call sites).
-#[derive(Copy, Clone, Debug, ValueEnum)]
-enum CliKind {
-    Symbol,
-    Any,
-}
-
-impl From<CliKind> for SymbolMode {
-    fn from(k: CliKind) -> Self {
-        match k {
-            CliKind::Symbol => SymbolMode::Strict,
-            CliKind::Any => SymbolMode::Any,
-        }
-    }
-}
 
 /// tilth — Tree-sitter indexed lookups, smart code reading for AI agents.
 /// One tool replaces `read_file`, grep, glob, `ast_grep`, and find.
@@ -87,14 +68,6 @@ struct Cli {
     /// File pattern filter (e.g. "*.rs", "!*.test.ts", "*.{go,rs}").
     #[arg(long)]
     glob: Option<String>,
-
-    /// Symbol-search mode. `symbol` (default): declarations only. `any`:
-    /// also include word-boundary usage matches in comments, strings, and
-    /// call sites. Affects symbol-classified queries (e.g. `tilth Foo`)
-    /// and multi-symbol comma queries; exploratory single-word queries
-    /// (e.g. `tilth config`) always include usages.
-    #[arg(long, value_enum, default_value_t = CliKind::Symbol)]
-    kind: CliKind,
 
     /// Find all callers of a symbol.
     #[arg(long, conflicts_with_all = ["deps", "map", "edit"])]
@@ -169,6 +142,22 @@ enum Command {
     },
     /// Show the project fingerprint (what MCP init would inject).
     Overview,
+    /// Grok a symbol — one call returns def + doc + callees + callers + siblings + tests.
+    ///
+    /// Target accepts: bare symbol (`parse_unified_diff`), path:line
+    /// (`src/diff/parse.rs:7`), or qualified name (`Type::method`).
+    Grok {
+        /// Symbol name or path:line.
+        target: String,
+
+        /// Restrict search to a subdirectory.
+        #[arg(long, default_value = ".")]
+        scope: PathBuf,
+
+        /// Widen output caps (more callers, callees, siblings, tests).
+        #[arg(long)]
+        full: bool,
+    },
 }
 
 fn main() {
@@ -198,6 +187,20 @@ fn main() {
                     process::exit(1);
                 }
                 println!("{output}");
+            }
+            Command::Grok {
+                target,
+                scope,
+                full,
+            } => {
+                let scope = scope.canonicalize().unwrap_or(scope);
+                match tilth::run_grok(&target, &scope, full) {
+                    Ok(output) => emit_output(&output, io::stdout().is_terminal()),
+                    Err(e) => {
+                        eprintln!("grok error: {e}");
+                        process::exit(e.exit_code());
+                    }
+                }
             }
             Command::Diff {
                 source,
@@ -291,31 +294,34 @@ fn main() {
     let cache = tilth::cache::OutlineCache::new();
     let scope = cli.scope.canonicalize().unwrap_or(cli.scope);
 
-    // When piped (not a TTY), force full output for FilePath queries — scripts
-    // expect raw content. Harmless for Glob (which ignores `full_file`). Search
-    // queries stay outline-only here; they auto-expand only via the explicit
-    // `cli.full` guard below.
-    let full_file = cli.full || !is_tty;
+    // When piped (not a TTY), force full output — scripts expect raw content.
+    // This promotion exists for FilePath queries (return full file instead of
+    // outline) and is harmless for Glob (which ignores `full`). Search queries
+    // also receive `full=true` here but stay outline-only — they do not auto-
+    // expand on piping. See the `cli.full` guard on the expand override below.
+    let full = cli.full || !is_tty;
 
     // Explicit `--full` on a search query means expand every match. Guarded on
-    // `cli.full` (NOT the piped-derived `full_file` above) so that subprocess /
+    // `cli.full` (NOT the piped-derived `full` above) so that subprocess /
     // pipeline callers (Claude Code's Bash tool, CI scripts, `tilth foo | rg`)
-    // still receive the concise outline they want. Explicit `--expand=N` still
-    // wins because it produces `expand != 0`. We over-apply to all query types
-    // — `run_inner` only forwards `expand` to search dispatches, so the value
-    // is silently ignored for FilePath and Glob.
+    // still receive the concise outline they want. They opt into expand-all by
+    // adding `--full` themselves. Explicit `--expand=N` still wins because it
+    // produces `expand != 0`. We over-apply to all query types — `run_inner`
+    // only forwards `expand` to search dispatches, so the value is silently
+    // ignored for FilePath and Glob.
+    //
     let expand = compute_expand(cli.expand, cli.full);
-
-    let cap = if cli.full {
-        tilth::MatchCap::Extended
-    } else {
-        tilth::MatchCap::Default
-    };
 
     // Callers mode
     if cli.callers {
-        let result =
-            tilth::run_callers(&query, &scope, expand, cli.budget, cli.glob.as_deref(), cap);
+        let result = tilth::run_callers(
+            &query,
+            &scope,
+            expand,
+            cli.budget,
+            cli.glob.as_deref(),
+            cli.full,
+        );
         emit_result(result, &query, cli.json, is_tty);
         return;
     }
@@ -342,16 +348,37 @@ fn main() {
         return;
     }
 
-    let config = tilth::RunConfig {
-        section: cli.section.as_deref(),
-        budget_tokens: cli.budget,
-        expand,
-        glob: cli.glob.as_deref(),
-        mode: SymbolMode::from(cli.kind),
-        full_file,
-        cap,
+    let result = if expand > 0 {
+        tilth::run_expanded(
+            &query,
+            &scope,
+            cli.section.as_deref(),
+            cli.budget,
+            full,
+            expand,
+            cli.glob.as_deref(),
+            &cache,
+            cli.full,
+        )
+    } else if full {
+        tilth::run_full(
+            &query,
+            &scope,
+            cli.section.as_deref(),
+            cli.budget,
+            cli.glob.as_deref(),
+            &cache,
+        )
+    } else {
+        tilth::run(
+            &query,
+            &scope,
+            cli.section.as_deref(),
+            cli.budget,
+            cli.glob.as_deref(),
+            &cache,
+        )
     };
-    let result = tilth::run(&query, &scope, &cache, config);
 
     emit_result(result, &query, cli.json, is_tty);
 }

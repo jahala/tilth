@@ -49,10 +49,6 @@ enum EditResult {
         diff: String,
         /// Hashlined context around edit sites (existing behavior).
         context: String,
-        /// Formatted `── parse ──` block if the edit introduced new tree-sitter
-        /// `ERROR` / `MISSING` nodes. `None` when no new errors or the language
-        /// has no grammar.
-        parse: Option<String>,
     },
     /// One or more hashes didn't match current content.
     HashMismatch(String),
@@ -71,7 +67,6 @@ fn apply_edits(path: &Path, edits: &[Edit]) -> Result<EditResult, TilthError> {
         return Ok(EditResult::Applied {
             diff: String::new(),
             context: String::new(),
-            parse: None,
         });
     }
 
@@ -268,15 +263,8 @@ fn apply_edits(path: &Path, edits: &[Edit]) -> Result<EditResult, TilthError> {
 
     let diff = format_diffs(&diffs);
     let context = contexts.join("\n---\n");
-    let parse = crate::edit_parse_check::check(path, &content, &output)
-        .as_ref()
-        .map(crate::edit_parse_check::format_report);
 
-    Ok(EditResult::Applied {
-        diff,
-        context,
-        parse,
-    })
+    Ok(EditResult::Applied { diff, context })
 }
 
 /// Format per-edit diffs as compact `-`/`+` blocks with hashline anchors.
@@ -375,14 +363,7 @@ fn lexical_normalize(path: &Path) -> PathBuf {
     let mut normal_count: usize = 0;
     for component in path.components() {
         match component {
-            // On Windows, drive-relative paths like `C:foo` parse as
-            // `[Prefix("C:"), Normal("foo")]` with no `RootDir` — they are
-            // anchored to that drive's cwd but are NOT absolute, so leading
-            // `..` must still be preserved. Only `RootDir` flips the flag.
-            Component::Prefix(_) => {
-                out.push(component.as_os_str());
-            }
-            Component::RootDir => {
+            Component::Prefix(_) | Component::RootDir => {
                 is_absolute = true;
                 out.push(component.as_os_str());
             }
@@ -426,15 +407,6 @@ pub(crate) fn detect_duplicate_paths(tasks: &[FileEditTask]) -> Option<String> {
     None
 }
 
-/// Successful return from [`apply_batch`]. `applied` lists the files whose
-/// edits actually committed so callers can gate session bookkeeping on real
-/// writes instead of on the upstream `Ready`/`ParseError` discriminant.
-#[derive(Debug)]
-pub struct BatchOutcome {
-    pub output: String,
-    pub applied: Vec<PathBuf>,
-}
-
 /// Apply a batch of file edits in parallel.
 ///
 /// Each task is processed independently — a hash mismatch, parse error, or
@@ -450,55 +422,45 @@ pub fn apply_batch(
     tasks: Vec<FileEditTask>,
     bloom: &Arc<BloomFilterCache>,
     show_diff: bool,
-) -> Result<BatchOutcome, String> {
+) -> Result<String, String> {
     if let Some(msg) = detect_duplicate_paths(&tasks) {
         return Err(msg);
     }
 
     let bloom: &BloomFilterCache = bloom;
-    let outcomes: Vec<(String, Option<PathBuf>)> = tasks
+    let outcomes: Vec<(String, bool)> = tasks
         .into_par_iter()
         .map(|task| apply_one(task, bloom, show_diff))
         .collect();
 
-    let mut applied = Vec::with_capacity(outcomes.len());
-    let mut sections = Vec::with_capacity(outcomes.len());
-    for (section, path) in outcomes {
-        if let Some(p) = path {
-            applied.push(p);
-        }
-        sections.push(section);
-    }
-    let output = sections.join("\n\n---\n\n");
+    let any_success = outcomes.iter().any(|(_, ok)| *ok);
+    let combined = outcomes
+        .into_iter()
+        .map(|(s, _)| s)
+        .collect::<Vec<_>>()
+        .join("\n\n---\n\n");
 
-    if applied.is_empty() {
-        Err(output)
+    if any_success {
+        Ok(combined)
     } else {
-        Ok(BatchOutcome { output, applied })
+        Err(combined)
     }
 }
 
-/// Process one task into a `(section, applied_path)` tuple. The path is
-/// `Some` only when the file's edits committed — callers use that to gate
-/// session bookkeeping (e.g. `record_read`) on actual writes rather than on
-/// the upstream `Ready`/`ParseError` discriminant, which only reflects parse
-/// validation.
-fn apply_one(
-    task: FileEditTask,
-    bloom: &BloomFilterCache,
-    show_diff: bool,
-) -> (String, Option<PathBuf>) {
+/// Process one task into a `(section, success)` tuple. Kept separate so the
+/// parallel closure stays trivial and per-file logic is testable in isolation.
+fn apply_one(task: FileEditTask, bloom: &BloomFilterCache, show_diff: bool) -> (String, bool) {
     let (path, edits) = match task {
         FileEditTask::ParseError { label, msg } => {
-            return (format!("## {label}\nerror: {msg}"), None);
+            return (format!("## {label}\nerror: {msg}"), false);
         }
         FileEditTask::Ready { path, edits } => (path, edits),
     };
     let header = format!("## {}", path.display());
     match render_applied(&path, &edits, bloom, show_diff) {
-        Ok(body) if body.is_empty() => (header, Some(path)),
-        Ok(body) => (format!("{header}\n{body}"), Some(path)),
-        Err(msg) => (format!("{header}\n{msg}"), None),
+        Ok(body) if body.is_empty() => (header, true),
+        Ok(body) => (format!("{header}\n{body}"), true),
+        Err(msg) => (format!("{header}\n{msg}"), false),
     }
 }
 
@@ -509,11 +471,7 @@ fn render_applied(
     show_diff: bool,
 ) -> Result<String, String> {
     match apply_edits(path, edits).map_err(|e| e.to_string())? {
-        EditResult::Applied {
-            diff,
-            context,
-            parse,
-        } => {
+        EditResult::Applied { diff, context } => {
             let mut output = String::new();
             if show_diff && !diff.is_empty() {
                 output.push_str(&diff);
@@ -523,12 +481,6 @@ fn render_applied(
             }
             if !context.is_empty() {
                 output.push_str(&context);
-            }
-            if let Some(parse_block) = parse {
-                if !output.is_empty() {
-                    output.push_str("\n\n");
-                }
-                output.push_str(&parse_block);
             }
             let abs_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
             let scope = crate::lang::package_root(&abs_path).map_or_else(
@@ -577,7 +529,7 @@ mod tests {
 
         let result = apply_edits(&path, &edits).unwrap();
         match result {
-            EditResult::Applied { diff, context, .. } => {
+            EditResult::Applied { diff, context } => {
                 assert!(
                     diff.contains("- 2:"),
                     "diff should have removed line: {diff}"
@@ -741,7 +693,7 @@ mod tests {
 
         let result = apply_edits(&path, &[]).unwrap();
         match result {
-            EditResult::Applied { diff, context, .. } => {
+            EditResult::Applied { diff, context } => {
                 assert!(diff.is_empty(), "diff should be empty for no edits");
                 assert!(context.is_empty(), "context should be empty for no edits");
             }
@@ -912,115 +864,6 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[test]
-    fn parse_block_set_when_edit_breaks_syntax() {
-        // Use a .rs extension so detect_file_type picks up the Rust grammar.
-        let path = std::env::temp_dir().join("tilth_edit_test_parse_break.rs");
-        std::fs::write(&path, "fn a() { 1 }\n").unwrap();
-        let h = hash_at("fn a() { 1 }\n", 1);
-
-        // Replace the line with an unbalanced version.
-        let edits = vec![Edit {
-            start_line: 1,
-            start_hash: h,
-            end_line: 1,
-            end_hash: h,
-            content: "fn a() { 1".into(),
-        }];
-
-        let result = apply_edits(&path, &edits).unwrap();
-        match result {
-            EditResult::Applied { parse, .. } => {
-                let block = parse.expect("parse block expected when edit breaks syntax");
-                assert!(
-                    block.starts_with("\u{2500}\u{2500} parse \u{2500}\u{2500}"),
-                    "missing parse header: {block}",
-                );
-            }
-            EditResult::HashMismatch(msg) => panic!("unexpected mismatch: {msg}"),
-        }
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn parse_block_none_when_edit_keeps_syntax_valid() {
-        let path = std::env::temp_dir().join("tilth_edit_test_parse_clean.rs");
-        std::fs::write(&path, "fn a() { 1 }\n").unwrap();
-        let h = hash_at("fn a() { 1 }\n", 1);
-
-        let edits = vec![Edit {
-            start_line: 1,
-            start_hash: h,
-            end_line: 1,
-            end_hash: h,
-            content: "fn a() { 99 }".into(),
-        }];
-
-        let result = apply_edits(&path, &edits).unwrap();
-        match result {
-            EditResult::Applied { parse, .. } => assert!(parse.is_none()),
-            EditResult::HashMismatch(msg) => panic!("unexpected mismatch: {msg}"),
-        }
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn parse_block_per_file_in_batch_independent() {
-        // Verify that in a multi-file batch, one file breaking and another
-        // staying clean each get their own parse block (or lack thereof).
-        // File 1: syntax error introduced (parse block expected).
-        let path1 = std::env::temp_dir().join("tilth_edit_test_batch1.rs");
-        std::fs::write(&path1, "fn a() { 1 }\n").unwrap();
-        let h1 = hash_at("fn a() { 1 }\n", 1);
-
-        // File 2: syntax stays valid (no parse block).
-        let path2 = std::env::temp_dir().join("tilth_edit_test_batch2.rs");
-        std::fs::write(&path2, "fn b() { 2 }\n").unwrap();
-        let h2 = hash_at("fn b() { 2 }\n", 1);
-
-        let edits1 = vec![Edit {
-            start_line: 1,
-            start_hash: h1,
-            end_line: 1,
-            end_hash: h1,
-            content: "fn a() { 1".into(), // breaks
-        }];
-
-        let edits2 = vec![Edit {
-            start_line: 1,
-            start_hash: h2,
-            end_line: 1,
-            end_hash: h2,
-            content: "fn b() { 99 }".into(), // stays clean
-        }];
-
-        let r1 = apply_edits(&path1, &edits1).unwrap();
-        let r2 = apply_edits(&path2, &edits2).unwrap();
-
-        match r1 {
-            EditResult::Applied { parse, .. } => {
-                assert!(
-                    parse.is_some(),
-                    "file 1 should have parse block when broken"
-                );
-            }
-            EditResult::HashMismatch(msg) => panic!("unexpected mismatch: {msg}"),
-        }
-
-        match r2 {
-            EditResult::Applied { parse, .. } => {
-                assert!(
-                    parse.is_none(),
-                    "file 2 should have no parse block when clean"
-                );
-            }
-            EditResult::HashMismatch(msg) => panic!("unexpected mismatch: {msg}"),
-        }
-
-        let _ = std::fs::remove_file(&path1);
-        let _ = std::fs::remove_file(&path2);
-    }
-
     // ----------------------------------------------------------------- batch
 
     fn ready_task(path: PathBuf, edits: Vec<Edit>) -> FileEditTask {
@@ -1064,9 +907,7 @@ mod tests {
             ),
         ];
 
-        let out = apply_batch(tasks, &fresh_bloom(), false)
-            .expect("batch should succeed")
-            .output;
+        let out = apply_batch(tasks, &fresh_bloom(), false).expect("batch should succeed");
         assert!(out.contains(&format!("## {}", a.display())));
         assert!(out.contains(&format!("## {}", b.display())));
         assert_eq!(std::fs::read_to_string(&a).unwrap(), "AAA\nbbb\n");
@@ -1106,9 +947,7 @@ mod tests {
             ),
         ];
 
-        let out = apply_batch(tasks, &fresh_bloom(), false)
-            .expect("good half succeeded")
-            .output;
+        let out = apply_batch(tasks, &fresh_bloom(), false).expect("good half succeeded");
         assert!(out.contains("hash mismatch"), "bad file reports mismatch");
         assert!(out.contains(&format!("## {}", bad.display())));
         // good file actually got written
@@ -1163,9 +1002,8 @@ mod tests {
             },
         ];
 
-        let out = apply_batch(tasks, &fresh_bloom(), false)
-            .expect("good half kept the batch alive")
-            .output;
+        let out =
+            apply_batch(tasks, &fresh_bloom(), false).expect("good half kept the batch alive");
         assert!(out.contains("## files[1]"));
         assert!(out.contains("error: missing 'edits' array"));
         assert_eq!(std::fs::read_to_string(&good).unwrap(), "K\n");
@@ -1199,53 +1037,17 @@ mod tests {
         assert!(detect_duplicate_paths(&tasks).is_none());
     }
 
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn dedup_catches_case_aliases_on_macos() {
-        // Case-insensitive APFS resolves Foo.rs and FOO.RS to the same inode.
-        // normalize_path_key ASCII-lowercases on macOS so the keys collide
-        // before two workers can race writes.
-        let tasks = vec![
-            ready_noop(PathBuf::from("nonexistent_case_target.rs")),
-            ready_noop(PathBuf::from("NONEXISTENT_CASE_TARGET.RS")),
-        ];
-        let err = detect_duplicate_paths(&tasks).expect("case aliases should collide on macOS");
-        assert!(err.contains("duplicate file path"), "unexpected: {err}");
-    }
-
-    #[test]
-    fn apply_batch_rejects_duplicate_paths() {
-        // The dedup gate lives inside apply_batch — exercise the integration
-        // path so the invariant is locked even if a future caller bypasses
-        // the MCP wire layer.
-        let dir = tempfile::tempdir().unwrap();
-        let a = dir.path().join("dup.txt");
-        std::fs::write(&a, "x\n").unwrap();
-        let h = hash_at("x\n", 1);
-
-        let make_edit = || Edit {
-            start_line: 1,
-            start_hash: h,
-            end_line: 1,
-            end_hash: h,
-            content: "X".into(),
-        };
-
-        let tasks = vec![
-            ready_task(a.clone(), vec![make_edit()]),
-            ready_task(a.clone(), vec![make_edit()]),
-        ];
-
-        let err = apply_batch(tasks, &fresh_bloom(), false)
-            .expect_err("duplicate paths must reject the batch");
-        assert!(err.contains("duplicate file path"), "unexpected: {err}");
-        // File must be untouched — no worker ran.
-        assert_eq!(std::fs::read_to_string(&a).unwrap(), "x\n");
-    }
-
     /// Pin the race fix: `normalize_path_key` MUST NOT depend on
-    /// `current_dir()`. Two parallel tests calling `set_current_dir` would
-    /// otherwise produce different keys for the same logical path.
+    /// `current_dir()`. If it did, this test could flake under parallel
+    /// test execution (another test calling `set_current_dir` could
+    /// change the result of the second key computation). The dedup
+    /// must hold even when cwd changes between the two computations,
+    /// which we simulate here by toggling cwd in between.
+    ///
+    /// Regression: pre-fix this used `std::path::absolute()` whose
+    /// behavior depends on `current_dir()`; the test was flaky on
+    /// Linux CI because `mcp::tests::scope_handoff_when_cwd_is_root`
+    /// runs in parallel and calls `set_current_dir("/")`.
     #[test]
     fn normalize_path_key_is_cwd_independent() {
         let key_a = normalize_path_key(Path::new("foo.rs"));
@@ -1325,5 +1127,49 @@ mod tests {
             normalize_path_key(Path::new("../foo.rs")),
             normalize_path_key(Path::new("foo.rs"))
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dedup_catches_case_aliases_on_macos() {
+        // Case-insensitive APFS resolves Foo.rs and FOO.RS to the same inode.
+        // normalize_path_key ASCII-lowercases on macOS so the keys collide
+        // before two workers can race writes.
+        let tasks = vec![
+            ready_noop(PathBuf::from("nonexistent_case_target.rs")),
+            ready_noop(PathBuf::from("NONEXISTENT_CASE_TARGET.RS")),
+        ];
+        let err = detect_duplicate_paths(&tasks).expect("case aliases should collide on macOS");
+        assert!(err.contains("duplicate file path"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn apply_batch_rejects_duplicate_paths() {
+        // The dedup gate lives inside apply_batch — exercise the integration
+        // path so the invariant is locked even if a future caller bypasses
+        // the MCP wire layer.
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("dup.txt");
+        std::fs::write(&a, "x\n").unwrap();
+        let h = hash_at("x\n", 1);
+
+        let make_edit = || Edit {
+            start_line: 1,
+            start_hash: h,
+            end_line: 1,
+            end_hash: h,
+            content: "X".into(),
+        };
+
+        let tasks = vec![
+            ready_task(a.clone(), vec![make_edit()]),
+            ready_task(a.clone(), vec![make_edit()]),
+        ];
+
+        let err = apply_batch(tasks, &fresh_bloom(), false)
+            .expect_err("duplicate paths must reject the batch");
+        assert!(err.contains("duplicate file path"), "unexpected: {err}");
+        // File must be untouched — no worker ran.
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "x\n");
     }
 }

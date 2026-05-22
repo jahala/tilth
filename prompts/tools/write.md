@@ -5,6 +5,7 @@ Example with `diff: true` (verify what landed, no follow-up read): `tilth_write(
 Example overwrite (new file): `tilth_write(files: [{path: "src/new.rs", mode: "overwrite", content: "fn main(){}\n"}])`.
 
 Request shape:
+
 ```json
 {
   "files": [

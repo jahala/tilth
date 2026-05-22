@@ -11,23 +11,25 @@ use grep_regex::RegexMatcher;
 use grep_searcher::sinks::UTF8;
 use grep_searcher::Searcher;
 
-use super::{FULL_EARLY_QUIT_THRESHOLD, FULL_MAX_MATCHES};
-
 const MAX_MATCHES: usize = 10;
 const EARLY_QUIT_THRESHOLD: usize = MAX_MATCHES * 3;
+const FULL_MAX_MATCHES: usize = 100;
+const FULL_EARLY_QUIT_THRESHOLD: usize = FULL_MAX_MATCHES * 3;
+const MAX_SEARCH_FILE_SIZE: u64 = 500_000;
 
 /// Content search using ripgrep crates. Literal by default, regex if `is_regex`.
 pub fn search(
     pattern: &str,
     scope: &Path,
     is_regex: bool,
+    context: Option<&Path>,
     glob: Option<&str>,
     full: bool,
 ) -> Result<SearchResult, TilthError> {
-    let (early_quit, cap) = if full {
-        (FULL_EARLY_QUIT_THRESHOLD, FULL_MAX_MATCHES)
+    let (max_matches, early_quit) = if full {
+        (FULL_MAX_MATCHES, FULL_EARLY_QUIT_THRESHOLD)
     } else {
-        (EARLY_QUIT_THRESHOLD, MAX_MATCHES)
+        (MAX_MATCHES, EARLY_QUIT_THRESHOLD)
     };
     let matcher = if is_regex {
         RegexMatcher::new(pattern)
@@ -66,14 +68,25 @@ pub fn search(
 
             let path = entry.path();
 
-            // Shared stat-only filter (minified-by-name + size cap). The
-            // empty-header walker calls the same helper so the `Files
-            // searched: N` count reported on zero-result responses always
-            // matches the rule the real search applies.
-            if !super::passes_stat_filter(path) {
+            // Skip files that look minified by filename — `.min.js`, `app-min.css`.
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(crate::lang::detection::is_minified_by_name)
+            {
                 return ignore::WalkState::Continue;
             }
-            let file_size = std::fs::metadata(path).map_or(0, |m| m.len());
+
+            // Skip oversized files — tree-sitter and ripgrep shouldn't spend time on minified bundles
+            let file_size = match std::fs::metadata(path) {
+                Ok(meta) => {
+                    if meta.len() > MAX_SEARCH_FILE_SIZE {
+                        return ignore::WalkState::Continue;
+                    }
+                    meta.len()
+                }
+                Err(_) => 0,
+            };
 
             // Read the file once. Use `search_slice` instead of `search_path`
             // so the minified-check (when triggered) and the actual search
@@ -83,12 +96,7 @@ pub fn search(
                 return ignore::WalkState::Continue;
             };
 
-            // Catch unmarked minified bundles in the 100KB–500KB range. This
-            // byte-content check is intentionally NOT part of
-            // `passes_stat_filter`: it requires the file bytes, so the
-            // empty-header walker cannot replicate it without paying the
-            // read cost on every file. A non-empty real search reads the
-            // bytes anyway and pays the extra check once per file.
+            // Catch unmarked minified bundles in the 100KB–500KB range.
             if file_size >= crate::lang::detection::MINIFIED_CHECK_THRESHOLD
                 && crate::lang::detection::is_minified_by_content(&bytes)
             {
@@ -142,8 +150,8 @@ pub fn search(
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    rank::sort(&mut all_matches, pattern, scope);
-    all_matches.truncate(cap);
+    rank::sort(&mut all_matches, pattern, scope, context);
+    all_matches.truncate(max_matches);
 
     Ok(SearchResult {
         query: pattern.to_string(),
@@ -154,79 +162,4 @@ pub fn search(
         usages: total,
         facet_totals: FacetTotals::default(),
     })
-}
-
-#[cfg(test)]
-mod tests {
-    /// `--full` raises the content match cap from 10 → 100 and proportionally
-    /// raises the walker early-quit threshold. Seeds 15 files each containing the
-    /// target literal once so all 15 are real matches. With `full=false` the cap
-    /// stays at 10; with `full=true` it lifts above 10. `total_found` is computed
-    /// pre-truncation and matches in both arms.
-    #[test]
-    fn content_full_flag_raises_match_cap() {
-        let tmp = tempfile::tempdir().unwrap();
-        for i in 0..15 {
-            let path = tmp.path().join(format!("file_{i}.rs"));
-            std::fs::write(&path, "// uniqueContentMarkerXYZ\n").unwrap();
-        }
-
-        let default_result =
-            super::search("uniqueContentMarkerXYZ", tmp.path(), false, None, false).unwrap();
-        assert!(
-            default_result.matches.len() <= 10,
-            "default cap should keep matches <= 10, got {}",
-            default_result.matches.len()
-        );
-        assert!(
-            default_result.total_found >= 15,
-            "total_found should reflect pre-truncation count, got {} (expected >= 15)",
-            default_result.total_found
-        );
-        assert!(
-            default_result.total_found > default_result.matches.len(),
-            "total_found must exceed matches.len() in the truncated default case: total={} displayed={}",
-            default_result.total_found,
-            default_result.matches.len()
-        );
-
-        let full_result =
-            super::search("uniqueContentMarkerXYZ", tmp.path(), false, None, true).unwrap();
-        assert!(
-            full_result.matches.len() > 10,
-            "full=true should raise the cap above 10, got {}",
-            full_result.matches.len()
-        );
-        assert_eq!(
-            default_result.total_found, full_result.total_found,
-            "total_found should match pre-truncation across both arms"
-        );
-    }
-
-    /// Regex path shares the same `full` plumbing as literal content search.
-    /// Pin the cap behavior for `is_regex=true` so a future refactor that splits
-    /// the two paths cannot quietly drop the cap raise on the regex side.
-    #[test]
-    fn content_full_flag_raises_match_cap_regex() {
-        let tmp = tempfile::tempdir().unwrap();
-        for i in 0..15 {
-            let path = tmp.path().join(format!("file_{i}.rs"));
-            std::fs::write(&path, "// regexMarkerXYZ\n").unwrap();
-        }
-
-        let default_result =
-            super::search("regexMarker..Z", tmp.path(), true, None, false).unwrap();
-        assert!(
-            default_result.matches.len() <= 10,
-            "regex default cap should keep matches <= 10, got {}",
-            default_result.matches.len()
-        );
-
-        let full_result = super::search("regexMarker..Z", tmp.path(), true, None, true).unwrap();
-        assert!(
-            full_result.matches.len() > 10,
-            "regex full=true should raise the cap above 10, got {}",
-            full_result.matches.len()
-        );
-    }
 }

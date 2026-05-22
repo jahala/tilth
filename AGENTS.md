@@ -1,18 +1,79 @@
 <!-- generated from prompts/mcp-base.md + prompts/mcp-edit.md by scripts/regen-agents-md.sh — do not edit directly -->
+tilth — code intelligence MCP server. Replaces grep, cat, find, ls with AST-aware equivalents.
 
-tilth — AST-aware code intelligence MCP server.
+To explore code, always search first. tilth_search finds definitions, usages, and file locations in one call.
+Usage: tilth_search(query: "handleRequest").
+tilth_files is ONLY for listing directory contents when you have no symbol or text to search for.
+DO NOT use Read if content is already shown in expanded search results.
+DO NOT use Grep, Read, or Glob. Always use the better tools tilth_search (grep), tilth_read (read), tilth_files (glob).
 
-Four tools, all batch-capable via array inputs:
-  • tilth_search — find by symbol/content/regex/callers (merged by default)
-  • tilth_read   — load files with smart auto-sizing (full / signature / stripped / preview)
-  • tilth_list   — directory layout with token-cost rollups
-  • tilth_write  — hash-anchored / overwrite / append; tolerates stale anchor hashes
+tilth_search: Search code — finds definitions, usages, and text. Replaces grep/rg for all code search.
+For multi-symbol lookup, separate each with a comma "symbol1,symbol2" (max 5).
+kind: "symbol" (default) | "content" (strings/comments) | "callers" (call sites)
+expand (default 2): inline full source for top matches.
+context: path to file being edited — boosts nearby results.
+glob: file pattern filter — "*.rs" (whitelist), "!*.test.ts" (exclude).
+Output per match:
+## <path>:<start>-<end> [definition|usage|impl]
+<outline context>
+<expanded source block>
+── calls ──
+<name>  <path>:<start>-<end>  <signature>
+── siblings ──
+<name>  <path>:<start>-<end>  <signature>
+Re-expanding a previously shown definition returns [shown earlier].
 
-Each tool's description carries detailed usage, examples, and batching rules.
-DO NOT use host Grep, Read, Glob, Write, or Edit.
+tilth_read: Read file content with smart outlining. Replaces cat/head/tail.
+Small files → full content. Large files → structural outline.
+section: "<start>-<end>" or "<heading text>"
+sections: array of ranges/headings — multiple slices from the same file in one call.
+paths: read multiple files in one call.
+Output:
+<line_number> │ <content>                  ← full/section mode
+[<start>-<end>]  <symbol name>             ← outline mode
 
-Aux tools: tilth_deps (blast-radius before signature changes), tilth_diff (structural diff: [+] added, [-] deleted, [~] body changed, [~:sig] signature changed)
+tilth_files: Find files by glob pattern. Replaces find, ls, pwd, and the host Glob tool.
+patterns: run multiple globs in one call (e.g. patterns: ["*.rs", "*.toml"]).
+Output: <path>  (~<token_count> tokens).
 
-Edit mode: tilth_write is exposed. See its tool description for modes (hash / overwrite / append), request shape, batching rule, and auto-fix behavior.
+tilth_deps: Blast-radius check — what imports this file and what it imports.
+Use ONLY before renaming, removing, or changing an export's signature.
 
-DO NOT use the host Edit or Write tools.
+tilth_grok: Everything structural about a symbol in one call — def + body + signature + doc + callees + callers + siblings + tests.
+Usage: tilth_grok(target: "parse_unified_diff"). Also accepts "src/file.rs:7" or "Type::method".
+scope: narrow when the name is ambiguous. full: widen caps from 5/5/8/8 to 50/30/30/30.
+Use ONLY for "understand this symbol" questions — replaces the search → expand → callers chain.
+DO NOT use for concept search (use tilth_search) or reading file contents (use tilth_read).
+
+tilth_diff: Structural diff — shows what changed at function level. Replaces Bash(git diff).
+Usage: tilth_diff(source: "HEAD~1") for last commit. No args = uncommitted changes.
+scope: "file.rs" or "file.rs:fn_name". log: "HEAD~5..HEAD" for per-commit summaries.
+search: filter to lines matching a term. blast: true to show callers of changed signatures.
+Output: [+] added, [-] deleted, [~] body changed, [~:sig] signature changed.
+DO NOT use Bash(git diff) or Bash(git log --patch). Use tilth_diff instead.
+
+To search code, use tilth_search instead of Grep or Bash(grep/rg).
+To read files, use tilth_read instead of Read or Bash(cat).
+To find files, use tilth_files instead of Glob or Bash(find/ls).
+To check what changed, use tilth_diff instead of Bash(git diff/git log).
+DO NOT re-read files already shown in expanded search results.
+
+tilth_edit: Batch edit one or more files using hash-anchored lines. Replaces the host Edit tool.
+ALWAYS group edits to multiple files into ONE tilth_edit call (max 20 files). Never call tilth_edit twice in a row.
+tilth_read → copy anchors (<line>:<hash>) (BOTH line and hash required) → pass to tilth_edit.
+tilth_search does NOT provide hashes — you MUST tilth_read the file or section first.
+Shape: {"files": [{"path": "a.rs", "edits": [...]}, {"path": "b.rs", "edits": [...]}]}
+Single file: {"files": [{"path": "a.rs", "edits": [{"start": "<line>:<hash>", "content": "<new code>"}]}]}
+Edit forms inside `edits`:
+Single line: {"start": "<line>:<hash>", "content": "<new code>"}
+Range:       {"start": "<line>:<hash>", "end": "<line>:<hash>", "content": "..."}
+Delete:      {"start": "<line>:<hash>", "content": ""}
+Per-file results: each file is processed independently. A hash mismatch on one file does NOT block the others.
+isError is false whenever ≥1 file succeeded — always scan the per-file `## <path>` sections for failures rather than trusting the top-level status.
+Hash mismatch → file changed, re-read THAT file and retry it (other files in the batch already applied).
+A parse error on one edit invalidates ALL edits for that file (none applied); retry the whole file's edits after fixing the malformed entry.
+Each file path may appear at most once per call — group all edits for a file under its single entry.
+Large files: tilth_read shows outline — use section to get hashlined content.
+Pass diff: true to see a compact before/after diff per file.
+After editing a function signature, tilth_edit shows callers that may need updating.
+DO NOT use the host Edit tool. Use tilth_edit for all edits.

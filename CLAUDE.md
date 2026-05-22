@@ -8,7 +8,7 @@ Rust MCP server + CLI for AST-aware code intelligence. Tree-sitter outlines, sym
 src/
   main.rs              CLI entry (clap). Dispatches to MCP, map, or single-query mode.
   lib.rs               Public API: classify query → read/search/glob → formatted output.
-  mcp.rs               MCP server (JSON-RPC on stdio). SERVER_INSTRUCTIONS + EDIT_MODE_EXTRA.
+  mcp/mod.rs           MCP server (JSON-RPC on stdio). Embeds SERVER_INSTRUCTIONS + EDIT_MODE_EXTRA via include_str! from prompts/.
   classify.rs          Query type detection (file path, glob, symbol, content, fallthrough).
   lang/
     mod.rs             Shared language infrastructure: detect_file_type(), package_root().
@@ -57,7 +57,8 @@ src/
   error.rs             Error types with exit codes.
 npm/                   npm wrapper — postinstall downloads binary, run.js proxies to it.
 benchmark/             Evaluation harness (see Benchmarks section below).
-AGENTS.md              MCP tool usage instructions shipped to users (read by Claude Code).
+prompts/               MCP server instruction source (mcp-base.md + mcp-edit.md). Embedded into the binary at compile time and regenerated into AGENTS.md.
+AGENTS.md              User-facing copy of the MCP instructions. Generated from prompts/*.md via scripts/regen-agents-md.sh — do not edit directly.
 ```
 
 ## Languages supported
@@ -122,11 +123,11 @@ Task definitions are in `benchmark/tasks/*.py`. Each has `name`, `prompt`, `grou
 
 ## MCP instructions
 
-Server instructions live in `prompts/`:
-- `prompts/mcp-base.md` — base instructions for all modes (compiled into the binary as `SERVER_INSTRUCTIONS` via `include_str!` in `src/mcp.rs`)
-- `prompts/mcp-edit.md` — appended in edit mode (compiled in as `EDIT_MODE_EXTRA`)
+Server instructions sent via MCP protocol live in `prompts/`:
+- `prompts/mcp-base.md` — base instructions for all modes (wired in as `SERVER_INSTRUCTIONS`)
+- `prompts/mcp-edit.md` — appended in edit mode (wired in as `EDIT_MODE_EXTRA`)
 
-After editing either file, run `scripts/regen-agents-md.sh` to refresh `AGENTS.md` (which is a generated artifact for hosts that read repo-root prompt files). The MCP-connected agent receives the contents of `prompts/*.md` directly via the protocol's `instructions` field.
+`src/mcp/mod.rs` embeds both at compile time via `include_str!`. `AGENTS.md` is the user-facing copy; regenerate it via `./scripts/regen-agents-md.sh` after any change so both surfaces stay in lockstep. The byte-lock tests in `src/mcp/mod.rs` (`server_instructions_byte_lock`, `edit_mode_extra_byte_lock`) flag accidental drift and must be updated alongside intentional prompt edits.
 
 Changes to MCP instructions must be surgical — no bloat. Haiku is sensitive to:
 - Instruction positioning (top-weighted — put important guidance first)

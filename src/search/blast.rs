@@ -5,7 +5,7 @@ use std::path::Path;
 use crate::edit::Edit;
 use crate::lang::detect_file_type;
 use crate::lang::outline::get_outline_entries;
-use crate::search::callers::{find_callers_batch_default, CallerMatch};
+use crate::search::callers::{find_callers_batch, CallerMatch};
 use crate::types::{is_test_file, FileType, OutlineEntry, OutlineKind};
 
 pub(crate) struct TouchedSymbol {
@@ -82,7 +82,14 @@ pub(crate) fn blast_radius(
 
     let symbol_names: HashSet<String> = touched.iter().map(|t| t.name.clone()).collect();
 
-    let callers = find_callers_batch_default(&symbol_names, scope, bloom, None).ok()?;
+    let callers = find_callers_batch(
+        &symbol_names,
+        scope,
+        bloom,
+        None,
+        crate::search::callers::BATCH_EARLY_QUIT,
+    )
+    .ok()?;
 
     let canonical = path.canonicalize().ok()?;
     let callers: Vec<(String, CallerMatch)> = callers

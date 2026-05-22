@@ -1,39 +1,28 @@
-//! MCP tool dispatchers. Each `tilth_*` tool has its own file here; this
-//! module exposes their entry points to `super::dispatch_tool`.
-//!
-//! Tool dispatchers are private to `crate::mcp`: they're invoked by the
-//! JSON-RPC handler and never called from outside the server.
+mod definitions;
+mod deps;
+mod diff;
+mod edit;
+mod files;
+mod grok;
+mod read;
+mod search;
+mod session;
+
+pub(super) use definitions::tool_definitions;
+pub(super) use deps::tool_deps;
+pub(super) use diff::tool_diff;
+pub(super) use edit::tool_edit;
+pub(super) use files::tool_files;
+pub(super) use grok::tool_grok;
+pub(super) use read::tool_read;
+pub(super) use search::tool_search;
+pub(super) use session::tool_session;
 
 use std::path::PathBuf;
 
 use serde_json::Value;
 
-mod definitions;
-mod deps;
-mod diff;
-mod files;
-mod list;
-mod read;
-mod search;
-mod session;
-mod write;
-
-pub(super) use definitions::tool_definitions;
-pub(super) use deps::tool_deps;
-pub(super) use diff::tool_diff;
-#[cfg(test)]
-pub(super) use files::tool_files;
-pub(super) use list::tool_list;
-pub(super) use read::tool_read;
-pub(super) use search::tool_search;
-pub(super) use session::tool_session;
-#[cfg(test)]
-pub(super) use write::tool_edit;
-pub(super) use write::tool_write;
-
-/// Resolve the `scope` argument to a canonical directory. Falls back to cwd
-/// with a warning message when the argument is missing, invalid, or not a
-/// directory.
+/// Falls back to cwd when scope is invalid, with a warning message.
 pub(super) fn resolve_scope(args: &Value) -> (PathBuf, Option<String>) {
     let raw_str = args.get("scope").and_then(|v| v.as_str()).unwrap_or(".");
     let raw: PathBuf = raw_str.into();
@@ -53,10 +42,92 @@ pub(super) fn resolve_scope(args: &Value) -> (PathBuf, Option<String>) {
     (resolved, None)
 }
 
-/// Apply an optional token budget to an output string.
 pub(super) fn apply_budget(output: String, budget: Option<u64>) -> String {
     match budget {
         Some(b) => crate::budget::apply(&output, b),
         None => output,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_scope_explicit_arg() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = serde_json::json!({ "scope": tmp.path().to_str().unwrap() });
+        let (scope, warning) = resolve_scope(&args);
+        assert_eq!(scope, tmp.path().canonicalize().unwrap());
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn resolve_scope_no_arg_uses_cwd() {
+        let args = serde_json::json!({});
+        let (scope, warning) = resolve_scope(&args);
+        // With no arg, defaults to "." which is cwd
+        let cwd = std::env::current_dir().unwrap();
+        // The function returns "." when resolved == cwd
+        assert!(scope == PathBuf::from(".") || scope == cwd);
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn resolve_scope_invalid_dir_warns() {
+        let args = serde_json::json!({ "scope": "/nonexistent/directory/zzz" });
+        let (scope, warning) = resolve_scope(&args);
+        assert_eq!(scope, PathBuf::from("."));
+        assert!(warning.is_some());
+        assert!(warning.unwrap().contains("not a valid directory"));
+    }
+
+    /// Reproduces issue #37: MCP host launches tilth with cwd=/. The --scope
+    /// flag should override this.
+    #[test]
+    fn scope_flag_overrides_bad_cwd() {
+        let project = tempfile::tempdir().unwrap();
+        let project_path = project.path();
+
+        // Create a manifest so package_root can find it
+        std::fs::write(
+            project_path.join("Cargo.toml"),
+            "[package]\nname = \"test\"",
+        )
+        .unwrap();
+        std::fs::create_dir(project_path.join("src")).unwrap();
+        std::fs::write(project_path.join("src/main.rs"), "fn main() {}").unwrap();
+
+        // Save current cwd
+        let orig_cwd = std::env::current_dir().unwrap();
+
+        // Simulate Codex: cwd=/
+        std::env::set_current_dir("/").unwrap();
+
+        // Without --scope: resolve_scope returns "." which is /
+        let args = serde_json::json!({});
+        let (scope, _) = resolve_scope(&args);
+        assert_eq!(
+            scope,
+            PathBuf::from("."),
+            "Without --scope, should return . (which is /)"
+        );
+
+        // With --scope pointing to project: set_current_dir should fix everything
+        let _ = std::env::set_current_dir(project_path);
+        let args = serde_json::json!({});
+        let (scope, _) = resolve_scope(&args);
+        assert_eq!(
+            scope,
+            PathBuf::from("."),
+            "After chdir to project, . should resolve correctly"
+        );
+
+        // Verify tilth_files would search in the project, not /
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(cwd, project_path.canonicalize().unwrap());
+
+        // Restore
+        std::env::set_current_dir(orig_cwd).unwrap();
     }
 }

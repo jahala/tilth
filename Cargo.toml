@@ -73,6 +73,9 @@ thiserror = "2"
 # Bloom filter (fast SIMD-optimized impl)
 fastbloom = "0.17"
 
+# MCP protocol (JSON-RPC over stdio)
+# (handled manually — no framework needed)
+
 # String similarity (char-aware Levenshtein for filename / heading suggestions)
 strsim = "0.11"
 
@@ -82,15 +85,11 @@ percent-encoding = "2.3"
 # Cross-platform home directory lookup (cargo-team maintained)
 home = "0.5"
 
-# MCP protocol (JSON-RPC over stdio)
-# (handled manually — no framework needed)
-
 # Terminal size detection (TIOCGWINSZ ioctl, falls back to env vars)
 terminal_size = "0.4"
 
 
 [dev-dependencies]
-insta = "1"
 tempfile = "3"
 
 [profile.release]

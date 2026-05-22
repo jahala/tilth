@@ -18,7 +18,6 @@ pub mod cache;
 pub(crate) mod classify;
 pub mod diff;
 pub(crate) mod edit;
-pub(crate) mod edit_parse_check;
 pub mod error;
 pub(crate) mod format;
 pub mod index;
@@ -29,10 +28,34 @@ pub mod mcp;
 pub mod overview;
 pub(crate) mod read;
 pub(crate) mod search;
-pub use search::symbol::SymbolMode;
 pub(crate) mod session;
 pub(crate) mod timeout;
 pub(crate) mod types;
+
+/// Re-exports for the fuzz harness. Not stable; do not depend on this.
+/// Items here are only `pub` so `fuzz/fuzz_targets/*.rs` can reach them
+/// without us widening the rest of the crate's pub(crate) surface.
+#[doc(hidden)]
+pub mod __fuzz {
+    use std::collections::HashSet;
+    use std::path::Path;
+
+    pub use crate::read::outline::code::outline;
+    pub use crate::types::Lang;
+
+    /// Wrapper: `strip_noise` is `pub(crate)`, so we re-export via a function
+    /// rather than `pub use` (which Rust forbids for less-visible items).
+    #[must_use]
+    pub fn strip_noise(content: &str, path: &Path, def_range: Option<(u32, u32)>) -> HashSet<u32> {
+        crate::search::strip::strip_noise(content, path, def_range)
+    }
+
+    /// Wrapper: same pattern for `parse_unified_diff`.
+    /// Returns unit because the fuzz target doesn't introspect the result.
+    pub fn parse_unified_diff(raw: &str) {
+        let _ = crate::diff::parse::parse_unified_diff(raw);
+    }
+}
 
 use std::path::Path;
 
@@ -47,92 +70,102 @@ struct ExpandedCtx {
     session: session::Session,
     bloom: index::bloom::BloomFilterCache,
     expand: usize,
-    /// Forwarded from the CLI's *parsed* `--full` flag (NOT the piped-derived
-    /// `full_file = cli.full || !is_tty`). When `Extended`, expanded search
-    /// dispatches raise the per-mode match cap (10 → 100). MCP and library
-    /// callers leave this `Default` to preserve current token budgets.
-    cap: MatchCap,
+    /// Raises the search match cap (10 → 100). Driven by the explicit `--full`
+    /// flag, NOT by `full = !is_tty`. Piped invocation must preserve the
+    /// concise outline — see the `piped_invocation_does_not_auto_expand`
+    /// pin in `main.rs` for the larger design rule this enforces.
+    full_search: bool,
 }
 
-/// Search match-cap selector. `Default` keeps the concise outline (10 matches);
-/// `Extended` raises it to 100. The CLI's parsed `--full` flag drives `Extended`;
-/// everything else stays on `Default`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum MatchCap {
-    #[default]
-    Default,
-    Extended,
-}
-
-impl MatchCap {
-    fn extended(self) -> bool {
-        matches!(self, MatchCap::Extended)
-    }
-}
-
-/// Per-call configuration for [`run`]. Groups the optional knobs so the public
-/// entry point stays one short parameter list instead of ten positional args.
-#[derive(Debug, Clone, Copy)]
-pub struct RunConfig<'a> {
-    pub section: Option<&'a str>,
-    pub budget_tokens: Option<u64>,
-    /// Number of top search matches to expand inline (0 = no expansion).
-    pub expand: usize,
-    pub glob: Option<&'a str>,
-    pub mode: SymbolMode,
-    /// Force full-file output for `FilePath` queries (drives piped-stdout
-    /// promotion). Search queries ignore this and stay outline-only.
-    pub full_file: bool,
-    /// Raise the search match cap. The CLI's *parsed* `--full` flag is the
-    /// only sanctioned source — piped-derived `!is_tty` must not promote to
-    /// `Extended`. Library / MCP callers leave this `Default`.
-    pub cap: MatchCap,
-}
-
-impl Default for RunConfig<'_> {
-    fn default() -> Self {
-        Self {
-            section: None,
-            budget_tokens: None,
-            expand: 0,
-            glob: None,
-            mode: SymbolMode::Strict,
-            full_file: false,
-            cap: MatchCap::Default,
-        }
-    }
-}
-
-/// Single public entry point — classify → dispatch → return formatted string.
+/// The single public API. Everything flows through here:
+/// classify → match on query type → return formatted string.
 pub fn run(
     query: &str,
     scope: &Path,
+    section: Option<&str>,
+    budget_tokens: Option<u64>,
+    glob: Option<&str>,
     cache: &OutlineCache,
-    config: RunConfig<'_>,
 ) -> Result<String, TilthError> {
-    run_inner(query, scope, cache, config)
+    run_inner(
+        query,
+        scope,
+        section,
+        budget_tokens,
+        false,
+        0,
+        glob,
+        cache,
+        false,
+    )
 }
 
-/// Find all callers of a symbol. Separate from `run` because callers is a
-/// distinct operation, not a search-query classification.
+/// Full variant — forces full file output, bypassing smart views.
+/// `full_file` covers piped-stdout promotion too; search cap bump never
+/// applies on this path (no expansion = no `run_query_expanded`).
+pub fn run_full(
+    query: &str,
+    scope: &Path,
+    section: Option<&str>,
+    budget_tokens: Option<u64>,
+    glob: Option<&str>,
+    cache: &OutlineCache,
+) -> Result<String, TilthError> {
+    run_inner(
+        query,
+        scope,
+        section,
+        budget_tokens,
+        true,
+        0,
+        glob,
+        cache,
+        false,
+    )
+}
+
+/// Run with expanded search — inline source for top N matches.
+/// `full` controls full-file display for `FilePath` queries (driven by
+/// `cli.full || !is_tty`). `cli_full` is the *parsed* `--full` flag and
+/// alone gates the search match-cap bump; piped invocation must not raise
+/// the cap (see `piped_invocation_does_not_auto_expand` pin).
+pub fn run_expanded(
+    query: &str,
+    scope: &Path,
+    section: Option<&str>,
+    budget_tokens: Option<u64>,
+    full: bool,
+    expand: usize,
+    glob: Option<&str>,
+    cache: &OutlineCache,
+    cli_full: bool,
+) -> Result<String, TilthError> {
+    run_inner(
+        query,
+        scope,
+        section,
+        budget_tokens,
+        full,
+        expand,
+        glob,
+        cache,
+        cli_full,
+    )
+}
+
+/// Find all callers of a symbol.
 pub fn run_callers(
     target: &str,
     scope: &Path,
     expand: usize,
     budget_tokens: Option<u64>,
     glob: Option<&str>,
-    cap: MatchCap,
+    full: bool,
 ) -> Result<String, TilthError> {
     let bloom = index::bloom::BloomFilterCache::new();
     let expand = if expand > 0 { expand } else { 2 };
-    let output = search::callers::search_callers_expanded(
-        target,
-        scope,
-        &bloom,
-        expand,
-        glob,
-        cap.extended(),
-    )?;
+    let output =
+        search::callers::search_callers_expanded(target, scope, &bloom, expand, None, glob, full)?;
     match budget_tokens {
         Some(b) => Ok(budget::apply(&output, b)),
         None => Ok(output),
@@ -151,22 +184,32 @@ pub fn run_deps(
     Ok(search::deps::format_deps(&result, scope, budget_usize))
 }
 
+/// Grok a symbol: return def + doc + callees + callers + siblings + tests in one call.
+///
+/// `target_spec` accepts a bare symbol name (`parse_unified_diff`), a path:line
+/// pair (`src/diff/parse.rs:7`), or a `Type::method` reference.
+pub fn run_grok(target_spec: &str, scope: &Path, full: bool) -> Result<String, TilthError> {
+    let bloom = index::bloom::BloomFilterCache::new();
+    let caps = if full {
+        search::grok::GrokCaps::full()
+    } else {
+        search::grok::GrokCaps::default()
+    };
+    let result = search::grok::grok(target_spec, scope, &bloom, caps)?;
+    Ok(search::grok::format_grok(&result, scope))
+}
+
 fn run_inner(
     query: &str,
     scope: &Path,
+    section: Option<&str>,
+    budget_tokens: Option<u64>,
+    full: bool,
+    expand: usize,
+    glob: Option<&str>,
     cache: &OutlineCache,
-    config: RunConfig<'_>,
+    cli_full: bool,
 ) -> Result<String, TilthError> {
-    let RunConfig {
-        section,
-        budget_tokens,
-        expand,
-        glob,
-        mode,
-        full_file,
-        cap,
-    } = config;
-
     let query_type = classify(query, scope);
 
     let use_expanded =
@@ -198,15 +241,7 @@ fn run_inner(
             let bloom = index::bloom::BloomFilterCache::new();
             let expand = if expand > 0 { expand } else { 2 };
             let output = search::search_multi_symbol_expanded(
-                &parts,
-                scope,
-                cache,
-                &session,
-                &bloom,
-                expand,
-                glob,
-                mode,
-                cap.extended(),
+                &parts, scope, cache, &session, &bloom, expand, None, glob, cli_full,
             )?;
             return match budget_tokens {
                 Some(b) => Ok(budget::apply(&output, b)),
@@ -218,8 +253,8 @@ fn run_inner(
     // FilePath and Glob are read operations, not search — handle before expanded dispatch
     let output = match query_type {
         QueryType::FilePath(path) => {
-            let mut out = read::read_file(&path, section, full_file, cache, false)?;
-            if section.is_none() && !full_file && read::would_outline(&path) {
+            let mut out = read::read_file(&path, section, full, cache, false)?;
+            if section.is_none() && !full && read::would_outline(&path) {
                 let related = read::imports::resolve_related_files(&path);
                 if !related.is_empty() {
                     let hints: Vec<String> = related
@@ -239,11 +274,11 @@ fn run_inner(
                 session: session::Session::new(),
                 bloom: index::bloom::BloomFilterCache::new(),
                 expand,
-                cap,
+                full_search: cli_full,
             };
-            run_query_expanded(&query_type, scope, cache, &ctx, glob, mode)?
+            run_query_expanded(&query_type, scope, cache, &ctx, glob)?
         }
-        _ => run_query_basic(&query_type, scope, cache, glob, mode)?,
+        _ => run_query_basic(&query_type, scope, cache, glob)?,
     };
 
     match budget_tokens {
@@ -260,7 +295,6 @@ fn run_query_expanded(
     cache: &OutlineCache,
     ctx: &ExpandedCtx,
     glob: Option<&str>,
-    mode: SymbolMode,
 ) -> Result<String, TilthError> {
     match query_type {
         QueryType::Symbol(name) => search::search_symbol_expanded(
@@ -270,9 +304,9 @@ fn run_query_expanded(
             &ctx.session,
             &ctx.bloom,
             ctx.expand,
+            None,
             glob,
-            mode,
-            ctx.cap.extended(),
+            ctx.full_search,
         ),
         QueryType::Concept(text) if text.contains(' ') => search::search_content_expanded(
             text,
@@ -280,8 +314,9 @@ fn run_query_expanded(
             cache,
             &ctx.session,
             ctx.expand,
+            None,
             glob,
-            ctx.cap.extended(),
+            ctx.full_search,
         ),
         // Single-word Concept and Fallthrough share the same expanded path:
         // both go straight to symbol_expanded, intentionally bypassing the
@@ -294,9 +329,9 @@ fn run_query_expanded(
             &ctx.session,
             &ctx.bloom,
             ctx.expand,
+            None,
             glob,
-            search::symbol::SymbolMode::Any,
-            ctx.cap.extended(),
+            ctx.full_search,
         ),
         QueryType::Content(text) => search::search_content_expanded(
             text,
@@ -304,8 +339,9 @@ fn run_query_expanded(
             cache,
             &ctx.session,
             ctx.expand,
+            None,
             glob,
-            ctx.cap.extended(),
+            ctx.full_search,
         ),
         QueryType::Regex(pattern) => search::search_regex_expanded(
             pattern,
@@ -313,8 +349,9 @@ fn run_query_expanded(
             cache,
             &ctx.session,
             ctx.expand,
+            None,
             glob,
-            ctx.cap.extended(),
+            ctx.full_search,
         ),
         // FilePath/Glob never reach here (gated by use_expanded)
         QueryType::FilePath(_) | QueryType::Glob(_) => {
@@ -330,10 +367,9 @@ fn run_query_basic(
     scope: &Path,
     cache: &OutlineCache,
     glob: Option<&str>,
-    mode: SymbolMode,
 ) -> Result<String, TilthError> {
     match query_type {
-        QueryType::Symbol(name) => search::search_symbol(name, scope, cache, glob, mode),
+        QueryType::Symbol(name) => search::search_symbol(name, scope, cache, glob),
         QueryType::Concept(text) if text.contains(' ') => {
             multi_word_concept_search(text, scope, cache, glob)
         }
@@ -366,7 +402,7 @@ fn single_query_search(
     prefer_definitions: bool,
     glob: Option<&str>,
 ) -> Result<String, error::TilthError> {
-    let sym_result = search::search_symbol_raw(text, scope, glob, search::symbol::SymbolMode::Any)?;
+    let sym_result = search::search_symbol_raw(text, scope, glob)?;
     let accept_sym = if prefer_definitions {
         sym_result.definitions > 0
     } else {

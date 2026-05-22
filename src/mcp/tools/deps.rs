@@ -1,5 +1,3 @@
-//! `tilth_deps` — file-level dependency analysis (imports + dependents).
-
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -7,13 +5,18 @@ use serde_json::Value;
 
 use crate::index::bloom::BloomFilterCache;
 
-pub(crate) fn tool_deps(args: &Value, bloom: &Arc<BloomFilterCache>) -> Result<String, String> {
+use super::resolve_scope;
+
+pub(in crate::mcp) fn tool_deps(
+    args: &Value,
+    bloom: &Arc<BloomFilterCache>,
+) -> Result<String, String> {
     let path_str = args
         .get("path")
         .and_then(|v| v.as_str())
         .ok_or("missing required parameter: path")?;
     let path = PathBuf::from(path_str);
-    let (scope, scope_warning) = super::resolve_scope(args);
+    let (scope, scope_warning) = resolve_scope(args);
     let budget = args
         .get("budget")
         .and_then(serde_json::Value::as_u64)

@@ -44,17 +44,9 @@ jobs:
           restore-keys: |
             fuzz-corpus-${{ matrix.target }}-
 
-      - name: Seed corpus from committed seeds
-        run: |
-          mkdir -p fuzz/corpus/${{ matrix.target }}
-          if [ -d "fuzz/seeds/${{ matrix.target }}" ]; then
-            cp -n fuzz/seeds/${{ matrix.target }}/* fuzz/corpus/${{ matrix.target }}/ 2>/dev/null || true
-          fi
-
       - name: Run ${{ matrix.target }}
-        env:
-          DURATION: ${{ github.event.inputs.duration_seconds || '300' }}
         run: |
+          DURATION="${{ github.event.inputs.duration_seconds || '300' }}"
           cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time="$DURATION"
 
       - name: Upload findings on failure

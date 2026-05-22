@@ -5,6 +5,7 @@ Read files with smart auto-sizing. **Defaults are tuned — omit `mode` unless y
 Output format: each line is prefixed `<line>:<3-hex-hash>|<content>`, e.g. `42:a1b|let x = 1;`. The hash anchors the line to its current content — copy the `<line>:<3-hex-hash>` portion (everything before `|`) into tilth_write `start`/`end` anchors for a drift-safe edit. Ignore the prefix when reading; resume after the `|`. Exception: `mode=stripped` uses a plain `<line>  <content>` gutter (no hash, no `|`); stripped output is non-contiguous with disk and cannot round-trip through `tilth_write`.
 
 Responses lead with a single JSON header line carrying any structured signals at once. Fields:
+
 - `if_modified_since: "<ts>"` — pass that exact ts in your next `tilth_read` call's `if_modified_since` to get `(unchanged @ <ts>)` stubs for files that haven't changed.
 - `view: "outline" | "signature" | "stripped"` — the shape the response was rendered as. Absent means full content.
 - `original_line_count: <N>` — the file's line count before view shaping or budget clipping.
