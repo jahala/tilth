@@ -299,7 +299,7 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
         "tilth_search" => tool_search(args, services.cache(), services.session(), services.bloom()),
         "tilth_files" => tool_files(args),
         "tilth_deps" => tool_deps(args, services.bloom()),
-        "tilth_grok" => tool_grok(args, services.bloom()),
+        "tilth_grok" => tool_grok(args, services.bloom(), services.session()),
         "tilth_diff" => tool_diff(args),
         "tilth_session" => tool_session(args, services.session()),
         "tilth_edit" if edit_mode => tool_edit(args, services.session(), services.bloom()),

@@ -190,12 +190,13 @@ pub fn run_deps(
 /// pair (`src/diff/parse.rs:7`), or a `Type::method` reference.
 pub fn run_grok(target_spec: &str, scope: &Path, full: bool) -> Result<String, TilthError> {
     let bloom = index::bloom::BloomFilterCache::new();
+    let session = session::Session::default();
     let caps = if full {
         search::grok::GrokCaps::full()
     } else {
         search::grok::GrokCaps::default()
     };
-    let result = search::grok::grok(target_spec, scope, &bloom, caps)?;
+    let result = search::grok::grok(target_spec, scope, &bloom, &session, caps)?;
     Ok(search::grok::format_grok(&result, scope))
 }
 

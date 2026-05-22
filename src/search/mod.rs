@@ -605,10 +605,16 @@ fn format_single_match(
     }
 
     if *expand_remaining > 0 {
-        // Check session dedup for definitions with def_range
+        // Check session dedup for definitions with def_range. The mtime
+        // check ensures a post-edit search re-inlines the body rather than
+        // pointing at stale line numbers.
+        let current_mtime = std::fs::metadata(&m.path)
+            .ok()
+            .and_then(|md| md.modified().ok());
         let deduped = m.is_definition
             && m.def_range.is_some()
-            && session.is_some_and(|s| s.is_expanded(&m.path, m.line));
+            && session
+                .is_some_and(|s| current_mtime.is_some_and(|t| s.is_expanded(&m.path, m.line, t)));
 
         if deduped {
             if let Some((start, end)) = m.def_range {
@@ -626,8 +632,8 @@ fn format_single_match(
             if !skip {
                 if let Some((code, content)) = expand_match(m, scope) {
                     if m.is_definition && m.def_range.is_some() {
-                        if let Some(s) = session {
-                            s.record_expand(&m.path, m.line);
+                        if let (Some(s), Some(t)) = (session, current_mtime) {
+                            s.record_expand(&m.path, m.line, t);
                         }
                     }
 

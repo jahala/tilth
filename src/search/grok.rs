@@ -203,6 +203,19 @@ fn find_by_start_line(entries: &[OutlineEntry], line: u32) -> Option<&OutlineEnt
 }
 
 // ---------------------------------------------------------------------------
+// Body-dedup constants.
+// ---------------------------------------------------------------------------
+
+/// Skip dedup for bodies at or below this line count. A small body is already
+/// cheap; degrading it to a pointer saves no meaningful tokens and loses
+/// signal the agent might need.
+const BODY_DEGRADE_THRESHOLD: usize = 15;
+
+/// Number of body lines to keep after the signature when degrading. Enough
+/// to anchor the agent's mental model; few enough to actually save tokens.
+const BODY_PREVIEW_LINES: usize = 3;
+
+// ---------------------------------------------------------------------------
 // A2: bundle assembly
 // ---------------------------------------------------------------------------
 
@@ -298,16 +311,12 @@ pub fn grok(
     target_spec: &str,
     scope: &Path,
     bloom: &BloomFilterCache,
+    session: &crate::session::Session,
     caps: GrokCaps,
 ) -> Result<GrokResult, TilthError> {
     let (target, content, lang) = resolve_with_source(target_spec, scope)?;
     let entries = get_outline_entries(&content, lang);
-    let body = slice_body(
-        &content,
-        target.start_line,
-        target.end_line,
-        caps.max_body_lines,
-    );
+    let body = body_with_dedup(&target, &content, session, caps.max_body_lines);
 
     // --- Callees -----------------------------------------------------------
     let callee_names =
@@ -388,6 +397,13 @@ pub fn grok(
         .collect();
     tests.truncate(caps.max_tests);
 
+    // Record this expansion so a same-session repeat-grok of the same target
+    // degrades to a preview rather than re-inlining the full body. Silently
+    // skipped on metadata failure — the next call will just re-inline normally.
+    if let Ok(mtime) = std::fs::metadata(&target.path).and_then(|md| md.modified()) {
+        session.record_expand(&target.path, target.start_line, mtime);
+    }
+
     Ok(GrokResult {
         target,
         body,
@@ -408,6 +424,53 @@ pub fn grok(
 /// — when the body is longer, keeps the first 2/3 and last 1/3, separated by
 /// an elided-line marker. Returns "" on degenerate ranges or `max_lines == 0`
 /// (used by callers that want to suppress the body section entirely).
+/// Return either the full body slice (un-degraded) or a degraded preview
+/// when the body was already shown in this session AND the file is unchanged.
+///
+/// Degraded format:
+///   <full body line 1>           ← the signature line is part of the body slice
+///   <up to BODY_PREVIEW_LINES more lines>
+///   // [{N}-line body shown earlier — {path}:{line}]
+///
+/// Skips degradation when the body is at or below `BODY_DEGRADE_THRESHOLD` —
+/// the original is already short, degrading saves no meaningful tokens.
+/// Returns the un-degraded body whenever metadata lookup fails, the file's
+/// mtime has changed since the recorded expansion, or this is the first time
+/// we've seen this target. That's the safe fallback.
+fn body_with_dedup(
+    target: &ResolvedTarget,
+    content: &str,
+    session: &crate::session::Session,
+    max_body_lines: usize,
+) -> String {
+    let full = slice_body(content, target.start_line, target.end_line, max_body_lines);
+    let line_count = full.lines().count();
+    if line_count <= BODY_DEGRADE_THRESHOLD {
+        return full;
+    }
+    let Some(current_mtime) = std::fs::metadata(&target.path)
+        .ok()
+        .and_then(|md| md.modified().ok())
+    else {
+        return full;
+    };
+    if !session.is_expanded(&target.path, target.start_line, current_mtime) {
+        return full;
+    }
+    let mut preview = String::new();
+    for line in full.lines().take(BODY_PREVIEW_LINES + 1) {
+        preview.push_str(line);
+        preview.push('\n');
+    }
+    let _ = write!(
+        preview,
+        "// [{line_count}-line body shown earlier — {}:{}]",
+        target.path.display(),
+        target.start_line
+    );
+    preview
+}
+
 fn slice_body(content: &str, start_line: u32, end_line: u32, max_lines: usize) -> String {
     if start_line == 0 || end_line < start_line || max_lines == 0 {
         return String::new();
@@ -513,9 +576,24 @@ pub fn format_grok(result: &GrokResult, scope: &Path) -> String {
             out,
             "\n## callees ({internal_count} internal, {external_count} extern)"
         );
+        // Group internal callees by file so the agent sees the cross-file
+        // dependency structure at a glance. BTreeMap keeps file order stable.
+        let mut by_file: std::collections::BTreeMap<&Path, Vec<&ResolvedCallee>> =
+            std::collections::BTreeMap::new();
         for c in &result.callees_internal {
-            let r = display_rel(&c.file, scope);
-            let _ = writeln!(out, "{:<20} {}:{}", c.name, r, c.start_line);
+            by_file.entry(c.file.as_path()).or_default().push(c);
+        }
+        for (file, mut callees) in by_file {
+            callees.sort_by_key(|c| c.start_line);
+            let _ = writeln!(out, "  {}", display_rel(file, scope));
+            for c in callees {
+                let sig = c.signature.as_deref().unwrap_or("");
+                let _ = writeln!(
+                    out,
+                    "    {:<20} [{}-{}]   {}",
+                    c.name, c.start_line, c.end_line, sig
+                );
+            }
         }
         for ext in &result.callees_external {
             let _ = writeln!(out, "{ext:<20} extern");
@@ -534,10 +612,19 @@ pub fn format_grok(result: &GrokResult, scope: &Path) -> String {
             "\n## callers ({})",
             count_label(result.callers.len(), result.total_callers)
         );
+        // Group callers by file — collapses the common case of multiple
+        // call sites in the same file under one header.
+        let mut by_file: std::collections::BTreeMap<&Path, Vec<&CallerMatch>> =
+            std::collections::BTreeMap::new();
         for m in &result.callers {
-            let r = display_rel(&m.path, scope);
-            let loc = format!("{}:{}", r, m.line);
-            let _ = writeln!(out, "{:<35} in {}()", loc, m.calling_function);
+            by_file.entry(m.path.as_path()).or_default().push(m);
+        }
+        for (file, mut callers) in by_file {
+            callers.sort_by_key(|m| m.line);
+            let _ = writeln!(out, "  {}", display_rel(file, scope));
+            for m in callers {
+                let _ = writeln!(out, "    [{}]   in {}()", m.line, m.calling_function);
+            }
         }
         if result.callers.len() < result.total_callers {
             let _ = writeln!(
@@ -1004,7 +1091,15 @@ fn test_calls_target() {
         write_fixture(tmp.path(), "src/lib.test.rs", tests);
 
         let bloom = BloomFilterCache::default();
-        let result = grok("target_fn", tmp.path(), &bloom, GrokCaps::default()).unwrap();
+        let session = crate::session::Session::default();
+        let result = grok(
+            "target_fn",
+            tmp.path(),
+            &bloom,
+            &session,
+            GrokCaps::default(),
+        )
+        .unwrap();
 
         assert_eq!(result.target.name, "target_fn");
         assert_eq!(result.target.kind, OutlineKind::Function);
@@ -1071,7 +1166,8 @@ pub fn target() {
 ";
         write_fixture(tmp.path(), "src/lib.rs", lib);
         let bloom = BloomFilterCache::default();
-        let result = grok("target", tmp.path(), &bloom, GrokCaps::default()).unwrap();
+        let session = crate::session::Session::default();
+        let result = grok("target", tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
         let rendered = format_grok(&result, tmp.path());
 
         assert!(
@@ -1214,7 +1310,15 @@ pub fn target_fn() -> u32 {
 ";
         write_fixture(tmp.path(), "src/lib.rs", lib);
         let bloom = BloomFilterCache::default();
-        let result = grok("target_fn", tmp.path(), &bloom, GrokCaps::default()).unwrap();
+        let session = crate::session::Session::default();
+        let result = grok(
+            "target_fn",
+            tmp.path(),
+            &bloom,
+            &session,
+            GrokCaps::default(),
+        )
+        .unwrap();
         assert!(
             result.body.contains("let x = 42"),
             "body should contain target source, got {:?}",
@@ -1255,7 +1359,8 @@ fn h() {}
             max_tests: 8,
             max_body_lines: 60,
         };
-        let result = grok("target", tmp.path(), &bloom, caps).unwrap();
+        let session = crate::session::Session::default();
+        let result = grok("target", tmp.path(), &bloom, &session, caps).unwrap();
         assert_eq!(result.callees_internal.len(), 3, "callees capped");
         assert_eq!(result.siblings.len(), 2, "siblings capped");
         assert!(
@@ -1263,5 +1368,158 @@ fn h() {}
             "pre-cap total preserved"
         );
         assert!(result.total_siblings >= 8);
+    }
+
+    // ── GROK-DEDUP tests ───────────────────────────────────────────
+
+    /// Source with a body big enough to trigger degradation (> BODY_DEGRADE_THRESHOLD).
+    fn long_body_fixture(name: &str) -> String {
+        let mut s = format!("pub fn {name}() {{\n");
+        for i in 0..20 {
+            s.push_str(&format!("    let v{i} = {i};\n"));
+        }
+        s.push_str("}\n");
+        s
+    }
+
+    #[test]
+    fn grok_repeat_call_degrades_target_body() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(tmp.path(), "src/lib.rs", &long_body_fixture("big"));
+        let bloom = BloomFilterCache::default();
+        let session = crate::session::Session::default();
+
+        let r1 = grok("big", tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
+        assert!(
+            !r1.body.contains("shown earlier"),
+            "first call must be full body"
+        );
+
+        let r2 = grok("big", tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
+        assert!(
+            r2.body.contains("shown earlier"),
+            "second call must degrade"
+        );
+        // Degraded body should still anchor with the signature — first line preserved.
+        assert!(r2.body.starts_with("pub fn big()"), "signature preserved");
+    }
+
+    #[test]
+    fn grok_short_body_not_degraded() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(tmp.path(), "src/lib.rs", "pub fn tiny() { 1 }\n");
+        let bloom = BloomFilterCache::default();
+        let session = crate::session::Session::default();
+
+        let r1 = grok("tiny", tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
+        let r2 = grok("tiny", tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
+        assert_eq!(r1.body, r2.body, "sub-threshold body should never degrade");
+        assert!(!r2.body.contains("shown earlier"));
+    }
+
+    #[test]
+    fn grok_stale_after_edit_re_inlines_full_body() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("src/lib.rs");
+        write_fixture(tmp.path(), "src/lib.rs", &long_body_fixture("stale"));
+        let bloom = BloomFilterCache::default();
+        let session = crate::session::Session::default();
+
+        let _ = grok("stale", tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
+
+        // Bump mtime by overwriting (sleep 10ms to guarantee mtime tick on coarse FS).
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(&path, long_body_fixture("stale")).unwrap();
+
+        let r2 = grok("stale", tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
+        assert!(
+            !r2.body.contains("shown earlier"),
+            "post-edit re-grok must re-inline full body, got: {}",
+            r2.body
+        );
+    }
+
+    // ── GROK-GROUP tests ───────────────────────────────────────────
+
+    #[test]
+    fn format_groups_callers_by_file() {
+        // The fixture from existing tests already produces 1 caller in 1 file.
+        // Verify the rendered output uses the grouped shape (file header + indented sites).
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = r#"
+pub fn target() { let _ = 1; }
+pub fn caller_a() { target(); }
+pub fn caller_b() { target(); }
+"#;
+        write_fixture(tmp.path(), "src/lib.rs", lib);
+        let bloom = BloomFilterCache::default();
+        let session = crate::session::Session::default();
+        let result = grok("target", tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
+        let rendered = format_grok(&result, tmp.path());
+
+        // File header appears once, then per-site lines are indented.
+        let callers_block = rendered
+            .split("## callers")
+            .nth(1)
+            .expect("## callers section missing");
+        assert!(
+            callers_block.contains("\n  src/lib.rs\n"),
+            "expected file header in callers block: {callers_block}"
+        );
+        // Per-site lines render as `    [<line>]   in <fn>()`.
+        assert!(
+            callers_block.contains("in caller_a()"),
+            "caller_a should appear: {callers_block}"
+        );
+        assert!(
+            callers_block.contains("in caller_b()"),
+            "caller_b should appear: {callers_block}"
+        );
+    }
+
+    #[test]
+    fn format_groups_callees_by_file() {
+        // target_fn calls helper (same file) and peer (same file). Verify
+        // the single file header collapses both callees under it.
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = r#"
+pub fn helper() -> u32 { 1 }
+pub fn peer() {}
+pub fn target_fn() {
+    let _ = helper();
+    peer();
+}
+"#;
+        write_fixture(tmp.path(), "src/lib.rs", lib);
+        let bloom = BloomFilterCache::default();
+        let session = crate::session::Session::default();
+        let result = grok(
+            "target_fn",
+            tmp.path(),
+            &bloom,
+            &session,
+            GrokCaps::default(),
+        )
+        .unwrap();
+        let rendered = format_grok(&result, tmp.path());
+
+        let callees_block = rendered
+            .split("## callees")
+            .nth(1)
+            .expect("## callees section missing");
+        // Both callees live under the same file header.
+        let lib_pos = callees_block
+            .find("\n  src/lib.rs\n")
+            .expect("file header missing");
+        let helper_pos = callees_block.find("helper").expect("helper missing");
+        let peer_pos = callees_block.find("peer").expect("peer missing");
+        assert!(lib_pos < helper_pos, "file header must precede helper");
+        assert!(lib_pos < peer_pos, "file header must precede peer");
+        // No second `src/lib.rs` header — the grouping collapsed them.
+        let later = &callees_block[lib_pos + 1..];
+        assert!(
+            !later.contains("\n  src/lib.rs\n"),
+            "file header should appear once, not duplicated"
+        );
     }
 }
