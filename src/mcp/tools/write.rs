@@ -1,9 +1,11 @@
 //! `tilth_write` — hash / overwrite / append modes per file, plus the
 //! strict fingerprint auto-fix used when a hash anchor drifts.
 //!
-//! Helpers shared with the legacy `tilth_edit` alias (kept under
-//! `#[cfg(test)]`) live alongside the dispatcher to avoid scattering the
-//! edit-task parsing logic across two modules.
+//! The `overwrite` mode is **create-only by default** (atomic
+//! `O_CREAT|O_EXCL` open). Pass a per-file `overwrite: true` flag to
+//! swallow `AlreadyExists` and replace the file. Successful overwrite/append
+//! results echo back the hashlined contents so the agent can chain anchored
+//! edits in the next call without a re-read.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -85,43 +87,83 @@ pub(crate) fn tool_write(
         match mode {
             "hash" | "h" => hash_tasks.push(parse_file_edit(i, f)),
             "overwrite" | "w" => {
-                let content = f.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                let before = show_diff
+                let Some(content) = f.get("content").and_then(|v| v.as_str()) else {
+                    direct_results.push(format!(
+                        "## {}\nerror: 'content' must be a string",
+                        path.display()
+                    ));
+                    continue;
+                };
+                let Some(overwrite) = parse_overwrite_flag(f) else {
+                    direct_results.push(format!(
+                        "## {}\nerror: 'overwrite' must be a boolean",
+                        path.display()
+                    ));
+                    continue;
+                };
+                let pre_existed = path.try_exists().unwrap_or(false);
+                let before = (show_diff && pre_existed)
                     .then(|| std::fs::read_to_string(&path).ok())
                     .flatten();
-                match crate::mcp::write::write_overwrite(&path, content) {
+                match crate::mcp::write::write_overwrite(&path, content, overwrite) {
                     Ok(()) => {
-                        let line_count = content.matches('\n').count() + 1;
+                        let line_count = content.lines().count();
+                        let verb = if pre_existed { "overwrote" } else { "created" };
                         let mut block = format!(
-                            "## {}\noverwrite: {} bytes, {line_count} lines",
+                            "## {}\n{verb}: {} bytes, {line_count} lines\n{}",
                             path.display(),
-                            content.len()
+                            content.len(),
+                            crate::format::hashlines(content, 1),
                         );
                         if show_diff {
-                            block.push('\n');
                             block.push_str(&render_text_diff(before.as_deref(), content));
                         }
                         direct_results.push(block);
                         direct_applied.push(path);
                     }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        direct_results.push(format!(
+                            "## {}\nerror: file already exists — pass `overwrite: true` to replace it",
+                            path.display()
+                        ));
+                    }
                     Err(e) => direct_results.push(format!("## {}\nerror: {e}", path.display())),
                 }
             }
             "append" | "a" => {
-                let content = f.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                let Some(content) = f.get("content").and_then(|v| v.as_str()) else {
+                    direct_results.push(format!(
+                        "## {}\nerror: 'content' must be a string",
+                        path.display()
+                    ));
+                    continue;
+                };
                 let before = show_diff
                     .then(|| std::fs::read_to_string(&path).ok())
                     .flatten();
                 match crate::mcp::write::write_append(&path, content) {
                     Ok(()) => {
-                        let mut block =
-                            format!("## {}\nappend: {} bytes", path.display(), content.len());
+                        // Echo only the appended region's hashlines so
+                        // log-shaped append targets don't balloon the
+                        // response. The agent can tilth_read the file
+                        // separately if it needs anchors for pre-existing
+                        // content.
+                        let after = std::fs::read_to_string(&path)
+                            .unwrap_or_else(|_| before.clone().unwrap_or_default() + content);
+                        let after_lines: Vec<&str> = after.lines().collect();
+                        let total = after_lines.len();
+                        let appended = content.lines().count().max(1);
+                        let start_idx = total.saturating_sub(appended);
+                        let tail = after_lines[start_idx..].join("\n");
+                        let start_line = (start_idx + 1) as u32;
+                        let mut block = format!(
+                            "## {}\nappend: {} bytes (echoing last {} of {total} lines)\n{}",
+                            path.display(),
+                            content.len(),
+                            total - start_idx,
+                            crate::format::hashlines(&tail, start_line),
+                        );
                         if show_diff {
-                            let after = before.as_deref().map_or_else(
-                                || content.to_string(),
-                                |old| format!("{old}{content}"),
-                            );
-                            block.push('\n');
                             block.push_str(&render_text_diff(before.as_deref(), &after));
                         }
                         direct_results.push(block);
@@ -139,23 +181,28 @@ pub(crate) fn tool_write(
 
     let mut output = String::new();
     if !hash_tasks.is_empty() {
+        // Record session reads for every Ready task up front (matches legacy
+        // tilth_edit semantics: record_read counts attempts, not just
+        // successful commits, so dedup logic doesn't re-recommend a file the
+        // agent already touched even when hashes drifted).
+        for task in &hash_tasks {
+            if let crate::edit::FileEditTask::Ready { path, .. } = task {
+                session.record_read(path);
+            }
+        }
         // Pre-run strict auto-fix on hash-mode tasks. Capture original
         // anchor-range bodies, then try the standard apply_batch. If the
         // outcome reports hash mismatches per file, attempt auto-fix.
         let originals: Vec<Option<HashOriginal>> =
             hash_tasks.iter().map(capture_hash_original).collect();
         match crate::edit::apply_batch(hash_tasks, bloom, show_diff) {
-            Ok(outcome) => {
-                for p in &outcome.applied {
-                    session.record_read(p);
-                }
+            Ok(combined) => {
                 // Per-file independence: when a file's section reports a hash
                 // mismatch, append a per-file auto-fix probe so spec criterion 9
                 // (strict auto-fix on mismatch, per file) holds even on partial
                 // batch success. The probe re-applies on a single-match
                 // relocation, so any path it touches is recorded as read.
-                let (augmented, reapplied) =
-                    append_per_file_auto_fix(&outcome.output, &originals, bloom);
+                let (augmented, reapplied) = append_per_file_auto_fix(&combined, &originals, bloom);
                 for p in &reapplied {
                     session.record_read(p);
                 }
@@ -309,10 +356,7 @@ fn reapply_at_relocation(
         path: orig.path.clone(),
         edits: shifted,
     };
-    match apply_batch(vec![task], bloom, false) {
-        Ok(outcome) => Some(outcome.output),
-        Err(_) => None,
-    }
+    apply_batch(vec![task], bloom, false).ok()
 }
 
 /// Probe one captured original for a strict-fingerprint relocation and,
@@ -483,6 +527,17 @@ fn parse_file_edit(index: usize, val: &Value) -> crate::edit::FileEditTask {
     }
 }
 
+/// Per-file `overwrite` flag (strict boolean). Missing ⇒ false. Returns
+/// `None` if the field is present but not a JSON boolean — the caller surfaces
+/// that as a per-file error rather than silently coercing.
+fn parse_overwrite_flag(f: &Value) -> Option<bool> {
+    match f.get("overwrite") {
+        None => Some(false),
+        Some(Value::Bool(b)) => Some(*b),
+        _ => None,
+    }
+}
+
 /// Parse a single `edits[]` entry. Flat early-returns keep nesting shallow.
 fn parse_edit_entry(i: usize, e: &Value) -> Result<crate::edit::Edit, String> {
     let start_str = e
@@ -510,43 +565,221 @@ fn parse_edit_entry(i: usize, e: &Value) -> Result<crate::edit::Edit, String> {
 }
 
 #[cfg(test)]
-pub(crate) fn tool_edit(
-    args: &Value,
-    session: &Session,
-    bloom: &Arc<BloomFilterCache>,
-) -> Result<String, String> {
-    let files_val = args
-        .get("files")
-        .and_then(|v| v.as_array())
-        .ok_or("missing required parameter: files (array of {path, edits})")?;
+mod tests {
+    use super::*;
 
-    if files_val.is_empty() {
-        return Err("files array is empty".into());
-    }
-    if files_val.len() > 20 {
-        return Err(format!(
-            "batch edit limited to 20 files (got {})",
-            files_val.len()
-        ));
+    use crate::index::bloom::BloomFilterCache;
+    use crate::session::Session;
+
+    fn services() -> (Session, Arc<BloomFilterCache>) {
+        (Session::new(), Arc::new(BloomFilterCache::new()))
     }
 
-    let show_diff = args
-        .get("diff")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-
-    let tasks: Vec<crate::edit::FileEditTask> = files_val
-        .iter()
-        .enumerate()
-        .map(|(i, v)| parse_file_edit(i, v))
-        .collect();
-
-    // Record reads only for files whose edits actually committed. Hash
-    // mismatches, parse errors, and I/O failures didn't change the file, so
-    // they shouldn't inflate the session activity counter.
-    let outcome = crate::edit::apply_batch(tasks, bloom, show_diff)?;
-    for path in &outcome.applied {
-        session.record_read(path);
+    #[test]
+    fn overwrite_new_file_creates_and_returns_hashlines() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("new.rs");
+        let args = serde_json::json!({
+            "files": [{
+                "path": p.to_str().unwrap(),
+                "mode": "overwrite",
+                "content": "fn main() {}\n",
+            }],
+            "scope": dir.path().to_str().unwrap(),
+        });
+        let (session, bloom) = services();
+        let out = tool_write(&args, &session, &bloom).expect("create succeeds");
+        assert!(out.contains("created:"), "verb should be `created`: {out}");
+        assert!(
+            out.contains("1:") && out.contains("|fn main() {}"),
+            "hashlined output for new file missing: {out}"
+        );
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "fn main() {}\n");
     }
-    Ok(outcome.output)
+
+    #[test]
+    fn overwrite_existing_file_without_flag_errors_with_helpful_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("exists.rs");
+        std::fs::write(&p, "old\n").unwrap();
+        let args = serde_json::json!({
+            "files": [{
+                "path": p.to_str().unwrap(),
+                "mode": "overwrite",
+                "content": "new\n",
+            }],
+            "scope": dir.path().to_str().unwrap(),
+        });
+        let (session, bloom) = services();
+        let out = tool_write(&args, &session, &bloom).expect("partial-failure returns Ok");
+        assert!(
+            out.contains("already exists") && out.contains("overwrite: true"),
+            "expected guidance-bearing AlreadyExists error: {out}"
+        );
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "old\n");
+    }
+
+    #[test]
+    fn overwrite_true_swallows_already_exists_and_clobbers() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("exists.rs");
+        std::fs::write(&p, "old contents\n").unwrap();
+        let args = serde_json::json!({
+            "files": [{
+                "path": p.to_str().unwrap(),
+                "mode": "overwrite",
+                "overwrite": true,
+                "content": "replaced\n",
+            }],
+            "scope": dir.path().to_str().unwrap(),
+        });
+        let (session, bloom) = services();
+        let out = tool_write(&args, &session, &bloom).expect("overwrite succeeds");
+        assert!(
+            out.contains("overwrote:"),
+            "verb should be `overwrote`: {out}"
+        );
+        assert!(out.contains("|replaced"), "hashlined output missing: {out}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "replaced\n");
+    }
+
+    #[test]
+    fn overwrite_non_bool_flag_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("exists.rs");
+        std::fs::write(&p, "old\n").unwrap();
+        let args = serde_json::json!({
+            "files": [{
+                "path": p.to_str().unwrap(),
+                "mode": "overwrite",
+                "overwrite": "true",
+                "content": "x",
+            }],
+            "scope": dir.path().to_str().unwrap(),
+        });
+        let (session, bloom) = services();
+        let out =
+            tool_write(&args, &session, &bloom).expect("error reported per file, not at top level");
+        assert!(
+            out.contains("'overwrite' must be a boolean"),
+            "expected strict-bool rejection: {out}"
+        );
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "old\n");
+    }
+
+    #[test]
+    fn overwrite_non_string_content_rejected_without_clobbering() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("exists.rs");
+        std::fs::write(&p, "old\n").unwrap();
+        let args = serde_json::json!({
+            "files": [{
+                "path": p.to_str().unwrap(),
+                "mode": "overwrite",
+                "overwrite": true,
+                "content": 123,
+            }],
+            "scope": dir.path().to_str().unwrap(),
+        });
+        let (session, bloom) = services();
+        let out =
+            tool_write(&args, &session, &bloom).expect("error reported per file, not at top level");
+        assert!(
+            out.contains("'content' must be a string"),
+            "expected content-type rejection: {out}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "old\n",
+            "non-string content must not clobber under overwrite: true"
+        );
+    }
+
+    #[test]
+    fn overwrite_missing_content_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("new.rs");
+        let args = serde_json::json!({
+            "files": [{
+                "path": p.to_str().unwrap(),
+                "mode": "overwrite",
+            }],
+            "scope": dir.path().to_str().unwrap(),
+        });
+        let (session, bloom) = services();
+        let out = tool_write(&args, &session, &bloom).expect("partial-failure returns Ok");
+        assert!(
+            out.contains("'content' must be a string"),
+            "expected content-required rejection: {out}"
+        );
+        assert!(!p.exists(), "no file created when content missing");
+    }
+
+    #[test]
+    fn append_echoes_only_appended_region_not_full_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("log.txt");
+        // Pre-existing 50-line log.
+        let mut pre = String::new();
+        for n in 1..=50 {
+            use std::fmt::Write as _;
+            let _ = writeln!(pre, "pre-line-{n}");
+        }
+        std::fs::write(&p, &pre).unwrap();
+        let args = serde_json::json!({
+            "files": [{
+                "path": p.to_str().unwrap(),
+                "mode": "append",
+                "content": "new1\nnew2\n",
+            }],
+            "scope": dir.path().to_str().unwrap(),
+        });
+        let (session, bloom) = services();
+        let out = tool_write(&args, &session, &bloom).expect("append succeeds");
+        assert!(out.contains("append:"), "missing append verb: {out}");
+        assert!(
+            out.contains("|new1") && out.contains("|new2"),
+            "appended lines must appear in hashline echo: {out}"
+        );
+        for n in 1..=48 {
+            assert!(
+                !out.contains(&format!("|pre-line-{n}\n"))
+                    && !out.contains(&format!("|pre-line-{n}$"))
+                    && !out.contains(&format!("|pre-line-{n} ")),
+                "pre-existing line {n} must NOT appear in echo (bounded to appended region): {out}"
+            );
+        }
+        // Echo header reports how much was echoed vs total.
+        assert!(
+            out.contains("of 52 lines"),
+            "echo header should report total line count: {out}"
+        );
+    }
+
+    #[test]
+    fn append_non_string_content_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("log.txt");
+        std::fs::write(&p, "existing\n").unwrap();
+        let args = serde_json::json!({
+            "files": [{
+                "path": p.to_str().unwrap(),
+                "mode": "append",
+                "content": null,
+            }],
+            "scope": dir.path().to_str().unwrap(),
+        });
+        let (session, bloom) = services();
+        let out =
+            tool_write(&args, &session, &bloom).expect("error reported per file, not at top level");
+        assert!(
+            out.contains("'content' must be a string"),
+            "expected content-type rejection: {out}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "existing\n",
+            "non-string content must not modify the file"
+        );
+    }
 }

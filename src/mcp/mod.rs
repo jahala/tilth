@@ -11,10 +11,11 @@ use crate::session::Session;
 use crate::timeout::{self, spawn_with_timeout, SpawnFailure, ThreadTracker};
 
 mod tools;
+mod write;
 
 use tools::{
-    tool_definitions, tool_deps, tool_diff, tool_edit, tool_files, tool_grok, tool_read,
-    tool_search, tool_session,
+    tool_definitions, tool_deps, tool_diff, tool_files, tool_grok, tool_read, tool_search,
+    tool_session, tool_write,
 };
 
 /// Shared dependencies passed through the request → dispatch pipeline.
@@ -67,7 +68,7 @@ impl Services {
 const SERVER_INSTRUCTIONS: &str = include_str!("../../prompts/mcp-base.md");
 const EDIT_MODE_EXTRA: &str = include_str!("../../prompts/mcp-edit.md");
 
-/// MCP server over stdio. When `edit_mode` is true, exposes `tilth_edit` and
+/// MCP server over stdio. When `edit_mode` is true, exposes `tilth_write` and
 /// switches `tilth_read` to hashline output format.
 ///
 /// `scope` overrides the default search root. When provided, tilth chdir's to it
@@ -302,7 +303,7 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
         "tilth_grok" => tool_grok(args, services.bloom()),
         "tilth_diff" => tool_diff(args),
         "tilth_session" => tool_session(args, services.session()),
-        "tilth_edit" if edit_mode => tool_edit(args, services.session(), services.bloom()),
+        "tilth_write" if edit_mode => tool_write(args, services.session(), services.bloom()),
         _ => Err(format!("unknown tool: {tool}")),
     }
 }
@@ -521,15 +522,15 @@ mod tests {
     fn edit_mode_extra_byte_lock() {
         assert_eq!(
             EDIT_MODE_EXTRA.len(),
-            1724,
+            2424,
             "EDIT_MODE_EXTRA byte count drifted from refactor baseline"
         );
         assert!(
-            EDIT_MODE_EXTRA.starts_with("\n\ntilth_edit: Batch edit"),
+            EDIT_MODE_EXTRA.starts_with("\n\ntilth_write: Batch write"),
             "EDIT_MODE_EXTRA must keep its leading blank-line separator so format!(\"{{S}}{{E}}\") emits one blank line between sections"
         );
         assert!(EDIT_MODE_EXTRA
-            .ends_with("DO NOT use the host Edit tool. Use tilth_edit for all edits."));
+            .ends_with("DO NOT use the host Edit or Write tool. Use tilth_write for all writes."));
         assert!(
             !EDIT_MODE_EXTRA.contains("\n\n\n"),
             "EDIT_MODE_EXTRA must not introduce triple newlines"
@@ -544,7 +545,7 @@ mod tests {
         // This asserts the composition still has that shape.
         let combined = format!("{SERVER_INSTRUCTIONS}{EDIT_MODE_EXTRA}");
         assert!(combined.contains(
-            "DO NOT re-read files already shown in expanded search results.\n\ntilth_edit: Batch edit"
+            "DO NOT re-read files already shown in expanded search results.\n\ntilth_write: Batch write"
         ));
     }
 }

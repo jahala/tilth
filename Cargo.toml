@@ -88,9 +88,15 @@ home = "0.5"
 # Terminal size detection (TIOCGWINSZ ioctl, falls back to env vars)
 terminal_size = "0.4"
 
+# Low-level system constants — only used cfg(unix) to pass O_NOFOLLOW to the
+# overwrite open() so a symlink at the target cannot escape the scope guard.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 
 [dev-dependencies]
 tempfile = "3"
+jsonschema = { version = "0.18", default-features = false }
 
 [profile.release]
 opt-level = 3
