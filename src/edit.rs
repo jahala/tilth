@@ -49,6 +49,9 @@ enum EditResult {
         diff: String,
         /// Hashlined context around edit sites (existing behavior).
         context: String,
+        /// Rendered `── parse ──` block when the edit introduced new
+        /// tree-sitter `ERROR`/`MISSING` nodes; `None` otherwise.
+        parse: Option<String>,
     },
     /// One or more hashes didn't match current content.
     HashMismatch(String),
@@ -67,6 +70,7 @@ fn apply_edits(path: &Path, edits: &[Edit]) -> Result<EditResult, TilthError> {
         return Ok(EditResult::Applied {
             diff: String::new(),
             context: String::new(),
+            parse: None,
         });
     }
 
@@ -264,7 +268,15 @@ fn apply_edits(path: &Path, edits: &[Edit]) -> Result<EditResult, TilthError> {
     let diff = format_diffs(&diffs);
     let context = contexts.join("\n---\n");
 
-    Ok(EditResult::Applied { diff, context })
+    let parse = crate::edit_parse_check::check(path, &content, &output)
+        .as_ref()
+        .map(crate::edit_parse_check::format_report);
+
+    Ok(EditResult::Applied {
+        diff,
+        context,
+        parse,
+    })
 }
 
 /// Format per-edit diffs as compact `-`/`+` blocks with hashline anchors.
@@ -471,7 +483,11 @@ fn render_applied(
     show_diff: bool,
 ) -> Result<String, String> {
     match apply_edits(path, edits).map_err(|e| e.to_string())? {
-        EditResult::Applied { diff, context } => {
+        EditResult::Applied {
+            diff,
+            context,
+            parse,
+        } => {
             let mut output = String::new();
             if show_diff && !diff.is_empty() {
                 output.push_str(&diff);
@@ -481,6 +497,12 @@ fn render_applied(
             }
             if !context.is_empty() {
                 output.push_str(&context);
+            }
+            if let Some(parse) = parse {
+                if !output.is_empty() {
+                    output.push_str("\n\n");
+                }
+                output.push_str(&parse);
             }
             let abs_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
             let scope = crate::lang::package_root(&abs_path).map_or_else(
@@ -529,7 +551,7 @@ mod tests {
 
         let result = apply_edits(&path, &edits).unwrap();
         match result {
-            EditResult::Applied { diff, context } => {
+            EditResult::Applied { diff, context, .. } => {
                 assert!(
                     diff.contains("- 2:"),
                     "diff should have removed line: {diff}"
@@ -693,7 +715,7 @@ mod tests {
 
         let result = apply_edits(&path, &[]).unwrap();
         match result {
-            EditResult::Applied { diff, context } => {
+            EditResult::Applied { diff, context, .. } => {
                 assert!(diff.is_empty(), "diff should be empty for no edits");
                 assert!(context.is_empty(), "context should be empty for no edits");
             }
@@ -1171,5 +1193,62 @@ mod tests {
         assert!(err.contains("duplicate file path"), "unexpected: {err}");
         // File must be untouched — no worker ran.
         assert_eq!(std::fs::read_to_string(&a).unwrap(), "x\n");
+    }
+
+    // ------------------------------------------------- parse check
+
+    #[test]
+    fn apply_batch_surfaces_parse_block_on_introduced_error() {
+        // Edit drops the closing brace on a Rust line → new ERROR node →
+        // the rendered batch output must carry the `── parse ──` block.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("m.rs");
+        let content = "fn a() { 1 }\nfn b() { 2 }\n";
+        std::fs::write(&f, content).unwrap();
+        let h = hash_at(content, 1);
+
+        let tasks = vec![ready_task(
+            f.clone(),
+            vec![Edit {
+                start_line: 1,
+                start_hash: h,
+                end_line: 1,
+                end_hash: h,
+                content: "fn a() { 1".into(), // dropped closing brace
+            }],
+        )];
+
+        let out = apply_batch(tasks, &fresh_bloom(), false).expect("edit applies");
+        assert!(
+            out.contains("\u{2500}\u{2500} parse \u{2500}\u{2500}"),
+            "introduced error should surface a parse block: {out}"
+        );
+    }
+
+    #[test]
+    fn apply_batch_no_parse_block_on_clean_edit() {
+        // Valid code edited into still-valid code → no `── parse ──` block.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("m.rs");
+        let content = "fn a() { 1 }\nfn b() { 2 }\n";
+        std::fs::write(&f, content).unwrap();
+        let h = hash_at(content, 1);
+
+        let tasks = vec![ready_task(
+            f.clone(),
+            vec![Edit {
+                start_line: 1,
+                start_hash: h,
+                end_line: 1,
+                end_hash: h,
+                content: "fn a() { 10 }".into(),
+            }],
+        )];
+
+        let out = apply_batch(tasks, &fresh_bloom(), false).expect("edit applies");
+        assert!(
+            !out.contains("\u{2500}\u{2500} parse \u{2500}\u{2500}"),
+            "clean edit must not surface a parse block: {out}"
+        );
     }
 }
