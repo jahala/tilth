@@ -94,6 +94,6 @@ pub(in crate::mcp) fn tool_search(
     .map_err(|e| e.to_string())?;
 
     let mut result = scope_warning.unwrap_or_default();
-    result.push_str(&apply_budget(output, budget));
+    result.push_str(&apply_budget(&output, budget));
     Ok(result)
 }

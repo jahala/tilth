@@ -38,7 +38,7 @@ pub(in crate::mcp) fn tool_files(args: &Value) -> Result<String, String> {
     let combined = blocks.join("\n\n");
 
     let mut result = scope_warning.unwrap_or_default();
-    result.push_str(&apply_budget(combined, budget));
+    result.push_str(&apply_budget(&combined, budget));
     Ok(result)
 }
 

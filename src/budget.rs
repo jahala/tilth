@@ -1,5 +1,10 @@
 use crate::types::estimate_tokens;
 
+/// Default cap applied to MCP tool responses when no explicit `budget` is given.
+/// Sits just under the host's ~25K-token tool-response limit so a broad
+/// `tilth_read full:true`, `regex`, or `diff` can't blow the host budget.
+pub const DEFAULT_BUDGET: u64 = 24_000;
+
 /// Apply token budget to output. Works backwards from the cap:
 /// 1. Reserve 50 tokens for header
 /// 2. Truncate content at section boundaries to avoid broken output

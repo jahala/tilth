@@ -84,7 +84,7 @@ pub(in crate::mcp) fn tool_read(
             }
         }
         let combined = results.join("\n\n");
-        return Ok(apply_budget(combined, budget));
+        return Ok(apply_budget(&combined, budget));
     }
 
     // Single file read
@@ -164,7 +164,7 @@ pub(in crate::mcp) fn tool_read(
         }
     }
 
-    Ok(apply_budget(output, budget))
+    Ok(apply_budget(&output, budget))
 }
 
 // `cache` is intentionally unwired on the tree-sitter path: OutlineCache stores
