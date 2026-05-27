@@ -19,7 +19,7 @@ pub struct Edit {
     pub content: String,
 }
 
-/// One file's worth of work for a batch `tilth_edit`. Parse errors are deferred
+/// One file's worth of work for a batch `tilth_write` (hash mode). Parse errors are deferred
 /// onto the task so a malformed entry surfaces as a per-file failure instead of
 /// aborting the whole batch.
 #[derive(Debug)]

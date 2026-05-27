@@ -4,7 +4,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
     let read_desc = if edit_mode {
         "Read a file with smart outlining. Replaces cat/head/tail and the host Read tool — \
          use this for all file reading. Output uses hashline format (line:hash|content) — \
-         the line:hash anchors are required by tilth_edit. Small files return full hashlined content. \
+         the line:hash anchors are required by tilth_write. Small files return full hashlined content. \
          Large files return a structural outline (no hashlines); use `section` to get hashlined \
          content for the lines you want to edit. Use `sections` to grab several disjoint slices \
          from the same file in one call. Use `full` to force complete content. \
@@ -221,8 +221,8 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
 
     if edit_mode {
         tools.push(serde_json::json!({
-            "name": "tilth_edit",
-            "description": "Batch edit one or more files in one call using hashline anchors from tilth_read. ALWAYS group edits to multiple files into a single tilth_edit call — never call tilth_edit twice in a row. Each file is processed independently (best-effort): a hash mismatch on one file does not block the others; results are reported per file. Partial success returns isError: false — scan the per-file `## <path>` sections for failures rather than trusting the top-level status. A parse error on one edit invalidates ALL edits for that file (none applied); retry the whole file after fixing the malformed entry. Each file path may appear at most once per call. Max 20 files per call.",
+            "name": "tilth_write",
+            "description": "Batch write one or more files in one call. Replaces the host Edit and Write tools — DO NOT use those. Three per-file modes: `hash` (default — replace lines at hash anchors from tilth_read), `overwrite` (whole file; create-only by default — pass `overwrite: true` to replace an existing file), `append` (append `content`, creates if absent). overwrite/append responses echo the file's hashlines so you can chain anchored edits in the next call without re-reading. ALWAYS group writes to multiple files into a single tilth_write call — never call tilth_write twice in a row. Each file is processed independently (best-effort): a failure on one file does not block the others; results are reported per file. Partial success returns isError: false — scan the per-file `## <path>` sections for failures rather than trusting the top-level status. A parse error on one edit invalidates ALL edits for that file (none applied); retry the whole file after fixing the malformed entry. Each file path may appear at most once per call. Max 20 files per call. Example overwrite (new file): `tilth_write(files: [{path: \"src/new.rs\", mode: \"overwrite\", content: \"fn main(){}\\n\"}])`.",
             "inputSchema": {
                 "type": "object",
                 "required": ["files"],
@@ -231,19 +231,25 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "type": "array",
                         "minItems": 1,
                         "maxItems": 20,
-                        "description": "One entry per file. Use a single-element array for a single-file edit. Each path must be unique within the call.",
+                        "description": "One entry per file. Use a single-element array for a single-file write. Each path must be unique within the call.",
                         "items": {
                             "type": "object",
-                            "required": ["path", "edits"],
+                            "required": ["path"],
                             "properties": {
                                 "path": {
                                     "type": "string",
-                                    "description": "Absolute or relative file path to edit."
+                                    "description": "Absolute or relative file path."
+                                },
+                                "mode": {
+                                    "type": "string",
+                                    "enum": ["hash", "h", "overwrite", "w", "append", "a"],
+                                    "default": "hash",
+                                    "description": "Write mode. hash (default): replace lines at hash anchors via `edits`. overwrite: write whole file from `content`; create-only by default — set `overwrite: true` to replace existing. append: append `content`, creates if absent."
                                 },
                                 "edits": {
                                     "type": "array",
                                     "minItems": 1,
-                                    "description": "Edit operations for this file, applied atomically per file.",
+                                    "description": "Hash-mode only: edit operations for this file, applied atomically per file.",
                                     "items": {
                                         "type": "object",
                                         "required": ["start", "content"],
@@ -262,8 +268,32 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                                             }
                                         }
                                     }
+                                },
+                                "content": {
+                                    "type": "string",
+                                    "description": "overwrite / append mode only: the file contents (overwrite) or text to append (append)."
+                                },
+                                "overwrite": {
+                                    "type": "boolean",
+                                    "default": false,
+                                    "description": "overwrite mode only: when true, replace an existing file. Default false fails with `AlreadyExists` so you don't clobber by accident."
                                 }
-                            }
+                            },
+                            "allOf": [
+                                {
+                                    "if": {"properties": {"mode": {"enum": ["hash", "h"]}}},
+                                    "then": {"required": ["edits"]}
+                                },
+                                {
+                                    "if": {
+                                        "required": ["mode"],
+                                        "properties": {
+                                            "mode": {"enum": ["overwrite", "w", "append", "a"]}
+                                        }
+                                    },
+                                    "then": {"required": ["content"]}
+                                }
+                            ]
                         }
                     },
                     "diff": {
@@ -277,4 +307,49 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
     }
 
     tools
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tilth_write_schema_requires_mode_specific_fields() {
+        let tools = tool_definitions(true);
+        let write = tools
+            .iter()
+            .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("tilth_write"))
+            .expect("tilth_write tool definition present in edit mode");
+        let items = &write["inputSchema"]["properties"]["files"]["items"];
+        let all_of = items["allOf"]
+            .as_array()
+            .expect("items.allOf clauses present");
+        assert_eq!(all_of.len(), 2, "expected hash-branch + content-branch");
+        // Hash branch: when mode absent or in {hash, h}, require edits.
+        assert_eq!(all_of[0]["then"]["required"][0], "edits");
+        // Content branch: when mode in {overwrite, w, append, a}, require content.
+        assert_eq!(all_of[1]["then"]["required"][0], "content");
+        let content_modes = all_of[1]["if"]["properties"]["mode"]["enum"]
+            .as_array()
+            .expect("content-mode enum present");
+        let modes: Vec<&str> = content_modes.iter().filter_map(|v| v.as_str()).collect();
+        assert!(modes.contains(&"overwrite") && modes.contains(&"append"));
+    }
+
+    #[test]
+    fn edit_mode_exposes_tilth_write_not_tilth_edit() {
+        let tools = tool_definitions(true);
+        let names: Vec<&str> = tools
+            .iter()
+            .filter_map(|t| t.get("name").and_then(|v| v.as_str()))
+            .collect();
+        assert!(
+            names.contains(&"tilth_write"),
+            "tilth_write must be exposed"
+        );
+        assert!(
+            !names.contains(&"tilth_edit"),
+            "tilth_edit must be renamed away"
+        );
+    }
 }
