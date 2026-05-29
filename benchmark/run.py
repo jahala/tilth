@@ -40,7 +40,7 @@ def _tilth_version() -> Optional[str]:
     """Get installed tilth version via `tilth --version`."""
     try:
         result = subprocess.run(
-            ["/Users/flysikring/.cargo/bin/tilth", "--version"],
+            [str(Path.home() / ".cargo" / "bin" / "tilth"), "--version"],
             capture_output=True, text=True, timeout=5,
         )
         # Output: "tilth 0.2.1"
