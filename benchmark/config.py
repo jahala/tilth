@@ -21,7 +21,7 @@ RUNNERS = {
 
 # MCP config arguments for codex (tilth server)
 TILTH_MCP_CODEX_ARGS = [
-    "-c", 'mcp_servers.tilth.command="/Users/flysikring/.cargo/bin/tilth"',
+    "-c", f'mcp_servers.tilth.command="{Path.home()}/.cargo/bin/tilth"',
     "-c", 'mcp_servers.tilth.args=["--mcp", "--edit"]',
 ]
 
