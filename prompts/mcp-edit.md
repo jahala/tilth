@@ -1,7 +1,7 @@
 
 
 tilth_write: Batch write one or more files. Replaces the host Edit and Write tools.
-Three per-file modes: hash (default — replace lines at hash anchors), overwrite (whole file), append (add to end).
+Three per-file modes: hash (default — replace lines at hash anchors), overwrite (whole file), append (add to end). Mode aliases: h=hash, w=overwrite, a=append.
 ALWAYS group writes to multiple files into ONE tilth_write call (max 20 files). Never call tilth_write twice in a row.
 Each file path may appear at most once per call.
 hash mode — edit an existing file:

@@ -10,6 +10,12 @@
 //! layer. `ELOOP` is remapped to `ErrorKind::InvalidInput`. On non-Unix the
 //! rewrite falls back to `fs::write` (Windows symlink semantics differ; no
 //! analogous escape).
+//!
+//! `append` carries the same `O_NOFOLLOW` guard on Unix: appending through a
+//! symlink (live or dangling) is refused with `ErrorKind::InvalidInput`, so an
+//! in-scope symlink can't be used to append outside the scope. This keeps the
+//! two write modes symmetric — neither follows a symlink. Non-Unix falls back
+//! to a plain create+append open.
 
 use std::fs;
 use std::path::Path;
@@ -37,6 +43,20 @@ pub fn write_overwrite(path: &Path, content: &str, overwrite: bool) -> std::io::
     }
 }
 
+/// Remap a `O_NOFOLLOW` open's `ELOOP` (the path's final component is a
+/// symlink) to a clear `InvalidInput` refusal; pass any other error through.
+#[cfg(unix)]
+fn refuse_symlink(e: std::io::Error, action: &str) -> std::io::Error {
+    if e.raw_os_error() == Some(libc::ELOOP) {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("refusing to {action} through symlink"),
+        )
+    } else {
+        e
+    }
+}
+
 #[cfg(unix)]
 fn rewrite_existing(path: &Path, content: &str) -> std::io::Result<()> {
     use std::io::Write as _;
@@ -47,16 +67,7 @@ fn rewrite_existing(path: &Path, content: &str) -> std::io::Result<()> {
         .truncate(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)
-        .map_err(|e| {
-            if e.raw_os_error() == Some(libc::ELOOP) {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "refusing to overwrite through symlink",
-                )
-            } else {
-                e
-            }
-        })?;
+        .map_err(|e| refuse_symlink(e, "overwrite"))?;
     f.write_all(content.as_bytes())
 }
 
@@ -66,6 +77,9 @@ fn rewrite_existing(path: &Path, content: &str) -> std::io::Result<()> {
 }
 
 /// Append `content` to `path`, creating the file (and parent dirs) if absent.
+/// On Unix the open passes `O_NOFOLLOW`, so appending through a symlink (live
+/// or dangling) is refused with `ErrorKind::InvalidInput` — symmetric with the
+/// `overwrite` path, so neither mode can write through an in-scope symlink.
 pub fn write_append(path: &Path, content: &str) -> std::io::Result<()> {
     use std::io::Write as _;
     if let Some(p) = path.parent() {
@@ -73,11 +87,24 @@ pub fn write_append(path: &Path, content: &str) -> std::io::Result<()> {
             fs::create_dir_all(p)?;
         }
     }
-    let mut f = fs::OpenOptions::new()
+    let mut f = open_append(path)?;
+    f.write_all(content.as_bytes())
+}
+
+#[cfg(unix)]
+fn open_append(path: &Path) -> std::io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(path)?;
-    f.write_all(content.as_bytes())
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| refuse_symlink(e, "append"))
+}
+
+#[cfg(not(unix))]
+fn open_append(path: &Path) -> std::io::Result<fs::File> {
+    fs::OpenOptions::new().create(true).append(true).open(path)
 }
 
 #[cfg(test)]
@@ -176,5 +203,30 @@ mod tests {
         std::fs::write(&p, "line1\n").unwrap();
         write_append(&p, "line2\n").unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "line1\nline2\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_append_refuses_symlinks() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        // Dangling symlink: a plain create+append would create the target.
+        let dangling = dir.path().join("dangling.log");
+        symlink(dir.path().join("missing-target"), &dangling).unwrap();
+        let err =
+            write_append(&dangling, "x\n").expect_err("append through dangling symlink must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        // Live symlink: a plain create+append would write the target through the link.
+        let target = dir.path().join("real.log");
+        std::fs::write(&target, "real\n").unwrap();
+        let link = dir.path().join("link.log");
+        symlink(&target, &link).unwrap();
+        let err = write_append(&link, "x\n").expect_err("append through live symlink must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "real\n",
+            "symlink target must be untouched"
+        );
     }
 }

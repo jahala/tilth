@@ -8,14 +8,14 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
          Large files return a structural outline (no hashlines); use `section` to get hashlined \
          content for the lines you want to edit. Use `sections` to grab several disjoint slices \
          from the same file in one call. Use `full` to force complete content. \
-         Use `paths` to read multiple files in one call."
+         Always pass `paths` as an array of file paths — a single-element array reads one file."
     } else {
         "Read a file with smart outlining. Replaces cat/head/tail and the host Read tool — \
          use this for all file reading. Small files return full content. Large files return \
          a structural outline (functions, classes, imports) so you see the shape without \
          consuming your context window. Use `section` to read a specific line range or heading. \
          Use `sections` to grab several disjoint slices from the same file in one call. \
-         Use `full` to force complete content. Use `paths` to read multiple files in one call."
+         Use `full` to force complete content. Always pass `paths` as an array of file paths — a single-element array reads one file."
     };
     let mut tools = vec![
         serde_json::json!({
@@ -64,29 +64,28 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
             "description": read_desc,
             "inputSchema": {
                 "type": "object",
+                "required": ["paths"],
                 "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Absolute or relative file path to read."
-                    },
                     "paths": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Multiple file paths to read in one call. Each file gets independent smart handling. Saves round-trips vs multiple single reads."
+                        "minItems": 1,
+                        "maxItems": 20,
+                        "description": "File paths to read (max 20). ALWAYS an array — use a single-element array for one file. Each file gets independent smart handling. Singular `path` is not accepted."
                     },
                     "section": {
                         "type": "string",
-                        "description": "Line range e.g. '45-89', or heading e.g. '## Architecture'. Bypasses smart view. Use `sections` for multiple ranges."
+                        "description": "Line range e.g. '45-89', or heading e.g. '## Architecture'. Single-file only (one entry in `paths`). Bypasses smart view. Use `sections` for multiple ranges."
                     },
                     "sections": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Multiple ranges from the same file in one call. Each entry is a line range or heading. Emits each block in user-supplied order, separated by `─── lines X-Y ───` delimiters. Mutually exclusive with `section`. Capped at 20 ranges."
+                        "description": "Multiple ranges from the same file in one call. Single-file only (one entry in `paths`). Each entry is a line range or heading. Emits each block in user-supplied order, separated by `─── lines X-Y ───` delimiters. Mutually exclusive with `section`. Capped at 20 ranges."
                     },
                     "full": {
                         "type": "boolean",
                         "default": false,
-                        "description": "Force full content output, bypass smart outlining."
+                        "description": "Force full content output, bypass smart outlining. Single-file only (one entry in `paths`)."
                     },
                     "budget": {
                         "type": "number",
@@ -351,5 +350,30 @@ mod tests {
             !names.contains(&"tilth_edit"),
             "tilth_edit must be renamed away"
         );
+    }
+
+    #[test]
+    fn tilth_read_schema_is_paths_only() {
+        for edit_mode in [false, true] {
+            let tools = tool_definitions(edit_mode);
+            let read = tools
+                .iter()
+                .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("tilth_read"))
+                .expect("tilth_read tool definition present");
+            let schema = &read["inputSchema"];
+            let props = &schema["properties"];
+            assert!(props.get("paths").is_some(), "paths must be present");
+            assert!(
+                props.get("path").is_none(),
+                "singular path must be removed (paths-only API)"
+            );
+            let required = schema["required"]
+                .as_array()
+                .expect("tilth_read schema must declare required");
+            assert!(
+                required.iter().any(|v| v == "paths"),
+                "paths must be required"
+            );
+        }
     }
 }

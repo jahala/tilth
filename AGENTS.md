@@ -24,10 +24,9 @@ Output per match:
 Re-expanding a previously shown definition returns [shown earlier].
 
 tilth_read: Read file content with smart outlining. Replaces cat/head/tail.
+Batch-only: ALWAYS pass paths: [...] as an array, even for one file. DO NOT use a singular `path`.
 Small files → full content. Large files → structural outline.
-section: "<start>-<end>" or "<heading text>"
-sections: array of ranges/headings — multiple slices from the same file in one call.
-paths: read multiple files in one call.
+For one file you may also pass section ("<start>-<end>" or "<heading text>"), sections (array of ranges), or full.
 Output:
 <line_number> │ <content>                  ← full/section mode
 [<start>-<end>]  <symbol name>             ← outline mode
@@ -59,7 +58,7 @@ To check what changed, use tilth_diff instead of Bash(git diff/git log).
 DO NOT re-read files already shown in expanded search results.
 
 tilth_write: Batch write one or more files. Replaces the host Edit and Write tools.
-Three per-file modes: hash (default — replace lines at hash anchors), overwrite (whole file), append (add to end).
+Three per-file modes: hash (default — replace lines at hash anchors), overwrite (whole file), append (add to end). Mode aliases: h=hash, w=overwrite, a=append.
 ALWAYS group writes to multiple files into ONE tilth_write call (max 20 files). Never call tilth_write twice in a row.
 Each file path may appear at most once per call.
 hash mode — edit an existing file:

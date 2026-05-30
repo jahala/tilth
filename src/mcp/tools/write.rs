@@ -1,7 +1,7 @@
 //! `tilth_write` — batch file writes in three per-file modes:
 //!
-//! * `hash` (default) — replace lines at hash anchors from `tilth_read`
-//!   (the former `tilth_edit`). Delegated to [`crate::edit::apply_batch`].
+//! * `hash` (default) — replace lines at hash anchors from `tilth_read`,
+//!   delegated to [`crate::edit::apply_batch`].
 //! * `overwrite` — whole-file write from `content`. Create-only by default
 //!   (atomic `O_CREAT|O_EXCL`); pass `overwrite: true` to replace an existing
 //!   file. See [`crate::mcp::write`] for the symlink guarantees.
@@ -208,27 +208,28 @@ pub(in crate::mcp) fn tool_write(
         };
         let path = PathBuf::from(path_str);
 
-        // Scope guard for direct modes only. hash mode goes through
-        // apply_batch, which roots paths to the package root itself.
-        if matches!(mode, "overwrite" | "w" | "append" | "a") {
-            match scope_canon.as_ref() {
-                Ok(root) => {
-                    if !path_within_scope(&path, root) {
-                        direct_results.push(format!(
-                            "## {}\nerror: refusing write outside scope ({})",
-                            path.display(),
-                            root.display()
-                        ));
-                        continue;
-                    }
-                }
-                Err(e) => {
+        // Scope guard for ALL modes. hash mode delegates to apply_batch, which
+        // computes a package_root only for blast-radius reporting — it does NOT
+        // enforce write containment, so a `../../etc/passwd` hash entry would
+        // otherwise traverse out of scope exactly like a direct write. Run the
+        // canonical-containment check uniformly before dispatching any mode.
+        match scope_canon.as_ref() {
+            Ok(root) => {
+                if !path_within_scope(&path, root) {
                     direct_results.push(format!(
-                        "## {}\nerror: scope unresolvable ({e}); refusing write",
+                        "## {}\nerror: refusing write outside scope ({})",
                         path.display(),
+                        root.display()
                     ));
                     continue;
                 }
+            }
+            Err(e) => {
+                direct_results.push(format!(
+                    "## {}\nerror: scope unresolvable ({e}); refusing write",
+                    path.display(),
+                ));
+                continue;
             }
         }
 
@@ -271,8 +272,9 @@ pub(in crate::mcp) fn tool_write(
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                         direct_results.push(format!(
-                            "## {}\nerror: file already exists — pass `overwrite: true` to replace it",
-                            path.display()
+                            "## {}\nerror: {}",
+                            path.display(),
+                            crate::error::TilthError::AlreadyExists { path: path.clone() }
                         ));
                     }
                     Err(e) => direct_results.push(format!("## {}\nerror: {e}", path.display())),
@@ -286,21 +288,33 @@ pub(in crate::mcp) fn tool_write(
                     ));
                     continue;
                 };
-                let before = show_diff
-                    .then(|| std::fs::read_to_string(&path).ok())
-                    .flatten();
+                // Snapshot the file BEFORE appending. The echo is computed from
+                // `before + content` (both known here), never from a post-write
+                // re-read: re-reading would race a concurrent appender, whose
+                // extra lines inflate the count and mis-number the echoed hash
+                // anchors — the agent then hash-edits against wrong line numbers.
+                let before = std::fs::read_to_string(&path).ok();
                 match crate::mcp::write::write_append(&path, content) {
                     Ok(()) => {
-                        // Echo only the appended region's hashlines so
-                        // log-shaped append targets don't balloon the response.
-                        let after = std::fs::read_to_string(&path)
-                            .unwrap_or_else(|_| before.clone().unwrap_or_default() + content);
+                        let before_str = before.as_deref().unwrap_or("");
+                        let after = format!("{before_str}{content}");
+                        // No trailing newline on the prior content means the first
+                        // appended line merges onto the last existing line, so the
+                        // echoed region starts one line earlier.
+                        let merged = !before_str.is_empty() && !before_str.ends_with('\n');
+                        let pre_count = before_str.lines().count();
                         let after_lines: Vec<&str> = after.lines().collect();
                         let total = after_lines.len();
-                        let appended = content.lines().count().max(1);
-                        let start_idx = total.saturating_sub(appended);
+                        let start_idx = if merged {
+                            pre_count.saturating_sub(1)
+                        } else {
+                            pre_count
+                        }
+                        .min(total);
                         let tail = after_lines[start_idx..].join("\n");
                         let start_line = (start_idx + 1) as u32;
+                        // Echo only the appended region's hashlines so log-shaped
+                        // append targets don't balloon the response.
                         let mut block = format!(
                             "## {}\nappend: {} bytes (echoing last {} of {total} lines)\n{}",
                             path.display(),
@@ -326,8 +340,8 @@ pub(in crate::mcp) fn tool_write(
 
     let mut output = String::new();
     if !hash_tasks.is_empty() {
-        // Record reads up front (matches legacy tilth_edit semantics:
-        // record_read counts attempts, not just committed edits).
+        // Record reads up front: record_read counts attempts, not just
+        // committed edits.
         for task in &hash_tasks {
             if let crate::edit::FileEditTask::Ready { path, .. } = task {
                 session.record_read(path);
@@ -534,5 +548,54 @@ mod tests {
             "expected scope refusal: {out}"
         );
         assert!(!p.exists(), "out-of-scope path must not be written");
+    }
+
+    #[test]
+    fn refuses_hash_write_outside_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let p = outside.path().join("secret.rs");
+        std::fs::write(&p, "secret\n").unwrap();
+        // hash mode must honor the scope guard too — apply_batch does not
+        // enforce containment, so a path traversing out of scope would write
+        // an arbitrary existing file if the guard skipped hash entries.
+        let args = serde_json::json!({
+            "scope": dir.path().to_str().unwrap(),
+            "files": [{"path": p.to_str().unwrap(), "mode": "hash",
+                       "edits": [{"start": "1:000", "content": "hacked"}]}],
+        });
+        let out = tool_write(&args, &Session::new(), &fresh_bloom()).unwrap();
+        assert!(
+            out.contains("outside scope"),
+            "hash mode must honor the scope guard: {out}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "secret\n",
+            "out-of-scope file must be untouched"
+        );
+    }
+
+    #[test]
+    fn append_echoes_appended_region_with_correct_line_numbers() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("multi.log");
+        std::fs::write(&p, "a\nb\nc\n").unwrap();
+        let args = serde_json::json!({
+            "scope": dir.path().to_str().unwrap(),
+            "files": [{"path": p.to_str().unwrap(), "mode": "append", "content": "d\n"}],
+        });
+        let out = tool_write(&args, &Session::new(), &fresh_bloom()).unwrap();
+        // 3 pre-existing lines → the appended line is numbered 4, and only it is
+        // echoed. Anchors come from before+content, not a post-write re-read.
+        assert!(
+            out.contains("echoing last 1 of 4 lines"),
+            "echo summary should reflect pre-append count: {out}"
+        );
+        assert!(
+            out.contains("4:"),
+            "appended line should be hashlined as line 4: {out}"
+        );
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "a\nb\nc\nd\n");
     }
 }

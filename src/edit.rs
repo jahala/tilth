@@ -525,7 +525,7 @@ mod tests {
     use super::*;
 
     fn write_temp(name: &str, content: &str) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!("tilth_edit_test_{name}"));
+        let path = std::env::temp_dir().join(format!("tilth_write_test_{name}"));
         std::fs::write(&path, content).unwrap();
         path
     }

@@ -23,10 +23,9 @@ Output per match:
 Re-expanding a previously shown definition returns [shown earlier].
 
 tilth_read: Read file content with smart outlining. Replaces cat/head/tail.
+Batch-only: ALWAYS pass paths: [...] as an array, even for one file. DO NOT use a singular `path`.
 Small files → full content. Large files → structural outline.
-section: "<start>-<end>" or "<heading text>"
-sections: array of ranges/headings — multiple slices from the same file in one call.
-paths: read multiple files in one call.
+For one file you may also pass section ("<start>-<end>" or "<heading text>"), sections (array of ranges), or full.
 Output:
 <line_number> │ <content>                  ← full/section mode
 [<start>-<end>]  <symbol name>             ← outline mode
