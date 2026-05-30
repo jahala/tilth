@@ -91,31 +91,6 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
             }
         }),
         serde_json::json!({
-            "name": "tilth_files",
-            "description": "Find files matching glob patterns. Replaces find/ls/pwd and the host Glob tool — use this for all file discovery. Returns matched file paths sorted by relevance with token size estimates. Pass one or more globs in `patterns`.",
-            "inputSchema": {
-                "type": "object",
-                "required": ["patterns"],
-                "properties": {
-                    "patterns": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "minItems": 1,
-                        "maxItems": 20,
-                        "description": "Glob patterns to run against the same scope, e.g. ['*'] (list directory), ['*.rs'], ['src/**/*.ts'], or ['*.rs', '*.toml'] for several at once. Each pattern emits its own `# Glob: ...` block, separated by a blank line. Capped at 20."
-                    },
-                    "scope": {
-                        "type": "string",
-                        "description": "Only use scope to list a specific subdirectory. DO NOT USE scope if you want to list the current working directory."
-                    },
-                    "budget": {
-                        "type": "number",
-                        "description": "Max tokens in response."
-                    }
-                }
-            }
-        }),
-        serde_json::json!({
             "name": "tilth_list",
             "description": "List files matching glob patterns as a directory tree. Replaces `ls -R`/`tree` — use this to see project structure with token-size rollups per directory. Pass `patterns` to combine several globs into one tree.",
             "inputSchema": {
@@ -495,6 +470,24 @@ mod tests {
                      (OpenAI/Codex rejects it — see issue #47)"
                 );
             }
+        }
+    }
+
+    /// `tilth_files` was consolidated into `tilth_list`; it must no longer be
+    /// advertised so clients can't discover a removed tool.
+    #[test]
+    fn tilth_files_is_not_advertised() {
+        for edit_mode in [false, true] {
+            let defs = tool_definitions(edit_mode);
+            let names: Vec<&str> = defs.iter().filter_map(|t| t["name"].as_str()).collect();
+            assert!(
+                !names.contains(&"tilth_files"),
+                "tilth_files must not be advertised (folded into tilth_list)"
+            );
+            assert!(
+                names.contains(&"tilth_list"),
+                "tilth_list must remain advertised"
+            );
         }
     }
 

@@ -1,0 +1,17 @@
+# Repo-layer hallouminate config.
+#
+# Declares this repo as a hallouminate tenant so the wiki under
+# .hallouminate/wiki/ is searchable + writable as the `repo:tilth:wiki` corpus
+# (and the source tree as `repo:tilth:corpus`). `path = "."` resolves against
+# the repo root (the parent of .hallouminate/), so this works from any checkout
+# or worktree without per-machine config — the daemon reads the repo layer
+# fresh on every request (no restart needed).
+#
+# Embeddings inherit the XDG baseline (~/.config/hallouminate/config.toml).
+#
+# Do NOT also declare `[[repository]] name = "tilth"` in the XDG baseline:
+# both layers would derive `repo:tilth:wiki` and collide on the duplicate-name
+# check.
+[[repository]]
+name = "tilth"
+path = "."

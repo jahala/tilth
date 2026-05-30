@@ -2,9 +2,9 @@ tilth — code intelligence MCP server. Replaces grep, cat, find, ls with AST-aw
 
 To explore code, always search first. tilth_search finds definitions, usages, and file locations in one call.
 Usage: tilth_search(queries: [{query: "handleRequest"}]).
-tilth_files is ONLY for listing directory contents when you have no symbol or text to search for.
+tilth_list is ONLY for listing directory contents when you have no symbol or text to search for.
 DO NOT use Read if content is already shown in expanded search results.
-DO NOT use Grep, Read, or Glob. Always use the better tools tilth_search (grep), tilth_read (read), tilth_files (glob).
+DO NOT use Grep, Read, or Glob. Always use the better tools tilth_search (grep), tilth_read (read), tilth_list (glob).
 
 tilth_search: Search code — finds definitions, usages, and text. Replaces grep/rg for all code search.
 Batch-only: ALWAYS pass queries: [...] as an array, even for one search. DO NOT use a singular `query` — it is not accepted. Per-entry kind/glob override the top-level values.
@@ -30,9 +30,10 @@ mode: auto (default) | full (force full content) | signature (outline, no bodies
 if_modified_since: ISO-8601 ts — unchanged files return (unchanged @ <ts>) stubs.
 Output: <line>:<hash>|<content> per line.
 
-tilth_files: Find files by glob patterns. Replaces find, ls, pwd, and the host Glob tool.
+tilth_list: List files by glob patterns as a directory tree with token-cost rollups. Replaces find, ls, tree, and the host Glob tool.
 Batch-only: ALWAYS pass patterns: [...] as an array, even for one glob (e.g. patterns: ["*.rs"] or ["*.rs", "*.toml"]). A singular `pattern` is not accepted.
-Output: <path>  (~<token_count> tokens).
+depth: cap directory depth (1 = top-level only).
+Output: tree with per-file (~<token_count> tokens) and per-directory rollups.
 
 tilth_deps: Blast-radius check — what imports this file and what it imports.
 Use ONLY before renaming, removing, or changing an export's signature.
@@ -52,6 +53,6 @@ DO NOT use Bash(git diff) or Bash(git log --patch). Use tilth_diff instead.
 
 To search code, use tilth_search instead of Grep or Bash(grep/rg).
 To read files, use tilth_read instead of Read or Bash(cat).
-To find files, use tilth_files instead of Glob or Bash(find/ls).
+To find files, use tilth_list instead of Glob or Bash(find/ls).
 To check what changed, use tilth_diff instead of Bash(git diff/git log).
 DO NOT re-read files already shown in expanded search results.

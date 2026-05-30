@@ -17,8 +17,8 @@ mod tree;
 mod write;
 
 use tools::{
-    tool_definitions, tool_deps, tool_diff, tool_files, tool_grok, tool_list, tool_read,
-    tool_search, tool_write,
+    tool_definitions, tool_deps, tool_diff, tool_grok, tool_list, tool_read, tool_search,
+    tool_write,
 };
 
 /// Shared dependencies passed through the request → dispatch pipeline.
@@ -317,7 +317,6 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
             services.bloom(),
             edit_mode,
         ),
-        "tilth_files" => tool_files(args),
         "tilth_list" => tool_list(args),
         "tilth_deps" => tool_deps(args, services.bloom()),
         "tilth_grok" => tool_grok(args, services.bloom(), services.session()),
@@ -518,7 +517,7 @@ mod tests {
     fn server_instructions_byte_lock() {
         assert_eq!(
             SERVER_INSTRUCTIONS.len(),
-            3866,
+            3993,
             "SERVER_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(SERVER_INSTRUCTIONS
@@ -2299,12 +2298,12 @@ mod tests {
         );
         assert_eq!(
             build_instructions(false, "").len(),
-            3866,
+            3993,
             "non-edit composed instructions byte count drifted"
         );
         assert_eq!(
             edit.len(),
-            6398,
+            6525,
             "edit-mode composed instructions byte count drifted (double-blank-line regression?)"
         );
     }

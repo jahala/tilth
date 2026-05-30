@@ -131,7 +131,7 @@ fn compute_dir_totals(tree: &BTreeMap<PathBuf, Vec<FileEntry>>) -> BTreeMap<Path
 }
 
 /// Compact human token count for directory rollups.
-/// Uses the same scale as `tilth_files` output (`12.3k`, `1.2M`).
+/// Uses the same scale as `tilth_list` output (`12.3k`, `1.2M`).
 ///
 /// The k→M switchover triggers at `999_950` rather than `1_000_000` so values
 /// that would round to `"1000.0k"` under `{:.1}` formatting roll cleanly into
