@@ -136,6 +136,21 @@ mod tests {
     }
 
     #[test]
+    fn apply_with_info_no_newline_at_all_does_not_panic() {
+        // Issue #39 bug 2: when the whole output has no `\n`, `header_end = 0`,
+        // `body` is the entire output, and all three `rfind`s return None — so
+        // the fallback (`.unwrap_or(safe_max)`) is what prevents `&body[..max_bytes]`
+        // from slicing mid-codepoint. A minified/emoji single line with zero
+        // newlines is the exact trigger.
+        let input: String = "🦀".repeat(500); // 2000 bytes, not one newline
+        assert!(!input.contains('\n'), "test input must have no newline");
+        let (out, info) = apply_with_info(&input, 100);
+        let info = info.expect("must truncate on tight budget");
+        assert!(info.at_line >= 1, "line accounting stays sane");
+        assert!(out.contains("truncated"), "marker line missing: {out}");
+    }
+
+    #[test]
     fn apply_with_info_code_format_survives_header_separator() {
         // Code-rendered output has `<n>:<hash>|<content>\n` on every line, so
         // the only `\n\n` in the body is the header/body separator at position
