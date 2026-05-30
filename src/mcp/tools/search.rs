@@ -142,6 +142,7 @@ fn tool_search_single(
                     session.record_search(queries[0]);
                     crate::search::search_symbol_expanded(
                         queries[0], &scope, cache, session, bloom, expand, context, glob, false,
+                        edit_mode,
                     )
                 }
                 2..=5 => {
@@ -150,6 +151,7 @@ fn tool_search_single(
                     }
                     crate::search::search_multi_symbol_expanded(
                         &queries, &scope, cache, session, bloom, expand, context, glob, false,
+                        edit_mode,
                     )
                 }
                 _ => {
@@ -163,13 +165,13 @@ fn tool_search_single(
         Some("content") => {
             session.record_search(query);
             crate::search::search_content_expanded(
-                query, &scope, cache, session, expand, context, glob, false,
+                query, &scope, cache, session, expand, context, glob, false, edit_mode,
             )
         }
         Some("regex") => {
             session.record_search(query);
             crate::search::search_regex_expanded(
-                query, &scope, cache, session, expand, context, glob, false,
+                query, &scope, cache, session, expand, context, glob, false, edit_mode,
             )
         }
         Some("callers") => {
@@ -225,19 +227,19 @@ fn search_merged_default(
     expand: usize,
     context: Option<&Path>,
     glob: Option<&str>,
-    _edit_mode: bool,
+    edit_mode: bool,
 ) -> Result<String, crate::error::TilthError> {
     let mut sections = Vec::new();
     sections.push(format!(
         "## symbol results\n\n{}",
         crate::search::search_symbol_expanded(
-            query, scope, cache, session, bloom, expand, context, glob, false,
+            query, scope, cache, session, bloom, expand, context, glob, false, edit_mode,
         )?
     ));
     sections.push(format!(
         "## content results\n\n{}",
         crate::search::search_content_expanded(
-            query, scope, cache, session, expand, context, glob, false,
+            query, scope, cache, session, expand, context, glob, false, edit_mode,
         )?
     ));
     if crate::classify::is_identifier(query) {

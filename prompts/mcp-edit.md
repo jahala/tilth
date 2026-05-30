@@ -4,7 +4,7 @@ tilth_write: Batch write one or more files in one call. Replaces the host Edit a
 ALWAYS group writes to multiple files into ONE tilth_write call (max 20 files). Never call tilth_write twice in a row.
 Modes per file (set via `mode`):
 
-- hash (default): replace lines at hash anchors. tilth_read → copy anchors (<line>:<hash>) (BOTH line and hash required) → pass to tilth_write. tilth_search does NOT provide hashes — you MUST tilth_read the file or section first.
+- hash (default): replace lines at hash anchors. Copy anchors (<line>:<hash>) (BOTH line and hash required) from tilth_read, or from expanded tilth_search results (source lines render as <line>:<hash>|content in edit mode), then pass to tilth_write. Search hits with no expanded source have no hashes — tilth_read that file or section first.
 - overwrite: write the file from scratch. Default is **create-only** — an existing file is rejected so you don't clobber by accident. Pass `overwrite: true` to replace an existing file.
 - append: append `content` to the file (creates it if absent).
 

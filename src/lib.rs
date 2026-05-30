@@ -243,7 +243,7 @@ fn run_inner(
             let bloom = index::bloom::BloomFilterCache::new();
             let expand = if expand > 0 { expand } else { 2 };
             let output = search::search_multi_symbol_expanded(
-                &parts, scope, cache, &session, &bloom, expand, None, glob, cli_full,
+                &parts, scope, cache, &session, &bloom, expand, None, glob, cli_full, false,
             )?;
             return match budget_tokens {
                 Some(b) => Ok(budget::apply(&output, b)),
@@ -309,6 +309,7 @@ fn run_query_expanded(
             None,
             glob,
             ctx.full_search,
+            false,
         ),
         QueryType::Concept(text) if text.contains(' ') => search::search_content_expanded(
             text,
@@ -319,6 +320,7 @@ fn run_query_expanded(
             None,
             glob,
             ctx.full_search,
+            false,
         ),
         // Single-word Concept and Fallthrough share the same expanded path:
         // both go straight to symbol_expanded, intentionally bypassing the
@@ -334,6 +336,7 @@ fn run_query_expanded(
             None,
             glob,
             ctx.full_search,
+            false,
         ),
         QueryType::Content(text) => search::search_content_expanded(
             text,
@@ -344,6 +347,7 @@ fn run_query_expanded(
             None,
             glob,
             ctx.full_search,
+            false,
         ),
         QueryType::Regex(pattern) => search::search_regex_expanded(
             pattern,
@@ -354,6 +358,7 @@ fn run_query_expanded(
             None,
             glob,
             ctx.full_search,
+            false,
         ),
         // FilePath/Glob never reach here (gated by use_expanded)
         QueryType::FilePath(_) | QueryType::Glob(_) => {

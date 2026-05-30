@@ -30,6 +30,7 @@ from config import (
     RESULTS_DIR,
     DEFAULT_REPS,
     TILTH_MCP_CODEX_ARGS,
+    TILTH_BIN,
 )
 from parse import parse_stream_json, parse_codex_json, tool_call_counts
 from tasks import TASKS
@@ -40,7 +41,7 @@ def _tilth_version() -> Optional[str]:
     """Get installed tilth version via `tilth --version`."""
     try:
         result = subprocess.run(
-            ["/Users/flysikring/.cargo/bin/tilth", "--version"],
+            [TILTH_BIN, "--version"],
             capture_output=True, text=True, timeout=5,
         )
         # Output: "tilth 0.2.1"

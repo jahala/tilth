@@ -178,7 +178,7 @@ def print_detailed_runs(runs: List[Dict], title: str, limit: int = 5):
 
 def main():
     """Main analysis function."""
-    results_dir = Path("/Users/flysikring/conductor/workspaces/tilth/almaty/benchmark/results")
+    results_dir = Path(__file__).parent / "results"
 
     # Focus on the two newest files
     target_files = [

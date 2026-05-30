@@ -1,6 +1,24 @@
+import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+
+def resolve_tilth_bin() -> str:
+    """Resolve the tilth binary portably so the benchmark runs on any machine.
+
+    Order: ``$TILTH_BIN`` env override → ``tilth`` on ``PATH`` (the
+    ``cargo install --path .`` workflow) → ``~/.cargo/bin/tilth`` fallback.
+    """
+    return (
+        os.environ.get("TILTH_BIN")
+        or shutil.which("tilth")
+        or str(Path.home() / ".cargo" / "bin" / "tilth")
+    )
+
+
+TILTH_BIN = resolve_tilth_bin()
 
 MODELS = {
     "haiku": "claude-haiku-4-5-20251001",
@@ -21,7 +39,7 @@ RUNNERS = {
 
 # MCP config arguments for codex (tilth server)
 TILTH_MCP_CODEX_ARGS = [
-    "-c", 'mcp_servers.tilth.command="/Users/flysikring/.cargo/bin/tilth"',
+    "-c", f'mcp_servers.tilth.command="{TILTH_BIN}"',
     "-c", 'mcp_servers.tilth.args=["--mcp", "--edit"]',
 ]
 

@@ -18,7 +18,7 @@ def parse_jsonl(file_path: str) -> List[Dict]:
     return results
 
 def main():
-    results_dir = Path("/Users/flysikring/conductor/workspaces/tilth/almaty/benchmark/results")
+    results_dir = Path(__file__).parent / "results"
 
     old_file = results_dir / "benchmark_20260213_131246.jsonl"
     new_file = results_dir / "benchmark_20260213_135039.jsonl"

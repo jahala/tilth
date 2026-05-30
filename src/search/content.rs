@@ -15,7 +15,10 @@ const MAX_MATCHES: usize = 10;
 const EARLY_QUIT_THRESHOLD: usize = MAX_MATCHES * 3;
 const FULL_MAX_MATCHES: usize = 100;
 const FULL_EARLY_QUIT_THRESHOLD: usize = FULL_MAX_MATCHES * 3;
-const MAX_SEARCH_FILE_SIZE: u64 = 500_000;
+/// Upper bound on file size searched by content/regex walkers. Files larger
+/// than this skip on stat alone. Shared so `content::search` and
+/// `super::count_files_for_empty` stay aligned.
+pub(crate) const MAX_SEARCH_FILE_SIZE: u64 = 500_000;
 
 /// Content search using ripgrep crates. Literal by default, regex if `is_regex`.
 pub fn search(

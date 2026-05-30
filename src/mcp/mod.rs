@@ -542,7 +542,7 @@ mod tests {
     fn edit_mode_extra_byte_lock() {
         assert_eq!(
             EDIT_MODE_EXTRA.len(),
-            2424,
+            2532,
             "EDIT_MODE_EXTRA byte count drifted from refactor baseline"
         );
         assert!(
@@ -2304,7 +2304,7 @@ mod tests {
         );
         assert_eq!(
             edit.len(),
-            6018,
+            6126,
             "edit-mode composed instructions byte count drifted (double-blank-line regression?)"
         );
     }
@@ -2708,6 +2708,119 @@ mod tests {
         assert!(
             out.contains("SECRET_NEW_BODY"),
             "changed file body must remain intact: {out}"
+        );
+    }
+
+    /// Spec criterion 4: in edit_mode, expanded search source lines carry
+    /// `<line>:<hash>` prefixes (no leading gutter), ready to round-trip
+    /// through `tilth_write` hash anchors.
+    #[test]
+    fn tool_search_expand_emits_hashlines_in_edit_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("hello.rs");
+        // Consecutive blank lines (3, 4) exercise the blank-line collapse /
+        // noise-stripping path. The marker on line 5 must keep its correct
+        // absolute anchor number even though lines above it are collapsed.
+        std::fs::write(
+            &p,
+            "fn unique_symbol_for_hashline_test() {\n    let a = 1;\n\n\n    let marker_xyz = a + 1;\n    marker_xyz\n}\n",
+        )
+        .unwrap();
+        let args = serde_json::json!({
+            "queries": [{"query": "unique_symbol_for_hashline_test"}],
+            "expand": 1,
+            "scope": dir.path().to_str().unwrap(),
+        });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let out = tool_search(&args, &cache, &session, &bloom, true).expect("edit-mode search ok");
+        // Expected: a line of the form `1:xxx|fn unique_symbol_for_hashline_test() {`.
+        let has_hash_anchor = out
+            .lines()
+            .any(|l| crate::format::parse_anchor(l.split('|').next().unwrap_or("")).is_some());
+        assert!(
+            has_hash_anchor,
+            "expected <line>:<hash>| anchor in expanded source: {out}"
+        );
+        // The marker is on source line 5; its anchor must read `5:` despite the
+        // collapsed blank run above it. Proves stripping preserves absolute line
+        // numbers (anchors stay valid for round-tripping into tilth_write).
+        assert!(
+            out.lines()
+                .any(|l| l.starts_with("5:") && l.contains("marker_xyz")),
+            "expected marker line to keep absolute anchor 5: {out}"
+        );
+        // The gutter form must NOT appear when edit_mode is set.
+        assert!(
+            !out.contains("│ fn unique_symbol_for_hashline_test"),
+            "gutter form must be suppressed under edit_mode: {out}"
+        );
+    }
+
+    // ── F3 hardening: zero-match search emits the new empty header with the
+    // three counts and the per-kind hint, end-to-end through tool_search.
+    // The unit tests in src/format.rs cover the helper in isolation; this
+    // proves the wiring from search.rs → format_search_result actually
+    // routes through the empty path on real walker results.
+    #[test]
+    fn tool_search_zero_matches_emits_empty_header_with_kind_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("only.rs"),
+            "fn unrelated() {}\n", // nothing here will match "zZxQyN_no_such_symbol"
+        )
+        .unwrap();
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "queries": [{"query": "zZxQyN_no_such_symbol", "kind": "content"}],
+            "scope": dir.path().to_str().unwrap()
+        });
+        let out = tool_search(&args, &cache, &session, &bloom, false).expect("search ok");
+        assert!(out.contains("0 matches"), "empty header missing: {out}");
+        assert!(
+            out.contains("Files matched glob:"),
+            "files matched count missing: {out}"
+        );
+        assert!(
+            out.contains("Files searched:"),
+            "files searched count missing: {out}"
+        );
+        assert!(out.contains("Content hits:"), "hits count missing: {out}");
+        // kind=content ⇒ literal-content hint (split from regex per Copilot review).
+        assert!(
+            out.contains("no content matches"),
+            "content-kind hint missing: {out}"
+        );
+    }
+
+    // ── F3 hardening: glob that excludes every file emits the dedicated
+    // glob-mismatch hint, regardless of the requested kind. This is the
+    // dispatch-table row most likely to silently regress if a future
+    // refactor stops populating files_matched_glob.
+    #[test]
+    fn tool_search_glob_excludes_everything_emits_glob_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn anything() {}\n").unwrap();
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        // Glob matches nothing in the scope → files_matched_glob == 0.
+        let args = serde_json::json!({
+            "queries": [{"query": "anything", "kind": "symbol", "glob": "*.bogus_ext_does_not_exist"}],
+            "scope": dir.path().to_str().unwrap()
+        });
+        let out = tool_search(&args, &cache, &session, &bloom, false).expect("search ok");
+        assert!(out.contains("0 matches"), "empty header missing: {out}");
+        assert!(
+            out.contains("Files matched glob: 0"),
+            "glob-mismatch count must be zero: {out}"
+        );
+        assert!(
+            out.contains("glob matched no files"),
+            "glob-zero hint must override the kind hint: {out}"
         );
     }
 }
