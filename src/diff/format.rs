@@ -413,7 +413,6 @@ fn format_marker(change: &ChangeType, confidence: &MatchConfidence) -> String {
         ChangeType::SignatureChanged => "[~:sig]".to_string(),
         ChangeType::Renamed { .. } => "[→]".to_string(),
         ChangeType::Moved { .. } => "[↦]".to_string(),
-        ChangeType::RenamedAndMoved { .. } => "[→↦]".to_string(),
         ChangeType::Unchanged => "[ ]".to_string(),
     }
 }
@@ -469,7 +468,6 @@ fn change_type_label(change: &ChangeType) -> &'static str {
         ChangeType::SignatureChanged => "signature changed",
         ChangeType::Renamed { .. } => "renamed",
         ChangeType::Moved { .. } => "moved",
-        ChangeType::RenamedAndMoved { .. } => "renamed and moved",
         ChangeType::Unchanged => "unchanged",
     }
 }
@@ -543,8 +541,6 @@ mod tests {
             path: PathBuf::from(path),
             symbol_changes: changes,
             attributed_hunks: Vec::new(),
-            conflicts: Vec::new(),
-            new_content: None,
         }
     }
 
@@ -577,7 +573,7 @@ mod tests {
     // Helper: build file_meta slice referencing the overlays' paths.
     // Since lifetimes are tricky with inline vec, callers build it manually.
 
-    // 1. All 6 change types produce correct markers
+    // 1. All 5 change types produce correct markers
     #[test]
     fn test_overview_markers() {
         let changes = vec![

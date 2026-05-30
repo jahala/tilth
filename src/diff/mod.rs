@@ -97,7 +97,6 @@ pub enum ChangeType {
     SignatureChanged,
     Renamed { old_name: String },
     Moved { old_path: PathBuf },
-    RenamedAndMoved { old_name: String, old_path: PathBuf },
     Unchanged,
 }
 
@@ -114,8 +113,6 @@ pub struct FileOverlay {
     pub path: PathBuf,
     pub symbol_changes: Vec<SymbolChange>,
     pub attributed_hunks: Vec<(String, Vec<DiffLine>)>,
-    pub conflicts: Vec<Conflict>,
-    pub new_content: Option<String>,
 }
 
 #[derive(Debug)]
@@ -505,25 +502,6 @@ fn diff_log(range: &str, scope: Option<&str>, budget: Option<u64>) -> Result<Str
     Ok(format::format_log(&summaries, range, budget))
 }
 
-/// Format a duration as a relative time string.
-#[allow(dead_code)]
-pub(crate) fn relative_time(secs: i64) -> String {
-    let secs = secs.max(0) as u64;
-    if secs < 60 {
-        return format!("{secs}s ago");
-    }
-    let mins = secs / 60;
-    if mins < 60 {
-        return format!("{mins}m ago");
-    }
-    let hours = mins / 60;
-    if hours < 24 {
-        return format!("{hours}h ago");
-    }
-    let days = hours / 24;
-    format!("{days}d ago")
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -577,7 +555,7 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).into_owned()
     }
 
-    /// Run diff() from within the test repo directory, serialized via CWD_LOCK.
+    /// Run `diff()` from within the test repo directory, serialized via `CWD_LOCK`.
     fn run_diff_in(
         dir: &Path,
         source: &DiffSource,

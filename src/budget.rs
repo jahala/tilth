@@ -95,6 +95,7 @@ pub(crate) fn apply_with_info(output: &str, budget: u64) -> (String, Option<Trun
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
 
     #[test]
     fn apply_with_info_roomy_budget_returns_none() {
@@ -109,7 +110,7 @@ mod tests {
         // Build a multi-line body large enough to force truncation.
         let mut input = String::from("# header\n");
         for i in 1..=200 {
-            input.push_str(&format!("line {i}\n"));
+            writeln!(input, "line {i}").unwrap();
         }
         // Budget that forces a cut somewhere in the middle.
         let (out, info) = apply_with_info(&input, 80);
@@ -176,7 +177,7 @@ mod tests {
         // real content survives.
         let mut input = String::from("# src/foo.rs (200 lines, ~2k tokens) [full]\n\n");
         for i in 1..=200 {
-            input.push_str(&format!("{i}:abc|let x_{i} = {i};\n"));
+            writeln!(input, "{i}:abc|let x_{i} = {i};").unwrap();
         }
         // Tight budget — must truncate, but should leave room for many lines.
         let (out, info) = apply_with_info(&input, 400);
@@ -197,7 +198,7 @@ mod tests {
         // apply() must still return identical output to apply_with_info().0
         let mut input = String::from("# header\n");
         for i in 1..=50 {
-            input.push_str(&format!("line {i}\n"));
+            writeln!(input, "line {i}").unwrap();
         }
         let from_wrapper = apply(&input, 60);
         let (from_info, _) = apply_with_info(&input, 60);

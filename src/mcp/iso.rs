@@ -157,7 +157,7 @@ mod tests {
         let p = dir.path().join("x.txt");
         std::fs::write(&p, "hi").unwrap();
         // ts is well in the future → file mtime <= ts → unchanged.
-        let future = SystemTime::now() + std::time::Duration::from_secs(60 * 60);
+        let future = SystemTime::now() + std::time::Duration::from_hours(1);
         assert!(!file_changed_since(&p, future), "future ts ⇒ unchanged");
     }
 

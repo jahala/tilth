@@ -69,6 +69,7 @@ fn with_omission_note(outline: String, max_lines: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::with_omission_note;
+    use std::fmt::Write as _;
 
     #[test]
     fn note_appended_when_at_cap() {
@@ -101,15 +102,16 @@ mod tests {
     }
 
     /// Integration test: drive the full `generate()` pipeline with a
-    /// real Rust source containing more than OUTLINE_CAP top-level
+    /// real Rust source containing more than `OUTLINE_CAP` top-level
     /// functions. Verifies the cap actually fires and that
     /// `with_omission_note` is wired into the pipeline correctly —
     /// not just exercised in isolation.
     #[test]
     fn integration_note_on_capped_code_file() {
-        let src: String = (0..150)
-            .map(|i| format!("pub fn func_{i}() {{}}\n"))
-            .collect();
+        let mut src = String::new();
+        for i in 0..150 {
+            writeln!(src, "pub fn func_{i}() {{}}").unwrap();
+        }
         let path = std::path::Path::new("fake.rs");
         let file_type = crate::types::FileType::Code(crate::types::Lang::Rust);
         let result = super::generate(path, file_type, &src, src.as_bytes(), true);
@@ -124,9 +126,10 @@ mod tests {
     /// the actual entry count is well below the cap.
     #[test]
     fn integration_no_note_on_small_code_file() {
-        let src: String = (0..5)
-            .map(|i| format!("pub fn func_{i}() {{}}\n"))
-            .collect();
+        let mut src = String::new();
+        for i in 0..5 {
+            writeln!(src, "pub fn func_{i}() {{}}").unwrap();
+        }
         let path = std::path::Path::new("fake.rs");
         let file_type = crate::types::FileType::Code(crate::types::Lang::Rust);
         let result = super::generate(path, file_type, &src, src.as_bytes(), true);

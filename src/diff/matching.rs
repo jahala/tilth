@@ -496,24 +496,6 @@ fn trim_ascii(bytes: &[u8]) -> &[u8] {
 mod tests {
     use super::*;
 
-    fn make_entry(
-        kind: OutlineKind,
-        name: &str,
-        start: u32,
-        end: u32,
-        sig: Option<&str>,
-    ) -> OutlineEntry {
-        OutlineEntry {
-            kind,
-            name: name.to_string(),
-            start_line: start,
-            end_line: end,
-            signature: sig.map(|s| s.to_string()),
-            children: Vec::new(),
-            doc: None,
-        }
-    }
-
     fn make_sym(
         kind: OutlineKind,
         name: &str,
@@ -529,7 +511,7 @@ mod tests {
                 name: name.to_string(),
                 start_line: 1,
                 end_line: 1,
-                signature: sig.map(|s| s.to_string()),
+                signature: sig.map(str::to_string),
                 children: Vec::new(),
                 doc: None,
             },

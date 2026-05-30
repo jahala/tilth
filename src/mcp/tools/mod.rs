@@ -67,7 +67,7 @@ mod tests {
         // With no arg, defaults to "." which is cwd
         let cwd = std::env::current_dir().unwrap();
         // The function returns "." when resolved == cwd
-        assert!(scope == PathBuf::from(".") || scope == cwd);
+        assert!(scope == std::path::Path::new(".") || scope == cwd);
         assert!(warning.is_none());
     }
 

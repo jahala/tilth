@@ -42,6 +42,36 @@ pub enum Lang {
     Make,
 }
 
+impl Lang {
+    /// Returns `true` if the language uses `'` for lifetime ticks (`'a`,
+    /// `'static`) rather than as a string/char delimiter.
+    ///
+    /// Lexers that scan `'` must disambiguate a lifetime from a single-quoted
+    /// literal; only Rust needs the lifetime branch.
+    pub(crate) fn has_lifetimes(self) -> bool {
+        match self {
+            Lang::Rust => true,
+            Lang::TypeScript
+            | Lang::Tsx
+            | Lang::JavaScript
+            | Lang::Python
+            | Lang::Go
+            | Lang::Java
+            | Lang::Scala
+            | Lang::C
+            | Lang::Cpp
+            | Lang::Ruby
+            | Lang::Php
+            | Lang::Swift
+            | Lang::Kotlin
+            | Lang::CSharp
+            | Lang::Elixir
+            | Lang::Dockerfile
+            | Lang::Make => false,
+        }
+    }
+}
+
 /// File type as detected by extension. Determines outline strategy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileType {

@@ -91,6 +91,32 @@ fn build_instructions(edit_mode: bool, overview: &str) -> String {
     out
 }
 
+/// Change the process working directory, logging failures to stderr.
+///
+/// A swallowed chdir leaves the server searching the wrong root while every
+/// later tool call still looks successful, so the operator needs a grep-able
+/// line when the configured root is unusable.
+fn chdir_or_log(path: &Path) {
+    if let Err(e) = std::env::set_current_dir(path) {
+        eprintln!(
+            "tilth: failed to set working directory to {}: {e}",
+            path.display()
+        );
+    }
+}
+
+/// The current working directory, logging to stderr and falling back to an
+/// empty path when `current_dir` fails (rare, but previously swallowed silently).
+fn current_dir_or_log() -> PathBuf {
+    match std::env::current_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!("tilth: failed to read current dir: {e}");
+            PathBuf::new()
+        }
+    }
+}
+
 /// MCP server over stdio. When `edit_mode` is true, exposes `tilth_write` and
 /// switches `tilth_read` to hashline output format.
 ///
@@ -104,12 +130,12 @@ pub fn run(edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
     // Priority: explicit --scope > MCP roots (handled later) > package_root(cwd) > cwd
     if let Some(s) = scope {
         if s.is_dir() {
-            let _ = std::env::set_current_dir(s);
+            chdir_or_log(s);
         }
     } else {
-        let cwd = std::env::current_dir().unwrap_or_default();
+        let cwd = current_dir_or_log();
         if let Some(root) = crate::lang::package_root(&cwd) {
-            let _ = std::env::set_current_dir(root);
+            chdir_or_log(root);
         }
     }
 
@@ -122,7 +148,13 @@ pub fn run(edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
     let mut pending_roots_id: Option<Value> = None;
 
     for line in stdin.lock().lines() {
-        let line = line?;
+        let line = match line {
+            Ok(line) => line,
+            Err(e) => {
+                eprintln!("tilth: stdin read error, shutting down: {e}");
+                return Err(e);
+            }
+        };
         if line.is_empty() {
             continue;
         }
@@ -143,7 +175,7 @@ pub fn run(edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
                 // Only apply roots on success and if --scope was NOT explicitly provided
                 if !scope_is_explicit {
                     if let Some(root_path) = extract_root_from_response(&msg) {
-                        let _ = std::env::set_current_dir(&root_path);
+                        chdir_or_log(&root_path);
                     }
                 }
                 continue;
@@ -252,7 +284,7 @@ fn handle_request(req: &JsonRpcRequest, services: &Services) -> JsonRpcResponse 
             let overview = if std::env::var("TILTH_NO_OVERVIEW").is_ok() {
                 String::new()
             } else {
-                let cwd = std::env::current_dir().unwrap_or_default();
+                let cwd = current_dir_or_log();
                 crate::overview::fingerprint(&cwd)
             };
             let instructions = build_instructions(edit_mode, &overview);
@@ -364,13 +396,22 @@ fn run_tool_with_timeout(
 
     match outcome {
         Ok(inner) => inner,
-        Err(SpawnFailure::Timeout) => Err(format!(
-            "tool timed out after {}s — the operation took too long. \
-             Try: reduce scope, use section instead of full, or set \
-             TILTH_TIMEOUT=<seconds> to increase the limit.",
-            timeout.as_secs()
-        )),
-        Err(SpawnFailure::Panic) => Err("tool panicked during execution".into()),
+        Err(SpawnFailure::Timeout) => {
+            eprintln!(
+                "tilth: tool '{tool_name}' timed out after {}s",
+                timeout.as_secs()
+            );
+            Err(format!(
+                "tool timed out after {}s — the operation took too long. \
+                 Try: reduce scope, use section instead of full, or set \
+                 TILTH_TIMEOUT=<seconds> to increase the limit.",
+                timeout.as_secs()
+            ))
+        }
+        Err(SpawnFailure::Panic) => {
+            eprintln!("tilth: tool '{tool_name}' panicked during execution");
+            Err("tool panicked during execution".into())
+        }
     }
 }
 
@@ -572,7 +613,7 @@ mod tests {
     // Restored from pre-merge 3801a4c (dropped by the #35 upstream merge).
     // These guard every behavior the batch-only read revert restored.
 
-    /// Helper: parse the first line of a tool_read response as JSON when the
+    /// Helper: parse the first line of a `tool_read` response as JSON when the
     /// header is present. Returns `None` when the response body has no JSON
     /// header (full content with no since/view-meta).
     fn parse_first_line_json(out: &str) -> Option<serde_json::Value> {
@@ -958,7 +999,7 @@ mod tests {
         assert!(out.contains("hello world"), "expected body: {out}");
     }
 
-    /// `tilth_read` `path#n` (FromLine) suffix returns from line n to end.
+    /// `tilth_read` `path#n` (`FromLine`) suffix returns from line n to end.
     #[test]
     fn tool_read_from_line_suffix() {
         let dir = tempfile::tempdir().unwrap();
@@ -1403,7 +1444,7 @@ mod tests {
         // for it to find a non-zero cut point.
         let mut src = String::new();
         for i in 0..100 {
-            src.push_str(&format!("fn f{i}() {{\n    let l = {i};\n}}\n\n"));
+            write!(src, "fn f{i}() {{\n    let l = {i};\n}}\n\n").unwrap();
         }
         std::fs::write(&p, src).unwrap();
         let args = serde_json::json!({
@@ -1442,7 +1483,7 @@ mod tests {
         let p = dir.path().join("big.rs");
         let mut src = String::new();
         for i in 0..400 {
-            src.push_str(&format!("fn f{i}() {{\n    let l = {i};\n}}\n\n"));
+            write!(src, "fn f{i}() {{\n    let l = {i};\n}}\n\n").unwrap();
         }
         std::fs::write(&p, src).unwrap();
         let budget = 500u64;
@@ -1817,7 +1858,7 @@ mod tests {
     }
 
     /// Boundary: a mixed parse-error + good-file batch at the wire layer.
-    /// The record_read gate sits in `tool_write`, not in `apply_batch`, so it
+    /// The `record_read` gate sits in `tool_write`, not in `apply_batch`, so it
     /// needs explicit wire-level coverage.
     #[test]
     fn tool_write_mixed_parse_error_and_good_file_records_only_good() {
@@ -2117,8 +2158,6 @@ mod tests {
     fn tool_write_auto_fix_shift_returns_fresh_region_not_relocation() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("shift.txt");
-
-        use std::fmt::Write as _;
 
         // C0: TARGET_BODY_TOKEN at line 10.
         let mut c0 = String::new();
@@ -2664,7 +2703,7 @@ mod tests {
             .write(true)
             .open(&path_old)
             .unwrap()
-            .set_modified(UNIX_EPOCH + Duration::from_secs(900_000_000))
+            .set_modified(UNIX_EPOCH + Duration::from_hours(250_000))
             .unwrap();
         std::fs::File::options()
             .write(true)
@@ -2700,7 +2739,7 @@ mod tests {
         );
     }
 
-    /// Spec criterion 4: in edit_mode, expanded search source lines carry
+    /// Spec criterion 4: in `edit_mode`, expanded search source lines carry
     /// `<line>:<hash>` prefixes (no leading gutter), ready to round-trip
     /// through `tilth_write` hash anchors.
     #[test]

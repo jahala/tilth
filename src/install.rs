@@ -150,27 +150,45 @@ fn write_toml_config(host_info: &HostInfo, edit: bool) -> Result<(), String> {
         String::new()
     };
 
-    // Remove existing [mcp_servers.tilth] section if present
-    let output = if let Some(start) = existing.find("[mcp_servers.tilth]") {
-        // Find end of section: next [header] or EOF
-        let rest = &existing[start..];
-        let end = rest[1..] // skip the opening '['
-            .find("\n[")
-            .map_or(existing.len(), |i| start + 1 + i + 1);
-        format!("{}{}{}", &existing[..start], section, &existing[end..])
-    } else {
-        // Append with a blank line separator
+    let output = upsert_toml_section(&existing, "[mcp_servers.tilth]", &section);
+
+    fs::write(&host_info.path, &output)
+        .map_err(|e| format!("failed to write {}: {e}", host_info.path.display()))?;
+    Ok(())
+}
+
+/// Finds a TOML table header anchored to a line start (or the file start),
+/// returning the byte offset of its opening `[`.
+///
+/// A bare substring search matches the header text inside a comment or string,
+/// then splices from that offset and corrupts a hand-edited config. Anchoring to
+/// `\n<header>` (or start-of-file) only matches a real table header.
+fn find_section_start(text: &str, header: &str) -> Option<usize> {
+    if text.starts_with(header) {
+        return Some(0);
+    }
+    let needle = format!("\n{header}");
+    text.find(&needle).map(|newline_at| newline_at + 1)
+}
+
+/// Replaces an existing `header` table with `section`, or appends `section`
+/// (blank-line separated) when the table is absent. The match is line-anchored
+/// via [`find_section_start`], and the section end is the next table header.
+fn upsert_toml_section(existing: &str, header: &str, section: &str) -> String {
+    let Some(start) = find_section_start(existing, header) else {
         let sep = if existing.is_empty() || existing.ends_with('\n') {
             ""
         } else {
             "\n"
         };
-        format!("{existing}{sep}\n{section}")
+        return format!("{existing}{sep}\n{section}");
     };
 
-    fs::write(&host_info.path, &output)
-        .map_err(|e| format!("failed to write {}: {e}", host_info.path.display()))?;
-    Ok(())
+    let rest = &existing[start..];
+    let end = rest[1..] // skip the opening '['
+        .find("\n[")
+        .map_or(existing.len(), |i| start + 1 + i + 1);
+    format!("{}{}{}", &existing[..start], section, &existing[end..])
 }
 
 /// Returns (command, args) for the tilth MCP server entry.
@@ -503,6 +521,60 @@ fn claude_desktop_path() -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TILTH_HEADER: &str = "[mcp_servers.tilth]";
+
+    #[test]
+    fn toml_section_appended_when_absent() {
+        let out = upsert_toml_section(
+            "[other]\nk = 1\n",
+            TILTH_HEADER,
+            "[mcp_servers.tilth]\ncommand = \"x\"\n",
+        );
+        assert!(out.contains("[other]"));
+        assert!(out.contains("[mcp_servers.tilth]\ncommand = \"x\""));
+    }
+
+    #[test]
+    fn toml_header_in_comment_is_not_spliced() {
+        let existing = "# legacy note about [mcp_servers.tilth] kept for humans\n[other]\nk = 1\n";
+        let out = upsert_toml_section(
+            existing,
+            TILTH_HEADER,
+            "[mcp_servers.tilth]\ncommand = \"x\"\n",
+        );
+        assert!(
+            out.contains("# legacy note about [mcp_servers.tilth] kept for humans"),
+            "comment corrupted by a substring splice: {out:?}"
+        );
+        assert!(out.contains("[other]"));
+        assert!(out.contains("command = \"x\""));
+    }
+
+    #[test]
+    fn toml_section_replaced_at_line_start() {
+        let existing = "[mcp_servers.tilth]\ncommand = \"old\"\nargs = []\n[other]\nk = 1\n";
+        let out = upsert_toml_section(
+            existing,
+            TILTH_HEADER,
+            "[mcp_servers.tilth]\ncommand = \"new\"\n",
+        );
+        assert!(out.contains("command = \"new\""));
+        assert!(!out.contains("\"old\""), "old section not removed: {out:?}");
+        assert!(out.contains("[other]"));
+    }
+
+    #[test]
+    fn toml_section_replaced_at_start_of_file() {
+        let existing = "[mcp_servers.tilth]\ncommand = \"old\"\n";
+        let out = upsert_toml_section(
+            existing,
+            TILTH_HEADER,
+            "[mcp_servers.tilth]\ncommand = \"new\"\n",
+        );
+        assert!(out.contains("\"new\""));
+        assert!(!out.contains("\"old\""));
+    }
 
     #[test]
     fn amp_resolve_host() {

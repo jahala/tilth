@@ -1372,11 +1372,11 @@ fn h() {}
 
     // ── GROK-DEDUP tests ───────────────────────────────────────────
 
-    /// Source with a body big enough to trigger degradation (> BODY_DEGRADE_THRESHOLD).
+    /// Source with a body big enough to trigger degradation (> `BODY_DEGRADE_THRESHOLD`).
     fn long_body_fixture(name: &str) -> String {
         let mut s = format!("pub fn {name}() {{\n");
         for i in 0..20 {
-            s.push_str(&format!("    let v{i} = {i};\n"));
+            writeln!(s, "    let v{i} = {i};").unwrap();
         }
         s.push_str("}\n");
         s
@@ -1461,11 +1461,11 @@ fn h() {}
         // The fixture from existing tests already produces 1 caller in 1 file.
         // Verify the rendered output uses the grouped shape (file header + indented sites).
         let tmp = tempfile::tempdir().unwrap();
-        let lib = r#"
+        let lib = r"
 pub fn target() { let _ = 1; }
 pub fn caller_a() { target(); }
 pub fn caller_b() { target(); }
-"#;
+";
         write_fixture(tmp.path(), "src/lib.rs", lib);
         let bloom = BloomFilterCache::default();
         let session = crate::session::Session::default();
@@ -1497,14 +1497,14 @@ pub fn caller_b() { target(); }
         // target_fn calls helper (same file) and peer (same file). Verify
         // the single file header collapses both callees under it.
         let tmp = tempfile::tempdir().unwrap();
-        let lib = r#"
+        let lib = r"
 pub fn helper() -> u32 { 1 }
 pub fn peer() {}
 pub fn target_fn() {
     let _ = helper();
     peer();
 }
-"#;
+";
         write_fixture(tmp.path(), "src/lib.rs", lib);
         let bloom = BloomFilterCache::default();
         let session = crate::session::Session::default();

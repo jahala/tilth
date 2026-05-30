@@ -29,8 +29,6 @@ pub(crate) fn compute_overlay(file_diff: &FileDiff, source: &DiffSource) -> File
             path: path.clone(),
             symbol_changes: Vec::new(),
             attributed_hunks: Vec::new(),
-            conflicts: Vec::new(),
-            new_content: None,
         };
     }
 
@@ -224,8 +222,6 @@ fn compute_modified(file_diff: &FileDiff, source: &DiffSource) -> FileOverlay {
         path: path.clone(),
         symbol_changes,
         attributed_hunks,
-        conflicts: Vec::new(),
-        new_content: Some(new_content),
     }
 }
 
@@ -239,8 +235,6 @@ fn compute_added(file_diff: &FileDiff, source: &DiffSource) -> FileOverlay {
         path: path.clone(),
         symbol_changes,
         attributed_hunks: Vec::new(),
-        conflicts: Vec::new(),
-        new_content: Some(new_content),
     }
 }
 
@@ -254,8 +248,6 @@ fn compute_deleted(file_diff: &FileDiff, source: &DiffSource) -> FileOverlay {
         path: path.clone(),
         symbol_changes,
         attributed_hunks: Vec::new(),
-        conflicts: Vec::new(),
-        new_content: None,
     }
 }
 
@@ -281,8 +273,6 @@ fn compute_renamed(file_diff: &FileDiff, source: &DiffSource) -> FileOverlay {
         path: path.clone(),
         symbol_changes,
         attributed_hunks,
-        conflicts: Vec::new(),
-        new_content: Some(new_content),
     }
 }
 
@@ -300,13 +290,33 @@ fn get_old_content(path: &Path, old_path: Option<&Path>, source: &DiffSource) ->
             if let Some((left, _)) = r.split_once("..") {
                 git_show(&format!("{left}:{path_str}"))
             } else {
-                // `git diff HEAD~1` compares HEAD~1 (old) against HEAD (new).
-                // So old content is at the ref itself.
+                // `git diff <ref>` compares <ref> (old) against the working tree
+                // (new), so the old content is the file at the ref itself.
                 git_show(&format!("{r}:{path_str}"))
             }
         }
         DiffSource::Files(a, _) => std::fs::read_to_string(a).unwrap_or_default(),
         DiffSource::Patch(_) | DiffSource::Log(_) => String::new(),
+    }
+}
+
+/// Where the "new" side of a `GitRef` diff reads its content from.
+enum GitRefNewSide {
+    /// A range ref (`a..b`): the committed blob at the right side, via `git show`.
+    Committed(String),
+    /// A bare ref: `git diff <ref>` compares against the working tree on disk.
+    WorkingTree,
+}
+
+/// Decide how a `GitRef`'s new-side content is sourced.
+///
+/// A range ref (`a..b`) reads the committed blob at `b` via `git show b:<path>`;
+/// a bare ref reads the working tree, because `git diff <ref>` compares `<ref>`
+/// against the working tree rather than against `HEAD`.
+fn resolve_git_ref_new_side(reff: &str, path_str: &str) -> GitRefNewSide {
+    match reff.split_once("..") {
+        Some((_, right)) => GitRefNewSide::Committed(format!("{right}:{path_str}")),
+        None => GitRefNewSide::WorkingTree,
     }
 }
 
@@ -316,15 +326,10 @@ fn get_new_content(path: &Path, source: &DiffSource) -> String {
     match source {
         DiffSource::GitUncommitted => std::fs::read_to_string(path).unwrap_or_default(),
         DiffSource::GitStaged => git_show(&format!(":{path_str}")),
-        DiffSource::GitRef(r) => {
-            if let Some((_, right)) = r.split_once("..") {
-                git_show(&format!("{right}:{path_str}"))
-            } else {
-                // `git diff HEAD~1` compares HEAD~1 against HEAD.
-                // New content is HEAD (current commit).
-                git_show(&format!("HEAD:{path_str}"))
-            }
-        }
+        DiffSource::GitRef(r) => match resolve_git_ref_new_side(r, &path_str) {
+            GitRefNewSide::Committed(spec) => git_show(&spec),
+            GitRefNewSide::WorkingTree => std::fs::read_to_string(path).unwrap_or_default(),
+        },
         DiffSource::Files(_, b) => std::fs::read_to_string(b).unwrap_or_default(),
         DiffSource::Patch(_) | DiffSource::Log(_) => String::new(),
     }
@@ -522,4 +527,49 @@ fn find_enclosing_function(entries: &[OutlineEntry], line: u32) -> Option<String
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bare_git_ref_new_content_reads_working_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("sample.rs");
+        std::fs::write(&file, "fn worktree_only() {}\n").unwrap();
+
+        // A single ref (no `..`) diffs against the working tree, so the new
+        // content must come from the file on disk — not `git show HEAD:<path>`,
+        // which would return empty here and silently mis-attribute the diff.
+        let content = get_new_content(&file, &DiffSource::GitRef("HEAD".to_string()));
+        assert!(
+            content.contains("worktree_only"),
+            "bare GitRef new content must be the working tree, got {content:?}"
+        );
+
+        // Lock the routing decision too: a bare ref must take the working-tree branch.
+        match resolve_git_ref_new_side("HEAD", "src/lib.rs") {
+            GitRefNewSide::WorkingTree => {}
+            GitRefNewSide::Committed(spec) => {
+                panic!("bare ref must read the working tree, not `git show {spec}`")
+            }
+        }
+    }
+
+    #[test]
+    fn range_git_ref_new_content_reads_committed_blob() {
+        // Dual-path lock: a RANGE ref (`a..b`) must read the committed blob at the
+        // right side via `git show b:<path>`, NOT the working tree. Without this a
+        // regression collapsing both branches into the working-tree read would pass
+        // the bare-ref test above while silently breaking range diffs.
+        match resolve_git_ref_new_side("HEAD..feature", "src/lib.rs") {
+            GitRefNewSide::Committed(spec) => {
+                assert_eq!(spec, "feature:src/lib.rs", "wrong git show spec");
+            }
+            GitRefNewSide::WorkingTree => {
+                panic!("range ref must read the committed blob, not the working tree")
+            }
+        }
+    }
 }

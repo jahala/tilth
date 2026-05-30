@@ -1739,7 +1739,7 @@ mod tests {
     #[test]
     fn walker_brace_expansion_matches_multiple_extensions() {
         let scope = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let filtered = walk_paths(&scope, Some("*.{rs,toml}"));
+        let filtered = walk_paths(scope, Some("*.{rs,toml}"));
         let exts = extensions(&filtered);
         assert!(
             exts.contains("rs"),
@@ -1762,8 +1762,8 @@ mod tests {
         // Use project root (not src/) — project root has .toml, .md, .lock etc.
         // alongside .rs files, so *.rs is guaranteed to be a strict subset.
         let scope = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let all = walk_paths(&scope, None);
-        let rs_only = walk_paths(&scope, Some("*.rs"));
+        let all = walk_paths(scope, None);
+        let rs_only = walk_paths(scope, Some("*.rs"));
         assert!(
             rs_only.len() < all.len(),
             "whitelist ({}) should find fewer files than unfiltered ({})",
@@ -1775,7 +1775,7 @@ mod tests {
     #[test]
     fn walker_path_pattern_restricts_directory() {
         let scope = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let filtered = walk_paths(&scope, Some("src/**/*.rs"));
+        let filtered = walk_paths(scope, Some("src/**/*.rs"));
         assert!(!filtered.is_empty(), "path pattern should find files");
         let src_dir = scope.join("src");
         for p in &filtered {
@@ -2053,7 +2053,7 @@ mod tests {
         assert_eq!(label, "§Outer");
     }
 
-    /// CommonMark §4.6.1 caps ATX headings at 6 leading `#`s. 7+ hashes is
+    /// `CommonMark` §4.6.1 caps ATX headings at 6 leading `#`s. 7+ hashes is
     /// raw text, not a heading, and must not surface as the enclosing scope.
     /// Pre-AST migration the regex matched `#######` and produced a bogus
     /// `§# Fake Heading 7` label.
@@ -2078,7 +2078,7 @@ mod tests {
         );
     }
 
-    /// CommonMark §4.6.1 requires whitespace after the leading `#`s. `##NoSpace`
+    /// `CommonMark` §4.6.1 requires whitespace after the leading `#`s. `##NoSpace`
     /// is paragraph text, not a heading. Pre-AST migration the regex accepted
     /// it and produced `§NoSpace`.
     #[test]
@@ -2240,7 +2240,7 @@ mod tests {
         // Heading on line 1, then 60 body lines.
         let mut content = String::from("## Big Section\n");
         for i in 0..60 {
-            let _ = write!(content, "body line {i}\n");
+            let _ = writeln!(content, "body line {i}");
         }
         std::fs::write(&p, &content).unwrap();
 
@@ -2313,7 +2313,7 @@ mod tests {
         let p = tmp.path().join("long.md");
         let mut content = String::from("## Big Section\n");
         for i in 0..60 {
-            let _ = write!(content, "body line {i}\n");
+            let _ = writeln!(content, "body line {i}");
         }
         std::fs::write(&p, &content).unwrap();
 
@@ -2366,7 +2366,7 @@ mod tests {
         );
     }
 
-    /// Worst-case bound: with MAX_MATCHES = 10 markdown-heading defs each
+    /// Worst-case bound: with `MAX_MATCHES` = 10 markdown-heading defs each
     /// hitting the 40-line preview cap, total inlined preview content is at
     /// most 10 × 40 = 400 lines. This pins the bound by exercising the cap
     /// and asserting the truncation shape, so a future bump of either
