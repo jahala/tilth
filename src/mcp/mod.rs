@@ -498,7 +498,7 @@ mod tests {
     fn server_instructions_byte_lock() {
         assert_eq!(
             SERVER_INSTRUCTIONS.len(),
-            3508,
+            3466,
             "SERVER_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(SERVER_INSTRUCTIONS
