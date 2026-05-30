@@ -56,6 +56,14 @@ class Task(ABC):
         """Command to validate the fix. Empty = no test-based validation."""
         return []
 
+    @property
+    def hide_git(self) -> bool:
+        """If True, apply mutations WITHOUT committing and move `.git` aside for
+        the agent run, so git history/diff/blame cannot be used to localize the
+        bug. The bug must be found by reading and navigating the code. Reset
+        restores `.git` (see fixtures/reset.py). Default: False (committed bug)."""
+        return False
+
     def apply_mutations(self, repo_path: str) -> None:
         """Apply all mutations to the repo and commit them.
 
@@ -73,6 +81,16 @@ class Task(ABC):
                 )
             content = content.replace(m.original, m.mutated, 1)
             fp.write_text(content)
+
+        # No-git tasks: leave the edit uncommitted and move `.git` aside so the
+        # agent cannot use git log/show/diff/blame as an oracle. ensure_repo_clean
+        # restores `.git` before the next reset.
+        if self.hide_git:
+            git_dir = Path(repo_path) / ".git"
+            hidden = Path(repo_path) / ".git_hidden"
+            if git_dir.exists():
+                git_dir.rename(hidden)
+            return
 
         mutated_files = [m.file_path for m in self.mutations]
         git_env = {
