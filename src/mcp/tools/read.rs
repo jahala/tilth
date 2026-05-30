@@ -37,13 +37,33 @@ pub(in crate::mcp) fn tool_read(
     let force_signature = mode_str == "signature";
     let force_stripped = mode_str == "stripped";
 
-    // Multi-file batch read (capped at 20 to bound I/O)
-    if let Some(paths_arr) = args.get("paths").and_then(|v| v.as_array()) {
-        if paths_arr.len() > 20 {
-            return Err(format!(
-                "batch read limited to 20 files (got {})",
-                paths_arr.len()
-            ));
+    // Batch-only API: `paths` is required — pass a single-element array to read
+    // one file. The singular `path` parameter was removed; accepting both made
+    // agents guess which one each call wanted.
+    let paths_arr = args.get("paths").and_then(|v| v.as_array()).ok_or(
+        "missing required parameter: paths (array of file paths; use a single-element array to read one file)",
+    )?;
+    if paths_arr.is_empty() {
+        return Err("paths must contain at least one file path".into());
+    }
+    if paths_arr.len() > 20 {
+        return Err(format!(
+            "batch read limited to 20 files (got {})",
+            paths_arr.len()
+        ));
+    }
+
+    let sections_arr = args.get("sections").and_then(|v| v.as_array());
+
+    // Multi-file batch read (capped at 20 to bound I/O). `sections` is a
+    // single-file control — reject it rather than silently ignore. `mode`
+    // (and its legacy `full` alias) reshape each file, so they're fine in batch.
+    if paths_arr.len() > 1 {
+        if sections_arr.is_some() {
+            return Err(
+                "sections applies to a single file — pass exactly one path in `paths` to use it"
+                    .into(),
+            );
         }
 
         // Aggregate deadline for batch reads: 60s default, override with TILTH_BATCH_TIMEOUT
@@ -87,25 +107,18 @@ pub(in crate::mcp) fn tool_read(
         return Ok(apply_budget(&combined, budget));
     }
 
-    // Single file read
-    let path_str = args
-        .get("path")
-        .and_then(|v| v.as_str())
-        .ok_or("missing required parameter: path (or use paths for batch read)")?;
+    // Single-file read (`paths` has exactly one entry).
+    let path_str = paths_arr[0]
+        .as_str()
+        .ok_or("paths must be an array of strings")?;
     let path = PathBuf::from(path_str);
-    let section = args.get("section").and_then(|v| v.as_str());
-    let sections_arr = args.get("sections").and_then(|v| v.as_array());
-
-    if section.is_some() && sections_arr.is_some() {
-        return Err("provide either section (single) or sections (array), not both".into());
-    }
 
     // signature/stripped reshape the whole file; a section selection has no
     // meaning there. Error rather than silently dropping the mode.
-    if (force_signature || force_stripped) && (section.is_some() || sections_arr.is_some()) {
+    if (force_signature || force_stripped) && sections_arr.is_some() {
         return Err(format!(
-            "mode={mode_str} cannot be combined with section/sections — \
-             {mode_str} reshapes the whole file. Drop section/sections or pick mode=auto/full."
+            "mode={mode_str} cannot be combined with sections — \
+             {mode_str} reshapes the whole file. Drop sections or pick mode=auto/full."
         ));
     }
 
@@ -137,21 +150,21 @@ pub(in crate::mcp) fn tool_read(
     }
 
     session.record_read(&path);
-    let mut output = if section.is_none() && force_signature {
+    let mut output = if force_signature {
         read_signature_file(&path, cache)
             .map(|(body, _)| body)
             .map_err(|e| e.to_string())?
-    } else if section.is_none() && force_stripped {
+    } else if force_stripped {
         read_stripped_file(&path, cache)
             .map(|(body, _, _)| body)
             .map_err(|e| e.to_string())?
     } else {
-        crate::read::read_file(&path, section, force_full, cache, edit_mode)
+        crate::read::read_file(&path, None, force_full, cache, edit_mode)
             .map_err(|e| e.to_string())?
     };
 
-    // Append related-file hint for outlined code files (not section reads, not batch).
-    if section.is_none() && crate::read::would_outline(&path) {
+    // Append related-file hint for outlined code files (not batch reads).
+    if crate::read::would_outline(&path) {
         let related = crate::read::imports::resolve_related_files(&path);
         if !related.is_empty() {
             output.push_str("\n\n> Related: ");
@@ -289,7 +302,7 @@ mod tests {
         )
         .unwrap();
         let args = serde_json::json!({
-            "path": path.to_str().unwrap(),
+            "paths": [path.to_str().unwrap()],
             "mode": "signature",
         });
         let cache = OutlineCache::new();
@@ -322,7 +335,7 @@ mod tests {
         )
         .unwrap();
         let args = serde_json::json!({
-            "path": path.to_str().unwrap(),
+            "paths": [path.to_str().unwrap()],
             "mode": "stripped",
         });
         let cache = OutlineCache::new();
@@ -350,7 +363,7 @@ mod tests {
         let path = dir.path().join("any.rs");
         std::fs::write(&path, "fn f() {}\n").unwrap();
         let args = serde_json::json!({
-            "path": path.to_str().unwrap(),
+            "paths": [path.to_str().unwrap()],
             "mode": "outline",
         });
         let cache = OutlineCache::new();
@@ -373,7 +386,7 @@ mod tests {
         let path = dir.path().join("notes.txt");
         std::fs::write(&path, "alpha line\nbeta line\ngamma line\n").unwrap();
         let args = serde_json::json!({
-            "path": path.to_str().unwrap(),
+            "paths": [path.to_str().unwrap()],
             "mode": "signature",
         });
         let cache = OutlineCache::new();
@@ -396,7 +409,7 @@ mod tests {
         let path = dir.path().join("notes.txt");
         std::fs::write(&path, "alpha line\nbeta line\ngamma line\n").unwrap();
         let args = serde_json::json!({
-            "path": path.to_str().unwrap(),
+            "paths": [path.to_str().unwrap()],
             "mode": "stripped",
         });
         let cache = OutlineCache::new();
@@ -428,21 +441,21 @@ mod tests {
         let session = Session::new();
 
         let via_flag = tool_read(
-            &serde_json::json!({ "path": path.to_str().unwrap(), "full": true }),
+            &serde_json::json!({ "paths": [path.to_str().unwrap()], "full": true }),
             &cache,
             &session,
             false,
         )
         .expect("full:true read");
         let via_mode = tool_read(
-            &serde_json::json!({ "path": path.to_str().unwrap(), "mode": "full" }),
+            &serde_json::json!({ "paths": [path.to_str().unwrap()], "mode": "full" }),
             &cache,
             &session,
             false,
         )
         .expect("mode:full read");
         let via_auto = tool_read(
-            &serde_json::json!({ "path": path.to_str().unwrap() }),
+            &serde_json::json!({ "paths": [path.to_str().unwrap()] }),
             &cache,
             &session,
             false,
@@ -476,7 +489,7 @@ mod tests {
         )
         .unwrap();
         let args = serde_json::json!({
-            "path": path.to_str().unwrap(),
+            "paths": [path.to_str().unwrap()],
             "mode": "signature",
             "full": true,
         });
@@ -496,24 +509,24 @@ mod tests {
     }
 
     #[test]
-    fn tool_read_signature_mode_rejects_section() {
-        // Combining a reshaping mode with section must error, not silently drop the
+    fn tool_read_signature_mode_rejects_sections() {
+        // Combining a reshaping mode with sections must error, not silently drop the
         // mode (which would return a section slice and ignore signature entirely).
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("conflict.rs");
         std::fs::write(&path, "fn a() {}\nfn b() {}\n").unwrap();
         let args = serde_json::json!({
-            "path": path.to_str().unwrap(),
+            "paths": [path.to_str().unwrap()],
             "mode": "signature",
-            "section": "1-1",
+            "sections": ["1-1"],
         });
         let cache = OutlineCache::new();
         let session = Session::new();
 
         let err =
-            tool_read(&args, &cache, &session, false).expect_err("signature + section must error");
+            tool_read(&args, &cache, &session, false).expect_err("signature + sections must error");
         assert!(
-            err.contains("signature") && err.contains("section"),
+            err.contains("signature") && err.contains("sections"),
             "error must name the conflict: {err}"
         );
     }

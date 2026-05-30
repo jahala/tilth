@@ -5,17 +5,17 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         "Read a file with smart outlining. Replaces cat/head/tail and the host Read tool — \
          use this for all file reading. Output uses hashline format (line:hash|content) — \
          the line:hash anchors are required by tilth_edit. Small files return full hashlined content. \
-         Large files return a structural outline (no hashlines); use `section` to get hashlined \
-         content for the lines you want to edit. Use `sections` to grab several disjoint slices \
-         from the same file in one call. Use `full` to force complete content. \
-         Use `paths` to read multiple files in one call."
+         Large files return a structural outline (no hashlines); use `sections` to get hashlined \
+         content for the lines you want to edit — a single-element array for one range, several \
+         for disjoint slices in one call. Use `full` to force complete content. \
+         Always pass `paths` as an array of file paths — a single-element array reads one file."
     } else {
         "Read a file with smart outlining. Replaces cat/head/tail and the host Read tool — \
          use this for all file reading. Small files return full content. Large files return \
          a structural outline (functions, classes, imports) so you see the shape without \
-         consuming your context window. Use `section` to read a specific line range or heading. \
-         Use `sections` to grab several disjoint slices from the same file in one call. \
-         Use `full` to force complete content. Use `paths` to read multiple files in one call."
+         consuming your context window. Use `sections` to read specific line ranges or headings — \
+         a single-element array for one range, several for disjoint slices in one call. \
+         Use `full` to force complete content. Always pass `paths` as an array of file paths — a single-element array reads one file."
     };
     let mut tools = vec![
         serde_json::json!({
@@ -64,24 +64,21 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
             "description": read_desc,
             "inputSchema": {
                 "type": "object",
+                "required": ["paths"],
                 "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Absolute or relative file path to read."
-                    },
                     "paths": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Multiple file paths to read in one call. Each file gets independent smart handling. Saves round-trips vs multiple single reads."
-                    },
-                    "section": {
-                        "type": "string",
-                        "description": "Line range e.g. '45-89', or heading e.g. '## Architecture'. Bypasses smart view. Use `sections` for multiple ranges."
+                        "minItems": 1,
+                        "maxItems": 20,
+                        "description": "File paths to read (max 20). ALWAYS an array — use a single-element array for one file. Each file gets independent smart handling. Singular `path` is not accepted."
                     },
                     "sections": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Multiple ranges from the same file in one call. Each entry is a line range or heading. Emits each block in user-supplied order, separated by `─── lines X-Y ───` delimiters. Mutually exclusive with `section`. Capped at 20 ranges."
+                        "minItems": 1,
+                        "maxItems": 20,
+                        "description": "Line ranges or headings to read from the file. Each entry is a line range e.g. '45-89' or a heading e.g. '## Architecture'. ALWAYS an array — use a single-element array for one range. Single-file only (one entry in `paths`). Bypasses smart view. Emits each block in user-supplied order, separated by `─── lines X-Y ───` delimiters. Capped at 20 ranges."
                     },
                     "full": {
                         "type": "boolean",
@@ -283,4 +280,39 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
     }
 
     tools
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tilth_read_schema_is_paths_only() {
+        for edit_mode in [false, true] {
+            let tools = tool_definitions(edit_mode);
+            let read = tools
+                .iter()
+                .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("tilth_read"))
+                .expect("tilth_read tool definition present");
+            let schema = &read["inputSchema"];
+            let props = &schema["properties"];
+            assert!(props.get("paths").is_some(), "paths must be present");
+            assert!(
+                props.get("path").is_none(),
+                "singular path must be removed (paths-only API)"
+            );
+            assert!(props.get("sections").is_some(), "sections must be present");
+            assert!(
+                props.get("section").is_none(),
+                "singular section must be removed (sections-only API)"
+            );
+            let required = schema["required"]
+                .as_array()
+                .expect("tilth_read schema must declare required");
+            assert!(
+                required.iter().any(|v| v == "paths"),
+                "paths must be required"
+            );
+        }
+    }
 }
