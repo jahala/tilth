@@ -9,8 +9,8 @@ DO NOT use Grep, Read, or Glob. Always use the better tools tilth_search (grep),
 
 tilth_search: Search code — finds definitions, usages, and text. Replaces grep/rg for all code search.
 Batch-only: ALWAYS pass queries: [...] as an array, even for one search. DO NOT use a singular `query` — it is not accepted. Per-entry kind/glob override the top-level values.
-For multi-symbol lookup, separate each with a comma "symbol1,symbol2" (max 5).
-kind: "symbol" (default) | "content" (strings/comments) | "callers" (call sites)
+For multi-symbol lookup, separate symbols with a comma "symbol1,symbol2" (max 5). For mixed kinds (symbol + content), pass separate query objects, not a comma string.
+kind: "any" (default, merged symbol+content+caller) | "symbol" | "content" (strings/comments) | "callers" (call sites)
 expand (default 2): inline full source for top matches.
 context: path to file being edited — boosts nearby results.
 glob: file pattern filter — "*.rs" (whitelist), "!*.test.ts" (exclude).

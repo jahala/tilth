@@ -21,11 +21,11 @@ pub(in crate::mcp) fn tool_read(
     // Default to DEFAULT_BUDGET when the caller omits `budget`, matching
     // `apply_budget` used by the other tools — an uncapped `mode=full` or
     // multi-file batch read would otherwise exceed the host response limit.
-    let budget = Some(
-        args.get("budget")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(crate::budget::DEFAULT_BUDGET),
-    );
+    let budget_val = args
+        .get("budget")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(crate::budget::DEFAULT_BUDGET);
+    let budget = Some(budget_val);
 
     let paths_arr = match args.get("paths") {
         Some(v) => v.as_array().ok_or(
@@ -147,6 +147,16 @@ pub(in crate::mcp) fn tool_read(
                 PerPath::NotFound(s) => not_found.push(s),
             }
         }
+        // Batch budget: split the total across files so every file is
+        // represented (no silent trailing drops). Only the budget is split
+        // here — each file's smart-view shaping above is left untouched.
+        // Per-file truncation cites the total budget; finalize_response
+        // applies the aggregate ceiling.
+        let per_file = crate::budget::item_budget(budget_val, parts.len().max(1));
+        let parts: Vec<String> = parts
+            .into_iter()
+            .map(|p| crate::budget::apply_item(&p, per_file, budget_val))
+            .collect();
         let mut combined = parts.join("\n\n");
         if !not_found.is_empty() {
             if !combined.is_empty() {
@@ -162,7 +172,7 @@ pub(in crate::mcp) fn tool_read(
         return Ok(finalize_response(
             Some(now),
             serde_json::Map::new(),
-            combined,
+            &combined,
             budget,
         ));
     }
@@ -181,7 +191,7 @@ pub(in crate::mcp) fn tool_read(
             return Ok(finalize_response(
                 Some(now),
                 serde_json::Map::new(),
-                body,
+                &body,
                 None,
             ));
         }
@@ -200,7 +210,7 @@ pub(in crate::mcp) fn tool_read(
         return Ok(finalize_response(
             since.map(|_| now),
             serde_json::Map::new(),
-            body,
+            &body,
             budget,
         ));
     }
@@ -250,7 +260,7 @@ pub(in crate::mcp) fn tool_read(
         meta.insert("next_view".into(), Value::String("full".into()));
     }
 
-    Ok(finalize_response(None, meta, output, budget))
+    Ok(finalize_response(None, meta, &output, budget))
 }
 
 /// Resolve a single path+suffix to its read output. `signature` and
@@ -411,18 +421,20 @@ fn count_lines(path: &Path) -> Option<u32> {
 fn finalize_response(
     now: Option<SystemTime>,
     mut meta: serde_json::Map<String, Value>,
-    body: String,
+    body: &str,
     budget: Option<u64>,
 ) -> String {
-    let body_budget = budget.map(|b| {
+    let Some(total_budget) = budget else {
+        return crate::mcp::iso::with_meta_header(now, meta, body);
+    };
+
+    let body_budget = |meta: &serde_json::Map<String, Value>| {
         let header_preview = crate::mcp::iso::with_meta_header(now, meta.clone(), "");
         let header_tokens = crate::types::estimate_tokens(header_preview.len() as u64);
-        b.saturating_sub(header_tokens + 16)
-    });
-    let (body_final, info) = match body_budget {
-        Some(b) => crate::budget::apply_with_info(&body, b),
-        None => (body, None),
+        total_budget.saturating_sub(header_tokens + 16)
     };
+
+    let (mut body_final, info) = crate::budget::apply_with_info(body, body_budget(&meta));
     if let Some(info) = info {
         meta.insert("truncated".into(), Value::Bool(true));
         meta.insert("truncated_at_line".into(), Value::from(info.at_line));
@@ -430,6 +442,13 @@ fn finalize_response(
         // set a more accurate value from a non-budgeted source).
         meta.entry("original_line_count")
             .or_insert_with(|| Value::from(info.original_line_count));
+        let (final_body, final_info) = crate::budget::apply_with_info(body, body_budget(&meta));
+        if let Some(info) = final_info {
+            meta.insert("truncated_at_line".into(), Value::from(info.at_line));
+            meta.entry("original_line_count")
+                .or_insert_with(|| Value::from(info.original_line_count));
+        }
+        body_final = final_body;
     }
     crate::mcp::iso::with_meta_header(now, meta, &body_final)
 }
@@ -452,7 +471,7 @@ fn respond_signature(
     if auto_promotion {
         meta.insert("next_view".into(), Value::String("full".into()));
     }
-    Ok(finalize_response(None, meta, body, budget))
+    Ok(finalize_response(None, meta, &body, budget))
 }
 
 /// Single-file `mode=stripped`. Explicit shape request, so no `next_view`
@@ -468,7 +487,7 @@ fn respond_stripped(
     meta.insert("view".into(), Value::String("stripped".into()));
     meta.insert("original_line_count".into(), Value::from(total_lines));
     meta.insert("lines_stripped".into(), Value::from(lines_stripped));
-    Ok(finalize_response(None, meta, body, budget))
+    Ok(finalize_response(None, meta, &body, budget))
 }
 
 /// Returns `(body, total_lines)` so the dispatcher can build view-meta

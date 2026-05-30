@@ -16,7 +16,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                             "type": "object",
                             "required": ["query"],
                             "properties": {
-                                "query": {"type": "string", "description": "Symbol name, text string, or regex pattern. e.g. 'resolve_dependencies' or 'ServeHTTP,Next' for multi-symbol lookup."},
+                                "query": {"type": "string", "description": "Symbol name, text string, or regex pattern. e.g. 'resolve_dependencies' or 'ServeHTTP,Next' for multi-symbol lookup. Commas mean multiple symbols (works under the default and kind:symbol/callers); for mixed symbol + content terms use separate query objects instead."},
                                 "glob": {"type": "string"},
                                 "kind": {"type": "string", "enum": ["any", "symbol", "content", "regex", "callers"]}
                             }

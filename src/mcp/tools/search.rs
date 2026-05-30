@@ -12,7 +12,7 @@ use crate::cache::OutlineCache;
 use crate::index::bloom::BloomFilterCache;
 use crate::session::Session;
 
-use super::{apply_budget, resolve_scope};
+use super::resolve_scope;
 
 pub(in crate::mcp) fn tool_search(
     args: &Value,
@@ -43,6 +43,16 @@ pub(in crate::mcp) fn tool_search(
             queries_arr.len()
         ));
     }
+
+    // Batch budget: split the total across queries so every query is
+    // represented (no silent trailing drops). Per-query truncation cites the
+    // total `budget` as the lever; an aggregate ceiling caps the whole batch.
+    let budget = args
+        .get("budget")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(crate::budget::DEFAULT_BUDGET);
+    let per_query = crate::budget::item_budget(budget, queries_arr.len());
+
     let mut parts: Vec<String> = Vec::with_capacity(queries_arr.len());
     for (i, q) in queries_arr.iter().enumerate() {
         let qstr = q
@@ -63,26 +73,25 @@ pub(in crate::mcp) fn tool_search(
         if let Some(kind) = kind {
             sub.insert("kind".into(), Value::String(kind.to_string()));
         }
-        for k in ["expand", "scope", "budget", "if_modified_since"] {
+        for k in ["expand", "scope", "if_modified_since"] {
             if let Some(v) = args.get(k) {
                 sub.insert(k.into(), v.clone());
             }
         }
         let sub_val = Value::Object(sub);
         let body = tool_search_single(&sub_val, cache, session, bloom, edit_mode)?;
-        parts.push(format!("## query: {qstr}\n\n{body}"));
+        let headed = format!("## query: {qstr}\n\n{body}");
+        parts.push(crate::budget::apply_item(&headed, per_query, budget));
     }
     let combined = parts.join("\n\n---\n\n");
     let (scope, _) = resolve_scope(args);
     let combined = since
         .map(|s| redact_unchanged_search_sections(&combined, &scope, s))
         .unwrap_or(combined);
-    // Per-entry budget caps each query in isolation; cap the concatenated
-    // batch once more so an N-entry batch can't return ~N× the budget.
-    let combined = apply_budget(
-        &combined,
-        args.get("budget").and_then(serde_json::Value::as_u64),
-    );
+    // Aggregate ceiling: the per-query split already bounds the total, but
+    // header/separator overhead can nudge it over — cap once more so the
+    // batch can never exceed the host response limit.
+    let combined = crate::budget::apply(&combined, budget);
     Ok(crate::mcp::iso::with_meta_header(
         Some(now),
         serde_json::Map::new(),
@@ -113,14 +122,42 @@ fn tool_search_single(
         .map(PathBuf::from);
     let context = context_path.as_deref();
     let glob = args.get("glob").and_then(|v| v.as_str());
-    let budget = args.get("budget").and_then(serde_json::Value::as_u64);
 
     let output = match kind {
         None | Some("any") => {
-            session.record_search(query);
-            search_merged_default(
-                query, &scope, cache, session, bloom, expand, context, glob, edit_mode,
-            )
+            // Comma = multi-symbol lookup, identical to kind:symbol. Without this
+            // split the merged default searches the literal "a,b" string as one
+            // symbol (and as content), silently breaking the comma syntax the tool
+            // schema advertises under the default mode.
+            let symbols: Vec<&str> = query
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            match symbols.len() {
+                0 => return Err("missing required parameter: query".into()),
+                1 => {
+                    session.record_search(symbols[0]);
+                    search_merged_default(
+                        symbols[0], &scope, cache, session, bloom, expand, context, glob, edit_mode,
+                    )
+                }
+                2..=5 => {
+                    for q in &symbols {
+                        session.record_search(q);
+                    }
+                    crate::search::search_multi_symbol_expanded(
+                        &symbols, &scope, cache, session, bloom, expand, context, glob, false,
+                        edit_mode,
+                    )
+                }
+                _ => {
+                    return Err(format!(
+                        "multi-symbol search limited to 5 queries (got {})",
+                        symbols.len()
+                    ))
+                }
+            }
         }
         Some("symbol") => {
             let queries: Vec<&str> = query
@@ -205,7 +242,7 @@ fn tool_search_single(
     .map_err(|e| e.to_string())?;
 
     let mut result = scope_warning.unwrap_or_default();
-    result.push_str(&apply_budget(&output, budget));
+    result.push_str(&output);
     Ok(result)
 }
 
@@ -354,6 +391,41 @@ mod tests {
         assert!(
             !out.contains("\"alpha,beta\""),
             "comma query was treated as a literal symbol: {out}"
+        );
+    }
+
+    /// Regression: a comma query under the default (merged/`any`) kind must be
+    /// treated as a multi-symbol lookup, not searched as a literal "a,b" string.
+    /// Before the fix `search_merged_default` passed the raw comma string to
+    /// symbol + content search, so e.g. "Planner,planning_agent" found nothing
+    /// even though `Planner` existed.
+    #[test]
+    fn default_comma_query_finds_both_symbols() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("lib.rs"),
+            "fn alpha() {}\n\
+             fn beta() {}\n",
+        )
+        .unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = std::sync::Arc::new(BloomFilterCache::new());
+        // No `kind` → default merged/any path.
+        let args = serde_json::json!({
+            "queries": [{"query": "alpha,beta"}],
+            "scope": tmp.path().to_str().unwrap(),
+        });
+
+        let out = tool_search(&args, &cache, &session, &bloom, false).unwrap();
+
+        assert!(out.contains("alpha"), "missing alpha: {out}");
+        assert!(out.contains("beta"), "missing beta: {out}");
+        // The literal combined string must never be searched as one symbol.
+        assert!(
+            !out.contains("\"alpha,beta\""),
+            "comma query was treated as a literal symbol under default kind: {out}"
         );
     }
 

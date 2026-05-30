@@ -28,13 +28,35 @@ pub fn apply(output: &str, budget: u64) -> String {
 /// actually clips the input. Returns `(text, None)` when the budget is
 /// roomy enough that nothing was cut.
 pub(crate) fn apply_with_info(output: &str, budget: u64) -> (String, Option<TruncationInfo>) {
+    truncate(output, budget, budget)
+}
+
+/// Per-section token cap when `n` batch items share `budget`: `budget / n`
+/// (min 1) so every item is represented instead of early items starving
+/// later ones.
+pub(crate) fn item_budget(budget: u64, n: usize) -> u64 {
+    (budget / (n.max(1) as u64)).max(1)
+}
+
+/// Truncate one batch section to its per-item `cap` while citing the total
+/// `budget` (not the per-item share) as the lever in any truncation marker —
+/// raising `budget` is what gives the section more room.
+pub(crate) fn apply_item(output: &str, cap: u64, budget: u64) -> String {
+    truncate(output, cap, budget).0
+}
+
+/// Core truncation: clip `output` to `cap` tokens, preferring a section
+/// boundary, and cite `display_budget` as the lever in the marker. For a
+/// single call `cap == display_budget`; for a batch section `cap` is the
+/// per-item share while `display_budget` stays the agent-facing total.
+fn truncate(output: &str, cap: u64, display_budget: u64) -> (String, Option<TruncationInfo>) {
     let current = estimate_tokens(output.len() as u64);
-    if current <= budget {
+    if current <= cap {
         return (output.to_string(), None);
     }
 
     let header_reserve = 50u64;
-    let content_budget = budget.saturating_sub(header_reserve);
+    let content_budget = cap.saturating_sub(header_reserve);
     let max_bytes = (content_budget * 4) as usize; // inverse of estimate_tokens
 
     // Find the first newline after the header (first line)
@@ -49,16 +71,9 @@ pub(crate) fn apply_with_info(output: &str, budget: u64) -> (String, Option<Trun
     let safe_max = body.floor_char_boundary(max_bytes);
     let truncated = &body[..safe_max];
 
-    // Prefer section boundaries (\n\n##) to avoid cutting mid-match in search results.
-    // Fallback is `safe_max` (= truncated.len()), never `max_bytes`: `max_bytes` may
-    // land mid-UTF-8-codepoint and would panic `&body[..cut_point]` on emoji-heavy
-    // single-line content with no newline in the truncated region.
-    //
-    // Reject `\n\n` cuts at position 0: body always starts with the structural
-    // header/body separator, and for code-rendered output (every line carries
-    // a `<n>:<hash>|` prefix, so blank source lines are still non-empty) that's
-    // the *only* `\n\n` in the body. Without this filter, every truncated code
-    // file would return zero content lines.
+    // Prefer section boundaries (\n\n##); reject position 0 so code-rendered
+    // bodies (whose only \n\n is the header/body separator) don't return an
+    // empty body. Fall back to safe_max to stay on a char boundary.
     let cut_point = truncated
         .rfind("\n\n##")
         .filter(|&p| p > 0)
@@ -71,12 +86,9 @@ pub(crate) fn apply_with_info(output: &str, budget: u64) -> (String, Option<Trun
     let omitted_bytes = output.len() - header_end - cut_point;
     let remaining_tokens = estimate_tokens(omitted_bytes as u64);
     let result = format!(
-        "{header}{clean_body}\n\n... truncated ({remaining_tokens} tokens omitted, budget: {budget})"
+        "{header}{clean_body}\n\n... truncated — raise `budget` (currently {display_budget}) or request less per call to see the remaining ~{remaining_tokens} tokens"
     );
 
-    // Count newlines in the kept portion so callers can show "truncated at
-    // line N" without scanning the result themselves, and on the full input
-    // so they can show "of M".
     let kept = &output[..header_end + cut_point];
     let at_line =
         u32::try_from(kept.bytes().filter(|&b| b == b'\n').count() + 1).unwrap_or(u32::MAX);
@@ -203,5 +215,31 @@ mod tests {
         let from_wrapper = apply(&input, 60);
         let (from_info, _) = apply_with_info(&input, 60);
         assert_eq!(from_wrapper, from_info);
+    }
+
+    #[test]
+    fn item_budget_splits_evenly_with_floor() {
+        assert_eq!(item_budget(300, 3), 100);
+        assert_eq!(item_budget(10, 4), 2); // 10 / 4 = 2
+        assert_eq!(item_budget(3, 10), 1); // floor of 1 — never starves to 0
+        assert_eq!(item_budget(1000, 0), 1000); // n.max(1) guards div-by-zero
+    }
+
+    #[test]
+    fn apply_item_cites_total_budget_not_per_item_share() {
+        // A section larger than its per-item cap truncates, and the marker
+        // must name the TOTAL budget (the real lever), not the per-item cap.
+        let big = format!("# header\n{}", "x = 1;\n".repeat(2000));
+        let out = apply_item(&big, 50, 24_000);
+        let tail = &out[out.len().saturating_sub(160)..];
+        assert!(out.contains("truncated"), "must truncate: {tail}");
+        assert!(
+            out.contains("currently 24000"),
+            "must cite total budget, not the per-item cap (50): {tail}"
+        );
+        assert!(
+            !out.contains("currently 50"),
+            "must not leak the per-item cap as the lever: {tail}"
+        );
     }
 }

@@ -551,7 +551,7 @@ fn apply_budget_truncation(
         |hdr, _ul, _ue, _pd, _td, _bn, _sc| hdr.to_string(),
     ];
 
-    for candidate_fn in candidates {
+    for (level, candidate_fn) in candidates.iter().enumerate() {
         let candidate = candidate_fn(
             header,
             uses_local_full,
@@ -561,14 +561,29 @@ fn apply_budget_truncation(
             barrel_note,
             scope,
         );
-        let tokens = crate::types::estimate_tokens(candidate.len() as u64) as usize;
-        if tokens <= budget {
+        if level == 0 && fits_budget(&candidate, budget) {
             return candidate;
+        }
+        if level > 0 {
+            if let Some(candidate) = with_truncation_notice(&candidate, budget) {
+                return candidate;
+            }
         }
     }
 
-    // Absolute fallback: just the header
-    header.to_string()
+    // Absolute fallback: header only.
+    with_truncation_notice(header, budget).unwrap_or_else(|| header.to_string())
+}
+
+fn with_truncation_notice(candidate: &str, budget: usize) -> Option<String> {
+    let candidate = format!(
+        "{candidate}\n\n... truncated — raise `budget` (currently {budget}) to see full dependency detail"
+    );
+    fits_budget(&candidate, budget).then_some(candidate)
+}
+
+fn fits_budget(output: &str, budget: usize) -> bool {
+    crate::types::estimate_tokens(output.len() as u64) as usize <= budget
 }
 
 /// Join non-empty parts with double newlines.
@@ -579,4 +594,42 @@ fn assemble(parts: &[&str]) -> String {
         .copied()
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn budget_truncation_keeps_notice_inside_budget() {
+        let header = "# deps for src/lib.rs";
+        let uses_local = format!(
+            "## Uses (local)\n{}",
+            (0..100)
+                .map(|i| format!("src/module_{i}.rs  symbol_{i}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let budget = 32;
+
+        let out = apply_budget_truncation(
+            header,
+            &uses_local,
+            "",
+            &[],
+            &[],
+            "",
+            Path::new("."),
+            budget,
+        );
+
+        assert_eq!(
+            out,
+            "# deps for src/lib.rs\n\n... truncated — raise `budget` (currently 32) to see full dependency detail"
+        );
+        assert!(
+            fits_budget(&out, budget),
+            "truncation notice must count against budget: {out}"
+        );
+    }
 }

@@ -340,6 +340,14 @@ fn handle_request(req: &JsonRpcRequest, services: &Services) -> JsonRpcResponse 
 /// No classifier involved — the caller specifies the tool explicitly.
 fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String, String> {
     let edit_mode = services.edit_mode();
+    if let Some(b) = args.get("budget") {
+        if !matches!(b.as_u64(), Some(n) if n >= 1) {
+            return Err(format!(
+                "budget must be a positive integer ≥ 1 (got {b}); omit it for the default {}",
+                crate::budget::DEFAULT_BUDGET
+            ));
+        }
+    }
     match tool {
         "tilth_read" => tool_read(args, services.cache(), services.session(), edit_mode),
         "tilth_search" => tool_search(
@@ -558,7 +566,7 @@ mod tests {
     fn server_instructions_byte_lock() {
         assert_eq!(
             SERVER_INSTRUCTIONS.len(),
-            3993,
+            4119,
             "SERVER_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(SERVER_INSTRUCTIONS
@@ -569,7 +577,9 @@ mod tests {
             !SERVER_INSTRUCTIONS.contains("\n\n\n"),
             "SERVER_INSTRUCTIONS must not introduce triple newlines (likely a trailing-newline drift in prompts/mcp-base.md)"
         );
-        assert!(SERVER_INSTRUCTIONS.contains("For multi-symbol lookup, separate each with a comma"));
+        assert!(
+            SERVER_INSTRUCTIONS.contains("For multi-symbol lookup, separate symbols with a comma")
+        );
         assert!(SERVER_INSTRUCTIONS
             .contains("Re-expanding a previously shown definition returns [shown earlier]"));
         assert!(
@@ -2337,12 +2347,12 @@ mod tests {
         );
         assert_eq!(
             build_instructions(false, "").len(),
-            3993,
+            4119,
             "non-edit composed instructions byte count drifted"
         );
         assert_eq!(
             edit.len(),
-            6525,
+            6651,
             "edit-mode composed instructions byte count drifted (double-blank-line regression?)"
         );
     }
@@ -2469,6 +2479,105 @@ mod tests {
         assert!(
             out.contains("query: build_instructions"),
             "expected per-query header: {out}"
+        );
+    }
+
+    /// Dispatch rejects a non-positive `budget` (0, negative, non-integer)
+    /// across all tools instead of silently defaulting — a sub-1 budget used
+    /// to collapse batch output to useless stubs.
+    #[test]
+    fn dispatch_rejects_non_positive_budget() {
+        let services = Services::new(false);
+        for bad in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(0.5),
+        ] {
+            let args = serde_json::json!({ "queries": [{ "query": "foo" }], "budget": bad });
+            let err = dispatch_tool("tilth_search", &args, &services)
+                .expect_err("non-positive budget must be rejected");
+            assert!(
+                err.contains("positive integer"),
+                "expected budget validation error for {bad}, got: {err}"
+            );
+        }
+        // A valid budget still dispatches.
+        let ok =
+            serde_json::json!({ "queries": [{ "query": "foo" }], "budget": 5000, "expand": 0 });
+        assert!(
+            dispatch_tool("tilth_search", &ok, &services).is_ok(),
+            "a valid budget must still dispatch"
+        );
+    }
+
+    /// Batch search splits the budget per query so every query is
+    /// represented even under a tight budget — no silent trailing drops.
+    #[test]
+    fn batch_budget_represents_every_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body: String = (0..400)
+            .map(|i| format!("fn f_{i}() {{ let u_{i} = use_it({i}); }}\n"))
+            .collect();
+        std::fs::write(tmp.path().join("lib.rs"), body).unwrap();
+        let args = serde_json::json!({
+            "queries": [
+                { "query": "fn", "kind": "content" },
+                { "query": "let", "kind": "content" },
+                { "query": "use", "kind": "content" }
+            ],
+            "scope": tmp.path().to_str().unwrap(),
+            "budget": 300
+        });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let out = tool_search(&args, &cache, &session, &bloom, false).expect("batch search");
+        for q in ["fn", "let", "use"] {
+            assert!(
+                out.contains(&format!("query: {q}")),
+                "query '{q}' was silently dropped under a tight budget:\n{out}"
+            );
+        }
+        assert!(
+            out.contains("truncated"),
+            "expected truncation marker:\n{out}"
+        );
+        assert!(
+            out.contains("raise `budget`"),
+            "truncation must name the budget lever:\n{out}"
+        );
+    }
+
+    /// Multi-file read splits the budget per file so every file is
+    /// represented even under a tight budget — no silent trailing drops.
+    #[test]
+    fn read_batch_budget_represents_every_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let names = ["a.rs", "b.rs", "c.rs"];
+        let mut paths = Vec::new();
+        for name in names {
+            let p = tmp.path().join(name);
+            let body: String = (0..400).map(|i| format!("let x_{i} = {i};\n")).collect();
+            std::fs::write(&p, format!("fn main() {{\n{body}}}\n")).unwrap();
+            paths.push(p.to_str().unwrap().to_string());
+        }
+        let args = serde_json::json!({
+            "paths": paths,
+            "mode": "full",
+            "budget": 600
+        });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let out = tool_read(&args, &cache, &session, false).expect("batch read");
+        for name in names {
+            assert!(
+                out.contains(name),
+                "file '{name}' was silently dropped under a tight budget:\n{out}"
+            );
+        }
+        assert!(
+            out.contains("truncated"),
+            "expected truncation marker:\n{out}"
         );
     }
 
