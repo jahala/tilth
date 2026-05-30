@@ -12,20 +12,10 @@ pub(crate) fn tool_list(args: &Value) -> Result<String, String> {
     let (scope, scope_warning) = super::resolve_scope(args);
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
 
-    if args.get("patterns").is_some() && args.get("pattern").is_some() {
-        return Err("`pattern` and `patterns` are mutually exclusive — pass one".into());
-    }
-    let patterns_arr_owned: Vec<Value>;
-    let patterns_arr: &Vec<Value> = match args.get("patterns") {
-        Some(v) => v.as_array().ok_or("patterns must be an array of globs")?,
-        None => match args.get("pattern").and_then(|v| v.as_str()) {
-            Some(p) => {
-                patterns_arr_owned = vec![Value::String(p.to_string())];
-                &patterns_arr_owned
-            }
-            None => return Err("missing required parameter: patterns".into()),
-        },
-    };
+    let patterns_arr = args
+        .get("patterns")
+        .and_then(|v| v.as_array())
+        .ok_or("missing required parameter: patterns (array of globs)")?;
     if patterns_arr.is_empty() {
         return Err("patterns must contain at least one glob".into());
     }

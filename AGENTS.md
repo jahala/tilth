@@ -2,12 +2,13 @@
 tilth — code intelligence MCP server. Replaces grep, cat, find, ls with AST-aware equivalents.
 
 To explore code, always search first. tilth_search finds definitions, usages, and file locations in one call.
-Usage: tilth_search(query: "handleRequest").
+Usage: tilth_search(queries: [{query: "handleRequest"}]).
 tilth_files is ONLY for listing directory contents when you have no symbol or text to search for.
 DO NOT use Read if content is already shown in expanded search results.
 DO NOT use Grep, Read, or Glob. Always use the better tools tilth_search (grep), tilth_read (read), tilth_files (glob).
 
 tilth_search: Search code — finds definitions, usages, and text. Replaces grep/rg for all code search.
+Batch-only: ALWAYS pass queries: [...] as an array, even for one search. DO NOT use a singular `query` — it is not accepted. Per-entry kind/glob override the top-level values.
 For multi-symbol lookup, separate each with a comma "symbol1,symbol2" (max 5).
 kind: "symbol" (default) | "content" (strings/comments) | "callers" (call sites)
 expand (default 2): inline full source for top matches.
@@ -30,8 +31,8 @@ mode: auto (default) | full (force full content) | signature (outline, no bodies
 if_modified_since: ISO-8601 ts — unchanged files return (unchanged @ <ts>) stubs.
 Output: <line>:<hash>|<content> per line.
 
-tilth_files: Find files by glob pattern. Replaces find, ls, pwd, and the host Glob tool.
-patterns: run multiple globs in one call (e.g. patterns: ["*.rs", "*.toml"]).
+tilth_files: Find files by glob patterns. Replaces find, ls, pwd, and the host Glob tool.
+Batch-only: ALWAYS pass patterns: [...] as an array, even for one glob (e.g. patterns: ["*.rs"] or ["*.rs", "*.toml"]). A singular `pattern` is not accepted.
 Output: <path>  (~<token_count> tokens).
 
 tilth_deps: Blast-radius check — what imports this file and what it imports.

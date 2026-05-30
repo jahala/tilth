@@ -518,7 +518,7 @@ mod tests {
     fn server_instructions_byte_lock() {
         assert_eq!(
             SERVER_INSTRUCTIONS.len(),
-            3594,
+            3866,
             "SERVER_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(SERVER_INSTRUCTIONS
@@ -2299,12 +2299,12 @@ mod tests {
         );
         assert_eq!(
             build_instructions(false, "").len(),
-            3594,
+            3866,
             "non-edit composed instructions byte count drifted"
         );
         assert_eq!(
             edit.len(),
-            6126,
+            6398,
             "edit-mode composed instructions byte count drifted (double-blank-line regression?)"
         );
     }
@@ -2409,16 +2409,6 @@ mod tests {
             !out.contains("node_modules"),
             "node_modules must be skipped: {out}"
         );
-    }
-
-    /// `tilth_list` rejects `pattern` and `patterns` together — the schema
-    /// advertises them as mutually exclusive, so the code must enforce it
-    /// rather than silently ignoring one.
-    #[test]
-    fn tool_list_both_pattern_and_patterns_rejected() {
-        let args = serde_json::json!({ "pattern": "*.rs", "patterns": ["*.toml"] });
-        let err = tool_list(&args).expect_err("both must error");
-        assert!(err.contains("mutually exclusive"), "unexpected: {err}");
     }
 
     // -- tilth_search wire layer: restored from pre-merge 3801a4c (PR-A)

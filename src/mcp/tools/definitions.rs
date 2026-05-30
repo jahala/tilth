@@ -8,25 +8,22 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
             "description": "Search for symbols, text, or regex patterns in code. Replaces grep/rg and the host Grep tool — use this for all code search. Symbol search returns definitions first (via tree-sitter AST), then usages, with full source code inlined for top matches. Content search finds literal text. Regex search supports full regex patterns. For cross-file tracing, pass comma-separated symbol names (max 5). Omitting `kind` runs a merged default search — symbol, content, and caller results in one call (`## symbol/content/caller results`); set `kind` to narrow to a single mode.",
             "inputSchema": {
                 "type": "object",
+                "required": ["queries"],
                 "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Symbol name, text string, or regex pattern to search for. e.g. 'resolve_dependencies' or 'ServeHTTP,Next' for multi-symbol lookup."
-                    },
                     "queries": {
                         "type": "array",
                         "items": {
                             "type": "object",
                             "required": ["query"],
                             "properties": {
-                                "query": {"type": "string"},
+                                "query": {"type": "string", "description": "Symbol name, text string, or regex pattern. e.g. 'resolve_dependencies' or 'ServeHTTP,Next' for multi-symbol lookup."},
                                 "glob": {"type": "string"},
                                 "kind": {"type": "string", "enum": ["any", "symbol", "content", "regex", "callers"]}
                             }
                         },
                         "minItems": 1,
                         "maxItems": 10,
-                        "description": "Batch form. Array of query objects, each run independently with optional per-entry `kind`/`glob` overriding the top-level values; results concatenate under `## query: <q>` headers. Use instead of `query` to search several things in one call."
+                        "description": "Array of query objects, each run independently with optional per-entry `kind`/`glob` overriding the top-level values. A single-element array runs one search and returns a clean result; multiple entries concatenate under `## query: <q>` headers. For one search pass `queries: [{query: \"foo\"}]`."
                     },
                     "scope": {
                         "type": "string",
@@ -59,8 +56,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "type": "string",
                         "description": "ISO-8601 timestamp. Result sections for files unchanged since this return `(unchanged @ <ts>)` stubs instead of bodies."
                     }
-                },
-                "anyOf": [{"required": ["query"]}, {"required": ["queries"]}]
+                }
             }
         }),
         serde_json::json!({
@@ -96,18 +92,17 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "tilth_files",
-            "description": "Find files matching a glob pattern. Replaces find/ls/pwd and the host Glob tool — use this for all file discovery. Returns matched file paths sorted by relevance with token size estimates. Use `patterns` to run several globs in one call.",
+            "description": "Find files matching glob patterns. Replaces find/ls/pwd and the host Glob tool — use this for all file discovery. Returns matched file paths sorted by relevance with token size estimates. Pass one or more globs in `patterns`.",
             "inputSchema": {
                 "type": "object",
+                "required": ["patterns"],
                 "properties": {
-                    "pattern": {
-                        "type": "string",
-                        "description": "Glob pattern e.g. '*' (list directory), '*.rs', 'src/**/*.ts'. Use `patterns` for multiple globs."
-                    },
                     "patterns": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Multiple glob patterns to run in one call against the same scope. Each pattern emits its own `# Glob: ...` block, separated by a blank line. Mutually exclusive with `pattern`. Capped at 20."
+                        "minItems": 1,
+                        "maxItems": 20,
+                        "description": "Glob patterns to run against the same scope, e.g. ['*'] (list directory), ['*.rs'], ['src/**/*.ts'], or ['*.rs', '*.toml'] for several at once. Each pattern emits its own `# Glob: ...` block, separated by a blank line. Capped at 20."
                     },
                     "scope": {
                         "type": "string",
@@ -125,45 +120,14 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
             "description": "List files matching glob patterns as a directory tree. Replaces `ls -R`/`tree` — use this to see project structure with token-size rollups per directory. Pass `patterns` to combine several globs into one tree.",
             "inputSchema": {
                 "type": "object",
+                "required": ["patterns"],
                 "properties": {
-                    "pattern": {
-                        "type": "string",
-                        "description": "Glob pattern e.g. '*.rs', 'src/**/*.ts'. Use `patterns` for multiple globs."
-                    },
                     "patterns": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Multiple glob patterns rendered into one tree. Mutually exclusive with `pattern`. Capped at 20."
-                    },
-                    "depth": {
-                        "type": "number",
-                        "description": "Cap directory depth (1 = top-level only)."
-                    },
-                    "scope": {
-                        "type": "string",
-                        "description": "Directory to root the tree at. Default: current working directory."
-                    },
-                    "budget": {
-                        "type": "number",
-                        "description": "Max tokens in response."
-                    }
-                }
-            }
-        }),
-        serde_json::json!({
-            "name": "tilth_list",
-            "description": "List files matching glob patterns as a directory tree. Replaces `ls -R`/`tree` — use this to see project structure with token-size rollups per directory. Pass `patterns` to combine several globs into one tree.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "pattern": {
-                        "type": "string",
-                        "description": "Glob pattern e.g. '*.rs', 'src/**/*.ts'. Use `patterns` for multiple globs."
-                    },
-                    "patterns": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Multiple glob patterns rendered into one tree. Mutually exclusive with `pattern`. Capped at 20."
+                        "minItems": 1,
+                        "maxItems": 20,
+                        "description": "Glob patterns rendered into one tree, e.g. ['*.rs'] or ['*.rs', '*.toml']. Capped at 20."
                     },
                     "depth": {
                         "type": "number",
@@ -451,7 +415,8 @@ mod tests {
 
     /// `tilth_search` schema must stay aligned with the runtime: `any` is a
     /// valid `kind` (top-level + per-entry), `any` is the default, and the
-    /// root requires one of `query`/`queries` so `{}` is rejected client-side.
+    /// root requires `queries` so `{}` (and the dropped singular `query`) are
+    /// rejected client-side.
     #[test]
     fn tilth_search_schema_matches_runtime_kind_and_requires_a_query() {
         let tools = tool_definitions(false);
@@ -493,10 +458,61 @@ mod tests {
             .expect("tilth_search inputSchema must be a valid JSON Schema");
         assert!(
             !compiled.is_valid(&serde_json::json!({})),
-            "empty args must fail: neither query nor queries supplied"
+            "empty args must fail: queries is required"
         );
-        assert!(compiled.is_valid(&serde_json::json!({"query": "x"})));
+        assert!(
+            !compiled.is_valid(&serde_json::json!({"query": "x"})),
+            "the singular `query` key was dropped — only `queries` is accepted"
+        );
         assert!(compiled.is_valid(&serde_json::json!({"queries": [{"query": "x"}]})));
-        assert!(compiled.is_valid(&serde_json::json!({"query": "x", "kind": "any"})));
+        assert!(compiled.is_valid(&serde_json::json!({"queries": [{"query": "x", "kind": "any"}]})));
+    }
+
+    /// Regression for issue #47: OpenAI/Codex's strict function-schema
+    /// validator rejects any tool whose `parameters` (inputSchema) is not a
+    /// plain top-level object, or that uses `oneOf`/`anyOf`/`allOf`/`enum`/`not`
+    /// at the top level. Anthropic/Claude tolerates the looser shape, so this
+    /// only surfaced under Codex. Every advertised tool's inputSchema must
+    /// satisfy the rule (nested `enum`/`allOf` under `properties` is fine —
+    /// the constraint is top-level only).
+    #[test]
+    fn tool_schemas_are_openai_strict_compatible() {
+        const FORBIDDEN_TOP_LEVEL: [&str; 5] = ["oneOf", "anyOf", "allOf", "enum", "not"];
+        // edit_mode=true advertises the widest tool set (includes tilth_write).
+        for tool in tool_definitions(true) {
+            let name = tool["name"].as_str().expect("tool name present");
+            let schema = &tool["inputSchema"];
+            assert_eq!(
+                schema["type"].as_str(),
+                Some("object"),
+                "{name}: inputSchema top level must be type 'object'"
+            );
+            let obj = schema.as_object().expect("inputSchema is an object");
+            for key in FORBIDDEN_TOP_LEVEL {
+                assert!(
+                    !obj.contains_key(key),
+                    "{name}: inputSchema must not use top-level '{key}' \
+                     (OpenAI/Codex rejects it — see issue #47)"
+                );
+            }
+        }
+    }
+
+    /// Tool names must be unique. A duplicate function name is itself an
+    /// invalid request under OpenAI/Codex. Regression for the duplicate
+    /// `tilth_list` registration removed alongside #47.
+    #[test]
+    fn tool_names_are_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for tool in tool_definitions(true) {
+            let name = tool["name"]
+                .as_str()
+                .expect("tool name present")
+                .to_string();
+            assert!(
+                seen.insert(name.clone()),
+                "duplicate tool definition: {name}"
+            );
+        }
     }
 }

@@ -6,29 +6,23 @@ pub(in crate::mcp) fn tool_files(args: &Value) -> Result<String, String> {
     let (scope, scope_warning) = resolve_scope(args);
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
 
-    let single = args.get("pattern").and_then(|v| v.as_str());
-    let patterns_arr = args.get("patterns").and_then(|v| v.as_array());
-
-    if single.is_some() && patterns_arr.is_some() {
-        return Err("provide either pattern (single) or patterns (array), not both".into());
+    let arr = args
+        .get("patterns")
+        .and_then(|v| v.as_array())
+        .ok_or("missing required parameter: patterns (array of globs)")?;
+    if arr.is_empty() {
+        return Err("patterns must contain at least one glob".into());
     }
-
-    let patterns: Vec<&str> = if let Some(arr) = patterns_arr {
-        if arr.is_empty() {
-            return Err("patterns must contain at least one glob".into());
-        }
-        if arr.len() > 20 {
-            return Err(format!(
-                "patterns limited to 20 per call (got {})",
-                arr.len()
-            ));
-        }
-        arr.iter()
-            .map(|v| v.as_str().ok_or("patterns must be an array of strings"))
-            .collect::<Result<Vec<_>, _>>()?
-    } else {
-        vec![single.ok_or("missing required parameter: pattern (or use patterns for batch)")?]
-    };
+    if arr.len() > 20 {
+        return Err(format!(
+            "patterns limited to 20 per call (got {})",
+            arr.len()
+        ));
+    }
+    let patterns: Vec<&str> = arr
+        .iter()
+        .map(|v| v.as_str().ok_or("patterns must be an array of strings"))
+        .collect::<Result<Vec<_>, _>>()?;
 
     let mut blocks = Vec::with_capacity(patterns.len());
     for p in &patterns {
@@ -74,16 +68,6 @@ mod tests {
         // Files from both patterns appear in the combined output.
         assert!(out.contains("main.rs"), "missing main.rs in: {out}");
         assert!(out.contains("Cargo.toml"), "missing Cargo.toml in: {out}");
-    }
-
-    #[test]
-    fn tool_files_pattern_and_patterns_mutually_exclusive() {
-        let args = serde_json::json!({
-            "pattern": "*.rs",
-            "patterns": ["*.rs"],
-        });
-        let err = tool_files(&args).expect_err("expected mutual-exclusion error");
-        assert!(err.contains("either pattern"), "unexpected error: {err}");
     }
 
     #[test]

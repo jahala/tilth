@@ -27,74 +27,66 @@ pub(in crate::mcp) fn tool_search(
         .and_then(|v| v.as_str())
         .and_then(crate::mcp::iso::parse_iso_utc);
 
-    // v2 surface: `queries: [{query, glob?, kind?}]`. When present, run each
-    // entry through the legacy single-query path and concatenate. Per-query
-    // glob/kind override the top-level values.
-    if let Some(queries_arr) = args.get("queries").and_then(|v| v.as_array()) {
-        if queries_arr.is_empty() {
-            return Err("queries array is empty".into());
-        }
-        if queries_arr.len() > 10 {
-            return Err(format!(
-                "queries array limited to 10 entries (got {})",
-                queries_arr.len()
-            ));
-        }
-        let mut parts: Vec<String> = Vec::with_capacity(queries_arr.len());
-        for (i, q) in queries_arr.iter().enumerate() {
-            let qstr = q
-                .get("query")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| format!("queries[{i}]: missing 'query' string"))?;
-            let mut sub = serde_json::Map::new();
-            sub.insert("query".into(), Value::String(qstr.to_string()));
-            if let Some(g) = q.get("glob").and_then(|v| v.as_str()) {
-                sub.insert("glob".into(), Value::String(g.to_string()));
-            } else if let Some(g) = args.get("glob").and_then(|v| v.as_str()) {
-                sub.insert("glob".into(), Value::String(g.to_string()));
-            }
-            let kind = q
-                .get("kind")
-                .and_then(|v| v.as_str())
-                .or_else(|| args.get("kind").and_then(|v| v.as_str()));
-            if let Some(kind) = kind {
-                sub.insert("kind".into(), Value::String(kind.to_string()));
-            }
-            for k in ["expand", "scope", "budget", "if_modified_since"] {
-                if let Some(v) = args.get(k) {
-                    sub.insert(k.into(), v.clone());
-                }
-            }
-            let sub_val = Value::Object(sub);
-            let body = tool_search_single(&sub_val, cache, session, bloom, edit_mode)?;
-            parts.push(format!("## query: {qstr}\n\n{body}"));
-        }
-        let combined = parts.join("\n\n---\n\n");
-        let (scope, _) = resolve_scope(args);
-        let combined = since
-            .map(|s| redact_unchanged_search_sections(&combined, &scope, s))
-            .unwrap_or(combined);
-        // Per-entry budget caps each query in isolation; cap the concatenated
-        // batch once more so an N-entry batch can't return ~N× the budget.
-        let combined = apply_budget(
-            &combined,
-            args.get("budget").and_then(serde_json::Value::as_u64),
-        );
-        return Ok(crate::mcp::iso::with_meta_header(
-            Some(now),
-            serde_json::Map::new(),
-            &combined,
+    // Single surface: `queries: [{query, glob?, kind?}]`. Each entry runs
+    // independently; per-entry glob/kind override the top-level values.
+    // Results concatenate under `## query: <q>` headers.
+    let queries_arr = args
+        .get("queries")
+        .and_then(|v| v.as_array())
+        .ok_or("missing required parameter: queries (array of {query, glob?, kind?} objects)")?;
+    if queries_arr.is_empty() {
+        return Err("queries array is empty".into());
+    }
+    if queries_arr.len() > 10 {
+        return Err(format!(
+            "queries array limited to 10 entries (got {})",
+            queries_arr.len()
         ));
     }
-    let body = tool_search_single(args, cache, session, bloom, edit_mode)?;
+    let mut parts: Vec<String> = Vec::with_capacity(queries_arr.len());
+    for (i, q) in queries_arr.iter().enumerate() {
+        let qstr = q
+            .get("query")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("queries[{i}]: missing 'query' string"))?;
+        let mut sub = serde_json::Map::new();
+        sub.insert("query".into(), Value::String(qstr.to_string()));
+        if let Some(g) = q.get("glob").and_then(|v| v.as_str()) {
+            sub.insert("glob".into(), Value::String(g.to_string()));
+        } else if let Some(g) = args.get("glob").and_then(|v| v.as_str()) {
+            sub.insert("glob".into(), Value::String(g.to_string()));
+        }
+        let kind = q
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .or_else(|| args.get("kind").and_then(|v| v.as_str()));
+        if let Some(kind) = kind {
+            sub.insert("kind".into(), Value::String(kind.to_string()));
+        }
+        for k in ["expand", "scope", "budget", "if_modified_since"] {
+            if let Some(v) = args.get(k) {
+                sub.insert(k.into(), v.clone());
+            }
+        }
+        let sub_val = Value::Object(sub);
+        let body = tool_search_single(&sub_val, cache, session, bloom, edit_mode)?;
+        parts.push(format!("## query: {qstr}\n\n{body}"));
+    }
+    let combined = parts.join("\n\n---\n\n");
     let (scope, _) = resolve_scope(args);
-    let body = since
-        .map(|s| redact_unchanged_search_sections(&body, &scope, s))
-        .unwrap_or(body);
+    let combined = since
+        .map(|s| redact_unchanged_search_sections(&combined, &scope, s))
+        .unwrap_or(combined);
+    // Per-entry budget caps each query in isolation; cap the concatenated
+    // batch once more so an N-entry batch can't return ~N× the budget.
+    let combined = apply_budget(
+        &combined,
+        args.get("budget").and_then(serde_json::Value::as_u64),
+    );
     Ok(crate::mcp::iso::with_meta_header(
         Some(now),
         serde_json::Map::new(),
-        &body,
+        &combined,
     ))
 }
 
@@ -337,8 +329,7 @@ mod tests {
         let session = Session::new();
         let bloom = std::sync::Arc::new(BloomFilterCache::new());
         let args = serde_json::json!({
-            "query": "alpha,beta",
-            "kind": "callers",
+            "queries": [{"query": "alpha,beta", "kind": "callers"}],
             "scope": tmp.path().to_str().unwrap(),
         });
 
@@ -384,8 +375,7 @@ mod tests {
         let session = Session::new();
         let bloom = std::sync::Arc::new(BloomFilterCache::new());
         let args = serde_json::json!({
-            "query": "alpha,alpha",
-            "kind": "callers",
+            "queries": [{"query": "alpha,alpha", "kind": "callers"}],
             "scope": tmp.path().to_str().unwrap(),
         });
 
