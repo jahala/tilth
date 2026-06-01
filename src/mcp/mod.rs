@@ -566,7 +566,7 @@ mod tests {
     fn server_instructions_byte_lock() {
         assert_eq!(
             SERVER_INSTRUCTIONS.len(),
-            4192,
+            4438,
             "SERVER_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(SERVER_INSTRUCTIONS
@@ -583,6 +583,14 @@ mod tests {
         assert!(
             SERVER_INSTRUCTIONS.contains("tilth_grok: Everything structural about a symbol"),
             "tilth_grok description must remain in SERVER_INSTRUCTIONS"
+        );
+        // Regression guard for #58: the instructions must advertise the
+        // MCP-qualified tool names so models stop calling bare `tilth_read`
+        // (rejected as "No such tool available").
+        assert!(
+            SERVER_INSTRUCTIONS.contains("mcp__tilth__tilth_search")
+                && SERVER_INSTRUCTIONS.contains("mcp__tilth__tilth_read"),
+            "qualified-name guidance (mcp__tilth__<tool>) must remain in SERVER_INSTRUCTIONS"
         );
     }
 
@@ -2345,12 +2353,12 @@ mod tests {
         );
         assert_eq!(
             build_instructions(false, "").len(),
-            4192,
+            4438,
             "non-edit composed instructions byte count drifted"
         );
         assert_eq!(
             edit.len(),
-            6724,
+            6970,
             "edit-mode composed instructions byte count drifted (double-blank-line regression?)"
         );
     }
