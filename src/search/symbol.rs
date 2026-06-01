@@ -289,6 +289,20 @@ fn find_definitions(
         .unwrap_or_else(std::sync::PoisonError::into_inner))
 }
 
+/// Return every structural definition matching `query`, ranked like display search
+/// but not truncated to the interactive result cap. Programmatic resolvers use
+/// this when correctness depends on considering owners beyond the first page.
+pub(crate) fn all_definitions(
+    query: &str,
+    scope: &Path,
+    glob: Option<&str>,
+) -> Result<Vec<Match>, TilthError> {
+    let mut defs = find_definitions(query, scope, glob, usize::MAX)?;
+    rank::sort(&mut defs, query, scope, None);
+    defs.sort_by_key(stratum_for_display);
+    Ok(defs)
+}
+
 /// Tree-sitter structural definition detection.
 /// Accepts pre-read content — no redundant file read.
 fn find_defs_treesitter(
@@ -332,7 +346,10 @@ fn walk_for_definitions(
     lang: Option<crate::types::Lang>,
     depth: usize,
 ) {
-    if depth > 3 {
+    // Pathological-recursion guard only — definitions can nest arbitrarily
+    // deep (export-wrapped classes, nested modules, namespace-nested classes),
+    // so this must not re-hide real definitions. A low cap previously did.
+    if depth > 64 {
         return;
     }
 
@@ -905,6 +922,154 @@ const unexported = "hello";
         );
         assert!(!defs.is_empty(), "should find 'unexported' definition");
         assert!(defs[0].is_definition);
+    }
+
+    #[test]
+    fn deeply_nested_definitions_detected() {
+        // Regression for the v2 depth-cap removal in walk_for_definitions.
+        // A TS `export class` method sits at AST depth 4
+        // (program → export_statement → class_declaration → class_body →
+        // method_definition) and a doubly-nested Rust module fn at depth 5 —
+        // both exceeded the old `depth > 3` cap and were misclassified as
+        // usages. They must now be detected as definitions.
+        let ts_code = "export class Alpha {\n  dispatch(): number {\n    return 1;\n  }\n}\n";
+        let ts_lang =
+            crate::lang::outline::outline_language(crate::types::Lang::TypeScript).unwrap();
+        let defs = find_defs_treesitter(
+            std::path::Path::new("test.ts"),
+            "dispatch",
+            &ts_lang,
+            Some(crate::types::Lang::TypeScript),
+            ts_code,
+            ts_code.lines().count() as u32,
+            SystemTime::now(),
+        );
+        // Pin the exact definition, not merely "some definition exists": the
+        // method sits on line 2, and it must be the only match — the cap removal
+        // must not also start surfacing the call site or duplicate the def.
+        assert_eq!(
+            defs.len(),
+            1,
+            "exactly one `dispatch` definition, got {defs:?}"
+        );
+        assert!(defs[0].is_definition);
+        assert_eq!(
+            defs[0].line, 2,
+            "TS export-class method (depth 4) must be detected at its own line"
+        );
+
+        let rust_code = "pub mod a {\n    pub mod b {\n        pub fn method() {}\n    }\n}\n";
+        let rust_lang = crate::lang::outline::outline_language(crate::types::Lang::Rust).unwrap();
+        let defs = find_defs_treesitter(
+            std::path::Path::new("test.rs"),
+            "method",
+            &rust_lang,
+            Some(crate::types::Lang::Rust),
+            rust_code,
+            rust_code.lines().count() as u32,
+            SystemTime::now(),
+        );
+        assert_eq!(
+            defs.len(),
+            1,
+            "exactly one `method` definition, got {defs:?}"
+        );
+        assert!(defs[0].is_definition);
+        assert_eq!(
+            defs[0].line, 3,
+            "doubly-nested module fn (depth 5) must be detected at its own line"
+        );
+    }
+
+    #[test]
+    fn deeply_nested_call_site_is_not_a_definition() {
+        // Cap removal must descend without reclassifying usages: a deeply-nested
+        // *call* to `helper` (no definition of that name in scope) must yield no
+        // definition matches. Guards against the walk turning call sites into
+        // false-positive defs now that it recurses past the old depth-3 fence.
+        let rust_code = "\
+pub mod a {
+    pub mod b {
+        pub fn caller() {
+            helper();
+        }
+    }
+}
+";
+        let rust_lang = crate::lang::outline::outline_language(crate::types::Lang::Rust).unwrap();
+        let defs = find_defs_treesitter(
+            std::path::Path::new("test.rs"),
+            "helper",
+            &rust_lang,
+            Some(crate::types::Lang::Rust),
+            rust_code,
+            rust_code.lines().count() as u32,
+            SystemTime::now(),
+        );
+        assert!(
+            defs.is_empty(),
+            "a deeply-nested call site is not a definition, got {defs:?}"
+        );
+    }
+
+    #[test]
+    fn pathological_nesting_guard_bounds_recursion() {
+        // The `depth > 64` guard caps recursion against pathological input. Each
+        // Rust module level adds two AST levels (mod_item → declaration_list), so
+        // a fn under N modules sits at AST depth 2N+1. 33 modules → depth 67,
+        // past the guard, so the walk stops before reaching it: no def found.
+        // This pins the guard so a future lift (or a re-lowered cap) regresses
+        // loudly in a known direction.
+        let rust_lang = crate::lang::outline::outline_language(crate::types::Lang::Rust).unwrap();
+
+        let mk = |levels: usize| {
+            use std::fmt::Write;
+            let mut s = String::new();
+            for i in 0..levels {
+                s.push_str(&"    ".repeat(i));
+                let _ = writeln!(s, "pub mod m{i} {{");
+            }
+            s.push_str(&"    ".repeat(levels));
+            s.push_str("pub fn target() {}\n");
+            for i in (0..levels).rev() {
+                s.push_str(&"    ".repeat(i));
+                s.push_str("}\n");
+            }
+            s
+        };
+
+        // 33 modules → fn at AST depth 67 > 64: guard stops the walk first.
+        let deep = mk(33);
+        let defs = find_defs_treesitter(
+            std::path::Path::new("deep.rs"),
+            "target",
+            &rust_lang,
+            Some(crate::types::Lang::Rust),
+            &deep,
+            deep.lines().count() as u32,
+            SystemTime::now(),
+        );
+        assert!(
+            defs.is_empty(),
+            "fn nested past the depth-64 guard must not be returned, got {defs:?}"
+        );
+
+        // 30 modules → fn at AST depth 61 ≤ 64: still found. Confirms the guard
+        // bounds only pathological depths, not realistic ones.
+        let ok = mk(30);
+        let defs = find_defs_treesitter(
+            std::path::Path::new("ok.rs"),
+            "target",
+            &rust_lang,
+            Some(crate::types::Lang::Rust),
+            &ok,
+            ok.lines().count() as u32,
+            SystemTime::now(),
+        );
+        assert!(
+            defs.iter().any(|d| d.is_definition),
+            "fn within the depth-64 guard must still be detected, got {defs:?}"
+        );
     }
 
     /// Helper: search for an Elixir definition by name in a code snippet.

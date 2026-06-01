@@ -7,6 +7,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::cache::OutlineCache;
 use crate::error::TilthError;
 use crate::index::bloom::BloomFilterCache;
 use crate::lang::detect_file_type;
@@ -84,20 +85,237 @@ fn resolve_with_source(
 }
 
 fn resolve_by_name(name: &str, scope: &Path) -> Result<(ResolvedTarget, String, Lang), TilthError> {
-    let result = search_symbol_raw(name, scope, None)?;
-    let definitions: Vec<_> = result.matches.iter().filter(|m| m.is_definition).collect();
-    let Some(top) = definitions.first() else {
-        return Err(TilthError::NotFound {
-            path: PathBuf::from(name),
-            suggestion: None,
-        });
+    // The literal spec (`Alpha::dispatch`) never equals a bare definition name,
+    // so this attempt only fires for genuinely bare targets. No qualifier to honor.
+    if let Some(resolved) = resolve_def_by_query(name, None, scope)? {
+        return Ok(resolved);
+    }
+    // Qualified target (`Type::method`, `Type.method`, or `a::b::method`): retry
+    // with the trailing segment, passing the immediate-owner qualifier so the
+    // retry selects the same-named definition owned by that qualifier.
+    let (qualifier, bare) = split_qualified(name);
+    if bare != name && !bare.is_empty() {
+        if let Some(resolved) = resolve_def_by_query(bare, qualifier, scope)? {
+            return Ok(resolved);
+        }
+    }
+    Err(TilthError::NotFound {
+        path: PathBuf::from(name),
+        suggestion: None,
+    })
+}
+
+/// Split a qualified target into its immediate-owner qualifier and bare name.
+///
+/// The immediate owner is the **last** segment of the prefix:
+/// `"Alpha::dispatch"` → `(Some("Alpha"), "dispatch")`,
+/// `"a::b::method"` → `(Some("b"), "method")`,
+/// `"dispatch"` → `(None, "dispatch")`.
+fn split_qualified(name: &str) -> (Option<&str>, &str) {
+    match name.rfind([':', '.']) {
+        Some(idx) => {
+            let bare = &name[idx + 1..];
+            let prefix = name[..idx].trim_end_matches([':', '.']);
+            let qualifier = prefix.rsplit([':', '.']).next().filter(|s| !s.is_empty());
+            (qualifier, bare)
+        }
+        None => (None, name),
+    }
+}
+
+/// Search for `query` as a symbol and resolve a definition to a full target.
+///
+/// When `qualifier` is `Some`, select the definition whose owning type/container
+/// matches it (see the decision tree below); when `None`, take the top-ranked
+/// definition unchanged. Returns `None` when no definition matches `query` at
+/// all, letting the caller retry with a different query.
+fn resolve_def_by_query(
+    query: &str,
+    qualifier: Option<&str>,
+    scope: &Path,
+) -> Result<Option<(ResolvedTarget, String, Lang)>, TilthError> {
+    let Some(qualifier) = qualifier else {
+        let result = search_symbol_raw(query, scope, None)?;
+        let definitions: Vec<_> = result.matches.iter().filter(|m| m.is_definition).collect();
+        if definitions.is_empty() {
+            return Ok(None);
+        }
+
+        // Bare resolution: top-ranked definition, rest reported as ambiguous.
+        let top = definitions[0];
+        let other_def_count = definitions.len() - 1;
+        let start = def_start(top, query)?;
+        return enrich_from_outline(top.path.clone(), start, query.to_string(), other_def_count)
+            .map(Some);
     };
-    let other_def_count = definitions.len().saturating_sub(1);
-    let (start, _end) = top.def_range.ok_or_else(|| TilthError::ParseError {
-        path: top.path.clone(),
-        reason: format!("definition match for `{name}` had no def_range"),
-    })?;
-    enrich_from_outline(top.path.clone(), start, name.to_string(), other_def_count)
+
+    let definitions = crate::search::symbol::all_definitions(query, scope, None)?;
+    if definitions.is_empty() {
+        return Ok(None);
+    }
+
+    // Qualified resolution: partition candidates by whether their owner matches.
+    let cache = OutlineCache::new();
+    let owner_matched: Vec<_> = definitions
+        .iter()
+        .filter(|m| owner_of_match(m, &cache).is_some_and(|owner| owner_matches(&owner, qualifier)))
+        .collect();
+
+    match owner_matched.first() {
+        Some(top) => {
+            // One match → unambiguous; multiple same-owner overloads → best-effort
+            // top match with the rest counted (preserves PR #61's labeled choice).
+            let other_def_count = owner_matched.len() - 1;
+            let start = def_start(top, query)?;
+            enrich_from_outline(top.path.clone(), start, query.to_string(), other_def_count)
+                .map(Some)
+        }
+        None => {
+            // Zero owner-match → never return a misleading body for an owner the
+            // caller did not ask for. 404 with a suggestion naming the real owners.
+            Err(TilthError::NotFound {
+                path: PathBuf::from(query),
+                suggestion: Some(owner_suggestion(query, qualifier, &definitions, &cache)),
+            })
+        }
+    }
+}
+
+/// Extract a definition match's `def_range` start, erroring if absent.
+fn def_start(m: &crate::types::Match, query: &str) -> Result<u32, TilthError> {
+    m.def_range
+        .map(|(start, _)| start)
+        .ok_or_else(|| TilthError::ParseError {
+            path: m.path.clone(),
+            reason: format!("definition match for `{query}` had no def_range"),
+        })
+}
+
+/// Derive a candidate definition's owning type/container name, or `None` when
+/// it is top-level (free function) or its language doesn't nest under a named
+/// owner. Nesting languages read the cached outline; Go reads the receiver type.
+fn owner_of_match(m: &crate::types::Match, cache: &OutlineCache) -> Option<String> {
+    let (start, _) = m.def_range?;
+    let FileType::Code(lang) = detect_file_type(&m.path) else {
+        return None;
+    };
+    if lang == Lang::Go {
+        return go_receiver_type(&m.path, start, cache);
+    }
+    let parsed = cache.get_or_parse(&m.path)?;
+    let lines: Vec<&str> = parsed.content.lines().collect();
+    find_parent_name(parsed.tree.root_node(), &lines, lang, start)
+}
+
+/// Name of the nearest enclosing named container (class/struct/impl/module) of
+/// the definition node starting at `start_line`, derived from the AST. `None`
+/// when the target is top-level or not found. The innermost container wins, so
+/// `a::b::method` resolves against `b`, not `a`.
+///
+/// Reads the AST directly rather than the outline tree: the outline caps its own
+/// nesting at one container level (`node_to_entry`'s `depth < 1`), which would
+/// hide a doubly-nested method's parent. `container_entry_name` keeps the owner
+/// string in lockstep with the outline's container naming.
+fn find_parent_name(
+    root: tree_sitter::Node,
+    lines: &[&str],
+    lang: Lang,
+    start_line: u32,
+) -> Option<String> {
+    find_parent_name_inner(root, lines, lang, start_line, None)
+}
+
+/// Descend toward the definition node, carrying the nearest enclosing container
+/// name seen so far. Container nesting in the AST is interrupted by body/block
+/// nodes (e.g. `impl_item → declaration_list → function_item`), so the owner is
+/// tracked across the whole ancestor path, not just the literal parent node.
+fn find_parent_name_inner(
+    node: tree_sitter::Node,
+    lines: &[&str],
+    lang: Lang,
+    start_line: u32,
+    enclosing: Option<String>,
+) -> Option<String> {
+    let here = crate::lang::outline::container_entry_name(node, lines, lang).or(enclosing);
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.start_position().row as u32 + 1 == start_line
+            && crate::lang::treesitter::DEFINITION_KINDS.contains(&child.kind())
+        {
+            return here;
+        }
+        if let Some(found) = find_parent_name_inner(child, lines, lang, start_line, here.clone()) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Compare a candidate's container name against the qualifier. Normalizes the
+/// container by stripping a leading `impl ` prefix, dropping `<…>` generic
+/// arguments, and taking the trailing `::`/`.` segment; compares case-sensitively.
+fn owner_matches(container_name: &str, qualifier: &str) -> bool {
+    let stripped = container_name
+        .strip_prefix("impl ")
+        .unwrap_or(container_name);
+    let no_generics = stripped.split('<').next().unwrap_or(stripped).trim();
+    let tail = no_generics.rsplit([':', '.']).next().unwrap_or(no_generics);
+    tail == qualifier
+}
+
+/// Tree-sitter query for a Go `method_declaration`'s receiver type, scoped to
+/// the method whose node starts at `start_line`. Handles both value (`Foo`) and
+/// pointer (`*Foo`) receivers, returning the bare type name.
+fn go_receiver_type(path: &Path, start_line: u32, cache: &OutlineCache) -> Option<String> {
+    use streaming_iterator::StreamingIterator;
+
+    const GO_RECV_TYPE_QUERY: &str = "(method_declaration receiver: (parameter_list (parameter_declaration type: [(type_identifier) @ty (pointer_type (type_identifier) @ty)])) name: (field_identifier) @method)";
+
+    let parsed = cache.get_or_parse(path)?;
+    let ts_lang = crate::lang::outline::outline_language(parsed.lang)?;
+    let bytes = parsed.content.as_bytes();
+
+    crate::search::siblings::with_query(&ts_lang, GO_RECV_TYPE_QUERY, |query| {
+        let ty_idx = query.capture_index_for_name("ty")?;
+        let method_idx = query.capture_index_for_name("method")?;
+        let mut cursor = tree_sitter::QueryCursor::new();
+        let mut matches = cursor.matches(query, parsed.tree.root_node(), bytes);
+        while let Some(m) = matches.next() {
+            let starts_here = m.captures.iter().any(|c| {
+                c.index == method_idx && c.node.start_position().row as u32 + 1 == start_line
+            });
+            if !starts_here {
+                continue;
+            }
+            for cap in m.captures {
+                if cap.index == ty_idx {
+                    return cap.node.utf8_text(bytes).ok().map(String::from);
+                }
+            }
+        }
+        None
+    })
+    .flatten()
+}
+
+/// Build the `NotFound` suggestion for a zero-owner-match qualified target: name
+/// the bare method, the requested owner, and where the method actually lives.
+fn owner_suggestion(
+    bare: &str,
+    qualifier: &str,
+    definitions: &[crate::types::Match],
+    cache: &OutlineCache,
+) -> String {
+    let mut locations = String::new();
+    for (i, m) in definitions.iter().enumerate() {
+        if i > 0 {
+            locations.push_str(", ");
+        }
+        let owner = owner_of_match(m, cache).unwrap_or_else(|| "<top-level>".to_string());
+        let _ = write!(locations, "{owner} ({}:{})", m.path.display(), m.line);
+    }
+    format!("no '{bare}' owned by '{qualifier}'; found on {locations}")
 }
 
 fn resolve_by_path_line(
@@ -140,20 +358,29 @@ fn enrich_from_outline(
 ) -> Result<(ResolvedTarget, String, Lang), TilthError> {
     let (content, lang) = read_code_file(&path)?;
     let entries = get_outline_entries(&content, lang);
-    let entry = find_by_start_line(&entries, start_line)
-        .or_else(|| find_entry_at_line(&entries, start_line));
-    let target = match entry {
+    let target = match find_by_start_line(&entries, start_line) {
         Some(e) => target_from_entry(e, path, other_def_count),
-        None => ResolvedTarget {
-            name,
-            path,
-            start_line,
-            end_line: start_line,
-            kind: OutlineKind::Function,
-            signature: None,
-            doc: None,
-            other_def_count,
-        },
+        None => {
+            // The outline tree caps its nesting at one container level, so a
+            // deeply-nested definition (e.g. `a::b::method`) is absent. Pull it
+            // straight from the AST before degrading to the enclosing entry.
+            match crate::lang::outline::entry_at_start_line(&content, lang, start_line) {
+                Some(e) => target_from_entry(&e, path, other_def_count),
+                None => match find_entry_at_line(&entries, start_line) {
+                    Some(e) => target_from_entry(e, path, other_def_count),
+                    None => ResolvedTarget {
+                        name,
+                        path,
+                        start_line,
+                        end_line: start_line,
+                        kind: OutlineKind::Function,
+                        signature: None,
+                        doc: None,
+                        other_def_count,
+                    },
+                },
+            }
+        }
     };
     Ok((target, content, lang))
 }
@@ -974,6 +1201,481 @@ mod tests {
         // Relative path is joined with scope.
         let (target, _, _) = resolve_with_source("src/a.rs:3", tmp.path()).unwrap();
         assert_eq!(target.name, "two");
+    }
+
+    #[test]
+    fn resolve_qualified_target_strips_type_prefix() {
+        // Issue #59: `tilth_grok(target: "Executor.dispatch")` — and the
+        // documented `Type::method` form — must resolve to the bare method
+        // instead of returning `not found: Executor.dispatch`.
+        let tmp = tempfile::tempdir().unwrap();
+        let body = "\
+pub struct Executor;
+
+impl Executor {
+    pub fn dispatch(&self) -> u32 {
+        1
+    }
+}
+";
+        write_fixture(tmp.path(), "src/exec.rs", body);
+
+        for spec in ["Executor::dispatch", "Executor.dispatch"] {
+            let (target, _, _) = resolve_with_source(spec, tmp.path())
+                .unwrap_or_else(|e| panic!("grok could not resolve `{spec}`: {e}"));
+            assert_eq!(
+                target.name, "dispatch",
+                "spec `{spec}` should resolve to method `dispatch`"
+            );
+            assert_eq!(target.other_def_count, 0);
+        }
+    }
+
+    #[test]
+    fn resolve_qualified_target_still_404s_when_method_absent() {
+        // The trailing-segment retry must stay bounded: a qualified target whose
+        // method doesn't exist must still return NotFound, not resolve to junk.
+        let tmp = tempfile::tempdir().unwrap();
+        let body = "pub struct Executor;\n\nimpl Executor {\n    pub fn dispatch(&self) {}\n}\n";
+        write_fixture(tmp.path(), "src/exec.rs", body);
+
+        let err = resolve_with_source("Executor::missing", tmp.path()).unwrap_err();
+        assert!(
+            matches!(err, TilthError::NotFound { .. }),
+            "absent method should 404, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_qualified_target_ambiguous_segment_resolves_named_owner() {
+        // When the trailing segment matches multiple same-named definitions in
+        // different owners, the qualifier selects which one — `Alpha::dispatch`
+        // resolves to Alpha's, `Beta::dispatch` to Beta's. The owner-matched
+        // candidate is unique, so other_def_count is 0.
+        let tmp = tempfile::tempdir().unwrap();
+        let a = "pub struct Alpha;\n\nimpl Alpha {\n    pub fn dispatch(&self) {}\n}\n";
+        let b = "pub struct Beta;\n\nimpl Beta {\n    pub fn dispatch(&self) {}\n}\n";
+        write_fixture(tmp.path(), "src/alpha.rs", a);
+        write_fixture(tmp.path(), "src/beta.rs", b);
+
+        let (target, _, _) = resolve_with_source("Alpha::dispatch", tmp.path()).unwrap();
+        assert_eq!(target.name, "dispatch");
+        assert!(
+            target.path.ends_with("alpha.rs"),
+            "Alpha::dispatch must resolve to Alpha's dispatch, got {}",
+            target.path.display()
+        );
+        assert_eq!(
+            target.other_def_count, 0,
+            "exactly one dispatch is owned by Alpha"
+        );
+
+        let (target, _, _) = resolve_with_source("Beta::dispatch", tmp.path()).unwrap();
+        assert!(
+            target.path.ends_with("beta.rs"),
+            "Beta::dispatch must resolve to Beta's dispatch, got {}",
+            target.path.display()
+        );
+        assert_eq!(target.other_def_count, 0);
+    }
+
+    #[test]
+    fn resolve_qualified_target_owner_beyond_default_cap() {
+        // Qualified resolution must inspect every same-named definition, not just
+        // the default rendered top 10. The requested owner is sorted after the
+        // first ten files, so a capped candidate set would miss it.
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..10 {
+            let owner = format!("Owner{i:02}");
+            let body = format!(
+                "pub struct {owner};\n\nimpl {owner} {{\n    pub fn dispatch(&self) {{}}\n}}\n"
+            );
+            write_fixture(tmp.path(), &format!("src/{owner}.rs"), &body);
+        }
+        let body = "pub struct Owner99;\n\nimpl Owner99 {\n    pub fn dispatch(&self) {}\n}\n";
+        write_fixture(tmp.path(), "src/zz_owner99.rs", body);
+
+        let (target, _, _) = resolve_with_source("Owner99::dispatch", tmp.path())
+            .unwrap_or_else(|e| panic!("grok could not resolve capped owner: {e}"));
+        assert_eq!(target.name, "dispatch");
+        assert!(
+            target.path.ends_with("zz_owner99.rs"),
+            "Owner99::dispatch must resolve past the default cap, got {}",
+            target.path.display()
+        );
+        assert_eq!(target.other_def_count, 0);
+    }
+
+    #[test]
+    fn resolve_qualified_target_trait_impl_method() {
+        // `impl Trait for Foo { fn m }` — both `Foo::m` and `Foo.m` resolve to m.
+        let tmp = tempfile::tempdir().unwrap();
+        let body = "\
+pub trait Speak {
+    fn say(&self);
+}
+
+pub struct Foo;
+
+impl Speak for Foo {
+    fn say(&self) {}
+}
+";
+        write_fixture(tmp.path(), "src/foo.rs", body);
+
+        for spec in ["Foo::say", "Foo.say"] {
+            let (target, _, _) = resolve_with_source(spec, tmp.path())
+                .unwrap_or_else(|e| panic!("grok could not resolve `{spec}`: {e}"));
+            assert_eq!(target.name, "say");
+            assert!(target.path.ends_with("foo.rs"));
+        }
+    }
+
+    #[test]
+    fn resolve_qualified_target_nested_module_uses_immediate_parent() {
+        // `a::b::method` — the immediate owner is `b`. The method nested under a
+        // module named `b` must win over a same-named method under another owner.
+        let tmp = tempfile::tempdir().unwrap();
+        let body = "\
+pub mod a {
+    pub mod b {
+        pub fn method() {}
+    }
+}
+
+pub struct Other;
+
+impl Other {
+    pub fn method(&self) {}
+}
+";
+        write_fixture(tmp.path(), "src/nested.rs", body);
+
+        let (target, _, _) = resolve_with_source("a::b::method", tmp.path())
+            .unwrap_or_else(|e| panic!("grok could not resolve `a::b::method`: {e}"));
+        assert_eq!(target.name, "method");
+        // The module-nested method sits on line 3; the impl method on line 11.
+        assert_eq!(
+            target.start_line, 3,
+            "a::b::method must select the method whose immediate parent is `b`"
+        );
+    }
+
+    #[test]
+    fn resolve_qualified_target_generic_impl_strips_generics() {
+        // `impl<T> Foo<T> { fn m }` — target `Foo::m` resolves; the `<T>`
+        // generic arguments are stripped during owner normalization.
+        let tmp = tempfile::tempdir().unwrap();
+        let other = "pub struct Other;\n\nimpl Other {\n    pub fn build(&self) {}\n}\n";
+        let body = "\
+pub struct Foo<T>(T);
+
+impl<T> Foo<T> {
+    pub fn build(&self) {}
+}
+";
+        write_fixture(tmp.path(), "src/other.rs", other);
+        write_fixture(tmp.path(), "src/foo.rs", body);
+
+        let (target, _, _) = resolve_with_source("Foo::build", tmp.path())
+            .unwrap_or_else(|e| panic!("grok could not resolve `Foo::build`: {e}"));
+        assert_eq!(target.name, "build");
+        assert!(
+            target.path.ends_with("foo.rs"),
+            "Foo::build must resolve to the generic impl on Foo, got {}",
+            target.path.display()
+        );
+    }
+
+    #[test]
+    fn resolve_qualified_target_typescript_class_method() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = "export class Alpha {\n  dispatch(): number {\n    return 1;\n  }\n}\n";
+        let b = "export class Beta {\n  dispatch(): number {\n    return 2;\n  }\n}\n";
+        write_fixture(tmp.path(), "src/alpha.ts", a);
+        write_fixture(tmp.path(), "src/beta.ts", b);
+
+        let (target, _, _) = resolve_with_source("Beta.dispatch", tmp.path())
+            .unwrap_or_else(|e| panic!("grok could not resolve `Beta.dispatch`: {e}"));
+        assert_eq!(target.name, "dispatch");
+        assert!(
+            target.path.ends_with("beta.ts"),
+            "Beta.dispatch must resolve to Beta's method, got {}",
+            target.path.display()
+        );
+    }
+
+    #[test]
+    fn resolve_qualified_target_python_class_method() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = "class Alpha:\n    def dispatch(self):\n        return 1\n";
+        let b = "class Beta:\n    def dispatch(self):\n        return 2\n";
+        write_fixture(tmp.path(), "src/alpha.py", a);
+        write_fixture(tmp.path(), "src/beta.py", b);
+
+        let (target, _, _) = resolve_with_source("Alpha.dispatch", tmp.path())
+            .unwrap_or_else(|e| panic!("grok could not resolve `Alpha.dispatch`: {e}"));
+        assert_eq!(target.name, "dispatch");
+        assert!(
+            target.path.ends_with("alpha.py"),
+            "Alpha.dispatch must resolve to Alpha's method, got {}",
+            target.path.display()
+        );
+    }
+
+    #[test]
+    fn resolve_qualified_target_go_receiver_type() {
+        // Go methods are flat top-level entries; the owner is the receiver type.
+        // `Foo.Bar` must resolve to the Bar whose receiver is Foo, not Baz's Bar.
+        let tmp = tempfile::tempdir().unwrap();
+        let foo = "package main\n\ntype Foo struct{}\n\nfunc (f *Foo) Bar() int {\n\treturn 1\n}\n";
+        let baz = "package main\n\ntype Baz struct{}\n\nfunc (b Baz) Bar() int {\n\treturn 2\n}\n";
+        write_fixture(tmp.path(), "foo.go", foo);
+        write_fixture(tmp.path(), "baz.go", baz);
+
+        let (target, _, _) = resolve_with_source("Foo.Bar", tmp.path())
+            .unwrap_or_else(|e| panic!("grok could not resolve `Foo.Bar`: {e}"));
+        assert_eq!(target.name, "Bar");
+        assert!(
+            target.path.ends_with("foo.go"),
+            "Foo.Bar must resolve to Foo's method by receiver type, got {}",
+            target.path.display()
+        );
+    }
+
+    #[test]
+    fn resolve_qualified_target_zero_owner_match_404s_with_suggestion() {
+        // No `dispatch` is owned by Alpha — only Beta has one. Rather than return
+        // Beta's body (the silent-wrong-owner bug), grok returns NotFound with a
+        // suggestion naming the real owner.
+        let tmp = tempfile::tempdir().unwrap();
+        let body = "pub struct Beta;\n\nimpl Beta {\n    pub fn dispatch(&self) {}\n}\n";
+        write_fixture(tmp.path(), "src/beta.rs", body);
+
+        let err = resolve_with_source("Alpha::dispatch", tmp.path()).unwrap_err();
+        match err {
+            TilthError::NotFound { suggestion, .. } => {
+                let s = suggestion.expect("zero owner-match must carry a suggestion");
+                assert!(
+                    s.contains("Beta"),
+                    "suggestion must name the real owner, got {s:?}"
+                );
+                assert!(
+                    s.contains("dispatch"),
+                    "suggestion must name the bare method, got {s:?}"
+                );
+            }
+            other => panic!("expected NotFound with suggestion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_qualified_target_multiple_same_owner_overloads_counts_rest() {
+        // Decision-tree step 4: two `build` methods owned by the SAME type (a
+        // plain `impl Foo` and a generic `impl<T> Foo<T>`, both normalizing to
+        // `Foo`). Both owner-match, so grok resolves the top one and reports the
+        // remaining same-owner overload via other_def_count — it must NOT 404
+        // (that's the zero-match branch) and must NOT report 0 (that's the
+        // unique-match branch). Pins the multi-match branch left untested by cook.
+        let tmp = tempfile::tempdir().unwrap();
+        let body = "\
+pub struct Foo<T>(T);
+
+impl Foo<u32> {
+    pub fn build(&self) -> u32 {
+        1
+    }
+}
+
+impl<T> Foo<T> {
+    pub fn build(&self) -> u8 {
+        2
+    }
+}
+";
+        write_fixture(tmp.path(), "src/foo.rs", body);
+
+        let (target, _, _) = resolve_with_source("Foo::build", tmp.path())
+            .unwrap_or_else(|e| panic!("grok could not resolve `Foo::build`: {e}"));
+        assert_eq!(target.name, "build");
+        assert!(
+            target.path.ends_with("foo.rs"),
+            "must resolve to a Foo-owned build, got {}",
+            target.path.display()
+        );
+        assert_eq!(
+            target.other_def_count, 1,
+            "the second same-owner overload must be counted, not 404'd or dropped"
+        );
+    }
+
+    #[test]
+    fn resolve_qualified_target_other_owners_excluded_from_count() {
+        // A `build` owned by Foo and another owned by Bar. The Bar def is NOT a
+        // same-owner overload, so it must be excluded from other_def_count — the
+        // count reflects owner-matched candidates only, not the full def set.
+        let tmp = tempfile::tempdir().unwrap();
+        let foo = "pub struct Foo;\n\nimpl Foo {\n    pub fn build(&self) {}\n}\n";
+        let bar = "pub struct Bar;\n\nimpl Bar {\n    pub fn build(&self) {}\n}\n";
+        write_fixture(tmp.path(), "src/foo.rs", foo);
+        write_fixture(tmp.path(), "src/bar.rs", bar);
+
+        let (target, _, _) = resolve_with_source("Foo::build", tmp.path()).unwrap();
+        assert!(target.path.ends_with("foo.rs"));
+        assert_eq!(
+            target.other_def_count, 0,
+            "Bar's build is a different owner and must not inflate the count"
+        );
+    }
+
+    #[test]
+    fn nested_module_resolution_uses_ast_enrichment_not_bare_default() {
+        // The depth-5 method `a::b::method` is absent from the outline tree (it
+        // caps at one container level), so enrich_from_outline must reach it via
+        // the AST fallback (`entry_at_start_line`). A real AST entry carries a
+        // `signature`; the bare-default degradation leaves it `None`. Asserting
+        // the signature is present pins that the AST-finder path actually ran —
+        // the start_line/name alone are identical on both paths and can't tell
+        // them apart.
+        let tmp = tempfile::tempdir().unwrap();
+        let body =
+            "pub mod a {\n    pub mod b {\n        pub fn method(x: u32) -> u32 { x }\n    }\n}\n";
+        write_fixture(tmp.path(), "src/nested.rs", body);
+
+        let (target, _, _) = resolve_with_source("a::b::method", tmp.path())
+            .unwrap_or_else(|e| panic!("grok could not resolve `a::b::method`: {e}"));
+        assert_eq!(target.name, "method");
+        assert_eq!(target.start_line, 3);
+        let sig = target
+            .signature
+            .expect("AST-enriched entry must carry a signature; bare default would be None");
+        assert!(
+            sig.contains("fn method"),
+            "signature must come from the nested fn, got {sig:?}"
+        );
+    }
+
+    // -- entry_at_start_line (AST fallback for deeply-nested defs) --------
+
+    #[test]
+    fn entry_at_start_line_reaches_doubly_nested_method() {
+        // Direct test of the outline.rs AST fallback grok relies on: the outline
+        // tree omits a depth-5 method, so this must pull it straight from the AST.
+        let code = "pub mod a {\n    pub mod b {\n        pub fn method() {}\n    }\n}\n";
+        let entry = crate::lang::outline::entry_at_start_line(code, Lang::Rust, 3)
+            .expect("AST fallback must find the doubly-nested method at line 3");
+        assert_eq!(entry.name, "method");
+        assert_eq!(entry.start_line, 3);
+        assert!(entry.signature.is_some(), "fn entry must carry a signature");
+    }
+
+    #[test]
+    fn entry_at_start_line_none_when_no_def_starts_there() {
+        // Line 2 is a `mod` opener, not a definition start row for any leaf def —
+        // the finder keys on the exact start row, so a non-matching line is None.
+        let code = "pub mod a {\n    pub fn method() {}\n}\n";
+        // The mod `a` itself starts at line 1; line 2 is the fn. A line with no
+        // definition starting on it (e.g. line 3, the closing brace) is None.
+        assert!(crate::lang::outline::entry_at_start_line(code, Lang::Rust, 3).is_none());
+    }
+
+    // -- split_qualified -------------------------------------------------
+
+    #[test]
+    fn split_qualified_double_colon() {
+        assert_eq!(
+            split_qualified("Alpha::dispatch"),
+            (Some("Alpha"), "dispatch")
+        );
+    }
+
+    #[test]
+    fn split_qualified_dot() {
+        assert_eq!(
+            split_qualified("Alpha.dispatch"),
+            (Some("Alpha"), "dispatch")
+        );
+    }
+
+    #[test]
+    fn split_qualified_nested_takes_immediate_owner() {
+        // The immediate owner is the LAST segment of the prefix.
+        assert_eq!(split_qualified("a::b::method"), (Some("b"), "method"));
+    }
+
+    #[test]
+    fn split_qualified_bare_has_no_qualifier() {
+        assert_eq!(split_qualified("dispatch"), (None, "dispatch"));
+    }
+
+    // -- owner_matches ---------------------------------------------------
+
+    #[test]
+    fn owner_matches_plain() {
+        assert!(owner_matches("Foo", "Foo"));
+        assert!(!owner_matches("Foo", "Bar"));
+    }
+
+    #[test]
+    fn owner_matches_strips_impl_prefix() {
+        assert!(owner_matches("impl Foo", "Foo"));
+    }
+
+    #[test]
+    fn owner_matches_strips_generics() {
+        assert!(owner_matches("impl Foo<T>", "Foo"));
+        assert!(owner_matches("Foo<T, U>", "Foo"));
+    }
+
+    #[test]
+    fn owner_matches_takes_trailing_path_segment() {
+        // A container name that itself is qualified compares on its last segment.
+        assert!(owner_matches("crate::module::Foo", "Foo"));
+    }
+
+    #[test]
+    fn owner_matches_is_case_sensitive() {
+        assert!(!owner_matches("foo", "Foo"));
+    }
+
+    // -- find_parent_name ------------------------------------------------
+
+    /// Parse `code` and return the immediate-container name of the definition
+    /// starting at `start_line`, exercising the AST-based finder end to end.
+    fn parent_name_of(code: &str, lang: Lang, start_line: u32) -> Option<String> {
+        let ts_lang = crate::lang::outline::outline_language(lang).unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts_lang).unwrap();
+        let tree = parser.parse(code, None).unwrap();
+        let lines: Vec<&str> = code.lines().collect();
+        find_parent_name(tree.root_node(), &lines, lang, start_line)
+    }
+
+    #[test]
+    fn find_parent_name_returns_container() {
+        let code = "impl MyClass {\n    fn method(&self) {}\n}\n";
+        assert_eq!(
+            parent_name_of(code, Lang::Rust, 2).as_deref(),
+            Some("impl MyClass")
+        );
+    }
+
+    #[test]
+    fn find_parent_name_recurses_through_modules() {
+        // Doubly-nested module fn — the outline tree caps at one container
+        // level, so this only resolves because the finder reads the AST.
+        let code = "pub mod a {\n    pub mod b {\n        pub fn method() {}\n    }\n}\n";
+        assert_eq!(
+            parent_name_of(code, Lang::Rust, 3).as_deref(),
+            Some("b"),
+            "the immediate parent is the innermost container `b`"
+        );
+    }
+
+    #[test]
+    fn find_parent_name_top_level_is_none() {
+        let code = "pub fn free_fn() {}\n";
+        assert_eq!(parent_name_of(code, Lang::Rust, 1), None);
     }
 
     // -- collect_siblings ------------------------------------------------

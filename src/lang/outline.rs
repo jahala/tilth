@@ -318,6 +318,18 @@ fn node_to_entry(
     })
 }
 
+/// Canonical outline name for a single container node, with no child recursion.
+/// Used by grok's AST owner finder so the owner string stays in lockstep with how
+/// the outline tree names impls/modules/classes (e.g. `"impl Foo"`). `None` for
+/// non-container or unnamed nodes. Passing `depth = 1` skips child collection.
+pub(crate) fn container_entry_name(
+    node: tree_sitter::Node,
+    lines: &[&str],
+    lang: Lang,
+) -> Option<String> {
+    node_to_entry(node, lines, lang, 1).map(|e| e.name)
+}
+
 /// Collect child entries from a class/struct/impl body.
 fn collect_children(
     node: tree_sitter::Node,
@@ -829,6 +841,46 @@ pub(crate) fn extract_import_source(text: &str, lang: Option<crate::types::Lang>
         .last()
         .unwrap_or(trimmed)
         .to_string()
+}
+
+/// Outline entry for the single definition node starting at `start_line`,
+/// extracted straight from the AST. Unlike the outline tree (which caps its own
+/// nesting at one container level), this reaches a definition at any depth, so
+/// grok can enrich a deeply-nested method the tree would not surface. Returns
+/// `None` when no definition node starts at that line.
+pub(crate) fn entry_at_start_line(
+    content: &str,
+    lang: Lang,
+    start_line: u32,
+) -> Option<OutlineEntry> {
+    let ts_lang = outline_language(lang)?;
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&ts_lang).ok()?;
+    let tree = parser.parse(content, None)?;
+    let lines: Vec<&str> = content.lines().collect();
+    node_entry_at_start_line(tree.root_node(), &lines, lang, start_line)
+}
+
+fn node_entry_at_start_line(
+    node: tree_sitter::Node,
+    lines: &[&str],
+    lang: Lang,
+    start_line: u32,
+) -> Option<OutlineEntry> {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.start_position().row as u32 + 1 == start_line {
+            // depth 1 keeps node_to_entry from collecting children — only the
+            // entry's own metadata (name/kind/signature/doc/range) is needed.
+            if let Some(entry) = node_to_entry(child, lines, lang, 1) {
+                return Some(entry);
+            }
+        }
+        if let Some(found) = node_entry_at_start_line(child, lines, lang, start_line) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 /// Get structured outline entries for file content.

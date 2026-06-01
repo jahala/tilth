@@ -20,7 +20,7 @@ static QUERY_CACHE: LazyLock<Mutex<HashMap<(usize, usize, usize), tree_sitter::Q
 ///
 /// `query_str` must be `'static` so its pointer address is stable across
 /// calls and can serve as part of the cache key.
-fn with_query<R>(
+pub(crate) fn with_query<R>(
     ts_lang: &tree_sitter::Language,
     query_str: &'static str,
     f: impl FnOnce(&tree_sitter::Query) -> R,
