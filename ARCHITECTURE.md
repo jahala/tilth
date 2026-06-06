@@ -59,6 +59,7 @@ src/
 │   │                    kind:callers`); enclosing-scope annotation
 │   ├── callees.rs       Resolve function calls inside a definition
 │   ├── deps.rs          Blast-radius analysis (`tilth_deps`)
+│   ├── grok.rs          One-call symbol bundle (`tilth_grok`)
 │   ├── glob.rs          Glob query → file list (`tilth_files`)
 │   ├── blast.rs         Symbol-level blast radius
 │   ├── bloom_walk.rs    Shared walker preamble (size gating, mtime,

@@ -112,6 +112,28 @@ $ tilth src/auth.ts --deps
 
 In MCP mode, use the `tilth_deps` tool.
 
+### Grok a symbol
+
+Everything about one symbol in a single call — definition, signature, doc, callers, callees, siblings, tests:
+
+```bash
+$ tilth grok handleAuth
+# grok: handleAuth [src/auth.ts:42]
+
+## signature
+function handleAuth(req: Request): AuthContext
+
+## callers (3)
+  src/routes/api.ts:88   in registerRoutes()
+  src/app.ts:24          in bootstrap()
+
+## callees (2)
+  validateToken    src/auth.ts:120
+  loadUser         src/db/users.ts:55
+```
+
+In MCP mode, use the `tilth_grok` tool.
+
 ### Session dedup
 
 In MCP mode, previously expanded definitions show `[shown earlier]` instead of the full body on subsequent searches. Saves tokens when the agent revisits symbols it already saw.

@@ -36,6 +36,7 @@ src/
     callers.rs         Structural call-site detection (tree-sitter + memchr pre-filter).
     callees.rs         Callee extraction and resolution for expanded definitions.
     siblings.rs        Sibling symbol surfacing in search results.
+    grok.rs            One-call symbol bundle (def + body + callers + callees + siblings + tests).
     deps.rs            File-level dependency analysis (imports + dependents with symbols).
     rank.rs            Result ranking (definition weight, basename boost, context proximity).
     facets.rs          Faceted result grouping (definitions, usages, implementations).
