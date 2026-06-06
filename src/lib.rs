@@ -255,9 +255,10 @@ fn run_inner(
     // FilePath and Glob are read operations, not search — handle before expanded dispatch
     let output = match query_type {
         QueryType::FilePath(path) => {
-            let mut out = read::read_file_resolving(&path, section, full, cache, false, scope)?;
-            if section.is_none() && !full && read::would_outline(&path) {
-                let related = read::imports::resolve_related_files(&path);
+            let (mut out, opened) =
+                read::read_file_resolving(&path, section, full, cache, false, scope)?;
+            if section.is_none() && !full && read::would_outline(&opened) {
+                let related = read::imports::resolve_related_files(&opened);
                 if !related.is_empty() {
                     let hints: Vec<String> = related
                         .iter()

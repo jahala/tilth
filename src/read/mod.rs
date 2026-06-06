@@ -4,7 +4,7 @@ pub mod outline;
 
 use std::fmt::Write;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use memmap2::Mmap;
 
@@ -243,6 +243,12 @@ fn scope_relative_query<'a>(path: &'a Path, scope: &Path) -> std::borrow::Cow<'a
 /// with a correction header. Only `NotFound` triggers the cold-path tree walk;
 /// every other outcome (success or other error) returns untouched, so a
 /// successful read never pays for the walk.
+///
+/// Returns `(content, opened_path)` where `opened_path` is the file that was
+/// actually read — the fuzzy-resolved path when resolution succeeded, otherwise
+/// the original `path`. Callers should use `opened_path` for any post-read
+/// operations (e.g. `would_outline`, `resolve_related_files`) so they operate
+/// on the real file rather than the missing one.
 pub fn read_file_resolving(
     path: &Path,
     section: Option<&str>,
@@ -250,22 +256,45 @@ pub fn read_file_resolving(
     cache: &OutlineCache,
     edit_mode: bool,
     scope: &Path,
-) -> Result<String, TilthError> {
-    let (missing, suggestion) = match read_file(path, section, full, cache, edit_mode) {
-        Err(TilthError::NotFound { path, suggestion }) => (path, suggestion),
-        other => return other,
-    };
+) -> Result<(String, PathBuf), TilthError> {
+    read_with_fuzzy_retry(path, scope, |p| {
+        read_file(p, section, full, cache, edit_mode)
+    })
+}
 
+/// Fuzzy-retry wrapper: runs `read_fn(path)`; on `NotFound` fuzzy-resolves the
+/// path under `scope` and retries `read_fn(real)`, prepending a correction header.
+/// `Suggestions` from the fuzzy resolver surface into `NotFound.suggestion` so
+/// callers see "did you mean" hints instead of a bare missing-path error.
+/// Every other outcome (success or non-`NotFound` error) is returned untouched.
+///
+/// Returns `(content, opened_path)` where `opened_path` is the actually-opened
+/// file — callers should use it for `would_outline` / `resolve_related_files`.
+pub fn read_with_fuzzy_retry<F>(
+    path: &Path,
+    scope: &Path,
+    read_fn: F,
+) -> Result<(String, PathBuf), TilthError>
+where
+    F: Fn(&Path) -> Result<String, TilthError>,
+{
+    let (missing, suggestion) = match read_fn(path) {
+        Ok(body) => return Ok((body, path.to_path_buf())),
+        Err(TilthError::NotFound { path, suggestion }) => (path, suggestion),
+        Err(other) => return Err(other),
+    };
     let query = scope_relative_query(path, scope);
     match fuzzy_path::resolve_fuzzy_path(scope, &query, fuzzy_path::GateProfile::Read) {
         fuzzy_path::FuzzyResolution::Resolved(hit) => {
             hit.log_auto_open(&query);
             let real = scope.join(&hit.path);
-            let body = read_file(&real, section, full, cache, edit_mode)?;
-            Ok(format!(
-                "# {} (corrected from \"{query}\")\n\n{body}",
+            let body = read_fn(&real)?;
+            let content = format!(
+                "# {} (corrected from \"{query}\")\
+\n\n{body}",
                 hit.path.display()
-            ))
+            );
+            Ok((content, real))
         }
         fuzzy_path::FuzzyResolution::Suggestions(s) => Err(TilthError::NotFound {
             path: missing,

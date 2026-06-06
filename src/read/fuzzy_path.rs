@@ -8,6 +8,9 @@
 //! Cold path only — never invoked on a successful read or search. The matcher
 //! lives entirely behind [`resolve_fuzzy_path`]; the documented step-down (swap
 //! to a no-dependency basename match) is a body swap, not a rewrite.
+//! Walk honors gitignore rules, skips hidden files, and does not follow
+//! symlinks — a misdirected query cannot auto-open secrets that were never
+//! named by the agent.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -77,13 +80,15 @@ pub enum GateProfile {
     Search,
 }
 
-/// Resolve `query` against the gitignore-pruned file tree rooted at `scope`.
+/// Resolve `query` against the file tree rooted at `scope`, honoring
+/// gitignore rules and skipping hidden files. Symlinks are not followed.
 ///
-/// Walks `search::walker(scope, None)`, scores every file's scope-relative path
-/// against `query` with `nucleo-matcher`'s path-aware matcher, and applies the
-/// confidence gate for `gate`. nucleo returns `None` unless `query` is a
-/// subsequence of the candidate — that hard filter rejects stale/garbage paths
-/// (they never auto-resolve).
+/// Walks the scope with a dedicated security-conservative walker (hidden files
+/// excluded, .gitignore honored, symlinks not followed), scores every file's
+/// scope-relative path against `query` with `nucleo-matcher`'s path-aware
+/// matcher, and applies the confidence gate for `gate`. nucleo returns `None`
+/// unless `query` is a subsequence of the candidate — that hard filter rejects
+/// stale/garbage paths (they never auto-resolve).
 #[must_use]
 pub fn resolve_fuzzy_path(scope: &Path, query: &str, gate: GateProfile) -> FuzzyResolution {
     let (candidates, truncated) = collect_candidates(scope);
@@ -150,8 +155,8 @@ fn score_candidates(query: &str, candidates: &[String]) -> Vec<(u16, PathBuf)> {
 /// Apply the confidence gate to score-sorted candidates.
 ///
 /// `Resolved` iff (for `Search`, the query is path-like AND) the top candidate
-/// is the unique match, or it clears `MIN_SCORE` and beats the runner-up by
-/// `MARGIN`. Otherwise the top `SUGGESTION_K` become a "did you mean" list.
+/// clears `MIN_SCORE` and either is unique or beats the runner-up by `MARGIN`.
+/// Otherwise the top `SUGGESTION_K` become a "did you mean" list.
 fn apply_gate(scored: Vec<(u16, PathBuf)>, gate: GateProfile, query: &str) -> FuzzyResolution {
     let (min_score, margin, require_path_like) = match gate {
         GateProfile::Read => (READ_MIN_SCORE, READ_MARGIN, false),
@@ -162,7 +167,7 @@ fn apply_gate(scored: Vec<(u16, PathBuf)>, gate: GateProfile, query: &str) -> Fu
     let (top_score, top_path) = &scored[0];
     let unique = scored.len() == 1;
     let clears_margin = unique || f32::from(*top_score) >= f32::from(scored[1].0) * margin;
-    let clears_floor = unique || *top_score >= min_score;
+    let clears_floor = *top_score >= min_score;
 
     if path_like_ok && clears_margin && clears_floor {
         return FuzzyResolution::Resolved(FuzzyHit {
@@ -179,20 +184,39 @@ fn apply_gate(scored: Vec<(u16, PathBuf)>, gate: GateProfile, query: &str) -> Fu
     FuzzyResolution::Suggestions(suggestions)
 }
 
-/// A query is path-like when it contains a path separator and the final
-/// segment has a file extension. Used by the `Search` gate to refuse
-/// auto-opening a bare-concept query that merely happens to fuzzy-match a file.
+/// A query is path-like when it contains a path separator (`/` or `\\`).
+/// An extension tightens the gate further but is not required — so
+/// `config/Dockerfile` resolves while a bare `symbol` token does not.
+/// Used by the `Search` gate to refuse auto-opening a bare-concept query
+/// that merely happens to fuzzy-match a file.
 fn is_path_like(query: &str) -> bool {
-    query.contains('/') && Path::new(query).extension().is_some()
+    query.contains('/') || query.contains('\\')
 }
 
-/// Walk the gitignore-pruned tree under `scope`, collecting scope-relative path
-/// strings for files only. Returns `(candidates, truncated)`; `truncated` is
-/// true when the walk stopped at `MAX_FUZZY_CANDIDATES`.
+/// Walk the scope, honoring gitignore and skipping hidden files and symlinks,
+/// collecting scope-relative path strings for files only. Uses a dedicated
+/// walker (not the shared `search::walker`) so security settings cannot drift.
+/// Returns `(candidates, truncated)`; `truncated` is true when the walk
+/// stopped at `MAX_FUZZY_CANDIDATES`.
 fn collect_candidates(scope: &Path) -> (Vec<String>, bool) {
-    let Ok(walker) = crate::search::walker(scope, None) else {
-        return (Vec::new(), false);
-    };
+    use ignore::WalkBuilder;
+    let threads = std::env::var("TILTH_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism().map_or(4, |n| (n.get() / 2).clamp(2, 6))
+        });
+    let walker = WalkBuilder::new(scope)
+        .hidden(true)
+        .git_ignore(true)
+        .git_exclude(true)
+        .git_global(true)
+        .ignore(true)
+        .parents(true)
+        .require_git(false)
+        .follow_links(false)
+        .threads(threads)
+        .build_parallel();
 
     let collected: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let count = AtomicUsize::new(0);
@@ -372,6 +396,141 @@ mod tests {
         );
     }
 
+    // ── Finding 1 security regressions ──────────────────────────────────────
+
+    #[test]
+    fn gitignored_file_never_auto_opens() {
+        // A file that is listed in .gitignore must not appear as a Resolved
+        // result even when the query is a clear near-miss of its basename.
+        let dir = tempfile::tempdir().unwrap();
+        // Create the real file and the gitignore file
+        std::fs::write(dir.path().join(".gitignore"), "secret.env\n").unwrap();
+        std::fs::write(dir.path().join("secret.env"), "SECRET=hunter2\n").unwrap();
+        // Also put a real (non-ignored) file so there is a candidate pool
+        let p = dir.path().join("src");
+        std::fs::create_dir_all(&p).unwrap();
+        std::fs::write(p.join("main.rs"), "fn main() {}\n").unwrap();
+        // Query looks like a near-miss of "secret.env"
+        let res = resolve_fuzzy_path(dir.path(), "secre.env", GateProfile::Read);
+        assert!(
+            !matches!(res, FuzzyResolution::Resolved(ref h) if h.path.to_string_lossy().contains("secret.env")),
+            "gitignored file must never be Resolved, even on a near-miss query: {res:?}"
+        );
+    }
+
+    #[test]
+    fn dotfile_never_auto_opens() {
+        // A hidden dotfile (e.g. .env) must not auto-open for a near-miss query.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".env"), "SECRET=hunter2\n").unwrap();
+        let p = dir.path().join("src");
+        std::fs::create_dir_all(&p).unwrap();
+        std::fs::write(p.join("main.rs"), "fn main() {}\n").unwrap();
+        // Queries that are near-misses of ".env"
+        for query in &["env", ".en"] {
+            let res = resolve_fuzzy_path(dir.path(), query, GateProfile::Read);
+            assert!(
+                !matches!(res, FuzzyResolution::Resolved(ref h) if h.path.to_string_lossy().contains(".env")),
+                "hidden dotfile .env must not be Resolved for query {query:?}: {res:?}"
+            );
+        }
+    }
+
+    // ── Finding 2 regression ────────────────────────────────────────────────
+
+    #[test]
+    fn apply_gate_rejects_unique_below_floor() {
+        // A single candidate that is the only subsequence match (unique=true)
+        // but whose score is below MIN_SCORE must return Suggestions, not
+        // Resolved. Before the fix, `clears_floor = unique || score >= floor`
+        // let unique candidates bypass the floor entirely.
+        let below_floor = READ_MIN_SCORE - 1;
+        let scored = vec![(below_floor, PathBuf::from("src/lib.rs"))];
+        let res = apply_gate(scored, GateProfile::Read, "lib.rs");
+        assert!(
+            matches!(res, FuzzyResolution::Suggestions(_)),
+            "unique-but-below-floor candidate must return Suggestions, got {res:?}"
+        );
+    }
+
+    // ── Finding 5 score-threshold regression ────────────────────────────────
+
+    #[test]
+    fn canonical_near_miss_scores_above_search_floor() {
+        // "serch/symbol.rs" is a deletion-typo of "src/search/symbol.rs".
+        // If nucleo's scoring shifts materially this test fails loudly.
+        let candidates = vec!["src/search/symbol.rs".to_string()];
+        let scored = score_candidates("serch/symbol.rs", &candidates);
+        assert!(!scored.is_empty(), "near-miss must be a subsequence match");
+        let (score, _) = scored[0];
+        assert!(
+            score >= SEARCH_MIN_SCORE,
+            "near-miss score {score} must be >= SEARCH_MIN_SCORE={SEARCH_MIN_SCORE} \
+             (nucleo scoring may have shifted)"
+        );
+    }
+
+    #[test]
+    fn short_incidental_subsequence_scores_below_read_floor() {
+        // "ab" matches src/search/symbol.rs only incidentally (score 23 empirically).
+        // If nucleo's scoring shifts so that short incidental sequences score
+        // above the read floor, we'd be auto-opening unrelated files.
+        let candidates = vec!["src/search/symbol.rs".to_string()];
+        let scored = score_candidates("ab", &candidates);
+        // If it matches at all, assert the score is below the read floor.
+        if let Some(&(score, _)) = scored.first() {
+            assert!(
+                score < READ_MIN_SCORE,
+                "short incidental subsequence score {score} must be < READ_MIN_SCORE={READ_MIN_SCORE} \
+                 (nucleo scoring may have shifted)"
+            );
+        }
+        // None is also acceptable (no match → safely excluded regardless of floor)
+    }
+
+    // ── Finding 7 regressions ────────────────────────────────────────────────
+
+    #[test]
+    fn path_like_accepts_slash_without_extension() {
+        // config/Dockerfile has a separator but no extension — must be path-like.
+        assert!(
+            is_path_like("config/Dockerfile"),
+            "path with separator but no extension must be path-like"
+        );
+    }
+
+    #[test]
+    fn path_like_accepts_backslash_separator() {
+        assert!(
+            is_path_like("windows\\path\\file.rs"),
+            "path with backslash separator must be path-like"
+        );
+    }
+
+    #[test]
+    fn path_like_rejects_bare_token() {
+        assert!(
+            !is_path_like("symbol"),
+            "bare token without a separator must not be path-like"
+        );
+        assert!(
+            !is_path_like("MyClass"),
+            "bare identifier without a separator must not be path-like"
+        );
+    }
+
+    #[test]
+    fn search_profile_resolves_dockerfile_path() {
+        // config/Dockerfile is path-like under the new rule (separator present,
+        // no extension). A single-winner match should resolve under Search.
+        let dir = fixture(&["config/Dockerfile", "src/main.rs"]);
+        let res = resolve_fuzzy_path(dir.path(), "config/Dockerfile", GateProfile::Search);
+        assert_eq!(
+            resolved_path(&res).as_deref(),
+            Some("config/Dockerfile"),
+            "Dockerfile path (separator, no extension) must resolve under Search"
+        );
+    }
     impl std::fmt::Debug for FuzzyResolution {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self {
