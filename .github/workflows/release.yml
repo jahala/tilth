@@ -123,12 +123,16 @@ jobs:
   publish-npm:
     needs: build
     runs-on: ubuntu-latest
+    # Trusted publishing (OIDC): no NPM_TOKEN needed; provenance is automatic.
+    permissions:
+      id-token: write
+      contents: read
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # ratchet:actions/checkout@v6
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # ratchet:actions/setup-node@v6
         with:
           node-version: 20
           registry-url: https://registry.npmjs.org
+      # Trusted publishing needs npm >= 11.5.1 (node 20 ships npm 10.x).
+      - run: npm install -g npm@latest
       - run: npm publish ./npm
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
