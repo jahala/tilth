@@ -255,9 +255,10 @@ fn run_inner(
     // FilePath and Glob are read operations, not search — handle before expanded dispatch
     let output = match query_type {
         QueryType::FilePath(path) => {
-            let mut out = read::read_file(&path, section, full, cache, false)?;
-            if section.is_none() && !full && read::would_outline(&path) {
-                let related = read::imports::resolve_related_files(&path);
+            let (mut out, opened) =
+                read::read_file_resolving(&path, section, full, cache, false, scope)?;
+            if section.is_none() && !full && read::would_outline(&opened) {
+                let related = read::imports::resolve_related_files(&opened);
                 if !related.is_empty() {
                     let hints: Vec<String> = related
                         .iter()
@@ -425,10 +426,34 @@ fn single_query_search(
         return search::format_raw_result(&sym_result, cache);
     }
 
-    Err(error::TilthError::NotFound {
-        path: scope.join(text),
-        suggestion: read::suggest_similar_file(scope, text),
-    })
+    fuzzy_path_fallback(scope, text, text, cache)
+}
+
+/// Cold-path fuzzy fallback shared by the search `NotFound` sites. Attempts to
+/// resolve a path-like miss to a real file and auto-open it with a distinct
+/// header; otherwise enriches the `NotFound` with ranked suggestions, falling
+/// back to today's basename suggestion (`legacy_suggest_query`) when nothing
+/// subsequence-matches.
+fn fuzzy_path_fallback(
+    scope: &Path,
+    query: &str,
+    legacy_suggest_query: &str,
+    cache: &cache::OutlineCache,
+) -> Result<String, error::TilthError> {
+    use read::fuzzy_path::{
+        resolve_fuzzy_path, search_auto_open_body, FuzzyResolution, GateProfile,
+    };
+    match resolve_fuzzy_path(scope, query, GateProfile::Search) {
+        FuzzyResolution::Resolved(hit) => search_auto_open_body(scope, &hit, query, cache),
+        FuzzyResolution::Suggestions(s) => Err(error::TilthError::NotFound {
+            path: scope.join(query),
+            suggestion: Some(s.join(", ")),
+        }),
+        FuzzyResolution::None => Err(error::TilthError::NotFound {
+            path: scope.join(query),
+            suggestion: read::suggest_similar_file(scope, legacy_suggest_query),
+        }),
+    }
 }
 
 /// Multi-word concept search: exact phrase first, then relaxed word proximity.
@@ -471,8 +496,5 @@ fn multi_word_concept_search(
     }
 
     let first_word = words.first().copied().unwrap_or(text);
-    Err(error::TilthError::NotFound {
-        path: scope.join(text),
-        suggestion: read::suggest_similar_file(scope, first_word),
-    })
+    fuzzy_path_fallback(scope, text, first_word, cache)
 }
