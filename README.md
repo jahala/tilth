@@ -22,8 +22,8 @@ $ tilth src/auth.ts
 Small files come back whole. Large files get an outline. Drill in with `--section`:
 
 ```bash
-$ tilth src/auth.ts --section 44-89
-$ tilth docs/guide.md --section "## Installation"
+tilth src/auth.ts --section 44-89
+tilth docs/guide.md --section "## Installation"
 ```
 
 ## Search finds definitions first
@@ -60,8 +60,8 @@ Expanded definitions include a **callee footer** (`── calls ──`) showing
 CLI search returns compact results by default. Use `--expand` to inline source for the top matches:
 
 ```bash
-$ tilth handleAuth --scope src/ --expand       # top 2 (default when flag is bare)
-$ tilth handleAuth --scope src/ --expand=5     # top 5
+tilth handleAuth --scope src/ --expand       # top 2 (default when flag is bare)
+tilth handleAuth --scope src/ --expand=5     # top 5
 ```
 
 In MCP mode, `expand` defaults to 2 — no flag needed.
@@ -71,7 +71,7 @@ In MCP mode, `expand` defaults to 2 — no flag needed.
 Trace across files in one call:
 
 ```bash
-$ tilth "ServeHTTP, HandlersChain, Next" --scope .
+tilth "ServeHTTP, HandlersChain, Next" --scope .
 ```
 
 Each symbol gets its own result block with definitions and expansions. The expand budget is shared — at least one expansion per symbol, deduped across files.
@@ -222,21 +222,25 @@ Token-based, not line-based — a 1-line minified bundle gets outlined; a 120-li
 
 ## Edit mode
 
-Install with `--edit` to add `tilth_edit` and switch `tilth_read` to hashline output:
+Install with `--edit` to add `tilth_write` and switch `tilth_read` to hashline output:
 
 ```
 42:a3f|  let x = compute();
 43:f1b|  return x;
 ```
 
-`tilth_edit` uses these hashes as anchors. If the file changed since the last read, hashes won't match and the edit is rejected with current content shown:
+`tilth_write` batches one or more files, each in one of three modes: `hash` (default — replace lines at the hash anchors above), `overwrite` (whole file; create-only unless `overwrite: true`), and `append`. In hash mode the anchors must match the last read; if the file changed since, hashes won't match and the edit is rejected with current content shown:
 
 ```json
 {
-  "path": "src/auth.ts",
-  "edits": [
-    { "start": "42:a3f", "content": "  let x = recompute();" },
-    { "start": "44:b2c", "end": "46:e1d", "content": "" }
+  "files": [
+    {
+      "path": "src/auth.ts",
+      "edits": [
+        { "start": "42:a3f", "content": "  let x = recompute();" },
+        { "start": "44:b2c", "end": "46:e1d", "content": "" }
+      ]
+    }
   ]
 }
 ```

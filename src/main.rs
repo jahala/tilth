@@ -48,7 +48,7 @@ struct Cli {
     #[arg(long)]
     mcp: bool,
 
-    /// Enable edit mode: hashline output + tilth_edit tool.
+    /// Enable edit mode: hashline output + tilth_write tool.
     #[arg(long)]
     edit: bool,
 
@@ -94,7 +94,7 @@ enum Command {
         /// MCP host to configure.
         host: String,
 
-        /// Enable edit mode (hashline output + tilth_edit tool).
+        /// Enable edit mode (hashline output + tilth_write tool).
         #[arg(long)]
         edit: bool,
     },
