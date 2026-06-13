@@ -23,6 +23,51 @@ pub(crate) fn build_diff_symbols(
     out
 }
 
+/// Pair entries within one identity bucket (same name+kind — i.e. overloads).
+/// Exact content-hash twins are paired first regardless of position, so an
+/// unchanged overload matches its real counterpart even after reordering or
+/// insertion; the remainder pair in positional order. Old/new entries left
+/// over (unequal counts) are simply absent from the result and fall through
+/// to the structural/fuzzy phases.
+fn pair_overloads(
+    old: &[DiffSymbol],
+    new: &[DiffSymbol],
+    old_indices: &[usize],
+    new_indices: &[usize],
+) -> Vec<(usize, usize)> {
+    let mut pairs = Vec::with_capacity(old_indices.len().min(new_indices.len()));
+    let mut new_used = vec![false; new_indices.len()];
+    let mut old_unpaired: Vec<usize> = Vec::new();
+
+    // Pass 1: exact content-hash matches (order-independent).
+    for &oi in old_indices {
+        let twin = new_indices
+            .iter()
+            .enumerate()
+            .find(|(slot, &ni)| !new_used[*slot] && old[oi].content_hash == new[ni].content_hash);
+        if let Some((slot, &ni)) = twin {
+            new_used[slot] = true;
+            pairs.push((oi, ni));
+        } else {
+            old_unpaired.push(oi);
+        }
+    }
+
+    // Pass 2: pair the leftovers in positional order.
+    let mut remaining_new = new_indices
+        .iter()
+        .enumerate()
+        .filter(|(slot, _)| !new_used[*slot])
+        .map(|(_, &ni)| ni);
+    for oi in old_unpaired {
+        if let Some(ni) = remaining_new.next() {
+            pairs.push((oi, ni));
+        }
+    }
+
+    pairs
+}
+
 /// Three-phase symbol matching: identity → structural → fuzzy.
 ///
 /// Returns a `SymbolChange` for **every** matched pair (including unchanged)
@@ -40,12 +85,15 @@ pub(crate) fn match_symbols(old: &[DiffSymbol], new: &[DiffSymbol]) -> Vec<Symbo
 
     for (id, old_indices) in &old_by_id {
         if let Some(new_indices) = new_by_id.get(id) {
-            // Match by position order for overloads
-            for (oi, ni) in old_indices.iter().zip(new_indices.iter()) {
-                let o = &old[*oi];
-                let n = &new[*ni];
-                old_matched[*oi] = true;
-                new_matched[*ni] = true;
+            // Pair overloads by exact content-hash first, then the remainder
+            // by position. Naive positional zip mis-pairs a reordered or
+            // mid-list-inserted overload with its positional neighbour and
+            // reports a spurious SignatureChanged/BodyChanged.
+            for (oi, ni) in pair_overloads(old, new, old_indices, new_indices) {
+                let o = &old[oi];
+                let n = &new[ni];
+                old_matched[oi] = true;
+                new_matched[ni] = true;
 
                 if o.content_hash == n.content_hash {
                     changes.push(SymbolChange {
@@ -662,6 +710,62 @@ mod tests {
             .filter(|c| matches!(c.change, ChangeType::BodyChanged))
             .collect();
         assert_eq!(body_changes.len(), 2);
+    }
+
+    // 4b. reordered overload: the unchanged twin must match exactly, not
+    // mis-pair positionally and report a spurious BodyChanged.
+    #[test]
+    fn overload_reorder_matches_unchanged_twin() {
+        let old = vec![
+            make_sym(
+                OutlineKind::Function,
+                "process",
+                "",
+                "fn process() { a }",
+                Some("fn process()"),
+            ),
+            make_sym(
+                OutlineKind::Function,
+                "process",
+                "",
+                "fn process() { b }",
+                Some("fn process()"),
+            ),
+        ];
+        // New: order swapped; `{ b }` is unchanged, `{ a }` became `{ a_new }`.
+        let new = vec![
+            make_sym(
+                OutlineKind::Function,
+                "process",
+                "",
+                "fn process() { b }",
+                Some("fn process()"),
+            ),
+            make_sym(
+                OutlineKind::Function,
+                "process",
+                "",
+                "fn process() { a_new }",
+                Some("fn process()"),
+            ),
+        ];
+        let changes = match_symbols(&old, &new);
+        let unchanged = changes
+            .iter()
+            .filter(|c| matches!(c.change, ChangeType::Unchanged))
+            .count();
+        let body_changed = changes
+            .iter()
+            .filter(|c| matches!(c.change, ChangeType::BodyChanged))
+            .count();
+        assert_eq!(
+            unchanged, 1,
+            "the unchanged `{{ b }}` overload must match its twin exactly"
+        );
+        assert_eq!(
+            body_changed, 1,
+            "only the `{{ a }}`→`{{ a_new }}` overload changed"
+        );
     }
 
     // 5. rename_detection_structural_hash

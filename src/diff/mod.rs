@@ -187,6 +187,7 @@ fn run_git_diff(source: &DiffSource) -> Result<String, String> {
     }
 
     let mut cmd = Command::new("git");
+    cmd.args(["-c", "core.quotePath=false"]);
     cmd.arg("diff");
 
     match source {
@@ -319,9 +320,12 @@ pub fn diff(
             }
         }
         if !all_conflicts.is_empty() {
-            output.push('\n');
             for (path, conflicts) in &all_conflicts {
+                output.push('\n');
                 output.push_str(&format::format_conflicts(conflicts, path));
+            }
+            if let Some(b) = budget {
+                output = crate::budget::apply(&output, b);
             }
         }
     }
