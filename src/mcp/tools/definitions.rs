@@ -298,6 +298,10 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "type": "boolean",
                         "default": false,
                         "description": "Set true to include a compact diff of changes in the response per file."
+                    },
+                    "root": {
+                        "type": "string",
+                        "description": "Optional absolute path. When provided, every RELATIVE file path in this call is anchored under `root` instead of the server's process cwd. Absolute file paths are used as-is. Use this when the server was launched from a different directory than the worktree you are editing."
                     }
                 }
             }

@@ -489,11 +489,18 @@ fn apply_one(
         }
         FileEditTask::Ready { path, edits } => (path, edits),
     };
-    let header = format!("## {}", path.display());
+    let display_path = format!("{}", path.display());
     match render_applied(&path, &edits, bloom, show_diff) {
-        Ok(body) if body.is_empty() => (header, Some(path)),
-        Ok(body) => (format!("{header}\n{body}"), Some(path)),
-        Err(msg) => (format!("{header}\n{msg}"), None),
+        Ok(body) => {
+            let abs = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+            let header = format!("## {}", abs.display());
+            if body.is_empty() {
+                (header, Some(path))
+            } else {
+                (format!("{header}\n{body}"), Some(path))
+            }
+        }
+        Err(msg) => (format!("## {display_path}\n{msg}"), None),
     }
 }
 

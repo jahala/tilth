@@ -21,5 +21,6 @@ A parse error on one edit invalidates ALL edits for that file (none applied); re
 Each file path may appear at most once per call — group all edits for a file under its single entry.
 Large files: tilth_read shows outline — use section to get hashlined content.
 Pass diff: true to see a compact before/after diff per file.
+Pass root: "/abs/path" to anchor ALL relative file paths in the call to that directory instead of the server's cwd. Use this when the server launched from a different directory than the worktree you are editing. Absolute paths are always used as-is. Every successful write echoes its resolved absolute path so you can confirm where the edit landed.
 After editing a function signature, tilth_write shows callers that may need updating.
 DO NOT use the host Edit or Write tool. Use tilth_write for all writes.
