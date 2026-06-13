@@ -417,22 +417,25 @@ pub fn search_callers_expanded(
                     );
                 }
 
-                let _ = writeln!(
-                    output,
-                    "\n{} functions affected across 2 hops.",
-                    sorted_callers.len() + count
-                );
+                let _ = writeln!(output, "\n{} functions affected across 2 hops.", {
+                    // Dedup hop-1 by calling_function for a distinct-function count.
+                    let hop1_fns: std::collections::HashSet<&str> = sorted_callers
+                        .iter()
+                        .filter(|c| c.calling_function != "<top-level>")
+                        .map(|c| c.calling_function.as_str())
+                        .collect();
+                    hop1_fns.len() + unique_total
+                });
             }
         }
     }
 
     let tokens = crate::types::estimate_tokens(output.len() as u64);
-    let token_str = if tokens >= 1000 {
-        format!("~{}.{}k", tokens / 1000, (tokens % 1000) / 100)
-    } else {
-        format!("~{tokens}")
-    };
-    let _ = write!(output, "\n\n({token_str} tokens)");
+    let _ = write!(
+        output,
+        "\n\n({} tokens)",
+        crate::search::format_token_count(tokens)
+    );
     Ok(output)
 }
 
@@ -539,12 +542,11 @@ pub fn search_callers_multi_expanded(
     }
 
     let tokens = crate::types::estimate_tokens(output.len() as u64);
-    let token_str = if tokens >= 1000 {
-        format!("~{}.{}k", tokens / 1000, (tokens % 1000) / 100)
-    } else {
-        format!("~{tokens}")
-    };
-    let _ = write!(output, "\n({token_str} tokens)");
+    let _ = write!(
+        output,
+        "\n({} tokens)",
+        crate::search::format_token_count(tokens)
+    );
     Ok(output)
 }
 

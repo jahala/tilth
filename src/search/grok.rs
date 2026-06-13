@@ -954,6 +954,9 @@ fn is_recursive_call_site(
     canonical_target: &Path,
     target: &ResolvedTarget,
 ) -> bool {
+    // Edge case: a legitimately distinct same-named call site nested inside the
+    // target body (e.g. a recursive closure with the same name) would also be
+    // filtered here. Acceptable tradeoff — true self-recursion is the common case.
     m.path == canonical_target
         && m.line >= target.start_line
         && m.line <= target.end_line
