@@ -135,4 +135,12 @@ jobs:
           registry-url: https://registry.npmjs.org
       # Trusted publishing needs npm >= 11.5.1 (node 20 ships npm 10.x).
       - run: npm install -g npm@latest
+      # Primary package: unscoped `tilth`
       - run: npm publish ./npm
+      # Anchor the @plotplot org: dual-publish the SAME artifact as `@plotplot/tilth`.
+      # Requires a trusted publisher for @plotplot/tilth configured on npmjs.com (one-time).
+      - name: Dual-publish under the @plotplot scope
+        working-directory: ./npm
+        run: |
+          npm pkg set name=@plotplot/tilth
+          npm publish --access public
