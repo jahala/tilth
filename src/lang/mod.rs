@@ -2,69 +2,114 @@ pub mod detection;
 pub mod outline;
 pub mod treesitter;
 
+pub(crate) mod spec;
+
+pub(crate) mod c;
+pub(crate) mod cpp;
+pub(crate) mod csharp;
+pub(crate) mod dockerfile;
+pub(crate) mod elixir;
+pub(crate) mod go;
+pub(crate) mod java;
+pub(crate) mod javascript;
+pub(crate) mod kotlin;
+pub(crate) mod make;
+pub(crate) mod php;
+pub(crate) mod python;
+pub(crate) mod ruby;
+pub(crate) mod rust;
+pub(crate) mod scala;
+pub(crate) mod swift;
+pub(crate) mod tsx;
+pub(crate) mod typescript;
+
 use std::path::Path;
 
 use crate::types::{FileType, Lang};
 
+/// Every `Lang` variant, in declaration order. Used to scan per-language
+/// `spec(lang)` data when building extension / filename / manifest lookups.
+const ALL_LANGS: &[Lang] = &[
+    Lang::Rust,
+    Lang::TypeScript,
+    Lang::Tsx,
+    Lang::JavaScript,
+    Lang::Python,
+    Lang::Go,
+    Lang::Java,
+    Lang::Scala,
+    Lang::C,
+    Lang::Cpp,
+    Lang::Ruby,
+    Lang::Php,
+    Lang::Swift,
+    Lang::Kotlin,
+    Lang::CSharp,
+    Lang::Elixir,
+    Lang::Dockerfile,
+    Lang::Make,
+];
+
+/// Test-only accessor for the full `Lang` set, so `spec`'s table-invariant
+/// tests can iterate every variant without making `ALL_LANGS` public.
+#[cfg(test)]
+pub(crate) fn mod_all_langs_for_test() -> &'static [Lang] {
+    ALL_LANGS
+}
+
 /// Detect file type by extension, then by name.
 pub fn detect_file_type(path: &Path) -> FileType {
     match path.extension().and_then(|e| e.to_str()) {
-        Some("ts") => FileType::Code(Lang::TypeScript),
-        Some("tsx") => FileType::Code(Lang::Tsx),
-        Some("js" | "jsx") => FileType::Code(Lang::JavaScript),
-        Some("py" | "pyi") => FileType::Code(Lang::Python),
-        Some("rs") => FileType::Code(Lang::Rust),
-        Some("go") => FileType::Code(Lang::Go),
-        Some("java") => FileType::Code(Lang::Java),
-        Some("scala" | "sc") => FileType::Code(Lang::Scala),
-        Some("c" | "h") => FileType::Code(Lang::C),
-        Some("cpp" | "hpp" | "cc" | "cxx") => FileType::Code(Lang::Cpp),
-        Some("rb") => FileType::Code(Lang::Ruby),
-        Some("php" | "phtml") => FileType::Code(Lang::Php),
-        Some("swift") => FileType::Code(Lang::Swift),
-        Some("kt" | "kts") => FileType::Code(Lang::Kotlin),
-        Some("cs") => FileType::Code(Lang::CSharp),
-        Some("ex" | "exs") => FileType::Code(Lang::Elixir),
-
-        Some("md" | "mdx" | "rst") => FileType::Markdown,
-        Some("json" | "yaml" | "yml" | "toml" | "xml" | "ini") => FileType::StructuredData,
-        Some("csv" | "tsv") => FileType::Tabular,
-        Some("log") => FileType::Log,
-
+        Some(ext) => {
+            // Code extensions come from each language's `spec.extensions`.
+            for &lang in ALL_LANGS {
+                if spec::spec(lang).extensions.contains(&ext) {
+                    return FileType::Code(lang);
+                }
+            }
+            // Non-code extensions stay enumerated here.
+            match ext {
+                "md" | "mdx" | "rst" => FileType::Markdown,
+                "json" | "yaml" | "yml" | "toml" | "xml" | "ini" => FileType::StructuredData,
+                "csv" | "tsv" => FileType::Tabular,
+                "log" => FileType::Log,
+                _ => FileType::Other,
+            }
+        }
         None => file_type_from_name(path),
-        _ => FileType::Other,
     }
 }
 
 fn file_type_from_name(path: &Path) -> FileType {
-    match path.file_name().and_then(|n| n.to_str()) {
-        Some("Dockerfile" | "Containerfile") => FileType::Code(Lang::Dockerfile),
-        Some("Makefile" | "GNUmakefile") => FileType::Code(Lang::Make),
-        Some("Vagrantfile" | "Rakefile") => FileType::Code(Lang::Ruby),
-        Some(n) if n.starts_with(".env") => FileType::StructuredData,
-        _ => FileType::Other,
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return FileType::Other;
+    };
+    // Code filenames come from each language's `spec.filenames`.
+    for &lang in ALL_LANGS {
+        if spec::spec(lang).filenames.contains(&name) {
+            return FileType::Code(lang);
+        }
     }
+    if name.starts_with(".env") {
+        return FileType::StructuredData;
+    }
+    FileType::Other
 }
 
 /// Find the nearest package root by looking for manifest files.
+///
+/// The manifest list is aggregated from every language's `spec.manifests`. A
+/// directory is a package root if it contains *any* manifest; order is
+/// irrelevant because the matched directory is returned regardless of which
+/// manifest hit.
 pub(crate) fn package_root(path: &Path) -> Option<&Path> {
-    const MANIFESTS: &[&str] = &[
-        "Cargo.toml",
-        "package.json",
-        "pyproject.toml",
-        "setup.py",
-        "go.mod",
-        "pom.xml",
-        "build.gradle",
-        "build.sbt",
-        "mix.exs",
-        "composer.json", // PHP / Laravel
-    ];
     let mut dir = path;
     loop {
-        for m in MANIFESTS {
-            if dir.join(m).exists() {
-                return Some(dir);
+        for &lang in ALL_LANGS {
+            for m in spec::spec(lang).manifests {
+                if dir.join(m).exists() {
+                    return Some(dir);
+                }
             }
         }
         dir = dir.parent()?;

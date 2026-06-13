@@ -5,10 +5,10 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 
 use super::file_metadata;
+use crate::lang::elixir::is_elixir_definition;
+use crate::lang::spec::{spec, DefinitionOps, DEFAULT_DEFS, DEFAULT_DEF_KINDS};
 use crate::lang::treesitter::{
-    definition_weight, elixir_definition_weight, extract_definition_name,
-    extract_elixir_definition_name, extract_impl_trait, extract_impl_type,
-    extract_implemented_interfaces, is_elixir_definition, DEFINITION_KINDS,
+    extract_definition_name, extract_impl_trait, extract_impl_type, extract_implemented_interfaces,
 };
 
 use crate::error::TilthError;
@@ -355,9 +355,21 @@ fn walk_for_definitions(
 
     let kind = node.kind();
 
-    if DEFINITION_KINDS.contains(&kind) {
+    // Definition kinds and name/weight ops come from the per-language spec. For
+    // a known language these are `spec(lang).definition_kinds` / `.definitions`
+    // (the shared defaults for every language except Elixir, which carries its
+    // own); when `lang` is unknown we fall back to the shared defaults.
+    let (def_kinds, def_ops): (&[&str], &DefinitionOps) = match lang {
+        Some(l) => {
+            let s = spec(l);
+            (s.definition_kinds, &s.definitions)
+        }
+        None => (DEFAULT_DEF_KINDS, &DEFAULT_DEFS),
+    };
+
+    if def_kinds.contains(&kind) {
         // Check if this node defines the queried symbol
-        if let Some(name) = extract_definition_name(node, lines) {
+        if let Some(name) = (def_ops.extract_name)(node, lines) {
             if name == query {
                 let line_num = node.start_position().row as u32 + 1;
                 let line_text = lines
@@ -377,7 +389,7 @@ fn walk_for_definitions(
                         node.end_position().row as u32 + 1,
                     )),
                     def_name: Some(query.to_string()),
-                    def_weight: definition_weight(node.kind()),
+                    def_weight: (def_ops.weight)(node, lines),
                     impl_target: None,
                 });
             }
@@ -442,8 +454,9 @@ fn walk_for_definitions(
             }
         }
     } else if lang == Some(crate::types::Lang::Elixir) && is_elixir_definition(node, lines) {
-        // Elixir: definitions are `call` nodes — check separately
-        if let Some(name) = extract_elixir_definition_name(node, lines) {
+        // Elixir: definitions are `call` nodes — check separately. Name and
+        // weight come from `spec(Elixir).definitions` via `def_ops`.
+        if let Some(name) = (def_ops.extract_name)(node, lines) {
             if name == query {
                 let line_num = node.start_position().row as u32 + 1;
                 let line_text = lines
@@ -463,7 +476,7 @@ fn walk_for_definitions(
                         node.end_position().row as u32 + 1,
                     )),
                     def_name: Some(query.to_string()),
-                    def_weight: elixir_definition_weight(node, lines),
+                    def_weight: (def_ops.weight)(node, lines),
                     impl_target: None,
                 });
             }

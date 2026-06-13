@@ -12,66 +12,7 @@ use crate::types::Lang;
 /// Return the tree-sitter query string for extracting callee names in the given language.
 /// Each language has patterns targeting `@callee` captures on call-like expressions.
 pub(super) fn callee_query_str(lang: Lang) -> Option<&'static str> {
-    match lang {
-        Lang::Rust => Some(concat!(
-            "(call_expression function: (identifier) @callee)\n",
-            "(call_expression function: (field_expression field: (field_identifier) @callee))\n",
-            "(call_expression function: (scoped_identifier name: (identifier) @callee))\n",
-            "(macro_invocation macro: (identifier) @callee)\n",
-        )),
-        Lang::Go => Some(concat!(
-            "(call_expression function: (identifier) @callee)\n",
-            "(call_expression function: (selector_expression field: (field_identifier) @callee))\n",
-        )),
-        Lang::Python => Some(concat!(
-            "(call function: (identifier) @callee)\n",
-            "(call function: (attribute attribute: (identifier) @callee))\n",
-        )),
-        Lang::JavaScript | Lang::TypeScript | Lang::Tsx => Some(concat!(
-            "(call_expression function: (identifier) @callee)\n",
-            "(call_expression function: (member_expression property: (property_identifier) @callee))\n",
-        )),
-        Lang::Java => Some(
-            "(method_invocation name: (identifier) @callee)\n",
-        ),
-        Lang::Scala => Some(concat!(
-            "(call_expression function: (identifier) @callee)\n",
-            "(call_expression function: (field_expression field: (identifier) @callee))\n",
-            "(infix_expression operator: (identifier) @callee)\n",
-        )),
-        Lang::C | Lang::Cpp => Some(concat!(
-            "(call_expression function: (identifier) @callee)\n",
-            "(call_expression function: (field_expression field: (field_identifier) @callee))\n",
-        )),
-        Lang::Ruby => Some(
-            "(call method: (identifier) @callee)\n",
-        ),
-        Lang::Php => Some(concat!(
-            "(function_call_expression function: (name) @callee)\n",
-            "(function_call_expression function: (qualified_name) @callee)\n",
-            "(function_call_expression function: (relative_name) @callee)\n",
-            "(member_call_expression name: (name) @callee)\n",
-            "(nullsafe_member_call_expression name: (name) @callee)\n",
-            "(scoped_call_expression name: (name) @callee)\n",
-        )),
-        Lang::CSharp => Some(concat!(
-            "(invocation_expression function: (identifier) @callee)\n",
-            "(invocation_expression function: (member_access_expression name: (identifier) @callee))\n",
-        )),
-        Lang::Swift => Some(concat!(
-            "(call_expression (simple_identifier) @callee)\n",
-            "(call_expression (navigation_expression suffix: (navigation_suffix suffix: (simple_identifier) @callee)))\n",
-        )),
-        Lang::Kotlin => Some(concat!(
-            "(call_expression (identifier) @callee)\n",
-            "(call_expression (navigation_expression (identifier) @callee .))\n",
-        )),
-        Lang::Elixir => Some(concat!(
-            "(call target: (identifier) @callee)\n",
-            "(call target: (dot right: (identifier) @callee))\n",
-        )),
-        _ => None,
-    }
+    crate::lang::spec::spec(lang).callee_query
 }
 
 /// Global cache of compiled tree-sitter queries for callee extraction.

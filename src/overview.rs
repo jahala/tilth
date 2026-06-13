@@ -236,26 +236,7 @@ fn common_dir_prefix(mods: &[(String, usize)]) -> String {
 // ---------------------------------------------------------------------------
 
 fn lang_display_name(lang: Lang) -> &'static str {
-    match lang {
-        Lang::Rust => "Rust",
-        Lang::TypeScript => "TypeScript",
-        Lang::Tsx => "TSX",
-        Lang::JavaScript => "JavaScript",
-        Lang::Python => "Python",
-        Lang::Go => "Go",
-        Lang::Java => "Java",
-        Lang::Scala => "Scala",
-        Lang::C => "C",
-        Lang::Cpp => "C++",
-        Lang::Ruby => "Ruby",
-        Lang::Php => "PHP",
-        Lang::Swift => "Swift",
-        Lang::Kotlin => "Kotlin",
-        Lang::CSharp => "C#",
-        Lang::Elixir => "Elixir",
-        Lang::Dockerfile => "Docker",
-        Lang::Make => "Make",
-    }
+    crate::lang::spec::spec(lang).display
 }
 
 // ---------------------------------------------------------------------------

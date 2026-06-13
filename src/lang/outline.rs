@@ -3,29 +3,7 @@ use crate::types::{Lang, OutlineEntry, OutlineKind};
 
 /// Get the tree-sitter Language for a given Lang variant.
 pub fn outline_language(lang: Lang) -> Option<tree_sitter::Language> {
-    let lang = match lang {
-        Lang::Rust => tree_sitter_rust::LANGUAGE,
-        Lang::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT,
-        Lang::Tsx => tree_sitter_typescript::LANGUAGE_TSX,
-        Lang::JavaScript => tree_sitter_javascript::LANGUAGE,
-        Lang::Python => tree_sitter_python::LANGUAGE,
-        Lang::Scala => tree_sitter_scala::LANGUAGE,
-        Lang::Go => tree_sitter_go::LANGUAGE,
-        Lang::Java => tree_sitter_java::LANGUAGE,
-        Lang::C => tree_sitter_c::LANGUAGE,
-        Lang::Cpp => tree_sitter_cpp::LANGUAGE,
-        Lang::Ruby => tree_sitter_ruby::LANGUAGE,
-        Lang::Php => tree_sitter_php::LANGUAGE_PHP,
-        // Languages without shipped grammars — fall back
-        Lang::CSharp => tree_sitter_c_sharp::LANGUAGE,
-        Lang::Swift => tree_sitter_swift::LANGUAGE,
-        Lang::Kotlin => tree_sitter_kotlin_ng::LANGUAGE,
-        Lang::Elixir => tree_sitter_elixir::LANGUAGE,
-        Lang::Dockerfile | Lang::Make => {
-            return None;
-        }
-    };
-    Some(lang.into())
+    crate::lang::spec::spec(lang).grammar.map(Into::into)
 }
 
 /// Parse markdown content into a tree-sitter block tree.
@@ -466,7 +444,7 @@ fn extract_doc(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
 /// This is the subset of definition keywords handled uniformly (extract function
 /// name from arguments). Container keywords (`defmodule`, `defprotocol`, `defimpl`,
 /// `defstruct`, `defexception`) have their own match arms in `elixir_call_to_entry`.
-/// See also `ELIXIR_DEFINITION_TARGETS` in `treesitter.rs` for the complete set.
+/// See also `ELIXIR_DEFINITION_TARGETS` in `elixir.rs` for the complete set.
 const ELIXIR_DEF_KEYWORDS: &[&str] = &[
     "def",
     "defp",
