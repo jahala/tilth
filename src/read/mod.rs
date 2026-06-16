@@ -15,6 +15,11 @@ use crate::lang::outline::{heading_level, heading_text, parse_markdown};
 use crate::types::{estimate_tokens, FileType, ViewMode};
 
 pub(crate) const TOKEN_THRESHOLD: u64 = 6_000;
+/// Minimum compression ratio required to prefer the outline over full content.
+/// If `outline_tokens >= full_tokens * OUTLINE_MIN_COMPRESSION / 100`, the
+/// outline saves too few tokens to be worth the information loss, so the full
+/// file is returned instead. Integer arithmetic: 80 means 80%.
+const OUTLINE_MIN_COMPRESSION: u64 = 80;
 const FILE_SIZE_CAP: u64 = 500_000; // 500KB
 
 /// Max file size for `full=true` reads. Files above this threshold get a
@@ -145,14 +150,20 @@ pub fn read_file(
         ));
     }
 
-    // Full mode or small file → return full content (skip smart view)
-    if full || tokens <= TOKEN_THRESHOLD {
+    // Canonical full-content view — shared by the small-file gate and OGATE below.
+    let full_view = || {
         let header = format::file_header(path, byte_len, line_count, ViewMode::Full);
         if edit_mode {
             let numbered = format::hashlines(&content, 1);
-            return Ok(format!("{header}\n\n{numbered}"));
+            format!("{header}\n\n{numbered}")
+        } else {
+            format!("{header}\n\n{content}")
         }
-        return Ok(format!("{header}\n\n{content}"));
+    };
+
+    // Full mode or small file → return full content (skip smart view)
+    if full || tokens <= TOKEN_THRESHOLD {
+        return Ok(full_view());
     }
 
     // Large file → smart view by file type
@@ -164,6 +175,14 @@ pub fn read_file(
     let outline = cache.get_or_compute(path, mtime, || {
         outline::generate(path, file_type, &content, buf, capped)
     });
+
+    // OGATE: if the outline is not meaningfully smaller than the full file,
+    // return the full file — same token cost with less information is strictly
+    // worse and forces the caller to do a second read.
+    let outline_tokens = estimate_tokens(outline.len() as u64);
+    if outline_tokens >= tokens * OUTLINE_MIN_COMPRESSION / 100 {
+        return Ok(full_view());
+    }
 
     let mode = match file_type {
         FileType::StructuredData => ViewMode::Keys,
@@ -1078,6 +1097,86 @@ mod tests {
             "output {} tokens > budget {budget}: {out}",
             estimate_tokens(out.len() as u64)
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // OGATE: "never-worse outline gate" — if the outline barely compresses
+    // (outline_tokens >= 80% of full-file tokens), return full content instead.
+    #[test]
+    fn ogate_flat_file_returns_full_when_outline_barely_compresses() {
+        use std::fmt::Write as _;
+        // Build a Rust file with many short one-liner declarations.
+        // Each line is a complete `pub const`/`pub fn` so tree-sitter
+        // will generate an outline entry — but the body is empty, so
+        // the outline is nearly as long as the full file. We add a
+        // distinctive body string that only appears in the raw file,
+        // not in any outline entry, so we can prove we got the full file.
+        let mut src = String::new();
+        for i in 0..800 {
+            // fn with a distinct body comment that outline will strip
+            writeln!(src, "pub fn flat_{i}() {{ /* BODY_MARKER_{i} */ }}").unwrap();
+        }
+        // Total bytes ≈ 800 * ~40 = ~32 000 bytes → ~8 000 tokens (> TOKEN_THRESHOLD)
+        let path = write_temp("tilth_ogate_flat.rs", &src);
+
+        let cache = OutlineCache::new();
+        let result = read_file(&path, None, false, &cache, false).unwrap();
+
+        // Gate must have fired: the output contains actual body content
+        // that an outline would never include.
+        assert!(
+            result.contains("BODY_MARKER_0"),
+            "expected full content (BODY_MARKER_0 present), got outline: {}",
+            &result[..result.len().min(400)]
+        );
+        assert!(
+            result.contains("BODY_MARKER_799"),
+            "expected full content (BODY_MARKER_799 present)"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Contrasting test: a large file with big function bodies compresses well
+    /// and must still return the OUTLINE (gate must NOT fire).
+    #[test]
+    fn ogate_large_compressible_file_returns_outline() {
+        use std::fmt::Write as _;
+        // Each function has a large body (many comment lines) so the outline
+        // (which only shows the `fn` signature) is a tiny fraction of the
+        // full-file token count.
+        let mut src = String::new();
+        for i in 0..40 {
+            writeln!(src, "pub fn heavy_{i}() {{").unwrap();
+            // 200 lines of body per function → ~200 * 30 = 6 000 bytes each
+            for j in 0..200 {
+                writeln!(
+                    src,
+                    "    let _x_{j}: u64 = {j}_{i}_padding_value_that_fills_space;"
+                )
+                .unwrap();
+            }
+            writeln!(src, "}}").unwrap();
+        }
+        // Total ≈ 40 * 202 lines * ~50 bytes = ~400 KB → well over TOKEN_THRESHOLD
+        let path = write_temp("tilth_ogate_heavy.rs", &src);
+
+        let cache = OutlineCache::new();
+        let result = read_file(&path, None, false, &cache, false).unwrap();
+
+        // Gate must NOT have fired: the output should be an outline, not full content.
+        // An outline shows signatures but omits the body.
+        assert!(
+            result.contains("heavy_0"),
+            "expected outline to mention function name heavy_0: {}",
+            &result[..result.len().min(400)]
+        );
+        // Body variable lines are only in the full file, not in an outline
+        assert!(
+            !result.contains("_x_0: u64"),
+            "outline must not contain body variables; got full content instead"
+        );
+
         let _ = std::fs::remove_file(&path);
     }
 }

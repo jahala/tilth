@@ -416,12 +416,22 @@ mod tests {
     fn tool_read_full_flag_is_legacy_alias_for_mode_full() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("aliased.rs");
-        // Body must exceed TOKEN_THRESHOLD (6k tokens ≈ 24KB) so `auto` outlines
-        // rather than dumping full — making the alias equivalence observable, not
-        // a trivial small-file match where auto and full coincide.
+        // Body must exceed TOKEN_THRESHOLD (6k tokens ≈ 24KB) AND compress well
+        // so `auto` returns an outline rather than full content — making the
+        // alias equivalence observable, not a trivial small-file match where
+        // auto and full coincide. Functions have large bodies so the outline
+        // (signatures only) is a small fraction of the full-file token cost,
+        // ensuring OGATE does not fire and auto != full.
         let mut src = String::from("// header comment\n");
-        for i in 0..1500 {
-            src.push_str(&format!("fn f_{i}() {{\n    let v_{i} = {i};\n}}\n"));
+        for i in 0..80 {
+            src.push_str(&format!("fn f_{i}() {{\n"));
+            // Large body: many statements so the outline compresses well
+            for j in 0..30 {
+                src.push_str(&format!(
+                    "    let local_var_{j}_in_fn_{i}: u64 = {j} + {i};\n"
+                ));
+            }
+            src.push_str("}\n");
         }
         std::fs::write(&path, &src).unwrap();
         let cache = OutlineCache::new();
