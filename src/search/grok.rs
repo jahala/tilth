@@ -559,6 +559,10 @@ fn body_with_dedup(
         target.path.display(),
         target.start_line
     );
+    session.record_savings(
+        crate::types::estimate_tokens(full.len() as u64),
+        crate::types::estimate_tokens(preview.len() as u64),
+    );
     preview
 }
 
@@ -1869,5 +1873,75 @@ pub fn outer(x: u32) -> u32 {
             r2.delegate_body.is_none(),
             "large fn must not expand on re-grok despite degraded body"
         );
+    }
+
+    // ── SAVINGS tests ───────────────────────────────────────────
+
+    /// First grok of a large body: no degradation, savings zero.
+    /// Second grok of the same body: degraded to preview, savings > 0.
+    #[test]
+    fn grok_degradation_records_savings() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(tmp.path(), "src/lib.rs", &long_body_fixture("savings_fn"));
+        let bloom = BloomFilterCache::default();
+        let session = crate::session::Session::default();
+
+        // First grok — full body, no degradation, no savings from body_with_dedup.
+        let _ = grok(
+            "savings_fn",
+            tmp.path(),
+            &bloom,
+            &session,
+            GrokCaps::default(),
+        )
+        .unwrap();
+        let (baseline_after_first, saved_after_first) = session.savings();
+        assert_eq!(
+            baseline_after_first, 0,
+            "first grok (full body, no degradation) must not record savings, got baseline={baseline_after_first}"
+        );
+        assert_eq!(
+            saved_after_first, 0,
+            "first grok must record no savings, got saved={saved_after_first}"
+        );
+
+        // Second grok — body_with_dedup degrades to preview.
+        let r2 = grok(
+            "savings_fn",
+            tmp.path(),
+            &bloom,
+            &session,
+            GrokCaps::default(),
+        )
+        .unwrap();
+        assert!(
+            r2.body.contains("shown earlier"),
+            "precondition: second grok must degrade"
+        );
+        let (baseline_after_second, saved_after_second) = session.savings();
+        assert!(
+            baseline_after_second > 0,
+            "degradation must record a non-zero baseline, got {baseline_after_second}"
+        );
+        assert!(
+            saved_after_second > 0,
+            "degradation must record tokens saved, got {saved_after_second}"
+        );
+    }
+
+    /// A short body (at or below BODY_DEGRADE_THRESHOLD) never degrades,
+    /// so savings remain zero across repeated calls.
+    #[test]
+    fn grok_short_body_degradation_records_no_savings() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(tmp.path(), "src/lib.rs", "pub fn tiny() { 1 }\n");
+        let bloom = BloomFilterCache::default();
+        let session = crate::session::Session::default();
+
+        let _ = grok("tiny", tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
+        let _ = grok("tiny", tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
+        let (baseline, saved) = session.savings();
+        assert_eq!(baseline, 0, "sub-threshold body must not record savings");
+        assert_eq!(saved, 0, "sub-threshold body must not record savings");
     }
 }

@@ -681,6 +681,42 @@ fn format_single_match(
                                         skip_lines.insert(ln);
                                     }
                                 }
+
+                                // Record token savings: full def body vs kept lines.
+                                // Measure raw line content (bytes + 1 for newline each),
+                                // independent of any surrounding formatting.
+                                if let Some(sess) = session {
+                                    let body_lines: Vec<&str> = content
+                                        .lines()
+                                        .enumerate()
+                                        .filter_map(|(i, l)| {
+                                            let ln = (i as u32) + 1;
+                                            if ln >= def_start && ln <= def_end {
+                                                Some(l)
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                        .collect();
+                                    let full_bytes: u64 =
+                                        body_lines.iter().map(|l| l.len() as u64 + 1).sum();
+                                    let kept_bytes: u64 = body_lines
+                                        .iter()
+                                        .enumerate()
+                                        .filter_map(|(i, l)| {
+                                            let ln = def_start + i as u32;
+                                            if keep_set.contains(&ln) {
+                                                Some(l.len() as u64 + 1)
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                        .sum();
+                                    sess.record_savings(
+                                        crate::types::estimate_tokens(full_bytes),
+                                        crate::types::estimate_tokens(kept_bytes),
+                                    );
+                                }
                             }
                         }
                     }
@@ -2356,5 +2392,122 @@ mod tests {
             let _ = &out[start..end];
             cursor = end;
         }
+    }
+
+    // ── SAVINGS tests ───────────────────────────────────────────
+
+    /// A search that expands a definition large enough to trigger
+    /// `select_diverse_lines` (>= 80-line body) must record savings.
+    /// A search whose body is short records nothing extra from truncation.
+    #[test]
+    fn search_truncation_records_savings() {
+        use crate::session::Session;
+        use crate::types::Match;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("big.rs");
+
+        // Build a function body >= 80 lines so select_diverse_lines fires.
+        let mut src = String::from("pub fn big_fn() {\n");
+        for i in 0..85 {
+            src.push_str(&format!("    let v{i} = {i};\n"));
+        }
+        src.push_str("}\n");
+        std::fs::write(&p, &src).unwrap();
+
+        let total_lines = src.lines().count() as u32;
+        let m = Match {
+            path: p.clone(),
+            line: 1,
+            text: "pub fn big_fn() {".to_string(),
+            is_definition: true,
+            exact: true,
+            file_lines: total_lines,
+            mtime: std::time::SystemTime::now(),
+            def_range: Some((1, total_lines)),
+            def_name: Some("big_fn".to_string()),
+            def_weight: 0,
+            impl_target: None,
+        };
+
+        let cache = OutlineCache::new();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let session = Session::default();
+        let mut expand_remaining = 5usize;
+        let mut expanded_files: HashSet<PathBuf> = HashSet::new();
+        let mut out = String::new();
+
+        format_single_match(
+            &m,
+            tmp.path(),
+            &cache,
+            Some(&session),
+            &bloom,
+            &mut expand_remaining,
+            &mut expanded_files,
+            false,
+            &mut out,
+        );
+
+        let (baseline, saved) = session.savings();
+        assert!(
+            baseline > 0,
+            "truncation path must record a non-zero baseline, got baseline={baseline}"
+        );
+        assert!(
+            saved > 0,
+            "truncation must save tokens vs full body, got saved={saved}"
+        );
+    }
+
+    /// A search on a small definition (body < 80 lines) goes through
+    /// expand_match but never hits the truncation branch, so savings
+    /// remain zero.
+    #[test]
+    fn search_no_truncation_records_no_savings() {
+        use crate::session::Session;
+        use crate::types::Match;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("small.rs");
+        let src = "pub fn small_fn() {\n    let x = 1;\n    x\n}\n";
+        std::fs::write(&p, src).unwrap();
+
+        let m = Match {
+            path: p.clone(),
+            line: 1,
+            text: "pub fn small_fn() {".to_string(),
+            is_definition: true,
+            exact: true,
+            file_lines: 4,
+            mtime: std::time::SystemTime::now(),
+            def_range: Some((1, 4)),
+            def_name: Some("small_fn".to_string()),
+            def_weight: 0,
+            impl_target: None,
+        };
+
+        let cache = OutlineCache::new();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let session = Session::default();
+        let mut expand_remaining = 5usize;
+        let mut expanded_files: HashSet<PathBuf> = HashSet::new();
+        let mut out = String::new();
+
+        format_single_match(
+            &m,
+            tmp.path(),
+            &cache,
+            Some(&session),
+            &bloom,
+            &mut expand_remaining,
+            &mut expanded_files,
+            false,
+            &mut out,
+        );
+
+        let (baseline, saved) = session.savings();
+        assert_eq!(baseline, 0, "no truncation => no savings recorded");
+        assert_eq!(saved, 0, "no truncation => no savings recorded");
     }
 }
