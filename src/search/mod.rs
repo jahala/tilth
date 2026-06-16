@@ -641,10 +641,13 @@ fn format_single_match(
                     let mut skip_lines = strip::strip_noise(&content, &m.path, m.def_range);
 
                     if let Some((def_start, def_end)) = m.def_range {
-                        if let crate::types::FileType::Code(lang) = file_type {
-                            if let Some(keep) =
-                                truncate::select_diverse_lines(&content, def_start, def_end, lang)
-                            {
+                        if let crate::types::FileType::Code(_) = file_type {
+                            if let Some(keep) = truncate::select_diverse_lines(
+                                &content,
+                                def_start,
+                                def_end,
+                                m.def_name.as_deref(),
+                            ) {
                                 let keep_set: HashSet<u32> = keep.into_iter().collect();
                                 for ln in def_start..=def_end {
                                     if !keep_set.contains(&ln) {
