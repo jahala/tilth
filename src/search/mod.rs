@@ -1,3 +1,4 @@
+mod alloc;
 pub mod blast;
 pub mod callees;
 pub mod callers;
@@ -205,6 +206,7 @@ pub fn search_multi_symbol_expanded(
             result.definitions,
             result.usages,
         );
+        let mut segments: Vec<(i64, usize, usize)> = Vec::new();
         format_matches(
             &result.matches,
             &result.scope,
@@ -214,6 +216,7 @@ pub fn search_multi_symbol_expanded(
             &mut expand_remaining,
             &mut expanded_files,
             &mut out,
+            &mut segments,
         );
         if result.total_found > result.matches.len() {
             let omitted = result.total_found - result.matches.len();
@@ -222,6 +225,7 @@ pub fn search_multi_symbol_expanded(
                 "\n\n... and {omitted} more matches. Narrow with scope."
             );
         }
+        out = crate::search::alloc::fit_to_budget(&out, &segments, crate::budget::DEFAULT_BUDGET);
         sections.push(out);
     }
 
@@ -359,6 +363,7 @@ fn format_matches(
     expand_remaining: &mut usize,
     expanded_files: &mut HashSet<PathBuf>,
     out: &mut String,
+    segments: &mut Vec<(i64, usize, usize)>,
 ) {
     // Multi-file: one expand per unique file. Single-file: sequential per-match.
     // expanded_files may contain entries from prior queries (cross-query dedup).
@@ -373,6 +378,7 @@ fn format_matches(
     for group in &groups {
         if group.len() == 1 {
             // Single match — format as before
+            let start = out.len();
             format_single_match(
                 group[0],
                 scope,
@@ -384,9 +390,17 @@ fn format_matches(
                 multi_file,
                 out,
             );
+            segments.push((i64::from(group[0].def_weight), start, out.len()));
         } else {
             // Multiple usages collapsed into one entry
+            let start = out.len();
             format_grouped_usages(group, scope, cache, out);
+            let value = group
+                .iter()
+                .map(|m| i64::from(m.def_weight))
+                .max()
+                .unwrap_or(0);
+            segments.push((value, start, out.len()));
         }
     }
 }
@@ -933,6 +947,7 @@ fn format_search_result(
     let mut out = header;
     let mut expand_remaining = expand;
     let mut expanded_files = HashSet::new();
+    let mut segments: Vec<(i64, usize, usize)> = Vec::new();
 
     // File-level retrieval: when a file basename matches the query exactly,
     // prepend a compact outline so the agent gets file-level context first.
@@ -967,6 +982,7 @@ fn format_search_result(
                 &mut expand_remaining,
                 &mut expanded_files,
                 &mut out,
+                &mut segments,
             );
             write_hidden_tail(
                 &mut out,
@@ -991,6 +1007,7 @@ fn format_search_result(
                 &mut expand_remaining,
                 &mut expanded_files,
                 &mut out,
+                &mut segments,
             );
             write_hidden_tail(
                 &mut out,
@@ -1034,6 +1051,7 @@ fn format_search_result(
                 &mut expand_remaining,
                 &mut expanded_files,
                 &mut out,
+                &mut segments,
             );
             write_hidden_tail(
                 &mut out,
@@ -1058,6 +1076,7 @@ fn format_search_result(
                 &mut expand_remaining,
                 &mut expanded_files,
                 &mut out,
+                &mut segments,
             );
             write_hidden_tail(
                 &mut out,
@@ -1077,6 +1096,7 @@ fn format_search_result(
             &mut expand_remaining,
             &mut expanded_files,
             &mut out,
+            &mut segments,
         );
 
         // Global hidden-tail only on the linear path. The faceted path emits
@@ -1090,6 +1110,10 @@ fn format_search_result(
             );
         }
     }
+
+    // Apply value-based budget allocation before appending the token footer.
+    // Under-budget: byte-identical. Over-budget: drops lowest-value match blocks.
+    out = crate::search::alloc::fit_to_budget(&out, &segments, crate::budget::DEFAULT_BUDGET);
 
     let tokens = estimate_tokens(out.len() as u64);
     let token_str = if tokens >= 1000 {
@@ -2206,5 +2230,70 @@ mod tests {
             !out.starts_with("\n\n## "),
             "grouped-usage heading must not be H2, got: {out:?}"
         );
+    }
+
+    // Verify that format_matches records segment byte ranges correctly.
+    // Each push must cover non-empty, non-overlapping ranges that index into `out`.
+    #[test]
+    fn format_matches_segments_record_correct_byte_ranges() {
+        use crate::index::bloom::BloomFilterCache;
+        use crate::types::Match;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("a.rs");
+        std::fs::write(&p, "fn alpha() {}\nfn beta() {}\nfn gamma() {}\n").unwrap();
+
+        let mk = |line: u32, weight: u16, name: &str| Match {
+            path: p.clone(),
+            line,
+            text: format!("fn {name}()"),
+            is_definition: true,
+            exact: true,
+            file_lines: 3,
+            mtime: SystemTime::now(),
+            def_range: Some((line, line)),
+            def_name: Some(name.to_string()),
+            def_weight: weight,
+            impl_target: None,
+        };
+
+        let matches = vec![mk(1, 30, "alpha"), mk(2, 10, "beta"), mk(3, 50, "gamma")];
+        let cache = OutlineCache::new();
+        let bloom = BloomFilterCache::new();
+        let mut out = String::from("HEADER");
+        let mut segments: Vec<(i64, usize, usize)> = Vec::new();
+        let mut expand_remaining = 0usize;
+        let mut expanded_files = HashSet::new();
+
+        format_matches(
+            &matches,
+            tmp.path(),
+            &cache,
+            None,
+            &bloom,
+            &mut expand_remaining,
+            &mut expanded_files,
+            &mut out,
+            &mut segments,
+        );
+
+        // One segment per match (all singletons — definitions are never grouped).
+        assert_eq!(segments.len(), 3, "expected one segment per match");
+
+        // Values must match def_weight casts.
+        assert_eq!(segments[0].0, 30i64);
+        assert_eq!(segments[1].0, 10i64);
+        assert_eq!(segments[2].0, 50i64);
+
+        // Ranges must be valid, non-empty, and non-overlapping.
+        let mut cursor = "HEADER".len();
+        for (i, &(_, start, end)) in segments.iter().enumerate() {
+            assert!(start >= cursor, "segment {i} start < cursor");
+            assert!(end > start, "segment {i} is empty");
+            assert!(end <= out.len(), "segment {i} end out of bounds");
+            // Slice must not panic (validates char-boundary alignment).
+            let _ = &out[start..end];
+            cursor = end;
+        }
     }
 }
