@@ -220,6 +220,29 @@ const WRAPPER_MAX_BODY_LINES: usize = 10;
 /// to anchor the agent's mental model; few enough to actually save tokens.
 const BODY_PREVIEW_LINES: usize = 3;
 
+/// Read a thin-wrapper's single delegate callee for inline expansion.
+///
+/// Reuses the already-loaded `target_content` when the callee lives in the
+/// target's own file. For a cross-file callee it reads the file, but only when
+/// it is at or below `cap` bytes — a delegating wrapper should point at an
+/// ordinary function, not pull a huge or generated file into the bundle. Returns
+/// `None` on an oversized, missing, or unreadable file (expansion is silently
+/// skipped). `cap` is a parameter so the bound is exercisable in tests.
+fn read_delegate_content(
+    callee_file: &Path,
+    target_path: &Path,
+    target_content: &str,
+    cap: u64,
+) -> Option<String> {
+    if callee_file == target_path {
+        Some(target_content.to_string())
+    } else if std::fs::metadata(callee_file).is_ok_and(|m| m.len() <= cap) {
+        fs::read_to_string(callee_file).ok()
+    } else {
+        None
+    }
+}
+
 // ---------------------------------------------------------------------------
 // A2: bundle assembly
 // ---------------------------------------------------------------------------
@@ -363,6 +386,15 @@ pub fn grok(
     let total_callees_internal = resolved.len();
     let total_callees_external = externals.len();
 
+    // Capture the sole internal callee before the caps below truncate `resolved`,
+    // so thin-wrapper expansion stays correct independent of `caps.max_callees`
+    // (which could be 0). `Some` here iff there is exactly one internal callee.
+    let lone_internal_callee: Option<ResolvedCallee> = if total_callees_internal == 1 {
+        resolved.first().cloned()
+    } else {
+        None
+    };
+
     // --- Callers + tests (one walk, partitioned by is_test_file) ----------
     let symbols: HashSet<String> = std::iter::once(target.name.clone()).collect();
     let raw_callers = find_callers_batch(&symbols, scope, bloom, None, BATCH_EARLY_QUIT)?;
@@ -420,19 +452,23 @@ pub fn grok(
     // callee's body and attach it to the result for the formatter to render.
     // Measure the true definition span, not `body` — `body` may be a dedup-degraded
     // preview on a re-grok, which would otherwise make a large function look thin.
-    let delegate_body = if (target.end_line.saturating_sub(target.start_line) as usize + 1)
-        <= WRAPPER_MAX_BODY_LINES
+    let delegate_body = if target.start_line > 0
+        && (target.end_line.saturating_sub(target.start_line) as usize + 1)
+            <= WRAPPER_MAX_BODY_LINES
         && total_callees_internal == 1
         && total_callees_external == 0
     {
-        // Safety: predicate guarantees exactly one element after self-ref filter.
-        callees_internal.first().and_then(|callee| {
-            // Read callee content: reuse `content` when same file, else one read.
-            let callee_content: Option<String> = if callee.file == target.path {
-                Some(content.clone())
-            } else {
-                fs::read_to_string(&callee.file).ok()
-            };
+        // `lone_internal_callee` is the pre-cap single callee, so it is `Some`
+        // here whatever `caps.max_callees` is. The `start_line > 0` guard skips a
+        // degenerate/unresolved target (line numbers are 1-based; 0 means
+        // unresolved), mirroring `slice_body`.
+        lone_internal_callee.as_ref().and_then(|callee| {
+            let callee_content = read_delegate_content(
+                &callee.file,
+                &target.path,
+                &content,
+                super::bloom_walk::MAX_FILE_SIZE,
+            );
             callee_content.map(|cc| {
                 // Build a minimal ResolvedTarget so body_with_dedup can handle dedup.
                 let callee_target = ResolvedTarget {
@@ -1596,6 +1632,35 @@ pub fn target_fn() {
     }
 
     // ── THINWRAP tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn read_delegate_content_caps_cross_file_reads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target.rs");
+        let callee = tmp.path().join("callee.rs");
+        std::fs::write(&callee, "fn delegate() { real_work() }\n").unwrap();
+
+        // Same file: reuse the passed-in content, no disk read of `target`
+        // (which is never written here).
+        let same = read_delegate_content(&target, &target, "TARGET BODY", 1000);
+        assert_eq!(same.as_deref(), Some("TARGET BODY"));
+
+        // Cross-file under the cap: read the callee file.
+        let small = read_delegate_content(&callee, &target, "TARGET BODY", 1000);
+        assert!(small.is_some_and(|c| c.contains("real_work")));
+
+        // Cross-file over the cap: skipped (cap=5 < the 30-byte callee). Guards
+        // against pulling a huge or generated file into the bundle.
+        let capped = read_delegate_content(&callee, &target, "TARGET BODY", 5);
+        assert!(capped.is_none(), "oversized callee file must not be read");
+
+        // Missing cross-file: None, not a panic.
+        let missing = tmp.path().join("nope.rs");
+        assert!(
+            read_delegate_content(&missing, &target, "TARGET BODY", 1000).is_none(),
+            "missing callee file must yield None, not panic"
+        );
+    }
 
     /// A wrapper function: small body (≤10 lines) that calls exactly one
     /// internal function, with no external callees.
