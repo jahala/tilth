@@ -170,7 +170,7 @@ pub(in crate::mcp) fn tool_read(
     // explicit section/signature/stripped/full read asked for a specific view, so
     // crediting "saved vs the whole file" would overstate the savings.
     if section.is_none() && !force_signature && !force_stripped && !force_full {
-        let file_byte_len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let file_byte_len = std::fs::metadata(&path).map_or(0, |m| m.len());
         session.record_savings(
             estimate_tokens(file_byte_len),
             estimate_tokens(response.len() as u64),
