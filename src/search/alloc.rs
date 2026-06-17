@@ -23,8 +23,12 @@ use crate::types::estimate_tokens;
 /// When the total cost is within budget every block is kept, so the caller's
 /// render is byte-identical to the un-budgeted output.
 pub(crate) fn select_within_budget(items: &[(i64, u64)], budget: u64) -> Vec<bool> {
-    // Fast path: everything fits → keep all (byte-identical render).
-    let total: u64 = items.iter().map(|&(_, tokens)| tokens).sum();
+    // Fast path: everything fits → keep all (byte-identical render). Saturating
+    // so a future caller passing pathological token counts can't overflow-panic
+    // in debug (within `fit_to_budget` the sum is bounded by the body length).
+    let total: u64 = items
+        .iter()
+        .fold(0u64, |acc, &(_, tokens)| acc.saturating_add(tokens));
     if total <= budget {
         return vec![true; items.len()];
     }
@@ -62,6 +66,27 @@ pub(crate) fn fit_to_budget(
     blocks: &[(i64, usize, usize)],
     budget_tokens: u64,
 ) -> String {
+    // Invariant the slicing below relies on: blocks are ascending, non-overlapping,
+    // within `body`, and on char boundaries. They come from `String::len()`
+    // snapshots taken during assembly; assert it in debug so a future regression in
+    // the segment recorder trips here rather than panicking on a bad slice in
+    // release.
+    #[cfg(debug_assertions)]
+    {
+        let mut prev_end = 0usize;
+        for &(_, start, end) in blocks {
+            debug_assert!(start >= prev_end, "blocks overlap or are out of order");
+            debug_assert!(end >= start, "block end precedes start");
+            debug_assert!(end <= body.len(), "block end exceeds body length");
+            debug_assert!(
+                body.is_char_boundary(start),
+                "block start off char boundary"
+            );
+            debug_assert!(body.is_char_boundary(end), "block end off char boundary");
+            prev_end = end;
+        }
+    }
+
     if estimate_tokens(body.len() as u64) <= budget_tokens {
         return body.to_string();
     }
@@ -70,6 +95,15 @@ pub(crate) fn fit_to_budget(
     // selection only spends the budget left after reserving them.
     let block_bytes: usize = blocks.iter().map(|&(_, s, e)| e.saturating_sub(s)).sum();
     let structural_tokens = estimate_tokens(body.len().saturating_sub(block_bytes) as u64);
+
+    // If structural bytes alone already meet or exceed the budget, value selection
+    // can't help: every block would be dropped, leaving a still-over-budget string
+    // plus a misleading "lower-value omitted" note. Hand the whole body back and
+    // let `budget::apply`'s position cut handle it.
+    if structural_tokens >= budget_tokens {
+        return body.to_string();
+    }
+
     let block_budget = budget_tokens.saturating_sub(structural_tokens);
 
     let items: Vec<(i64, u64)> = blocks
@@ -193,6 +227,28 @@ mod tests {
         assert!(
             out.contains("omitted to fit budget"),
             "omitted marker expected: {out}"
+        );
+    }
+
+    #[test]
+    fn fit_to_budget_passes_through_when_structural_exceeds_budget() {
+        // A long structural header dwarfs a tiny block. Even dropping the block
+        // can't get under the budget, so value selection is useless: return the
+        // body unchanged (no misleading "omitted" note) and let the caller's
+        // position cut handle it.
+        let header = "H".repeat(400); // ~100 tokens of structural bytes
+        let body = format!("{header}## x\nbody-x");
+        let blk_start = body.find("body-x").unwrap();
+        let blocks = [(1i64, blk_start, body.len())];
+        // Budget 10 tokens « structural ~100 tokens.
+        let out = fit_to_budget(&body, &blocks, 10);
+        assert_eq!(
+            out, body,
+            "structural-over-budget must pass the body through unchanged"
+        );
+        assert!(
+            !out.contains("omitted"),
+            "no misleading omitted note when nothing was value-dropped: {out}"
         );
     }
 }
