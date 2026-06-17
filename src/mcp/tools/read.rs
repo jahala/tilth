@@ -137,6 +137,22 @@ pub(in crate::mcp) fn tool_read(
     }
 
     session.record_read(&path);
+
+    // Only genuine AUTO reads are credited with savings — where tilth transparently
+    // returns an outline instead of the full file a naive `cat` would dump. An
+    // explicit section/signature/stripped/full read asked for a specific view, so
+    // crediting "saved vs the whole file" would overstate.
+    let auto_read = section.is_none() && !force_signature && !force_stripped && !force_full;
+    // Capture the file size up front, close to `read_file`'s own read. Statting
+    // after the read+format pipeline would let an external append in that window
+    // inflate the baseline and overstate savings; statting here means a concurrent
+    // grow can only *understate* it, keeping the number a conservative lower bound.
+    let savings_baseline = if auto_read {
+        std::fs::metadata(&path).map(|m| m.len()).ok()
+    } else {
+        None
+    };
+
     let mut output = if section.is_none() && force_signature {
         read_signature_file(&path, cache)
             .map(|(body, _)| body)
@@ -165,12 +181,8 @@ pub(in crate::mcp) fn tool_read(
     }
 
     let response = apply_budget(&output, budget);
-    // Record token savings only for genuine AUTO reads — where tilth transparently
-    // returns an outline instead of the full file a naive `cat` would dump. An
-    // explicit section/signature/stripped/full read asked for a specific view, so
-    // crediting "saved vs the whole file" would overstate the savings.
-    if section.is_none() && !force_signature && !force_stripped && !force_full {
-        let file_byte_len = std::fs::metadata(&path).map_or(0, |m| m.len());
+    // Credit savings vs the full file using the baseline captured before the read.
+    if let Some(file_byte_len) = savings_baseline {
         session.record_savings(
             estimate_tokens(file_byte_len),
             estimate_tokens(response.len() as u64),
