@@ -37,9 +37,14 @@ pub(crate) fn select_diverse_lines(
     }
 
     let lines: Vec<&str> = content.lines().collect();
-    let mut scored: Vec<(u32, u32)> = Vec::new(); // (line_number, score)
+    // Treat an empty query as no query, so the boost pass below is skipped and
+    // behaviour stays byte-identical to the `None` path.
+    let query = query.filter(|q| !q.is_empty());
+    let mut scored: Vec<(u32, u32, bool)> = Vec::new(); // (line_number, score, matches_query)
 
-    // Pass 1: structural scoring
+    // Pass 1: structural scoring + query-match detection in a single walk. Each
+    // line is read once here; the match flag is recorded so Pass 2 never has to
+    // re-read `lines`.
     for line_num in start..=end {
         let idx = (line_num - 1) as usize;
         let line = match lines.get(idx) {
@@ -48,35 +53,22 @@ pub(crate) fn select_diverse_lines(
         };
         let trimmed = line.trim();
         let score = score_line(trimmed, line_num, start, end);
-        scored.push((line_num, score));
+        let matches_query = query.is_some_and(|q| line.contains(q));
+        scored.push((line_num, score, matches_query));
     }
 
-    // Pass 2: query-aware boost — if a query symbol is provided, boost lines
-    // that contain it (case-sensitive substring) and their immediate neighbours.
-    if let Some(q) = query {
-        if !q.is_empty() {
-            // Collect indices (within `scored`) of lines that match the query.
-            let match_indices: Vec<usize> = scored
-                .iter()
-                .enumerate()
-                .filter_map(|(i, &(line_num, _))| {
-                    let idx = (line_num - 1) as usize;
-                    if lines.get(idx).is_some_and(|l| l.contains(q)) {
-                        Some(i)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            // Apply match boost to direct matches and proximity boost to neighbours.
-            for mi in match_indices {
-                scored[mi].1 = scored[mi].1.saturating_add(QUERY_MATCH_BOOST);
-                if mi > 0 {
-                    scored[mi - 1].1 = scored[mi - 1].1.saturating_add(QUERY_PROXIMITY_BOOST);
+    // Pass 2: query-aware boost — lift lines that contain the searched symbol
+    // and their immediate neighbours (±1). Skipped entirely when there is no
+    // query, keeping the `None` path byte-identical.
+    if query.is_some() {
+        for i in 0..scored.len() {
+            if scored[i].2 {
+                scored[i].1 = scored[i].1.saturating_add(QUERY_MATCH_BOOST);
+                if i > 0 {
+                    scored[i - 1].1 = scored[i - 1].1.saturating_add(QUERY_PROXIMITY_BOOST);
                 }
-                if mi + 1 < scored.len() {
-                    scored[mi + 1].1 = scored[mi + 1].1.saturating_add(QUERY_PROXIMITY_BOOST);
+                if i + 1 < scored.len() {
+                    scored[i + 1].1 = scored[i + 1].1.saturating_add(QUERY_PROXIMITY_BOOST);
                 }
             }
         }
@@ -89,9 +81,9 @@ pub(crate) fn select_diverse_lines(
     scored.truncate(SMART_TRUNCATE_MAX_LINES);
 
     // Re-sort by line number for reading order
-    scored.sort_by_key(|&(line, _)| line);
+    scored.sort_by_key(|&(line, _, _)| line);
 
-    Some(scored.into_iter().map(|(line, _)| line).collect())
+    Some(scored.into_iter().map(|(line, _, _)| line).collect())
 }
 
 /// Score a single line based on its content. Higher scores indicate more
@@ -359,10 +351,10 @@ mod tests {
         lines.push("}".to_owned()); // line 100
         let content = lines.join("\n");
 
-        // With query=None the needle competes equally with 97 other score-1 lines.
-        // With only 38 interior slots available and 97 candidates, most are dropped.
-        // Verify None drops it (stable sort puts it anywhere — we assert it CAN be
-        // absent) by checking with the boosted version first, which MUST include it.
+        // Both selections are deterministic (stable sort, tie-broken by ascending
+        // line number). With the boost, line 50 jumps above the score-1 crowd and
+        // is kept; without it, the 38 interior slots fill with the lowest line
+        // numbers (2..=39), so line 50 is dropped. Check the boosted case first.
         let with_query = select_diverse_lines(&content, 1, 100, Some("needle_marker")).unwrap();
         assert!(
             with_query.contains(&50),

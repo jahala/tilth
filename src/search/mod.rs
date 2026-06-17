@@ -505,6 +505,19 @@ fn format_line_list(lines: &[u32]) -> String {
     parts.join(",")
 }
 
+/// The symbol to feed query-aware truncation when expanding a match's body.
+///
+/// For `impl`/`implements` matches the user searched for the trait or interface,
+/// which is held in `impl_target` — `def_name` is the rendered label
+/// (`"impl Trait for Type"` / `"Type implements Trait"`) and never appears
+/// verbatim in the body, so boosting on it is a no-op. For plain definitions
+/// `impl_target` is `None` and the searched token is the symbol name in
+/// `def_name`. Preferring `impl_target` routes the real query into the boost for
+/// both shapes.
+fn boost_query(m: &Match) -> Option<&str> {
+    m.impl_target.as_deref().or(m.def_name.as_deref())
+}
+
 /// Format a single match entry (unchanged from original behavior).
 fn format_single_match(
     m: &Match,
@@ -646,7 +659,7 @@ fn format_single_match(
                                 &content,
                                 def_start,
                                 def_end,
-                                m.def_name.as_deref(),
+                                boost_query(m),
                             ) {
                                 let keep_set: HashSet<u32> = keep.into_iter().collect();
                                 for ln in def_start..=def_end {
@@ -1927,6 +1940,46 @@ mod tests {
             out.contains("[usage in function Foo.bar]"),
             "expected scope suffix in output, got: {out}"
         );
+    }
+
+    #[test]
+    fn boost_query_routes_impl_target_into_truncation() {
+        use crate::types::Match;
+
+        let base = Match {
+            path: PathBuf::from("x.rs"),
+            line: 1,
+            text: String::new(),
+            is_definition: true,
+            exact: true,
+            file_lines: 200,
+            mtime: SystemTime::now(),
+            def_range: Some((1, 200)),
+            def_name: None,
+            def_weight: 0,
+            impl_target: None,
+        };
+
+        // Plain definition: the searched token is the symbol name in def_name.
+        let plain = Match {
+            def_name: Some("handle_request".to_string()),
+            ..base.clone()
+        };
+        assert_eq!(boost_query(&plain), Some("handle_request"));
+
+        // impl match: def_name is the rendered label ("impl Iterator for Counter")
+        // which never appears in the body — the searched trait lives in
+        // impl_target. Regression guard for the dead-boost bug where def_name was
+        // passed and the boost matched nothing.
+        let impl_match = Match {
+            def_name: Some("impl Iterator for Counter".to_string()),
+            impl_target: Some("Iterator".to_string()),
+            ..base.clone()
+        };
+        assert_eq!(boost_query(&impl_match), Some("Iterator"));
+
+        // No names: no boost.
+        assert_eq!(boost_query(&base), None);
     }
 
     #[test]
