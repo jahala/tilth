@@ -1105,33 +1105,41 @@ mod tests {
     #[test]
     fn ogate_flat_file_returns_full_when_outline_barely_compresses() {
         use std::fmt::Write as _;
-        // Build a Rust file with many short one-liner declarations.
-        // Each line is a complete `pub const`/`pub fn` so tree-sitter
-        // will generate an outline entry — but the body is empty, so
-        // the outline is nearly as long as the full file. We add a
-        // distinctive body string that only appears in the raw file,
-        // not in any outline entry, so we can prove we got the full file.
+        // A file of empty-body one-liner fns. The signature IS essentially the
+        // whole source line (only ` {}` is dropped), so any signature-bearing
+        // outline is ≥80% of the full-file tokens and OGATE must fire. This holds
+        // regardless of the outline's per-entry formatting overhead, so the test
+        // does not silently break if that format is ever tightened. Enough lines
+        // to clear TOKEN_THRESHOLD (6k) — otherwise the small-file gate returns
+        // full before OGATE is even consulted, passing for the wrong reason.
         let mut src = String::new();
-        for i in 0..800 {
-            // fn with a distinct body comment that outline will strip
-            writeln!(src, "pub fn flat_{i}() {{ /* BODY_MARKER_{i} */ }}").unwrap();
+        for i in 0..2000 {
+            writeln!(src, "pub fn flat_{i}() {{}}").unwrap();
         }
-        // Total bytes ≈ 800 * ~40 = ~32 000 bytes → ~8 000 tokens (> TOKEN_THRESHOLD)
+        // ~2000 * ~21 bytes ≈ 43 KB ≈ 10.7k tokens (> TOKEN_THRESHOLD = 6k).
+        // Assert it so the test provably exercises OGATE rather than the
+        // small-file gate (which would also return `[full]`).
+        assert!(
+            estimate_tokens(src.len() as u64) > TOKEN_THRESHOLD,
+            "fixture must exceed TOKEN_THRESHOLD so OGATE, not the small-file gate, returns full"
+        );
         let path = write_temp("tilth_ogate_flat.rs", &src);
 
         let cache = OutlineCache::new();
         let result = read_file(&path, None, false, &cache, false).unwrap();
 
-        // Gate must have fired: the output contains actual body content
-        // that an outline would never include.
+        // Gate fired → full view. The header tag records the decision directly
+        // (an outline would read `[outline]`), and the trailing fn's body braces
+        // `() {}` only appear in verbatim full content — an outline renders the
+        // signature without the body.
         assert!(
-            result.contains("BODY_MARKER_0"),
-            "expected full content (BODY_MARKER_0 present), got outline: {}",
-            &result[..result.len().min(400)]
+            result.contains("[full]"),
+            "OGATE must return the full view; header was: {}",
+            result.lines().next().unwrap_or("")
         );
         assert!(
-            result.contains("BODY_MARKER_799"),
-            "expected full content (BODY_MARKER_799 present)"
+            result.contains("flat_1999() {}"),
+            "expected verbatim full content (last fn body present)"
         );
 
         let _ = std::fs::remove_file(&path);
