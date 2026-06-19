@@ -24,6 +24,7 @@ pub(crate) const DEFINITION_KINDS: &[&str] = &[
     // Variables, constants & properties (Kotlin, C#, Swift)
     "lexical_declaration",
     "variable_declaration",
+    "variable_assignment", // Bash top-level assignments
     "const_item",
     "const_declaration",
     "static_item",
@@ -309,6 +310,7 @@ pub(crate) fn definition_weight(kind: &str) -> u16 {
         "const_item" | "const_declaration" | "static_item" => 80,
         "mod_item" | "namespace_definition" | "property_declaration" => 70,
         "lexical_declaration" | "variable_declaration" => 40,
+        "variable_assignment" => 60,
         "export_statement" => 30,
         _ => 50,
     }

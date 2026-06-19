@@ -65,6 +65,7 @@ pub(crate) fn is_import_line(line: &str, lang: Lang) -> bool {
                 || trimmed.starts_with("use ")
                 || trimmed.starts_with("require ")
         }
+        Lang::Bash => trimmed.starts_with("source ") || trimmed.starts_with(". "),
         _ => false,
     }
 }
@@ -79,7 +80,8 @@ pub(crate) fn is_external(source: &str, lang: Lang) -> bool {
         Lang::TypeScript | Lang::Tsx | Lang::JavaScript => {
             !(source.starts_with('.') || source.starts_with("@/") || source.starts_with("~/"))
         }
-        Lang::Python => !source.starts_with('.'),
+        // Bash: dot-relative paths are local; anything else (bare name, /abs/path) is external.
+        Lang::Python | Lang::Bash => !source.starts_with('.'),
         Lang::C | Lang::Cpp => !source.starts_with('"'),
         // Elixir, Go, Java, Scala, Kotlin — can't resolve without build system knowledge.
         _ => true,
@@ -92,6 +94,7 @@ fn resolve(dir: &Path, source: &str, lang: Lang) -> Option<PathBuf> {
         Lang::TypeScript | Lang::Tsx | Lang::JavaScript => resolve_js(dir, source),
         Lang::Python => resolve_python(dir, source),
         Lang::C | Lang::Cpp => resolve_c_include(dir, source),
+        Lang::Bash => resolve_bash(dir, source),
         // Elixir, Go, Java, etc. — module-to-file mapping requires build system conventions.
         _ => None,
     };
@@ -241,6 +244,18 @@ fn resolve_c_include(dir: &Path, source: &str) -> Option<PathBuf> {
     } else {
         None
     }
+}
+
+// --- Bash ---
+
+fn resolve_bash(dir: &Path, source: &str) -> Option<PathBuf> {
+    // Only resolve literal relative paths — no extension inference. A single
+    // metadata() stat avoids the exists()+is_file() two-call TOCTOU; resolution
+    // is best-effort, so a stale result only ever costs a related-file hint.
+    let candidate = dir.join(source);
+    std::fs::metadata(&candidate)
+        .is_ok_and(|m| m.is_file())
+        .then_some(candidate)
 }
 
 #[cfg(test)]

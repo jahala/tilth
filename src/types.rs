@@ -38,6 +38,7 @@ pub enum Lang {
     Kotlin,
     CSharp,
     Elixir,
+    Bash,
     Dockerfile,
     Make,
 }
@@ -66,6 +67,7 @@ impl Lang {
             | Lang::Kotlin
             | Lang::CSharp
             | Lang::Elixir
+            | Lang::Bash
             | Lang::Dockerfile
             | Lang::Make => false,
         }

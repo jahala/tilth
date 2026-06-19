@@ -21,6 +21,7 @@ pub fn outline_language(lang: Lang) -> Option<tree_sitter::Language> {
         Lang::Swift => tree_sitter_swift::LANGUAGE,
         Lang::Kotlin => tree_sitter_kotlin_ng::LANGUAGE,
         Lang::Elixir => tree_sitter_elixir::LANGUAGE,
+        Lang::Bash => tree_sitter_bash::LANGUAGE,
         Lang::Dockerfile | Lang::Make => {
             return None;
         }
@@ -281,6 +282,29 @@ fn node_to_entry(
         // Elixir: @type, @typep, @opaque are unary_operator nodes
         "unary_operator" if lang == Lang::Elixir => {
             return elixir_attr_to_entry(node, lines);
+        }
+
+        // Bash: top-level variable assignments (`MY_VAR=value`)
+        "variable_assignment" if lang == Lang::Bash => {
+            let name = find_child_text(node, "name", lines).unwrap_or_else(|| "<var>".into());
+            (OutlineKind::Variable, name, None)
+        }
+
+        // Bash: top-level `export` / `declare` / `readonly` declarations. The name
+        // is the `name` of the inner variable_assignment (`export FOO=bar`) or a
+        // bare variable_name child (`export FOO`). Function-local `local`
+        // declarations are nested in function bodies, so walk_top_level never
+        // reaches them here. Multi-variable declarations surface their first name.
+        "declaration_command" if lang == Lang::Bash => {
+            let mut cursor = node.walk();
+            let name = node
+                .children(&mut cursor)
+                .find_map(|child| match child.kind() {
+                    "variable_assignment" => find_child_text(child, "name", lines),
+                    "variable_name" => Some(node_text(child, lines)),
+                    _ => None,
+                })?;
+            (OutlineKind::Variable, name, None)
         }
 
         _ => return None,
@@ -789,6 +813,19 @@ fn elixir_extract_doc_string(node: tree_sitter::Node, lines: &[&str]) -> Option<
 pub(crate) fn extract_import_source(text: &str, lang: Option<crate::types::Lang>) -> String {
     let trimmed = text.trim().trim_end_matches(';');
 
+    // Bash: `source ./lib.sh` or `. ./lib.sh`
+    if lang == Some(crate::types::Lang::Bash) {
+        let after = trimmed
+            .strip_prefix("source ")
+            .or_else(|| trimmed.strip_prefix(". "))
+            .unwrap_or(trimmed);
+        // Skip variable-expanded paths (contain `$`)
+        if after.contains('$') {
+            return String::new();
+        }
+        return after.trim_matches(|c| c == '"' || c == '\'').to_string();
+    }
+
     // Elixir: `use GenServer`, `import Kernel`, `alias Foo.Bar`, `require Logger`
     // Must be checked before the Rust `use` and JS `import` branches.
     if lang == Some(crate::types::Lang::Elixir) {
@@ -941,5 +978,167 @@ mod markdown_helper_tests {
         let lines: Vec<&str> = src.lines().collect();
         let headings = collect_headings(&tree);
         assert_eq!(heading_text(headings[0], &lines), "Foo");
+    }
+}
+
+#[cfg(test)]
+mod bash_outline_tests {
+    use super::{extract_import_source, get_outline_entries};
+    use crate::search::callees::extract_callee_names;
+    use crate::types::{Lang, OutlineKind};
+
+    // Fixture covering both function syntaxes, top-level vars, and a nested local.
+    const BASH_FIXTURE: &str = r#"MY_CONST=hello
+DEBUG_MODE=0
+
+greet() { echo "hi $1"; }
+
+function cleanup {
+    rm -f /tmp/x
+}
+
+main() {
+    greet world
+    cleanup
+    local y=1
+}
+"#;
+
+    #[test]
+    fn bash_outline_functions_and_vars() {
+        let entries = get_outline_entries(BASH_FIXTURE, Lang::Bash);
+
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+
+        // All three functions must appear
+        assert!(
+            names.contains(&"greet"),
+            "expected greet in outline, got: {names:?}"
+        );
+        assert!(
+            names.contains(&"cleanup"),
+            "expected cleanup in outline, got: {names:?}"
+        );
+        assert!(
+            names.contains(&"main"),
+            "expected main in outline, got: {names:?}"
+        );
+
+        // Top-level variables must appear
+        assert!(
+            names.contains(&"MY_CONST"),
+            "expected MY_CONST in outline, got: {names:?}"
+        );
+        assert!(
+            names.contains(&"DEBUG_MODE"),
+            "expected DEBUG_MODE in outline, got: {names:?}"
+        );
+
+        // Functions must have Function kind
+        for fname in &["greet", "cleanup", "main"] {
+            let entry = entries.iter().find(|e| e.name == *fname).unwrap();
+            assert_eq!(
+                entry.kind,
+                OutlineKind::Function,
+                "{fname} should be OutlineKind::Function"
+            );
+        }
+
+        // Variables must have Variable kind
+        for vname in &["MY_CONST", "DEBUG_MODE"] {
+            let entry = entries.iter().find(|e| e.name == *vname).unwrap();
+            assert_eq!(
+                entry.kind,
+                OutlineKind::Variable,
+                "{vname} should be OutlineKind::Variable"
+            );
+        }
+
+        // Nested `local y=1` must NOT appear at the top level
+        assert!(
+            !names.contains(&"y"),
+            "nested local 'y' must not appear in top-level outline, got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn bash_callee_names_for_main() {
+        // Derive main's range from the outline so the test can't silently drift
+        // if the fixture is edited.
+        let main = get_outline_entries(BASH_FIXTURE, Lang::Bash)
+            .into_iter()
+            .find(|e| e.name == "main")
+            .expect("main must be in the outline");
+        let names = extract_callee_names(
+            BASH_FIXTURE,
+            Lang::Bash,
+            Some((main.start_line, main.end_line)),
+        );
+
+        assert!(
+            names.contains(&"greet".to_string()),
+            "expected greet as callee, got: {names:?}"
+        );
+        assert!(
+            names.contains(&"cleanup".to_string()),
+            "expected cleanup as callee, got: {names:?}"
+        );
+        // echo is called inside greet, outside main's range, so it is absent here.
+    }
+
+    #[test]
+    fn bash_outline_surfaces_declarations_and_hyphenated_names() {
+        // export/declare/readonly declarations must surface (the common config
+        // pattern), and hyphenated function names must be captured whole.
+        let src = "export E_VAR=1\n\
+                   declare -r D_VAR=2\n\
+                   readonly R_VAR=3\n\
+                   deploy-app() { :; }\n";
+        let entries = get_outline_entries(src, Lang::Bash);
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+
+        for v in ["E_VAR", "D_VAR", "R_VAR"] {
+            let e = entries
+                .iter()
+                .find(|e| e.name == v)
+                .unwrap_or_else(|| panic!("{v} should be outlined, got: {names:?}"));
+            assert_eq!(e.kind, OutlineKind::Variable, "{v} should be a Variable");
+        }
+        let dep = entries
+            .iter()
+            .find(|e| e.name == "deploy-app")
+            .unwrap_or_else(|| panic!("deploy-app should be outlined whole, got: {names:?}"));
+        assert_eq!(dep.kind, OutlineKind::Function);
+    }
+
+    #[test]
+    fn bash_extract_import_source_source_keyword() {
+        let line = "source ./lib/utils.sh";
+        let result = extract_import_source(line, Some(Lang::Bash));
+        assert_eq!(result, "./lib/utils.sh");
+    }
+
+    #[test]
+    fn bash_extract_import_source_dot_keyword() {
+        let line = ". ./config.sh";
+        let result = extract_import_source(line, Some(Lang::Bash));
+        assert_eq!(result, "./config.sh");
+    }
+
+    #[test]
+    fn bash_extract_import_source_quoted() {
+        let line = r#"source "./lib/helpers.sh""#;
+        let result = extract_import_source(line, Some(Lang::Bash));
+        assert_eq!(result, "./lib/helpers.sh");
+    }
+
+    #[test]
+    fn bash_extract_import_source_variable_expanded_returns_empty() {
+        let line = r#"source "$DIR/lib.sh""#;
+        let result = extract_import_source(line, Some(Lang::Bash));
+        assert!(
+            result.is_empty(),
+            "variable-expanded source should return empty, got: {result:?}"
+        );
     }
 }
