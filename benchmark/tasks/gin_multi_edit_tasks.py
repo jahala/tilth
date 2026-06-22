@@ -4,10 +4,13 @@ from tasks.base import Task, GroundTruth, Mutation
 class GinMultiContextTask(Task):
     """Three independent regressions in context.go for batched same-file edits.
 
-    The bugs sit in three unrelated methods (Next / Copy / reset) so the task
-    measures simultaneous multi-site localization, not recall of the single-bug
-    edit tasks. The prompt deliberately does not name the methods or the bug
-    shapes — the agent localizes from the failing tests.
+    The bugs sit in three unrelated methods (Next / Copy / reset). Two use novel
+    shapes absent from every single-bug edit task — the Next() handler-loop bound
+    flip and the Copy() detached-index sentinel — so the task can't be solved
+    purely by recalling prior single-bug solutions. (reset()'s index-init mirrors
+    gin_edit_context_reset; it is the only index mutation TestContextReset gates.)
+    The prompt deliberately does not name the methods or bug shapes — the agent
+    localizes all three from the failing tests.
     """
 
     @property
@@ -25,11 +28,13 @@ class GinMultiContextTask(Task):
     @property
     def mutations(self) -> list[Mutation]:
         return [
-            # Next(): pre-loop index advance, breaks the middleware chain.
+            # Next(): flip the handler-loop bound (< -> >) so the chain never
+            # advances past the first handler. Novel shape — gin_edit_middleware_skip
+            # mutates `c.index++`, not the loop bound, so this can't be recalled.
             Mutation(
                 file_path="context.go",
-                original="c.index++",
-                mutated="c.index += 2",
+                original="c.index < safeInt8(len(c.handlers))",
+                mutated="c.index > safeInt8(len(c.handlers))",
             ),
             # Copy(): detached-context index sentinel, so a goroutine copy can't
             # re-enter the handler chain. Novel site (not in any single-bug task).
