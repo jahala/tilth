@@ -65,7 +65,10 @@ pub(crate) fn is_import_line(line: &str, lang: Lang) -> bool {
                 || trimmed.starts_with("use ")
                 || trimmed.starts_with("require ")
         }
-        Lang::Bash => trimmed.starts_with("source ") || trimmed.starts_with(". "),
+        Lang::Bash => trimmed
+            .strip_prefix("source")
+            .or_else(|| trimmed.strip_prefix('.'))
+            .is_some_and(|rest| rest.starts_with(char::is_whitespace)),
         _ => false,
     }
 }
@@ -320,6 +323,31 @@ mod tests {
         assert_eq!(
             from_sibling, from_cousin,
             "different spellings should normalize to the same PathBuf"
+        );
+    }
+
+    #[test]
+    fn bash_is_import_line_tab_separated() {
+        // Tab between `source` and path is valid bash and must be detected.
+        assert!(
+            is_import_line("source\t./lib.sh", Lang::Bash),
+            "source<TAB>./lib.sh should be detected as an import line"
+        );
+        // False positives: `sourcefile=1` looks like it starts with `source` but
+        // has no whitespace separator.
+        assert!(
+            !is_import_line("sourcefile=1", Lang::Bash),
+            "sourcefile=1 must not be detected as an import line"
+        );
+        // `./script.sh` is a script execution, not a source directive.
+        assert!(
+            !is_import_line("./script.sh", Lang::Bash),
+            "./script.sh must not be detected as an import line"
+        );
+        // `.bashrc` — dot followed by non-whitespace, not a source directive.
+        assert!(
+            !is_import_line(".bashrc", Lang::Bash),
+            ".bashrc must not be detected as an import line"
         );
     }
 }

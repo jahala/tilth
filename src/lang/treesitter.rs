@@ -24,7 +24,7 @@ pub(crate) const DEFINITION_KINDS: &[&str] = &[
     // Variables, constants & properties (Kotlin, C#, Swift)
     "lexical_declaration",
     "variable_declaration",
-    "variable_assignment", // Bash top-level assignments
+    "variable_assignment", // Bash top-level assignments (bash-only today; a future grammar reusing this node kind would inherit definition_weight 60)
     "const_item",
     "const_declaration",
     "static_item",

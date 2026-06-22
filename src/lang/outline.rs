@@ -284,9 +284,9 @@ fn node_to_entry(
             return elixir_attr_to_entry(node, lines);
         }
 
-        // Bash: top-level variable assignments (`MY_VAR=value`)
+        // Bash: top-level variable assignments (`MY_VAR=value`, `ARR[0]=value`)
         "variable_assignment" if lang == Lang::Bash => {
-            let name = find_child_text(node, "name", lines).unwrap_or_else(|| "<var>".into());
+            let name = assignment_name(node, lines).unwrap_or_else(|| "<var>".into());
             (OutlineKind::Variable, name, None)
         }
 
@@ -300,7 +300,7 @@ fn node_to_entry(
             let name = node
                 .children(&mut cursor)
                 .find_map(|child| match child.kind() {
-                    "variable_assignment" => find_child_text(child, "name", lines),
+                    "variable_assignment" => assignment_name(child, lines),
                     "variable_name" => Some(node_text(child, lines)),
                     _ => None,
                 })?;
@@ -411,6 +411,23 @@ fn extract_signature(node: tree_sitter::Node, lines: &[&str]) -> String {
 /// Find a named child and return its text.
 fn find_child_text(node: tree_sitter::Node, field: &str, lines: &[&str]) -> Option<String> {
     node.child_by_field_name(field).map(|n| node_text(n, lines))
+}
+
+/// Resolve the variable name from an assignment `name` field, unwrapping a
+/// `subscript` (`ARR[0]=x`) to its base `variable_name` so the symbol
+/// surfaces as `ARR`, not `ARR[0]`.
+fn assignment_name(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
+    let name = node.child_by_field_name("name")?;
+    if name.kind() == "subscript" {
+        let mut cursor = name.walk();
+        let base = name
+            .children(&mut cursor)
+            .find(|c| c.kind() == "variable_name")
+            .unwrap_or(name);
+        Some(node_text(base, lines))
+    } else {
+        Some(node_text(name, lines))
+    }
 }
 
 /// Get the text of a node, truncated to the first line.
@@ -813,12 +830,13 @@ fn elixir_extract_doc_string(node: tree_sitter::Node, lines: &[&str]) -> Option<
 pub(crate) fn extract_import_source(text: &str, lang: Option<crate::types::Lang>) -> String {
     let trimmed = text.trim().trim_end_matches(';');
 
-    // Bash: `source ./lib.sh` or `. ./lib.sh`
+    // Bash: `source ./lib.sh`, `. ./lib.sh`, or tab-separated variants
     if lang == Some(crate::types::Lang::Bash) {
         let after = trimmed
-            .strip_prefix("source ")
-            .or_else(|| trimmed.strip_prefix(". "))
-            .unwrap_or(trimmed);
+            .strip_prefix("source")
+            .or_else(|| trimmed.strip_prefix('.'))
+            .filter(|rest| rest.starts_with(char::is_whitespace))
+            .map_or(trimmed, str::trim_start);
         // Skip variable-expanded paths (contain `$`)
         if after.contains('$') {
             return String::new();
@@ -1140,5 +1158,33 @@ main() {
             result.is_empty(),
             "variable-expanded source should return empty, got: {result:?}"
         );
+    }
+
+    #[test]
+    fn bash_subscript_assignment_surfaces_base_name() {
+        // `ARR[0]=hello` should appear as `ARR` (Variable), not `ARR[0]`.
+        let entries = get_outline_entries("ARR[0]=hello\n", Lang::Bash);
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            names.contains(&"ARR"),
+            "expected ARR in outline, got: {names:?}"
+        );
+        assert!(
+            !names.contains(&"ARR[0]"),
+            "ARR[0] must not appear verbatim in outline, got: {names:?}"
+        );
+        let entry = entries.iter().find(|e| e.name == "ARR").unwrap();
+        assert_eq!(
+            entry.kind,
+            OutlineKind::Variable,
+            "ARR should be OutlineKind::Variable"
+        );
+    }
+
+    #[test]
+    fn bash_extract_import_source_tab_separated() {
+        // `source\t./lib.sh` (tab separator) must be parsed correctly.
+        let result = extract_import_source("source\t./lib/utils.sh", Some(Lang::Bash));
+        assert_eq!(result, "./lib/utils.sh");
     }
 }
