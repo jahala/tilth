@@ -370,6 +370,25 @@ fn get_old_content(
     }
 }
 
+/// Where the "new" side of a `GitRef` diff reads its content from.
+enum GitRefNewSide {
+    /// A range ref (`a..b`): the committed blob at the right side, via `git show`.
+    Committed(String),
+    /// A bare ref: `git diff <ref>` compares against the working tree on disk.
+    WorkingTree,
+}
+
+/// Decide how a `GitRef`'s new-side content is sourced.
+///
+/// A range ref (`a..b`) reads the committed blob at `b` via `git show b:<path>`;
+/// a bare ref reads the working tree, because `git diff <ref>` compares `<ref>`
+/// against the working tree rather than against `HEAD`.
+fn resolve_git_ref_new_side(reff: &str, path_str: &str) -> GitRefNewSide {
+    match reff.split_once("..") {
+        Some((_, right)) => GitRefNewSide::Committed(format!("{right}:{path_str}")),
+        None => GitRefNewSide::WorkingTree,
+    }
+}
 fn get_new_content(path: &Path, source: &DiffSource) -> Result<String, String> {
     let path_str = path.to_string_lossy();
 
