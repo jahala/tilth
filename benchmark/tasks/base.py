@@ -114,6 +114,16 @@ class Task(ABC):
         """Validate result against ground truth."""
         gt = self.ground_truth
 
+        # Restore .git if a hide_git task moved it aside, so the test command (and the
+        # git-diff correctness path below) see a real repo rather than the agent-run
+        # state. Reset restores it later too; doing it here avoids a latent footgun for
+        # any hide_git task whose test_command shells out to git.
+        hidden = Path(repo_path) / ".git_hidden"
+        if hidden.exists():
+            git_dir = Path(repo_path) / ".git"
+            if not git_dir.exists():
+                hidden.rename(git_dir)
+
         # Mutation tasks with a test command: run the test. That's the source of truth.
         if self.mutations and self.test_command:
             result = subprocess.run(
