@@ -12,7 +12,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub(crate) fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    // `Path::new("foo.txt").parent()` returns `Some("")`, not `None`; treat an
+    // empty parent as "no directory" so the temp file anchors to "." rather than
+    // the empty-string path.
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     let tmp = dir.join(format!(".tilth-tmp.{}.{n}", std::process::id()));
     std::fs::write(&tmp, bytes).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
