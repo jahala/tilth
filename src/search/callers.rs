@@ -437,6 +437,118 @@ pub fn search_callers_expanded(
     Ok(output)
 }
 
+/// Multi-target caller search: find call sites of 2..=5 symbols in a single
+/// walk via `find_callers_batch`, then render one labeled section per target.
+/// Mirrors `search_multi_symbol_expanded` for the `kind=callers` comma path.
+pub fn search_callers_multi_expanded(
+    targets: &[&str],
+    scope: &Path,
+    bloom: &crate::index::bloom::BloomFilterCache,
+    expand: usize,
+    context: Option<&Path>,
+    glob: Option<&str>,
+    full: bool,
+) -> Result<String, TilthError> {
+    let (max_matches, batch_quit) = if full {
+        (FULL_MAX_MATCHES, FULL_BATCH_EARLY_QUIT)
+    } else {
+        (MAX_MATCHES, BATCH_EARLY_QUIT)
+    };
+
+    // Dedupe targets, preserving first-seen order: a repeated target (e.g.
+    // query "foo,foo") must not render an empty no-callers section on its
+    // second occurrence after the first consumed the matched bucket. The
+    // deduped list also feeds the batch search, so the input is deduped once.
+    let mut seen: HashSet<&str> = HashSet::new();
+    let ordered: Vec<&str> = targets
+        .iter()
+        .copied()
+        .filter(|t| seen.insert(*t))
+        .collect();
+
+    let target_set: HashSet<String> = ordered.iter().map(ToString::to_string).collect();
+    let raw = find_callers_batch(&target_set, scope, bloom, glob, batch_quit)?;
+
+    // Bucket matches by which target they call. Preserve the caller-supplied
+    // target order so output is deterministic.
+    let mut by_target: std::collections::HashMap<String, Vec<CallerMatch>> =
+        std::collections::HashMap::new();
+    for (name, m) in raw {
+        by_target.entry(name).or_default().push(m);
+    }
+
+    let mut output = String::new();
+    for target in &ordered {
+        let mut callers = by_target.remove(*target).unwrap_or_default();
+
+        let _ = write!(output, "## callers of \"{target}\"\n\n");
+
+        if callers.is_empty() {
+            let target_seen = target_seen_in_scope(target, scope, glob);
+            output.push_str(&no_callers_message(target, scope, target_seen, glob));
+            output.push_str("\n\n");
+            continue;
+        }
+
+        rank_callers(&mut callers, scope, context);
+        let total = callers.len();
+        callers.truncate(max_matches);
+
+        let _ = writeln!(
+            output,
+            "{} call site{}",
+            total,
+            if total == 1 { "" } else { "s" }
+        );
+
+        for (i, caller) in callers.iter().enumerate() {
+            let _ = write!(
+                output,
+                "\n### {}:{} [caller: {}]\n",
+                caller
+                    .path
+                    .strip_prefix(scope)
+                    .unwrap_or(&caller.path)
+                    .display(),
+                caller.line,
+                caller.calling_function
+            );
+            let _ = writeln!(output, "→ {}", caller.call_text);
+
+            if i < expand {
+                if let Some((start, end)) = caller.caller_range {
+                    let lines: Vec<&str> = caller.content.lines().collect();
+                    let start_idx = (start as usize).saturating_sub(1);
+                    let end_idx = (end as usize).min(lines.len());
+
+                    output.push('\n');
+                    output.push_str("```\n");
+                    for (idx, line) in lines[start_idx..end_idx].iter().enumerate() {
+                        let line_num = start_idx + idx + 1;
+                        let prefix = if line_num == caller.line as usize {
+                            "► "
+                        } else {
+                            "  "
+                        };
+                        let _ = writeln!(output, "{prefix}{line_num:4} │ {line}");
+                    }
+                    output.push_str("```\n");
+                }
+            }
+        }
+        output.push('\n');
+    }
+
+    let tokens = crate::types::estimate_tokens(output.len() as u64);
+    let token_str = if tokens >= 1000 {
+        format!("~{}.{}k", tokens / 1000, (tokens % 1000) / 100)
+    } else {
+        format!("~{tokens}")
+    };
+    let _ = write!(output, "\n({token_str} tokens)");
+    Ok(output)
+}
+
 /// Build the user-facing message when callers search returns no hits.
 /// Splits two cases that mean very different things to an agent:
 /// `target_seen = true` means the symbol exists somewhere but has no direct
