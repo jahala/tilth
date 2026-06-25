@@ -37,6 +37,24 @@ pub(in crate::mcp) fn tool_read(
     let force_signature = mode_str == "signature";
     let force_stripped = mode_str == "stripped";
 
+    // Conditional read: when the caller supplies `if_modified_since`, a file
+    // whose mtime is <= the timestamp is collapsed to a one-line stub instead
+    // of its content, and the response carries a `{"if_modified_since":<now>}`
+    // token header the caller echoes back on the next read. Absent the param,
+    // output is byte-identical to an unconditional read (no header).
+    let since = args
+        .get("if_modified_since")
+        .and_then(|v| v.as_str())
+        .and_then(crate::mcp::iso::parse_iso_utc);
+    let now = std::time::SystemTime::now();
+    let finish = |body: String| -> String {
+        if since.is_some() {
+            crate::mcp::iso::with_meta_header(Some(now), serde_json::Map::new(), &body)
+        } else {
+            body
+        }
+    };
+
     // Multi-file batch read (capped at 20 to bound I/O)
     if let Some(paths_arr) = args.get("paths").and_then(|v| v.as_array()) {
         if paths_arr.len() > 20 {
@@ -71,6 +89,12 @@ pub(in crate::mcp) fn tool_read(
             let path_str = p.as_str().ok_or("paths must be an array of strings")?;
             let path = PathBuf::from(path_str);
             session.record_read(&path);
+            if let Some(s_ts) = since {
+                if !crate::mcp::iso::file_changed_since(&path, s_ts) {
+                    results.push(crate::mcp::iso::unchanged_stub(&path, s_ts));
+                    continue;
+                }
+            }
             let read = if force_signature {
                 read_signature_file(&path, cache).map(|(body, _)| body)
             } else if force_stripped {
@@ -84,7 +108,7 @@ pub(in crate::mcp) fn tool_read(
             }
         }
         let combined = results.join("\n\n");
-        return Ok(apply_budget(&combined, budget));
+        return Ok(finish(apply_budget(&combined, budget)));
     }
 
     // Single file read
@@ -93,6 +117,17 @@ pub(in crate::mcp) fn tool_read(
         .and_then(|v| v.as_str())
         .ok_or("missing required parameter: path (or use paths for batch read)")?;
     let path = PathBuf::from(path_str);
+
+    // Conditional single read: stub the file when unchanged since the token.
+    // Covers every single-path variant below (section, sections, signature,
+    // stripped, normal) since they all read this same `path`.
+    if let Some(s_ts) = since {
+        if !crate::mcp::iso::file_changed_since(&path, s_ts) {
+            session.record_read(&path);
+            return Ok(finish(crate::mcp::iso::unchanged_stub(&path, s_ts)));
+        }
+    }
+
     let section = args.get("section").and_then(|v| v.as_str());
     let sections_arr = args.get("sections").and_then(|v| v.as_array());
 
@@ -133,7 +168,7 @@ pub(in crate::mcp) fn tool_read(
                 crate::read::read_ranges(&path, &ranges, edit_mode).map_err(|e| e.to_string())?
             }
         };
-        return Ok(output);
+        return Ok(finish(output));
     }
 
     session.record_read(&path);
@@ -164,7 +199,7 @@ pub(in crate::mcp) fn tool_read(
         }
     }
 
-    Ok(apply_budget(&output, budget))
+    Ok(finish(apply_budget(&output, budget)))
 }
 
 // `cache` is intentionally unwired on the tree-sitter path: OutlineCache stores
@@ -533,6 +568,114 @@ mod tests {
         assert!(
             modes.iter().any(|v| v.as_str() == Some("stripped")),
             "mode enum must advertise stripped: {read}"
+        );
+    }
+
+    #[test]
+    fn tool_read_if_modified_since_future_returns_unchanged_stub() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.txt");
+        std::fs::write(&path, "contents you should NOT see\n").unwrap();
+        // Future timestamp: file mtime <= ts ⇒ unchanged ⇒ stub, no body.
+        let args = serde_json::json!({
+            "path": path.to_str().unwrap(),
+            "if_modified_since": "2099-01-01T00:00:00Z",
+        });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+
+        let out = tool_read(&args, &cache, &session, false).expect("stub read");
+
+        assert!(out.contains("unchanged"), "expected stub marker: {out}");
+        assert!(
+            !out.contains("contents you should NOT see"),
+            "body must not leak on an unchanged stub: {out}"
+        );
+        assert!(
+            out.contains("\"if_modified_since\""),
+            "cache-token header must ride along when opted in: {out}"
+        );
+    }
+
+    #[test]
+    fn tool_read_if_modified_since_past_returns_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("now.txt");
+        std::fs::write(&path, "hello world\n").unwrap();
+        // Epoch timestamp: file is newer ⇒ changed ⇒ full content returned.
+        let args = serde_json::json!({
+            "path": path.to_str().unwrap(),
+            "if_modified_since": "1970-01-01T00:00:00Z",
+        });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+
+        let out = tool_read(&args, &cache, &session, false).expect("content read");
+
+        assert!(out.contains("hello world"), "expected file body: {out}");
+        assert!(
+            out.contains("\"if_modified_since\""),
+            "cache-token header must ride along when opted in: {out}"
+        );
+    }
+
+    #[test]
+    fn tool_read_batch_stubs_only_unchanged_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let unchanged = dir.path().join("cached.txt");
+        let changed = dir.path().join("fresh.txt");
+        std::fs::write(&unchanged, "stale body do not show\n").unwrap();
+        std::fs::write(&changed, "fresh body must show\n").unwrap();
+        // Pin both mtimes a full day either side of the token so the
+        // second-granularity of the ISO token can't make the comparison flaky:
+        // `unchanged` in the past (<= token ⇒ stub), `changed` in the future
+        // (> token ⇒ content).
+        let now = std::time::SystemTime::now();
+        let day = std::time::Duration::from_secs(86_400);
+        let set_mtime = |p: &std::path::Path, t: std::time::SystemTime| {
+            std::fs::File::options()
+                .write(true)
+                .open(p)
+                .unwrap()
+                .set_modified(t)
+                .unwrap();
+        };
+        set_mtime(&unchanged, now - day);
+        set_mtime(&changed, now + day);
+        let token = crate::mcp::iso::iso_ts(now);
+        let args = serde_json::json!({
+            "paths": [unchanged.to_str().unwrap(), changed.to_str().unwrap()],
+            "if_modified_since": token,
+        });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+
+        let out = tool_read(&args, &cache, &session, false).expect("batch read");
+
+        assert!(
+            !out.contains("stale body do not show"),
+            "unchanged file must be stubbed: {out}"
+        );
+        assert!(
+            out.contains("fresh body must show"),
+            "changed file must return content: {out}"
+        );
+    }
+
+    #[test]
+    fn tool_read_without_if_modified_since_emits_no_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plain.txt");
+        std::fs::write(&path, "plain content\n").unwrap();
+        let args = serde_json::json!({ "path": path.to_str().unwrap() });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+
+        let out = tool_read(&args, &cache, &session, false).expect("plain read");
+
+        assert!(
+            !out.contains("\"if_modified_since\""),
+            "no token header when the caller did not opt in: {out}"
         );
     }
 }

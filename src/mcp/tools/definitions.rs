@@ -55,6 +55,10 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     "glob": {
                         "type": "string",
                         "description": "File pattern filter. Whitelist: \"*.rs\" (only Rust files). Exclude: \"!*.test.ts\" (skip test files). Brace expansion: \"*.{go,rs}\" (Go and Rust). Path patterns: \"src/**/*.ts\"."
+                    },
+                    "if_modified_since": {
+                        "type": "string",
+                        "description": "ISO-8601 timestamp. Result sections for files unchanged since this return `(unchanged @ <ts>)` stubs instead of bodies."
                     }
                 }
             }
@@ -93,6 +97,10 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "enum": ["auto", "full", "signature", "stripped"],
                         "default": "auto",
                         "description": "Read view. auto: smart default. full: full content. signature: hash-prefixed declarations only. stripped: whole-file content with plain comments/debug logs/extra blanks removed."
+                    },
+                    "if_modified_since": {
+                        "type": "string",
+                        "description": "ISO-8601 timestamp. Files unchanged since this return `(unchanged @ <ts>)` stubs."
                     },
                     "budget": {
                         "type": "number",

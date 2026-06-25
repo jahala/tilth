@@ -10,6 +10,7 @@ use crate::index::bloom::BloomFilterCache;
 use crate::session::Session;
 use crate::timeout::{self, spawn_with_timeout, SpawnFailure, ThreadTracker};
 
+mod iso;
 mod tools;
 pub(crate) mod write;
 
