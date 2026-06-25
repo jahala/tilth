@@ -139,12 +139,12 @@ jobs:
       - run: npm publish ./npm
       # Anchor the @plotplot org: dual-publish the SAME artifact as `@plotplot/tilth`.
       # Requires a trusted publisher for @plotplot/tilth configured on npmjs.com (one-time).
-      # Recovery: if this scoped publish fails AFTER the unscoped publish (above) has
-      # succeeded, re-running the job re-fails at `npm publish ./npm` (npm 403 — version
-      # already published) and never reaches this step. Recover by publishing the scope
-      # once manually — `cd npm && npm pkg set name=@plotplot/tilth && npm publish --access public`
-      # — or by cutting a new patch version.
+      # Best-effort: the unscoped `tilth` publish above is the canonical release, so a
+      # failure here (e.g. the @plotplot trusted publisher isn't configured yet) must not
+      # fail the release. continue-on-error keeps the job green; if it fails, publish the
+      # scope manually when ready — `cd npm && npm pkg set name=@plotplot/tilth && npm publish --access public`.
       - name: Dual-publish under the @plotplot scope
+        continue-on-error: true
         working-directory: ./npm
         run: |
           npm pkg set name=@plotplot/tilth
