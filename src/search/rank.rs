@@ -409,10 +409,15 @@ fn non_code_penalty(path: &Path) -> i32 {
     let is_docs = ext == "md" || ext == "mdx" || ext == "txt" || ext == "rst" || has_docs_component;
 
     let path_str = path.to_string_lossy();
-    let is_config_example = (path_str.contains("example")
-        || path_str.contains("sample")
-        || path_str.contains("template"))
-        && (ext == "md" || ext == "txt" || ext == "rst");
+    let has_example_component = path.components().any(|c| {
+        c.as_os_str().to_str().is_some_and(|s| {
+            matches!(
+                s,
+                "example" | "examples" | "sample" | "samples" | "template" | "templates"
+            )
+        })
+    });
+    let is_config_example = has_example_component && (ext == "md" || ext == "txt" || ext == "rst");
 
     let is_generated = path_str.contains("generated");
 
@@ -850,5 +855,19 @@ mod tests {
             "/repo/build/output.js"
         )));
         assert!(!super::is_vendor_path(&PathBuf::from("/repo/src/auth.rs")));
+    }
+    #[test]
+    fn non_code_penalty_example_substring_not_penalized() {
+        // `examples_parser.rs` contains "example" as a substring but NOT as a
+        // standalone path component — must not be penalized (mirrors fixture_penalty fix).
+        let path = PathBuf::from("/repo/src/examples_parser.rs");
+        assert_eq!(super::non_code_penalty(&path), 0);
+    }
+
+    #[test]
+    fn non_code_penalty_example_component_penalized() {
+        // `examples/guide.md` has "examples" as a path component AND a doc ext.
+        let path = PathBuf::from("/repo/examples/guide.md");
+        assert!(super::non_code_penalty(&path) > 0);
     }
 }

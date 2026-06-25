@@ -413,6 +413,9 @@ const GO_STDLIB_ROOTS: &[&str] = &[
     "time",
     "unicode",
     "unsafe",
+    // Go 1.23+ additions
+    "iter",
+    "unique",
 ];
 
 /// Returns true if the import source is a standard library module.

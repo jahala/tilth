@@ -418,15 +418,11 @@ pub fn search_callers_expanded(
                     );
                 }
 
-                let _ = writeln!(output, "\n{} functions affected across 2 hops.", {
-                    // Dedup hop-1 by calling_function for a distinct-function count.
-                    let hop1_fns: std::collections::HashSet<&str> = sorted_callers
-                        .iter()
-                        .filter(|c| c.calling_function != "<top-level>")
-                        .map(|c| c.calling_function.as_str())
-                        .collect();
-                    hop1_fns.len() + unique_total
-                });
+                let _ = writeln!(
+                    output,
+                    "\n{} functions affected across 2 hops.",
+                    all_caller_names.len() + unique_total
+                );
             }
         }
     }
@@ -546,6 +542,60 @@ mod tests {
         assert!(
             msg.contains("test files"),
             "glob-driven hint should appear when glob is Some: {msg}"
+        );
+    }
+    /// Regression test: when there are more than MAX_MATCHES (10) hop-1 call
+    /// sites but still <= IMPACT_FANOUT_THRESHOLD unique callers, the footer
+    /// "N functions affected across 2 hops" must use the pre-truncation unique
+    /// count, not the post-truncation count.
+    ///
+    /// Setup: 8 unique functions, each calling `target_fn` twice = 16 call
+    /// sites. Truncation to MAX_MATCHES=10 only keeps the first ~5 functions,
+    /// dropping functions 6-8. The old code rebuilt the hop-1 set from
+    /// sorted_callers AFTER truncation and undercounted. The fix uses
+    /// all_caller_names (pre-truncation) which always holds 8.
+    #[test]
+    fn footer_count_uses_pre_truncation_caller_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+
+        // 8 files: each declares one function that calls `target_fn` twice.
+        // Total: 16 call sites from 8 unique caller names.
+        // One hop-2 file calls caller_a_0 so the 2nd-hop block fires.
+        for i in 0..8usize {
+            let content = format!(
+                "fn target_fn() {{}}\
+                \nfn caller_a_{i}() {{ target_fn(); target_fn(); }}\
+                \n"
+            );
+            std::fs::write(dir.path().join(format!("f{i}.rs")), content).unwrap();
+        }
+        std::fs::write(
+            dir.path().join("hop2.rs"),
+            "fn hop2_fn() { caller_a_0(); }\n",
+        )
+        .unwrap();
+
+        let result =
+            search_callers_expanded("target_fn", dir.path(), &bloom, 0, None, None, false).unwrap();
+
+        let footer_line = result
+            .lines()
+            .find(|l| l.contains("functions affected across 2 hops"))
+            .unwrap_or_else(|| panic!("footer line missing from output:\n{result}"));
+
+        let reported: usize = footer_line
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap_or_else(|_| panic!("footer count not a number: {footer_line}"));
+
+        // hop-1 = 8 (all_caller_names, pre-truncation); hop-2 = 1 (hop2_fn → caller_a_0).
+        assert_eq!(
+            reported, 9,
+            "footer reported {reported} but expected exactly 9 (8 hop-1 + 1 hop-2); \
+             old post-truncation rebuild would undercount: {footer_line}"
         );
     }
 }
