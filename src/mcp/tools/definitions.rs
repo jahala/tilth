@@ -27,7 +27,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Symbol name, text string, or regex pattern to search for. e.g. 'resolve_dependencies' or 'ServeHTTP,Next' for multi-symbol lookup."
+                        "description": "Symbol name, text string, or regex pattern to search for. e.g. 'resolve_dependencies' or 'ServeHTTP,Next' for comma-separated multi-symbol lookup (max 5)."
                     },
                     "scope": {
                         "type": "string",
@@ -241,6 +241,14 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "description": "Max tokens in response."
                     }
                 }
+            }
+        }),
+        serde_json::json!({
+            "name": "tilth_savings",
+            "description": "Report tokens tilth saved this session vs naive grep/cat (conservative lower bound). Call ONLY when the user explicitly asks how much tilth saved — never proactively.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
             }
         }),
     ];

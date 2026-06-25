@@ -64,8 +64,8 @@ AGENTS.md              User-facing copy of the MCP instructions. Generated from 
 
 ## Languages supported
 
-Rust, TypeScript, TSX, JavaScript, Python, Go, Java, C, C++, Ruby, PHP, C#, Swift.
-Kotlin, Dockerfile, Make detected but have no tree-sitter grammar (outline returns None).
+Rust, TypeScript, TSX, JavaScript, Python, Go, Java, Scala, C, C++, Ruby, PHP, C#, Swift, Kotlin, Elixir, Bash.
+Dockerfile, Make detected but have no tree-sitter grammar (outline returns None).
 
 ## Build, test, install
 
@@ -82,6 +82,8 @@ CI runs `fmt --check`, `clippy -D warnings`, `cargo test` on every push/PR.
 ## Version bumps
 
 Update version in **both** `Cargo.toml` and `npm/package.json`. Tag with `v<version>` on main.
+
+Releases publish **two npm names** from the same `npm/` wrapper: the canonical unscoped `tilth` and the org anchor `@plotplot/tilth` (the `publish-npm` job renames the artifact and republishes with `--access public`). Both names have an OIDC trusted publisher on npmjs.com (`jahala/tilth` + `release.yml`), so releases need no token. `@plotplot/tilth` was bootstrapped with a one-time manual publish — npm cannot configure trusted publishing for a package that does not exist yet.
 
 ## Benchmarks
 

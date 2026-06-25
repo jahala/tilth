@@ -25,6 +25,7 @@ pub fn detect_file_type(path: &Path) -> FileType {
         Some("kt" | "kts") => FileType::Code(Lang::Kotlin),
         Some("cs") => FileType::Code(Lang::CSharp),
         Some("ex" | "exs") => FileType::Code(Lang::Elixir),
+        Some("sh" | "bash" | "bats") => FileType::Code(Lang::Bash),
 
         Some("md" | "mdx" | "rst") => FileType::Markdown,
         Some("json" | "yaml" | "yml" | "toml" | "xml" | "ini") => FileType::StructuredData,
@@ -42,6 +43,9 @@ fn file_type_from_name(path: &Path) -> FileType {
         Some("Makefile" | "GNUmakefile") => FileType::Code(Lang::Make),
         Some("Vagrantfile" | "Rakefile") => FileType::Code(Lang::Ruby),
         Some(n) if n.starts_with(".env") => FileType::StructuredData,
+        Some(".bashrc" | ".bash_profile" | ".bash_aliases" | ".profile") => {
+            FileType::Code(Lang::Bash)
+        }
         _ => FileType::Other,
     }
 }

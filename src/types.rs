@@ -38,6 +38,7 @@ pub enum Lang {
     Kotlin,
     CSharp,
     Elixir,
+    Bash,
     Dockerfile,
     Make,
 }
@@ -66,6 +67,7 @@ impl Lang {
             | Lang::Kotlin
             | Lang::CSharp
             | Lang::Elixir
+            | Lang::Bash
             | Lang::Dockerfile
             | Lang::Make => false,
         }
@@ -90,13 +92,16 @@ pub enum ViewMode {
     Outline,
     Signature,
     Keys,
+    // Reserved/roadmap: planned head+tail view mode, not yet wired.
     #[allow(dead_code)]
     HeadTail,
     Empty,
     Generated,
     Minified,
+    // Reserved/roadmap: binary file view variant, not yet wired.
     #[allow(dead_code)]
     Binary,
+    // Reserved/roadmap: error view variant, not yet wired.
     #[allow(dead_code)]
     Error,
     Section,
@@ -196,11 +201,13 @@ pub enum OutlineKind {
     Variable,
     ImmutableVariable,
     Export,
-    #[allow(dead_code)]
+    // Property is constructed in lang/outline.rs (property_declaration nodes).
     Property,
     Module,
+    // Reserved/roadmap: no tree-sitter grammar currently emits TestSuite nodes.
     #[allow(dead_code)]
     TestSuite,
+    // Reserved/roadmap: no tree-sitter grammar currently emits TestCase nodes.
     #[allow(dead_code)]
     TestCase,
 }

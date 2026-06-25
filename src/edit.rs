@@ -217,7 +217,10 @@ fn apply_edits(path: &Path, edits: &[Edit]) -> Result<EditResult, TilthError> {
         output.push_str(line_sep);
     }
 
-    fs::write(path, &output).map_err(|e| TilthError::IoError {
+    // Write atomically: temp file in the same directory, then rename so a
+    // crash or full-disk mid-write never corrupts the original. Permissions
+    // on the temp are set to match the original before rename.
+    crate::util::atomic_write_bytes(path, output.as_bytes()).map_err(|e| TilthError::IoError {
         path: path.to_path_buf(),
         source: e,
     })?;

@@ -45,7 +45,7 @@ pub fn apply(output: &str, budget: u64) -> String {
         .rfind("\n\n##")
         .filter(|&p| p > 0)
         .or_else(|| truncated.rfind("\n\n").filter(|&p| p > 0))
-        .or_else(|| truncated.rfind('\n'))
+        .or_else(|| truncated.rfind('\n').filter(|&p| p > 0))
         .unwrap_or(safe_max);
 
     let clean_body = &body[..cut_point];
@@ -89,6 +89,26 @@ mod tests {
         // Pick a budget so max_bytes lands somewhere mid-crab.
         let out = apply(&input, 100);
         assert!(out.contains("... truncated"), "expected truncation: {out}");
+    }
+
+    #[test]
+    fn single_long_line_body_does_not_collapse() {
+        // Regression: a body that is one very long line with no interior \n has no
+        // `\n\n` to land on, so rfind('\n') finds only the leading separator at
+        // offset 0. Without the `filter(|&p| p > 0)` guard on that arm, cut_point
+        // becomes 0, clean_body is empty, and the response collapses to
+        // `header\n\n... truncated` with zero content.
+        let long_line = "x".repeat(10_000);
+        let input = format!("# header\n{long_line}");
+        let out = apply(&input, 400);
+        // The truncation marker must appear (body is 10k+ chars).
+        assert!(out.contains("truncated"), "marker line missing: {out:.80?}");
+        // The body content must survive — the output must contain some 'x' chars.
+        // If cut_point landed at 0, clean_body would be empty and no 'x' survives.
+        assert!(
+            out.contains('x'),
+            "body content collapsed to empty — single-long-line truncation bug: {out:.80?}"
+        );
     }
 
     #[test]
