@@ -69,7 +69,9 @@ const SERVER_INSTRUCTIONS: &str = include_str!("../../prompts/mcp-base.md");
 const EDIT_MODE_EXTRA: &str = include_str!("../../prompts/mcp-edit.md");
 
 /// MCP server over stdio. When `edit_mode` is true, exposes `tilth_write` and
-/// switches `tilth_read` to hashline output format.
+/// switches `tilth_read` to hashline output format. Read-only deployments
+/// (no `--edit`) omit `tilth_write` and its large schema entirely, so they pay
+/// no edit-protocol context tax.
 ///
 /// `scope` overrides the default search root. When provided, tilth chdir's to it
 /// at startup so all tools, git commands, and searches use the correct project root.
@@ -499,7 +501,7 @@ mod tests {
     fn server_instructions_byte_lock() {
         assert_eq!(
             SERVER_INSTRUCTIONS.len(),
-            3466,
+            1041,
             "SERVER_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(SERVER_INSTRUCTIONS
@@ -510,12 +512,16 @@ mod tests {
             !SERVER_INSTRUCTIONS.contains("\n\n\n"),
             "SERVER_INSTRUCTIONS must not introduce triple newlines (likely a trailing-newline drift in prompts/mcp-base.md)"
         );
-        assert!(SERVER_INSTRUCTIONS.contains("For multi-symbol lookup, separate each with a comma"));
+        // De-dup (R1) moved per-tool usage into the schemas. Lock that the
+        // native-vs-tilth steering for weaker models stays verbatim, and that the
+        // per-tool parameter manuals are gone from the always-on instructions field.
+        assert!(SERVER_INSTRUCTIONS.contains("DO NOT use Grep, Read, or Glob."));
         assert!(SERVER_INSTRUCTIONS
-            .contains("Re-expanding a previously shown definition returns [shown earlier]"));
+            .contains("To check what changed, use tilth_diff instead of Bash(git diff/git log)."));
+        assert!(SERVER_INSTRUCTIONS.contains("DO NOT use Bash(git diff) or Bash(git log --patch)."));
         assert!(
-            SERVER_INSTRUCTIONS.contains("tilth_grok: Everything structural about a symbol"),
-            "tilth_grok description must remain in SERVER_INSTRUCTIONS"
+            !SERVER_INSTRUCTIONS.contains("expand (default 2)"),
+            "per-tool parameter manuals belong in the tool schemas, not the instructions field"
         );
     }
 
@@ -523,11 +529,11 @@ mod tests {
     fn edit_mode_extra_byte_lock() {
         assert_eq!(
             EDIT_MODE_EXTRA.len(),
-            2108,
+            314,
             "EDIT_MODE_EXTRA byte count drifted from refactor baseline"
         );
         assert!(
-            EDIT_MODE_EXTRA.starts_with("\n\ntilth_write: Batch write"),
+            EDIT_MODE_EXTRA.starts_with("\n\ntilth_write replaces the host Edit and Write tools."),
             "EDIT_MODE_EXTRA must keep its leading blank-line separator so format!(\"{{S}}{{E}}\") emits one blank line between sections"
         );
         assert!(EDIT_MODE_EXTRA
@@ -536,7 +542,6 @@ mod tests {
             !EDIT_MODE_EXTRA.contains("\n\n\n"),
             "EDIT_MODE_EXTRA must not introduce triple newlines"
         );
-        assert!(EDIT_MODE_EXTRA.contains("(BOTH line and hash required)"));
     }
 
     #[test]
@@ -546,7 +551,7 @@ mod tests {
         // This asserts the composition still has that shape.
         let combined = format!("{SERVER_INSTRUCTIONS}{EDIT_MODE_EXTRA}");
         assert!(combined.contains(
-            "DO NOT re-read files already shown in expanded search results.\n\ntilth_write: Batch write"
+            "DO NOT re-read files already shown in expanded search results.\n\ntilth_write replaces"
         ));
     }
 }
