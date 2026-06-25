@@ -225,7 +225,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "tilth_savings",
-            "description": "Report tokens saved this session vs naive grep/cat (conservative lower bound).",
+            "description": "Report tokens tilth saved this session vs naive grep/cat (conservative lower bound). Call ONLY when the user explicitly asks how much tilth saved — never proactively.",
             "inputSchema": {
                 "type": "object",
                 "properties": {}
