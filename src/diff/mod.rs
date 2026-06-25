@@ -187,6 +187,7 @@ fn run_git_diff(source: &DiffSource) -> Result<String, String> {
     }
 
     let mut cmd = Command::new("git");
+    cmd.args(["-c", "core.quotePath=false"]);
     cmd.arg("diff");
 
     match source {
@@ -319,9 +320,12 @@ pub fn diff(
             }
         }
         if !all_conflicts.is_empty() {
-            output.push('\n');
             for (path, conflicts) in &all_conflicts {
+                output.push('\n');
                 output.push_str(&format::format_conflicts(conflicts, path));
+            }
+            if let Some(b) = budget {
+                output = crate::budget::apply(&output, b);
             }
         }
     }
@@ -469,7 +473,7 @@ fn diff_log(range: &str, scope: Option<&str>, budget: Option<u64>) -> Result<Str
         // Run diff for this commit.
         let ref_str = format!("{hash}^..{hash}");
         let commit_source = DiffSource::GitRef(ref_str);
-        let raw = run_git_diff(&commit_source).unwrap_or_default();
+        let raw = run_git_diff(&commit_source)?;
         let file_diffs = parse::parse_unified_diff(&raw);
 
         let mut overlays: Vec<FileOverlay> = file_diffs
