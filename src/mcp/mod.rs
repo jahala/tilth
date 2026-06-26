@@ -501,7 +501,7 @@ mod tests {
     fn server_instructions_byte_lock() {
         assert_eq!(
             SERVER_INSTRUCTIONS.len(),
-            1041,
+            1327,
             "SERVER_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(SERVER_INSTRUCTIONS
@@ -511,6 +511,11 @@ mod tests {
         assert!(
             !SERVER_INSTRUCTIONS.contains("\n\n\n"),
             "SERVER_INSTRUCTIONS must not introduce triple newlines (likely a trailing-newline drift in prompts/mcp-base.md)"
+        );
+        assert!(
+            SERVER_INSTRUCTIONS
+                .contains("DO NOT pass a relative path/scope without an absolute `root`"),
+            "require-root path discipline must lead the file-I/O guidance"
         );
         // De-dup (R1) moved per-tool usage into the schemas. Lock that the
         // native-vs-tilth steering for weaker models stays verbatim, and that the

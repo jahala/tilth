@@ -16,7 +16,11 @@ pub(in crate::mcp) fn tool_grok(
         .get("target")
         .and_then(|v| v.as_str())
         .ok_or("missing required parameter: target")?;
-    let (scope, scope_warning) = resolve_scope(args);
+    let root = args
+        .get("root")
+        .and_then(|v| v.as_str())
+        .map(std::path::Path::new);
+    let (scope, scope_warning) = resolve_scope(args, root)?;
     let full = args.get("full").and_then(Value::as_bool).unwrap_or(false);
     let caps = if full {
         crate::search::grok::GrokCaps::full()
