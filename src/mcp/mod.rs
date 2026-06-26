@@ -501,7 +501,7 @@ mod tests {
     fn server_instructions_byte_lock() {
         assert_eq!(
             SERVER_INSTRUCTIONS.len(),
-            1041,
+            1332,
             "SERVER_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(SERVER_INSTRUCTIONS
@@ -512,10 +512,17 @@ mod tests {
             !SERVER_INSTRUCTIONS.contains("\n\n\n"),
             "SERVER_INSTRUCTIONS must not introduce triple newlines (likely a trailing-newline drift in prompts/mcp-base.md)"
         );
+        assert!(
+            SERVER_INSTRUCTIONS
+                .contains("DO NOT pass a relative path/scope without an absolute `root`"),
+            "require-root path discipline must lead the file-I/O guidance"
+        );
         // De-dup (R1) moved per-tool usage into the schemas. Lock that the
         // native-vs-tilth steering for weaker models stays verbatim, and that the
         // per-tool parameter manuals are gone from the always-on instructions field.
-        assert!(SERVER_INSTRUCTIONS.contains("DO NOT use Grep, Read, or Glob."));
+        assert!(SERVER_INSTRUCTIONS.contains(
+            "prefer tilth_search, tilth_read, and tilth_files over Grep, Read, or Glob."
+        ));
         assert!(SERVER_INSTRUCTIONS
             .contains("To check what changed, use tilth_diff instead of Bash(git diff/git log)."));
         assert!(SERVER_INSTRUCTIONS.contains("DO NOT use Bash(git diff) or Bash(git log --patch)."));

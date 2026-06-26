@@ -55,6 +55,10 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     "glob": {
                         "type": "string",
                         "description": "File pattern filter. Whitelist: \"*.rs\" (only Rust files). Exclude: \"!*.test.ts\" (skip test files). Brace expansion: \"*.{go,rs}\" (Go and Rust). Path patterns: \"src/**/*.ts\"."
+                    },
+                    "root": {
+                        "type": "string",
+                        "description": "Absolute path to your checkout directory. REQUIRED unless `scope` is absolute. Must be an absolute path. A RELATIVE `scope` is anchored under `root`; an absolute `scope` is used as-is. The server cannot see your shell cwd, so a relative `scope` with no absolute `root` is refused."
                     }
                 }
             }
@@ -67,7 +71,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Absolute or relative file path to read."
+                        "description": "Absolute or relative file path to read. A relative path requires an absolute `root`; the server cannot see your shell cwd."
                     },
                     "paths": {
                         "type": "array",
@@ -97,6 +101,10 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     "budget": {
                         "type": "number",
                         "description": "Max tokens in response."
+                    },
+                    "root": {
+                        "type": "string",
+                        "description": "Absolute path to your checkout directory. REQUIRED unless every path in `paths` is absolute. Must be an absolute path. Every RELATIVE file path is anchored under `root`; absolute paths are used as-is. The server cannot see your shell cwd, so a relative path with no absolute `root` is refused."
                     }
                 }
             }
@@ -123,6 +131,10 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     "budget": {
                         "type": "number",
                         "description": "Max tokens in response."
+                    },
+                    "root": {
+                        "type": "string",
+                        "description": "Absolute path to your checkout directory. REQUIRED unless `scope` is absolute. Must be an absolute path. A RELATIVE `scope` is anchored under `root`; an absolute `scope` is used as-is. The server cannot see your shell cwd, so a relative `scope` with no absolute `root` is refused."
                     }
                 }
             }
@@ -145,6 +157,10 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     "budget": {
                         "type": "number",
                         "description": "Max tokens. Truncates 'Used by' first."
+                    },
+                    "root": {
+                        "type": "string",
+                        "description": "Absolute path to your checkout directory. REQUIRED unless `path` and `scope` are absolute. Must be an absolute path. RELATIVE `path`/`scope` are anchored under `root`; absolute ones are used as-is. The server cannot see your shell cwd, so a relative `path`/`scope` with no absolute `root` is refused."
                     }
                 }
             }
@@ -168,6 +184,10 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "type": "boolean",
                         "default": false,
                         "description": "Widen caps: 50 callers, 30 callees, 30 siblings, 30 tests (default 5/5/8/8)."
+                    },
+                    "root": {
+                        "type": "string",
+                        "description": "Absolute path to your checkout directory. REQUIRED unless `scope` is absolute. Must be an absolute path. A RELATIVE `scope` is anchored under `root`; an absolute `scope` is used as-is. The server cannot see your shell cwd, so a relative `scope` with no absolute `root` is refused."
                     }
                 }
             }
@@ -252,7 +272,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                             "properties": {
                                 "path": {
                                     "type": "string",
-                                    "description": "Absolute or relative file path."
+                                    "description": "Absolute or relative file path. A relative path requires an absolute `root`; the server cannot see your shell cwd."
                                 },
                                 "mode": {
                                     "type": "string",
@@ -314,6 +334,10 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "type": "boolean",
                         "default": false,
                         "description": "Set true to include a compact diff of changes in the response per file."
+                    },
+                    "root": {
+                        "type": "string",
+                        "description": "Optional absolute path. When provided, every RELATIVE file path in this call is anchored under `root` instead of the server's process cwd. Absolute file paths are used as-is. Use this when the server was launched from a different directory than the worktree you are editing."
                     }
                 }
             }
