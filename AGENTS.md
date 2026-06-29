@@ -5,6 +5,8 @@ Call tools by their full MCP name — prefix `mcp__tilth__`, e.g. `mcp__tilth__t
 
 PATHS: pass an ABSOLUTE path/scope, or set `root` to your ABSOLUTE checkout directory. DO NOT pass a relative path/scope without an absolute `root` — the server's cwd is frozen at startup and is NOT your shell's cwd, so a relative path is refused. A relative `root` is also refused.
 
+REQUIRED arrays per verb: tilth_read → paths: [...]; tilth_write → files: [...]; tilth_list → patterns: [...]; tilth_search → queries: [{query}]. Pass an absolute `root` whenever paths/scope are relative — the server's cwd is frozen at startup and refuses a relative scope without an absolute `root`.
+
 To explore code, always search first. tilth_search finds definitions, usages, and file locations in one call.
 Usage: tilth_search(queries: [{query: "handleRequest"}]).
 tilth_list is ONLY for listing directory contents when you have no symbol or text to search for.
@@ -14,6 +16,7 @@ For file reads, text search, and directory listings, prefer tilth_search, tilth_
 tilth_search: Search code — finds definitions, usages, and text. Replaces grep/rg for all code search.
 Batch-only: ALWAYS pass queries: [...] as an array, even for one search. DO NOT use a singular `query` — it is not accepted. Per-entry kind/glob override the top-level values.
 kind: "any" (default, merged symbol+content+callers) | "symbol" | "content" (literal text) | "regex" | "callers" (call sites)
+For "where is X defined / what calls Y", use kind: "symbol" (definitions) or kind: "callers" (call sites) — not content/regex. Content/regex match text; symbol/callers match AST definitions and real call sites. Example: tilth_search(queries: [{query: "handleAuth", kind: "symbol"}]).
 Comma-OR is for kind any/symbol/callers: "symbol1,symbol2" (max 5). DO NOT comma-separate a content query — content matches the whole string literally, commas included. To match any of several terms, use kind:"regex" with "a|b|c".
 expand (default 2): inline full source for top matches.
 context: path to file being edited — boosts nearby results.
@@ -61,10 +64,10 @@ search: filter to lines matching a term. blast: true to show callers of changed 
 Output: [+] added, [-] deleted, [~] body changed, [~:sig] signature changed.
 DO NOT use Bash(git diff) or Bash(git log --patch). Use tilth_diff instead.
 
-For code search, prefer tilth_search over Grep or Bash(grep/rg).
-For file reads, prefer tilth_read over Read or Bash(cat).
-For file listings, prefer tilth_list over Glob or Bash(find/ls).
+DO NOT `cat`/`head`/`tail`/`sed -n` a file via the shell → use tilth_read.
+DO NOT `grep`/`rg`/`ls`/`find`/`fd` on repo files via the shell → use tilth_search or tilth_list.
 To check what changed, use tilth_diff instead of Bash(git diff/git log).
+Shell out only for tests, builds, and non-file-IO commands.
 DO NOT re-read files already shown in expanded search results.
 
 tilth_write: Batch write one or more files in one call. Replaces the host Edit and Write tools.
