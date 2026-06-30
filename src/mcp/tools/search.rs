@@ -19,7 +19,11 @@ pub(in crate::mcp) fn tool_search(
         .get("query")
         .and_then(|v| v.as_str())
         .ok_or("missing required parameter: query")?;
-    let (scope, scope_warning) = resolve_scope(args);
+    let root = args
+        .get("root")
+        .and_then(|v| v.as_str())
+        .map(std::path::Path::new);
+    let (scope, scope_warning) = resolve_scope(args, root)?;
     let kind = args
         .get("kind")
         .and_then(|v| v.as_str())
@@ -96,4 +100,25 @@ pub(in crate::mcp) fn tool_search(
     let mut result = scope_warning.unwrap_or_default();
     result.push_str(&apply_budget(&output, budget));
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// WHY: a bare `tilth_search` defaults `scope` to "." and silently searched
+    /// the server's frozen cwd — the worktree bug. No scope + no root must now
+    /// refuse with an actionable message naming the root option.
+    #[test]
+    fn no_scope_no_root_errors() {
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({ "query": "anything" });
+        let err = tool_search(&args, &cache, &session, &bloom).unwrap_err();
+        assert!(
+            err.contains("relative scope") && err.contains("root"),
+            "bare search must refuse without a root: {err}"
+        );
+    }
 }

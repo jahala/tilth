@@ -471,11 +471,19 @@ fn apply_one(task: FileEditTask, bloom: &BloomFilterCache, show_diff: bool) -> (
         }
         FileEditTask::Ready { path, edits } => (path, edits),
     };
-    let header = format!("## {}", path.display());
     match render_applied(&path, &edits, bloom, show_diff) {
-        Ok(body) if body.is_empty() => (header, true),
-        Ok(body) => (format!("{header}\n{body}"), true),
-        Err(msg) => (format!("{header}\n{msg}"), false),
+        // Echo the resolved absolute path in the success header so a write that
+        // landed in a different worktree than the agent intended is visible.
+        Ok(body) => {
+            let abs = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+            let header = format!("## {}", abs.display());
+            if body.is_empty() {
+                (header, true)
+            } else {
+                (format!("{header}\n{body}"), true)
+            }
+        }
+        Err(msg) => (format!("## {}\n{msg}", path.display()), false),
     }
 }
 
@@ -933,8 +941,11 @@ mod tests {
         ];
 
         let out = apply_batch(tasks, &fresh_bloom(), false).expect("batch should succeed");
-        assert!(out.contains(&format!("## {}", a.display())));
-        assert!(out.contains(&format!("## {}", b.display())));
+        // The success header echoes the resolved absolute (canonicalized) path.
+        let a_abs = a.canonicalize().unwrap();
+        let b_abs = b.canonicalize().unwrap();
+        assert!(out.contains(&format!("## {}", a_abs.display())));
+        assert!(out.contains(&format!("## {}", b_abs.display())));
         assert_eq!(std::fs::read_to_string(&a).unwrap(), "AAA\nbbb\n");
         assert_eq!(std::fs::read_to_string(&b).unwrap(), "ccc\nDDD\n");
     }

@@ -84,20 +84,55 @@ fn resolve_with_source(
 }
 
 fn resolve_by_name(name: &str, scope: &Path) -> Result<(ResolvedTarget, String, Lang), TilthError> {
-    let result = search_symbol_raw(name, scope, None)?;
+    // The literal spec (`Type::method`) never equals a bare definition name, so
+    // this attempt only fires for genuinely bare targets.
+    if let Some(resolved) = resolve_def_by_query(name, scope)? {
+        return Ok(resolved);
+    }
+    // Qualified target (`Type::method` or `Type.method`): retry with the trailing
+    // segment. The retry is bounded — it fires only when the literal lookup found
+    // no definition, leaving bare-symbol resolution unchanged.
+    let bare = split_qualified(name);
+    if bare != name && !bare.is_empty() {
+        if let Some(resolved) = resolve_def_by_query(bare, scope)? {
+            return Ok(resolved);
+        }
+    }
+    Err(TilthError::NotFound {
+        path: PathBuf::from(name),
+        suggestion: None,
+    })
+}
+
+/// Split a qualified target into its bare trailing name.
+///
+/// `"Type::method"` → `"method"`, `"a::b::method"` → `"method"`,
+/// `"Type.method"` → `"method"`, `"method"` → `"method"`.
+fn split_qualified(name: &str) -> &str {
+    match name.rfind([':', '.']) {
+        Some(idx) => &name[idx + 1..],
+        None => name,
+    }
+}
+
+/// Search for `query` as a symbol and resolve its top-ranked definition to a
+/// full target. Returns `None` when no definition matches `query` at all, so the
+/// caller can retry with a different query.
+fn resolve_def_by_query(
+    query: &str,
+    scope: &Path,
+) -> Result<Option<(ResolvedTarget, String, Lang)>, TilthError> {
+    let result = search_symbol_raw(query, scope, None)?;
     let definitions: Vec<_> = result.matches.iter().filter(|m| m.is_definition).collect();
     let Some(top) = definitions.first() else {
-        return Err(TilthError::NotFound {
-            path: PathBuf::from(name),
-            suggestion: None,
-        });
+        return Ok(None);
     };
     let other_def_count = definitions.len().saturating_sub(1);
     let (start, _end) = top.def_range.ok_or_else(|| TilthError::ParseError {
         path: top.path.clone(),
-        reason: format!("definition match for `{name}` had no def_range"),
+        reason: format!("definition match for `{query}` had no def_range"),
     })?;
-    enrich_from_outline(top.path.clone(), start, name.to_string(), other_def_count)
+    enrich_from_outline(top.path.clone(), start, query.to_string(), other_def_count).map(Some)
 }
 
 fn resolve_by_path_line(
@@ -1943,5 +1978,48 @@ pub fn outer(x: u32) -> u32 {
         let (baseline, saved) = session.savings();
         assert_eq!(baseline, 0, "sub-threshold body must not record savings");
         assert_eq!(saved, 0, "sub-threshold body must not record savings");
+    }
+    #[test]
+    fn type_method_regression_real_impl_block() {
+        // Regression for commit 2f7c448 (fix #61): `Type::method` qualified targets
+        // must resolve to the method itself, not return NotFound. The `start_line`
+        // assertion confirms the resolver lands on the method inside the impl block.
+        let tmp = tempfile::tempdir().unwrap();
+        let body = "\
+pub struct OutlineCache;
+
+pub struct ParsedFile;
+
+impl OutlineCache {
+    pub fn new() -> Self {
+        Self
+    }
+
+    pub fn get_or_parse(&self, _path: &str) -> Option<ParsedFile> {
+        None
+    }
+}
+";
+        write_fixture(tmp.path(), "src/cache.rs", body);
+
+        for spec in ["OutlineCache::get_or_parse", "OutlineCache.get_or_parse"] {
+            let (target, _, _) = resolve_with_source(spec, tmp.path())
+                .unwrap_or_else(|e| panic!("`{spec}` must resolve, got: {e}"));
+            assert_eq!(
+                target.name, "get_or_parse",
+                "`{spec}` must resolve to method `get_or_parse`, not the qualified form"
+            );
+            // get_or_parse is the 10th line of the fixture (new() occupies lines 6-8);
+            // assert the exact line so a wrong resolution to `new` or a stub would fail.
+            assert_eq!(
+                target.start_line, 10,
+                "`{spec}` resolved to line {} — expected get_or_parse at line 10",
+                target.start_line
+            );
+            assert_eq!(
+                target.other_def_count, 0,
+                "exactly one `get_or_parse` definition in the fixture"
+            );
+        }
     }
 }
