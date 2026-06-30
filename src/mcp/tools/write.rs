@@ -190,7 +190,17 @@ pub(in crate::mcp) fn tool_write(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
 
-    let (scope_root, _scope_warn) = super::resolve_scope(args);
+    // Containment root for the overwrite/append scope guard. This is the write
+    // sandbox boundary, NOT a path-resolution channel: an explicit `scope`
+    // anchors it, otherwise it falls back to the server cwd. Kept cwd-defaulting
+    // on purpose — the read-side require-root discipline (resolve_scope) governs
+    // where reads resolve; a bare hash-mode write with an absolute path must not
+    // be refused just because it omitted `scope`. Write-side `root` anchoring is
+    // tracked separately (sibling PR #76).
+    let scope_root: PathBuf = match args.get("scope").and_then(|v| v.as_str()) {
+        Some(s) => PathBuf::from(s),
+        None => std::env::current_dir().unwrap_or_else(|_| ".".into()),
+    };
     // Canonicalize the scope once for the overwrite/append containment check.
     // Fail closed on canonicalize failure: an unresolvable scope refuses
     // direct writes rather than silently disabling the guard.
