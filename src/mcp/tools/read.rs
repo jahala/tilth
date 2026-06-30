@@ -19,6 +19,13 @@ pub(in crate::mcp) fn tool_read(
     edit_mode: bool,
 ) -> Result<String, String> {
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
+    // Extract optional root for anchoring relative paths. A relative path
+    // without an absolute `root` is unresolvable (the server cannot see the
+    // caller's shell cwd) — propagate that refusal at each path-resolution site.
+    let root = args
+        .get("root")
+        .and_then(|v| v.as_str())
+        .map(std::path::Path::new);
     let full_flag = args
         .get("full")
         .and_then(serde_json::Value::as_bool)
@@ -69,7 +76,7 @@ pub(in crate::mcp) fn tool_read(
             }
 
             let path_str = p.as_str().ok_or("paths must be an array of strings")?;
-            let path = PathBuf::from(path_str);
+            let path = super::resolve_read_path(&PathBuf::from(path_str), root)?;
             session.record_read(&path);
             let read = if force_signature {
                 read_signature_file(&path, cache).map(|(body, _)| body)
@@ -92,7 +99,7 @@ pub(in crate::mcp) fn tool_read(
         .get("path")
         .and_then(|v| v.as_str())
         .ok_or("missing required parameter: path (or use paths for batch read)")?;
-    let path = PathBuf::from(path_str);
+    let path = super::resolve_read_path(&PathBuf::from(path_str), root)?;
     let section = args.get("section").and_then(|v| v.as_str());
     let sections_arr = args.get("sections").and_then(|v| v.as_array());
 
@@ -567,6 +574,88 @@ mod tests {
         assert!(
             modes.iter().any(|v| v.as_str() == Some("stripped")),
             "mode enum must advertise stripped: {read}"
+        );
+    }
+
+    #[test]
+    fn root_param_anchors_relative_path_under_root() {
+        // Guards #78: tilth_read with a relative path + root must read from
+        // <root>/<path>, not from <cwd>/<path>. Prevents worktree agents from
+        // silently reading the wrong checkout.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("hello.rs"), "fn hello() {}").unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let args = serde_json::json!({
+            "paths": ["hello.rs"],
+            "mode": "full",
+            "root": root.to_str().unwrap()
+        });
+        let result = tool_read(&args, &cache, &session, false).unwrap();
+        assert!(
+            result.contains("fn hello()"),
+            "expected file content via root-anchored path, got: {result}"
+        );
+    }
+
+    #[test]
+    fn root_param_absolute_path_unaffected() {
+        // Absolute paths must be used as-is even when root is set.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let abs_file = root.join("abs.rs");
+        std::fs::write(&abs_file, "fn abs() {}").unwrap();
+
+        let unrelated_root = tempfile::tempdir().unwrap();
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let args = serde_json::json!({
+            "paths": [abs_file.to_str().unwrap()],
+            "mode": "full",
+            "root": unrelated_root.path().to_str().unwrap()
+        });
+        let result = tool_read(&args, &cache, &session, false).unwrap();
+        assert!(
+            result.contains("fn abs()"),
+            "absolute path must resolve independently of root, got: {result}"
+        );
+    }
+
+    #[test]
+    fn no_root_reads_absolute_path_unchanged() {
+        // Omitting root must behave identically to before #78: absolute paths
+        // resolve as-is regardless of whether root is set or not.
+        let tmp = tempfile::tempdir().unwrap();
+        let abs_file = tmp.path().join("check.rs");
+        std::fs::write(&abs_file, "fn check() {}").unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let args = serde_json::json!({
+            "paths": [abs_file.to_str().unwrap()],
+            "mode": "full"
+        });
+        let result = tool_read(&args, &cache, &session, false).unwrap();
+        assert!(
+            result.contains("fn check()"),
+            "no-root regression: absolute path must be readable without root, got: {result}"
+        );
+    }
+
+    #[test]
+    fn relative_path_no_root_errors() {
+        // WHY: a relative path + no root silently resolved against the frozen
+        // server cwd before this spec — the worktree bug. It must now refuse
+        // with a message naming the path and the absolute-root escape hatch.
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let args = serde_json::json!({ "paths": ["src/foo.rs"], "mode": "full" });
+        let err = tool_read(&args, &cache, &session, false).unwrap_err();
+        assert!(
+            err.contains("src/foo.rs") && err.contains("root"),
+            "relative path without root must refuse with an actionable message: {err}"
         );
     }
 
