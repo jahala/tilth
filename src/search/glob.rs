@@ -28,7 +28,7 @@ pub fn search(pattern: &str, scope: &Path) -> Result<GlobResult, TilthError> {
     })?;
     let matcher = glob.compile_matcher();
 
-    let files: std::sync::Mutex<Vec<GlobFileEntry>> = std::sync::Mutex::new(Vec::new());
+    let files: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
     let total_found = std::sync::atomic::AtomicUsize::new(0);
     let extensions: std::sync::Mutex<HashSet<String>> = std::sync::Mutex::new(HashSet::new());
 
@@ -65,17 +65,13 @@ pub fn search(pattern: &str, scope: &Path) -> Result<GlobResult, TilthError> {
 
             if matcher.is_match(name) || matcher.is_match(rel) {
                 total_found.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                // Compute preview outside the lock, then check-and-push in one acquisition
-                let preview = file_preview(path);
-                let mut locked = files
+                // Collect every match; selection happens deterministically after
+                // the walk (capping inside the parallel walk made the KEPT set
+                // thread-timing dependent — identical calls listed different files).
+                files
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if locked.len() < MAX_FILES {
-                    locked.push(GlobFileEntry {
-                        path: path.to_path_buf(),
-                        preview,
-                    });
-                }
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(path.to_path_buf());
             }
 
             ignore::WalkState::Continue
@@ -83,9 +79,20 @@ pub fn search(pattern: &str, scope: &Path) -> Result<GlobResult, TilthError> {
     });
 
     let total = total_found.load(std::sync::atomic::Ordering::Relaxed);
-    let files = files
+    let mut matched = files
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Deterministic selection: sort, cap, THEN compute previews (preview I/O
+    // only for the kept few — cheaper than previewing inside the walk).
+    matched.sort();
+    matched.truncate(MAX_FILES);
+    let files: Vec<GlobFileEntry> = matched
+        .into_iter()
+        .map(|path| {
+            let preview = file_preview(&path);
+            GlobFileEntry { path, preview }
+        })
+        .collect();
     let extensions = extensions
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner);

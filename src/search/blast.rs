@@ -122,6 +122,13 @@ fn format_blast_radius(
         }
     }
 
+    // Callers arrive in parallel-walk order — sort for deterministic output
+    // (identical edits must produce byte-identical blast radii).
+    for (prod, test) in by_symbol.values_mut() {
+        prod.sort_by(|a, b| (&a.path, a.line).cmp(&(&b.path, b.line)));
+        test.sort_by(|a, b| (&a.path, a.line).cmp(&(&b.path, b.line)));
+    }
+
     // Emit per-symbol prod callers in touched order (preserves definition order).
     for ts in touched {
         let Some((prod, _)) = by_symbol.get(ts.name.as_str()) else {

@@ -231,6 +231,30 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                 "properties": {}
             }
         }),
+        serde_json::json!({
+            "name": "tilth_scout",
+            "description": "Assemble candidate files for a natural-language prompt and rank them. Returns JSON with: candidates (ranked pool), gate_fired (bool), agreement (bool), skeleton (terse structural summary of the top match when gate fires), n_pool, elapsed_ms, model_used. Job 'rerank' (default) applies rrf(CE, embed) ranking on symbol texts and emits a grok skeleton when CE-top1 == embed-top1; degrades automatically to deterministic 'context' when models are absent.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["prompt"],
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "Natural-language prompt describing what to find, e.g. 'parse a unified diff'."
+                    },
+                    "scope": {
+                        "type": "string",
+                        "description": "Subdirectory to narrow the search. Default: project root."
+                    },
+                    "job": {
+                        "type": "string",
+                        "enum": ["context", "rerank"],
+                        "default": "rerank",
+                        "description": "Job to run: rerank (default — rrf fusion ranking + skeleton when gate fires) or context (deterministic candidate assembly only)."
+                    }
+                }
+            }
+        }),
     ];
 
     if edit_mode {

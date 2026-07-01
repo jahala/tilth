@@ -452,7 +452,8 @@ pub fn grok(
     // callee's body and attach it to the result for the formatter to render.
     // Measure the true definition span, not `body` — `body` may be a dedup-degraded
     // preview on a re-grok, which would otherwise make a large function look thin.
-    let delegate_body = if target.start_line > 0
+    let delegate_body = if !crate::types::feature_disabled("TILTH_NO_THINWRAP")
+        && target.start_line > 0
         && (target.end_line.saturating_sub(target.start_line) as usize + 1)
             <= WRAPPER_MAX_BODY_LINES
         && total_callees_internal == 1
