@@ -82,14 +82,7 @@ pub(crate) fn blast_radius(
 
     let symbol_names: HashSet<String> = touched.iter().map(|t| t.name.clone()).collect();
 
-    let callers = find_callers_batch(
-        &symbol_names,
-        scope,
-        bloom,
-        None,
-        crate::search::callers::BATCH_EARLY_QUIT,
-    )
-    .ok()?;
+    let callers = find_callers_batch(&symbol_names, scope, bloom, None).ok()?;
 
     let canonical = path.canonicalize().ok()?;
     let callers: Vec<(String, CallerMatch)> = callers

@@ -12,7 +12,7 @@ use crate::index::bloom::BloomFilterCache;
 use crate::lang::detect_file_type;
 use crate::lang::outline::get_outline_entries;
 use crate::search::callees::{extract_callee_names, resolve_callees, ResolvedCallee};
-use crate::search::callers::{find_callers_batch, CallerMatch, BATCH_EARLY_QUIT};
+use crate::search::callers::{find_callers_batch, CallerMatch};
 use crate::search::search_symbol_raw;
 use crate::types::{is_test_file, FileType, Lang, OutlineEntry, OutlineKind};
 
@@ -397,7 +397,7 @@ pub fn grok(
 
     // --- Callers + tests (one walk, partitioned by is_test_file) ----------
     let symbols: HashSet<String> = std::iter::once(target.name.clone()).collect();
-    let raw_callers = find_callers_batch(&symbols, scope, bloom, None, BATCH_EARLY_QUIT)?;
+    let raw_callers = find_callers_batch(&symbols, scope, bloom, None)?;
 
     let prod_and_test: Vec<CallerMatch> = raw_callers
         .into_iter()

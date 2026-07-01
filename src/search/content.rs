@@ -12,9 +12,7 @@ use grep_searcher::sinks::UTF8;
 use grep_searcher::Searcher;
 
 const MAX_MATCHES: usize = 10;
-const EARLY_QUIT_THRESHOLD: usize = MAX_MATCHES * 3;
 const FULL_MAX_MATCHES: usize = 100;
-const FULL_EARLY_QUIT_THRESHOLD: usize = FULL_MAX_MATCHES * 3;
 const MAX_SEARCH_FILE_SIZE: u64 = 500_000;
 
 /// Content search using ripgrep crates. Literal by default, regex if `is_regex`.
@@ -26,11 +24,7 @@ pub fn search(
     glob: Option<&str>,
     full: bool,
 ) -> Result<SearchResult, TilthError> {
-    let (max_matches, early_quit) = if full {
-        (FULL_MAX_MATCHES, FULL_EARLY_QUIT_THRESHOLD)
-    } else {
-        (MAX_MATCHES, EARLY_QUIT_THRESHOLD)
-    };
+    let max_matches = if full { FULL_MAX_MATCHES } else { MAX_MATCHES };
     let matcher = if is_regex {
         RegexMatcher::new(pattern)
     } else {
@@ -54,10 +48,6 @@ pub fn search(
         let total_found = &total_found;
 
         Box::new(move |entry| {
-            if total_found.load(Ordering::Relaxed) >= early_quit {
-                return ignore::WalkState::Quit;
-            }
-
             let Ok(entry) = entry else {
                 return ignore::WalkState::Continue;
             };
@@ -137,14 +127,14 @@ pub fn search(
                 all.extend(file_matches);
             }
 
-            if total_found.load(Ordering::Relaxed) >= early_quit {
-                ignore::WalkState::Quit
-            } else {
-                ignore::WalkState::Continue
-            }
+            ignore::WalkState::Continue
         })
     });
 
+    // The walk always completes — quitting on a racy shared counter made the
+    // discovered SET thread-timing dependent (identical calls returned
+    // different totals and silently missed whole files). Bounding happens
+    // deterministically below: rank, then display-cap.
     let total = total_found.load(Ordering::Relaxed);
     let mut all_matches = matches
         .into_inner()
@@ -162,4 +152,44 @@ pub fn search(
         usages: total,
         facet_totals: FacetTotals::default(),
     })
+}
+
+#[cfg(test)]
+mod completeness_tests {
+    use super::*;
+
+    fn fixture() -> tempfile::TempDir {
+        let d = tempfile::tempdir().unwrap();
+        let line = "// needle_alpha marker line\n";
+        std::fs::write(d.path().join("a.rs"), line.repeat(40)).unwrap();
+        std::fs::write(d.path().join("b.rs"), line.repeat(40)).unwrap();
+        std::fs::write(d.path().join("zz.rs"), format!("fn zz() {{}}\n{line}")).unwrap();
+        d
+    }
+
+    /// The walk must visit EVERY file before capping — an early quit on a racy
+    /// counter made the discovered SET thread-timing dependent (identical calls
+    /// returned different totals and silently missed whole files: the #51 bug).
+    #[test]
+    fn content_search_totals_are_complete_and_deterministic() {
+        let d = fixture();
+        let r1 = search("needle_alpha", d.path(), false, None, None, false).unwrap();
+        assert_eq!(
+            r1.total_found, 81,
+            "must count matches in ALL files (40+40+1), not quit mid-walk"
+        );
+        for _ in 0..4 {
+            let r = search("needle_alpha", d.path(), false, None, None, false).unwrap();
+            assert_eq!(
+                r.total_found, r1.total_found,
+                "totals must not vary run-to-run"
+            );
+            let p1: Vec<_> = r1.matches.iter().map(|m| (&m.path, m.line)).collect();
+            let p: Vec<_> = r.matches.iter().map(|m| (&m.path, m.line)).collect();
+            assert_eq!(
+                p, p1,
+                "the displayed match set must be identical run-to-run"
+            );
+        }
+    }
 }
