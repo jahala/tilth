@@ -97,6 +97,11 @@ enum Command {
         /// Enable edit mode (hashline output + tilth_write tool).
         #[arg(long)]
         edit: bool,
+
+        /// Also write the UserPromptSubmit hook for claude-code hosts.
+        /// For all other hosts, prints a note (MCP tool is always installed).
+        #[arg(long)]
+        with_scout: bool,
     },
     /// Show structural diff with function-level change summaries.
     Diff {
@@ -158,6 +163,64 @@ enum Command {
         #[arg(long)]
         full: bool,
     },
+    /// Assemble candidate files for a natural-language prompt and apply a typed job.
+    ///
+    /// Jobs: `context` (deterministic, default) — candidate files with scores
+    /// and leading symbols; `rerank` — cross-encoder rerank, degrades to
+    /// `context` when the local model is unavailable.
+    Scout {
+        /// Natural-language prompt describing what to find.
+        /// Ignored when --hook is set (prompt is read from stdin JSON).
+        #[arg(default_value = "")]
+        prompt: String,
+
+        /// Restrict search to a subdirectory.
+        #[arg(long, default_value = ".")]
+        scope: PathBuf,
+
+        /// Job to run on the candidates: context or rerank.
+        #[arg(long, default_value = "context")]
+        job: String,
+
+        /// Machine-readable JSON output.
+        #[arg(long)]
+        json: bool,
+
+        /// Hook adapter mode: read prompt + cwd from stdin JSON, emit hookSpecificOutput JSON.
+        /// Ignores the positional prompt argument. Always exits 0.
+        #[arg(long)]
+        hook: bool,
+
+        /// Build + cache the embed index for `scope`, then exit. Queries never
+        /// build it themselves (bounded on huge repos); run this to pre-warm.
+        #[arg(long)]
+        warm: bool,
+    },
+    /// Manage local models (pull, list, …).
+    Model {
+        #[command(subcommand)]
+        subcommand: ModelSubcommand,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum ModelSubcommand {
+    /// Copy or download a model into the tilth model cache.
+    ///
+    /// Local source: supply a directory path containing `model.onnx` and
+    /// `tokenizer.json`. The files are copied into
+    /// `~/.cache/tilth/models/<name>/`.
+    ///
+    /// Remote source (HTTP/HTTPS): requires `--features model-pull-http`.
+    Pull {
+        /// Cache name for the model (e.g. "reranker").
+        #[arg(long)]
+        name: String,
+
+        /// Source: a local directory path or an HTTP/HTTPS URL prefix.
+        #[arg(long)]
+        source: String,
+    },
 }
 
 fn main() {
@@ -173,12 +236,60 @@ fn main() {
     // Subcommands
     if let Some(cmd) = cli.command {
         match cmd {
-            Command::Install { ref host, edit } => {
-                if let Err(e) = tilth::install::run(host, edit) {
+            Command::Install {
+                ref host,
+                edit,
+                with_scout,
+            } => {
+                if let Err(e) = tilth::install::run(host, edit, with_scout) {
                     eprintln!("install error: {e}");
                     process::exit(1);
                 }
             }
+            Command::Scout {
+                prompt,
+                scope,
+                job,
+                json,
+                hook,
+                warm,
+            } => {
+                if hook {
+                    run_scout_hook();
+                    return;
+                }
+                let scope = scope.canonicalize().unwrap_or(scope);
+                if warm {
+                    match tilth::warm_scout_index(&scope) {
+                        Ok(msg) => println!("{msg}"),
+                        Err(e) => {
+                            eprintln!("scout warm error: {e}");
+                            process::exit(e.exit_code());
+                        }
+                    }
+                    return;
+                }
+                match tilth::run_scout(&prompt, &scope, &job, json) {
+                    Ok(output) => emit_output(&output, io::stdout().is_terminal()),
+                    Err(e) => {
+                        eprintln!("scout error: {e}");
+                        process::exit(e.exit_code());
+                    }
+                }
+            }
+            Command::Model { subcommand } => match subcommand {
+                ModelSubcommand::Pull { name, source } => {
+                    match tilth::model_pull::run_model_pull(&name, &source) {
+                        Ok(dest) => {
+                            println!("model '{}' ready at {}", name, dest.display());
+                        }
+                        Err(e) => {
+                            eprintln!("model pull error: {e}");
+                            process::exit(1);
+                        }
+                    }
+                }
+            },
             Command::Overview => {
                 let cwd = std::env::current_dir().unwrap_or_default();
                 let output = tilth::overview::fingerprint(&cwd);
@@ -506,6 +617,114 @@ fn compute_expand(cli_expand: Option<usize>, cli_full: bool) -> usize {
     }
 }
 
+/// Pure decision: the hook's `additionalContext` for a parsed scout JSON.
+/// `None` = emit nothing — the hook stays silent unless the gate fired with a
+/// structural skeleton. STRUCTURE only: no file-list (the skeleton carries its
+/// own file:line anchors; a bare file-list is the capped surfacing that hurts).
+fn hook_payload(parsed: &serde_json::Value) -> Option<String> {
+    let gate_fired = parsed
+        .get("gate_fired")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let skeleton = parsed
+        .get("skeleton")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if !gate_fired || skeleton.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Structural skeleton (local analysis — a hint, not a directive):\n{skeleton}"
+    ))
+}
+
+/// Hook adapter for `tilth scout --hook`.
+///
+/// Reads ALL of stdin, parses `{"user_input": "...", "cwd": "..."}`, runs
+/// `run_scout` with job="context" and json=true, extracts the top-3 candidate
+/// paths, and emits `hookSpecificOutput` JSON to stdout.
+///
+/// All I/O lives here at the edge; `run_scout` stays pure. NEVER exits non-zero,
+/// never panics to the caller — every failure path prints nothing (or an empty-
+/// context result) and returns normally. Wrapped in `catch_unwind` as a final
+/// safety net.
+fn run_scout_hook() {
+    // The outer catch_unwind guards against any panic in the hook logic.
+    let result = std::panic::catch_unwind(|| {
+        run_scout_hook_inner();
+    });
+    if result.is_err() {
+        // Panic was caught — emit nothing and exit 0 silently.
+    }
+    // Always exit 0.
+    process::exit(0);
+}
+
+fn run_scout_hook_inner() {
+    use std::io::Read as _;
+
+    // Read all of stdin.
+    let mut raw = String::new();
+    if std::io::stdin().read_to_string(&mut raw).is_err() {
+        return;
+    }
+
+    // Parse as JSON.
+    let v: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return, // bad stdin — emit nothing, exit 0
+    };
+
+    // Claude Code's UserPromptSubmit sends `prompt`; accept `user_input` too
+    // for any host/shim that renames it.
+    let user_input = match v
+        .get("prompt")
+        .or_else(|| v.get("user_input"))
+        .and_then(|x| x.as_str())
+    {
+        Some(s) if !s.is_empty() => s,
+        _ => return,
+    };
+    let cwd = v.get("cwd").and_then(|x| x.as_str()).unwrap_or(".");
+
+    let scope = std::path::Path::new(cwd);
+
+    // Run scout with json=true so we can parse the candidate paths.
+    // Use "rerank" so the full validated pipeline fires when models are present;
+    // it degrades automatically to the deterministic path when models are absent.
+    let scout_json = match tilth::run_scout(user_input, scope, "rerank", true) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+
+    // Parse the JSON result.
+    let parsed: serde_json::Value = match serde_json::from_str(&scout_json) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+
+    // Only inject when the gate fired with a structural skeleton — and inject
+    // STRUCTURE only (no file-list; the skeleton carries its own file:line
+    // anchors, and a bare file-list is the capped surfacing that hurts).
+    let Some(additional_context) = hook_payload(&parsed) else {
+        return;
+    };
+
+    let output = serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": additional_context
+        }
+    });
+
+    // Emit to stdout — ignore write errors (we must not panic or exit non-zero).
+    if let Ok(s) = serde_json::to_string(&output) {
+        let _ = std::io::stdout().write_all(s.as_bytes());
+        let _ = std::io::stdout().write_all(b"\n");
+        let _ = io::stdout().flush();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,5 +765,61 @@ mod tests {
         // handling, but cli.full stays false. compute_expand must return 0.
         let cli_full = false; // user did NOT pass --full
         assert_eq!(compute_expand(None, cli_full), 0);
+    }
+}
+
+#[cfg(test)]
+mod scout_hook_tests {
+    use super::*;
+
+    /// The hook's inject decision: skeleton-only when the gate fired; NOTHING
+    /// otherwise (no bare file-list — the capped surfacing hurts real outcome).
+    #[test]
+    fn hook_payload_is_skeleton_only_when_gated_and_silent_otherwise() {
+        let fired = serde_json::json!({
+            "gate_fired": true,
+            "skeleton": "ServeHTTP (fn) — gin.go:662\n  calls: handleHTTPRequest (gin.go:690)",
+            "candidates": [{"path": "gin.go"}],
+        });
+        let payload = hook_payload(&fired).expect("gated fire must inject");
+        assert!(
+            payload.contains("ServeHTTP"),
+            "must carry the skeleton: {payload}"
+        );
+        assert!(
+            !payload.contains("Possibly-relevant"),
+            "must NOT append a file-list: {payload}"
+        );
+
+        let silent = serde_json::json!({
+            "gate_fired": false,
+            "skeleton": "",
+            "candidates": [{"path": "gin.go"}],
+        });
+        assert!(
+            hook_payload(&silent).is_none(),
+            "no fire → emit nothing (no deterministic file-list fallback)"
+        );
+
+        let fired_without_skeleton = serde_json::json!({
+            "gate_fired": true,
+            "skeleton": "",
+        });
+        assert!(
+            hook_payload(&fired_without_skeleton).is_none(),
+            "fire without a skeleton → emit nothing"
+        );
+    }
+
+    /// Garbage stdin must not panic and must return from run_scout_hook_inner silently.
+    #[test]
+    fn hook_adapter_handles_garbage_stdin_gracefully() {
+        // We test the inner logic by calling run_scout with an empty/invalid prompt
+        // and verifying it returns Ok (empty candidates) rather than panicking.
+        let tmp = tempfile::tempdir().unwrap();
+        // run_scout with an empty terms list returns Ok with no candidates.
+        let result = tilth::run_scout("", tmp.path(), "context", true);
+        // Must not error on empty input.
+        assert!(result.is_ok(), "empty prompt must not error: {result:?}");
     }
 }

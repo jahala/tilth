@@ -113,3 +113,23 @@ inherits = "release"
 lto = "thin"
 codegen-units = 8
 strip = false
+
+# Local-inference layer — feature-gated, zero cost in the default build.
+[dependencies.ort]
+version = "2.0.0-rc.12"
+optional = true
+features = ["coreml"]
+
+[dependencies.tokenizers]
+version = "0.21"
+optional = true
+
+[dependencies.ureq]
+version = "2"
+optional = true
+
+[features]
+infer = ["dep:ort", "dep:tokenizers"]
+# HTTP download for `tilth model pull --source https://...`.
+# Default build is local-copy only; this feature adds ureq as a dep.
+model-pull-http = ["dep:ureq"]

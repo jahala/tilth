@@ -180,7 +180,9 @@ pub fn read_file(
     // return the full file — same token cost with less information is strictly
     // worse and forces the caller to do a second read.
     let outline_tokens = estimate_tokens(outline.len() as u64);
-    if outline_tokens >= tokens * OUTLINE_MIN_COMPRESSION / 100 {
+    if !crate::types::feature_disabled("TILTH_NO_OGATE")
+        && outline_tokens >= tokens * OUTLINE_MIN_COMPRESSION / 100
+    {
         return Ok(full_view());
     }
 

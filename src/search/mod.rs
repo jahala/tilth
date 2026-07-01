@@ -7,6 +7,7 @@ pub mod deps;
 pub mod facets;
 pub mod glob;
 pub mod grok;
+pub(crate) mod locate;
 pub mod rank;
 pub mod siblings;
 pub mod strip;
