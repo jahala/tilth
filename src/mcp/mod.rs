@@ -502,7 +502,7 @@ mod tests {
     fn server_instructions_byte_lock() {
         assert_eq!(
             SERVER_INSTRUCTIONS.len(),
-            1041,
+            1413,
             "SERVER_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(SERVER_INSTRUCTIONS
@@ -517,6 +517,11 @@ mod tests {
         // native-vs-tilth steering for weaker models stays verbatim, and that the
         // per-tool parameter manuals are gone from the always-on instructions field.
         assert!(SERVER_INSTRUCTIONS.contains("DO NOT use Grep, Read, or Glob."));
+        // The k-validated steering (first config to beat native baseline):
+        // grok-steering + batching must stay in the always-on instructions.
+        assert!(SERVER_INSTRUCTIONS.contains("tilth_grok(symbol) returns def + callers + callees"));
+        assert!(SERVER_INSTRUCTIONS
+            .contains(r#"Pass them together: tilth_search("parse,decode,apply")"#));
         assert!(SERVER_INSTRUCTIONS
             .contains("To check what changed, use tilth_diff instead of Bash(git diff/git log)."));
         assert!(SERVER_INSTRUCTIONS.contains("DO NOT use Bash(git diff) or Bash(git log --patch)."));
