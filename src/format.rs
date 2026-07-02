@@ -31,13 +31,21 @@ pub fn binary_header(path: &Path, byte_len: u64, mime: &str) -> String {
 pub fn search_header(
     query: &str,
     scope: &Path,
+    shown: usize,
     total: usize,
     defs: usize,
     usages: usize,
 ) -> String {
+    // When the display cap bit, say so — a bare capped count reads as a
+    // complete result and silently under-reports (the #51 bug).
+    let count = if total > shown {
+        format!("{shown} of {total} matches")
+    } else {
+        format!("{total} matches")
+    };
     let parts = match (defs, usages) {
-        (0, _) => format!("{total} matches"),
-        (d, u) => format!("{total} matches ({d} definitions, {u} usages)"),
+        (0, _) => count,
+        (d, u) => format!("{count} ({d} definitions, {u} usages)"),
     };
     format!("# Search: \"{query}\" in {} — {parts}", scope.display())
 }

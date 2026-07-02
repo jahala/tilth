@@ -36,6 +36,14 @@ pub(crate) fn select_diverse_lines(
         return None;
     }
 
+    // Bisect kill-switch: force the query-agnostic path (byte-identical to the
+    // pre-feature selector, per the doc above).
+    let query = if crate::types::feature_disabled("TILTH_NO_QTRUNC") {
+        None
+    } else {
+        query
+    };
+
     let lines: Vec<&str> = content.lines().collect();
     // Treat an empty query as no query, so the boost pass below is skipped and
     // behaviour stays byte-identical to the `None` path.

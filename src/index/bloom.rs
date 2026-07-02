@@ -107,7 +107,7 @@ fn build_filter(content: &str, lang: Option<Lang>) -> BloomFilter {
 /// `lang` gates language-specific lexing: the Rust lifetime heuristic only
 /// applies when `lang` is `Some(Lang::Rust)`. For every other language a `'`
 /// opens a single-quoted string, matching their actual syntax.
-fn extract_identifiers(content: &str, lang: Option<Lang>) -> impl Iterator<Item = &str> {
+pub(crate) fn extract_identifiers(content: &str, lang: Option<Lang>) -> impl Iterator<Item = &str> {
     IdentifierIter::new(content, lang)
 }
 

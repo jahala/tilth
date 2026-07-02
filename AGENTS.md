@@ -3,6 +3,8 @@ tilth — code intelligence MCP server. Replaces grep, cat, find, ls with AST-aw
 
 To explore code, always search first. tilth_search finds definitions, usages, and file locations in one call.
 Usage: tilth_search(query: "handleRequest").
+Tracing a call chain or a symbol's callers/callees? tilth_grok(symbol) returns def + callers + callees + siblings in one call — best in Go, Rust, and other statically-typed languages.
+Following a chain or comparing symbols? Pass them together: tilth_search("parse,decode,apply") (up to 5). Several parts of one file? tilth_read(sections=["10-40","80-110"]) in one call.
 tilth_files is ONLY for listing directory contents when you have no symbol or text to search for.
 DO NOT use Read if content is already shown in expanded search results.
 DO NOT use Grep, Read, or Glob. Always use the better tools tilth_search (grep), tilth_read (read), tilth_files (glob).

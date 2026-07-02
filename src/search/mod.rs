@@ -7,6 +7,7 @@ pub mod deps;
 pub mod facets;
 pub mod glob;
 pub mod grok;
+pub(crate) mod locate;
 pub mod rank;
 pub mod siblings;
 pub mod strip;
@@ -203,6 +204,7 @@ pub fn search_multi_symbol_expanded(
             &result.query,
             &result.scope,
             result.matches.len(),
+            result.total_found,
             result.definitions,
             result.usages,
         );
@@ -1002,6 +1004,7 @@ fn format_search_result(
         &result.query,
         &result.scope,
         result.matches.len(),
+        result.total_found,
         result.definitions,
         result.usages,
     );
@@ -1144,6 +1147,23 @@ fn format_search_result(
                 faceted.usages_cross.len(),
                 totals.usages_cross,
                 "usages",
+            );
+        }
+
+        // Content/regex results carry no per-facet totals (all-zero), so the
+        // per-facet hidden tails above cannot disclose the display cap — emit
+        // the global tail for them. Faceted symbol results disclose per-facet.
+        let facet_totals_present = totals.definitions
+            + totals.implementations
+            + totals.tests
+            + totals.usages_local
+            + totals.usages_cross
+            > 0;
+        if !facet_totals_present && result.total_found > result.matches.len() {
+            let omitted = result.total_found - result.matches.len();
+            let _ = write!(
+                out,
+                "\n\n... and {omitted} more matches. Narrow with scope."
             );
         }
     } else {
@@ -1708,22 +1728,10 @@ mod tests {
         let bloom = crate::index::bloom::BloomFilterCache::new();
         let single: std::collections::HashSet<String> =
             std::iter::once("walker".to_string()).collect();
-        let rs_callers = callers::find_callers_batch(
-            &single,
-            &scope,
-            &bloom,
-            Some("*.rs"),
-            callers::BATCH_EARLY_QUIT,
-        )
-        .expect("callers failed");
-        let toml_callers = callers::find_callers_batch(
-            &single,
-            &scope,
-            &bloom,
-            Some("*.toml"),
-            callers::BATCH_EARLY_QUIT,
-        )
-        .expect("callers toml failed");
+        let rs_callers = callers::find_callers_batch(&single, &scope, &bloom, Some("*.rs"))
+            .expect("callers failed");
+        let toml_callers = callers::find_callers_batch(&single, &scope, &bloom, Some("*.toml"))
+            .expect("callers toml failed");
 
         assert!(
             !rs_callers.is_empty(),

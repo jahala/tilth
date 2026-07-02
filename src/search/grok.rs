@@ -12,7 +12,7 @@ use crate::index::bloom::BloomFilterCache;
 use crate::lang::detect_file_type;
 use crate::lang::outline::get_outline_entries;
 use crate::search::callees::{extract_callee_names, resolve_callees, ResolvedCallee};
-use crate::search::callers::{find_callers_batch, CallerMatch, BATCH_EARLY_QUIT};
+use crate::search::callers::{find_callers_batch, CallerMatch};
 use crate::search::search_symbol_raw;
 use crate::types::{is_test_file, FileType, Lang, OutlineEntry, OutlineKind};
 
@@ -397,7 +397,7 @@ pub fn grok(
 
     // --- Callers + tests (one walk, partitioned by is_test_file) ----------
     let symbols: HashSet<String> = std::iter::once(target.name.clone()).collect();
-    let raw_callers = find_callers_batch(&symbols, scope, bloom, None, BATCH_EARLY_QUIT)?;
+    let raw_callers = find_callers_batch(&symbols, scope, bloom, None)?;
 
     let prod_and_test: Vec<CallerMatch> = raw_callers
         .into_iter()
@@ -452,7 +452,8 @@ pub fn grok(
     // callee's body and attach it to the result for the formatter to render.
     // Measure the true definition span, not `body` — `body` may be a dedup-degraded
     // preview on a re-grok, which would otherwise make a large function look thin.
-    let delegate_body = if target.start_line > 0
+    let delegate_body = if !crate::types::feature_disabled("TILTH_NO_THINWRAP")
+        && target.start_line > 0
         && (target.end_line.saturating_sub(target.start_line) as usize + 1)
             <= WRAPPER_MAX_BODY_LINES
         && total_callees_internal == 1
