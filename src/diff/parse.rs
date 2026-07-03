@@ -108,14 +108,16 @@ pub(crate) fn parse_unified_diff(raw: &str) -> Vec<FileDiff> {
                 hunks.push(h);
             }
             // Parse `@@ -old_start[,old_count] +new_start[,new_count] @@`
-            let (old_start, old_count, new_start, new_count) = parse_hunk_header(rest);
-            current_hunk = Some(Hunk {
-                old_start,
-                old_count,
-                new_start,
-                new_count,
-                lines: Vec::new(),
-            });
+            // Skip malformed hunks where the start line cannot be parsed.
+            if let Some((old_start, old_count, new_start, new_count)) = parse_hunk_header(rest) {
+                current_hunk = Some(Hunk {
+                    old_start,
+                    old_count,
+                    new_start,
+                    new_count,
+                    lines: Vec::new(),
+                });
+            }
             continue;
         }
 
@@ -151,10 +153,9 @@ pub(crate) fn parse_unified_diff(raw: &str) -> Vec<FileDiff> {
 }
 
 /// Parse `@@ -old_start[,old_count] +new_start[,new_count] @@ ...` and return
-/// `(old_start, old_count, new_start, new_count)`.
-///
-/// Omitted counts default to 1.
-fn parse_hunk_header(rest: &str) -> (u32, u32, u32, u32) {
+/// `(old_start, old_count, new_start, new_count)`, or `None` when either
+/// start line fails to parse (malformed hunk — skip it instead of defaulting to 0).
+fn parse_hunk_header(rest: &str) -> Option<(u32, u32, u32, u32)> {
     // `rest` is everything after the opening `@@ `, e.g.:
     //   `-3,7 +3,8 @@ fn foo()`
     // Find the closing `@@` to isolate the range part.
@@ -165,24 +166,28 @@ fn parse_hunk_header(rest: &str) -> (u32, u32, u32, u32) {
     };
 
     let mut parts = range_part.split_whitespace();
-    let old_spec = parts.next().unwrap_or("-0");
-    let new_spec = parts.next().unwrap_or("+0");
+    let old_spec = parts.next()?;
+    let new_spec = parts.next()?;
 
-    let (old_start, old_count) = parse_range_spec(old_spec.trim_start_matches('-'));
-    let (new_start, new_count) = parse_range_spec(new_spec.trim_start_matches('+'));
+    let (old_start, old_count) = parse_range_spec(old_spec.trim_start_matches('-'))?;
+    let (new_start, new_count) = parse_range_spec(new_spec.trim_start_matches('+'))?;
 
-    (old_start, old_count, new_start, new_count)
+    Some((old_start, old_count, new_start, new_count))
 }
 
-/// Parse `start` or `start,count` — omitted count defaults to 1.
-fn parse_range_spec(spec: &str) -> (u32, u32) {
+/// Parse `start` or `start,count`.
+///
+/// Returns `None` when the start cannot be parsed (malformed spec — the
+/// caller skips the hunk rather than mis-bucketing lines at line 0).
+/// Count defaults to 1 when omitted or unparseable.
+fn parse_range_spec(spec: &str) -> Option<(u32, u32)> {
     if let Some((s, c)) = spec.split_once(',') {
-        let start = s.parse().unwrap_or(0);
+        let start = s.parse().ok()?;
         let count = c.parse().unwrap_or(1);
-        (start, count)
+        Some((start, count))
     } else {
-        let start = spec.parse().unwrap_or(0);
-        (start, 1)
+        let start = spec.parse().ok()?;
+        Some((start, 1))
     }
 }
 
@@ -476,5 +481,28 @@ diff --git a/lib.rs b/lib.rs
         assert_eq!(h.new_start, 10);
         assert_eq!(h.new_count, 3);
         assert_eq!(h.lines.len(), 4);
+    }
+
+    // ── 14. Malformed hunk start skipped ─────────────────────────────────────
+    #[test]
+    fn test_malformed_hunk_skipped() {
+        // A hunk header with a non-numeric start must be skipped entirely
+        // rather than defaulting to line 0, which would mis-bucket diff lines.
+        let raw = "\
+diff --git a/z.rs b/z.rs
+--- a/z.rs
++++ b/z.rs
+@@ -abc,3 +def,3 @@
+-old
++new
+";
+        let diffs = parse_unified_diff(raw);
+        assert_eq!(diffs.len(), 1);
+        // Malformed hunk must be dropped rather than producing a hunk at line 0.
+        assert!(
+            diffs[0].hunks.is_empty(),
+            "malformed hunk header must be skipped, got {:?}",
+            diffs[0].hunks
+        );
     }
 }

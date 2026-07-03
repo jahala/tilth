@@ -211,9 +211,37 @@ fn find_by_start_line(entries: &[OutlineEntry], line: u32) -> Option<&OutlineEnt
 /// signal the agent might need.
 const BODY_DEGRADE_THRESHOLD: usize = 15;
 
+/// Maximum body line count for the wrapper to qualify for thin-wrapper
+/// auto-expansion. Bodies at or below this count are considered delegating
+/// wrappers rather than substantive implementations.
+const WRAPPER_MAX_BODY_LINES: usize = 10;
+
 /// Number of body lines to keep after the signature when degrading. Enough
 /// to anchor the agent's mental model; few enough to actually save tokens.
 const BODY_PREVIEW_LINES: usize = 3;
+
+/// Read a thin-wrapper's single delegate callee for inline expansion.
+///
+/// Reuses the already-loaded `target_content` when the callee lives in the
+/// target's own file. For a cross-file callee it reads the file, but only when
+/// it is at or below `cap` bytes — a delegating wrapper should point at an
+/// ordinary function, not pull a huge or generated file into the bundle. Returns
+/// `None` on an oversized, missing, or unreadable file (expansion is silently
+/// skipped). `cap` is a parameter so the bound is exercisable in tests.
+fn read_delegate_content(
+    callee_file: &Path,
+    target_path: &Path,
+    target_content: &str,
+    cap: u64,
+) -> Option<String> {
+    if callee_file == target_path {
+        Some(target_content.to_string())
+    } else if std::fs::metadata(callee_file).is_ok_and(|m| m.len() <= cap) {
+        fs::read_to_string(callee_file).ok()
+    } else {
+        None
+    }
+}
 
 // ---------------------------------------------------------------------------
 // A2: bundle assembly
@@ -298,6 +326,10 @@ pub struct GrokResult {
     pub total_callers: usize,
     pub total_siblings: usize,
     pub total_tests: usize,
+    /// When the target is a thin wrapper (small body delegating to exactly one
+    /// internal callee with no external callees), this holds that callee and
+    /// its sliced body so the formatter can render it inline. `None` otherwise.
+    pub delegate_body: Option<(ResolvedCallee, String)>,
 }
 
 /// Top-level entry: resolve the spec, then gather the structural neighborhood.
@@ -354,6 +386,15 @@ pub fn grok(
     let total_callees_internal = resolved.len();
     let total_callees_external = externals.len();
 
+    // Capture the sole internal callee before the caps below truncate `resolved`,
+    // so thin-wrapper expansion stays correct independent of `caps.max_callees`
+    // (which could be 0). `Some` here iff there is exactly one internal callee.
+    let lone_internal_callee: Option<ResolvedCallee> = if total_callees_internal == 1 {
+        resolved.first().cloned()
+    } else {
+        None
+    };
+
     // --- Callers + tests (one walk, partitioned by is_test_file) ----------
     let symbols: HashSet<String> = std::iter::once(target.name.clone()).collect();
     let raw_callers = find_callers_batch(&symbols, scope, bloom, None, BATCH_EARLY_QUIT)?;
@@ -404,6 +445,55 @@ pub fn grok(
         session.record_expand(&target.path, target.start_line, mtime);
     }
 
+    // --- Thin-wrapper auto-expansion --------------------------------------
+    // Predicate: the target's definition span is short (≤ WRAPPER_MAX_BODY_LINES),
+    // there is exactly one resolved internal callee (pre-cap total), and
+    // there are zero external callees. When this fires, slice the single
+    // callee's body and attach it to the result for the formatter to render.
+    // Measure the true definition span, not `body` — `body` may be a dedup-degraded
+    // preview on a re-grok, which would otherwise make a large function look thin.
+    let delegate_body = if target.start_line > 0
+        && (target.end_line.saturating_sub(target.start_line) as usize + 1)
+            <= WRAPPER_MAX_BODY_LINES
+        && total_callees_internal == 1
+        && total_callees_external == 0
+    {
+        // `lone_internal_callee` is the pre-cap single callee, so it is `Some`
+        // here whatever `caps.max_callees` is. The `start_line > 0` guard skips a
+        // degenerate/unresolved target (line numbers are 1-based; 0 means
+        // unresolved), mirroring `slice_body`.
+        lone_internal_callee.as_ref().and_then(|callee| {
+            let callee_content = read_delegate_content(
+                &callee.file,
+                &target.path,
+                &content,
+                super::bloom_walk::MAX_FILE_SIZE,
+            );
+            callee_content.map(|cc| {
+                // Build a minimal ResolvedTarget so body_with_dedup can handle dedup.
+                let callee_target = ResolvedTarget {
+                    name: callee.name.clone(),
+                    path: callee.file.clone(),
+                    start_line: callee.start_line,
+                    end_line: callee.end_line,
+                    kind: OutlineKind::Function,
+                    signature: callee.signature.clone(),
+                    doc: None,
+                    other_def_count: 0,
+                };
+                let sliced = body_with_dedup(&callee_target, &cc, session, caps.max_body_lines);
+                // Record the callee expansion so repeat-grok of the callee
+                // degrades correctly (same protocol as the target recording above).
+                if let Ok(mtime) = std::fs::metadata(&callee.file).and_then(|md| md.modified()) {
+                    session.record_expand(&callee.file, callee.start_line, mtime);
+                }
+                (callee.clone(), sliced)
+            })
+        })
+    } else {
+        None
+    };
+
     Ok(GrokResult {
         target,
         body,
@@ -417,6 +507,7 @@ pub fn grok(
         total_callers,
         total_siblings,
         total_tests,
+        delegate_body,
     })
 }
 
@@ -467,6 +558,10 @@ fn body_with_dedup(
         "// [{line_count}-line body shown earlier — {}:{}]",
         target.path.display(),
         target.start_line
+    );
+    session.record_savings(
+        crate::types::estimate_tokens(full.len() as u64),
+        crate::types::estimate_tokens(preview.len() as u64),
     );
     preview
 }
@@ -564,6 +659,21 @@ pub fn format_grok(result: &GrokResult, scope: &Path) -> String {
         out.push_str("\n## body\n");
         out.push_str(&result.body);
         if !result.body.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+
+    // Delegate body — rendered immediately after the wrapper's own body
+    // when the thin-wrapper predicate fired during assembly.
+    if let Some((callee, callee_body)) = &result.delegate_body {
+        let callee_rel = display_rel(&callee.file, scope);
+        let _ = writeln!(
+            out,
+            "\n## delegate body — {}:{}",
+            callee_rel, callee.start_line
+        );
+        out.push_str(callee_body);
+        if !callee_body.ends_with('\n') {
             out.push('\n');
         }
     }
@@ -727,6 +837,9 @@ fn is_recursive_call_site(
     canonical_target: &Path,
     target: &ResolvedTarget,
 ) -> bool {
+    // Edge case: a legitimately distinct same-named call site nested inside the
+    // target body (e.g. a recursive closure with the same name) would also be
+    // filtered here. Acceptable tradeoff — true self-recursion is the common case.
     m.path == canonical_target
         && m.line >= target.start_line
         && m.line <= target.end_line
@@ -1209,6 +1322,7 @@ pub fn target() {
             total_callers: 0,
             total_siblings: 0,
             total_tests: 0,
+            delegate_body: None,
         };
         let out = format_grok(&result, Path::new("."));
         assert!(out.contains("ambiguous: 3 other definitions match"));
@@ -1246,6 +1360,7 @@ pub fn target() {
             total_callers: 0,
             total_siblings: 17,
             total_tests: 0,
+            delegate_body: None,
         };
         let out = format_grok(&result, Path::new("."));
         assert!(out.contains("... and 16 more"));
@@ -1521,5 +1636,312 @@ pub fn target_fn() {
             !later.contains("\n  src/lib.rs\n"),
             "file header should appear once, not duplicated"
         );
+    }
+
+    // ── THINWRAP tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn read_delegate_content_caps_cross_file_reads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target.rs");
+        let callee = tmp.path().join("callee.rs");
+        std::fs::write(&callee, "fn delegate() { real_work() }\n").unwrap();
+
+        // Same file: reuse the passed-in content, no disk read of `target`
+        // (which is never written here).
+        let same = read_delegate_content(&target, &target, "TARGET BODY", 1000);
+        assert_eq!(same.as_deref(), Some("TARGET BODY"));
+
+        // Cross-file under the cap: read the callee file.
+        let small = read_delegate_content(&callee, &target, "TARGET BODY", 1000);
+        assert!(small.is_some_and(|c| c.contains("real_work")));
+
+        // Cross-file over the cap: skipped (cap=5 < the 30-byte callee). Guards
+        // against pulling a huge or generated file into the bundle.
+        let capped = read_delegate_content(&callee, &target, "TARGET BODY", 5);
+        assert!(capped.is_none(), "oversized callee file must not be read");
+
+        // Missing cross-file: None, not a panic.
+        let missing = tmp.path().join("nope.rs");
+        assert!(
+            read_delegate_content(&missing, &target, "TARGET BODY", 1000).is_none(),
+            "missing callee file must yield None, not panic"
+        );
+    }
+
+    /// A wrapper function: small body (≤10 lines) that calls exactly one
+    /// internal function, with no external callees.
+    #[test]
+    fn thinwrap_wrapper_expands_delegate_body() {
+        let tmp = tempfile::tempdir().unwrap();
+        // `do_work` is the real implementation with its own distinct logic.
+        // `wrapper` just delegates to it — a classic thin wrapper.
+        let lib = r#"pub fn do_work(x: u32) -> u32 {
+    let step1 = x * 2;
+    let step2 = step1 + 7;
+    step2
+}
+
+pub fn wrapper(x: u32) -> u32 {
+    do_work(x)
+}
+"#;
+        write_fixture(tmp.path(), "src/lib.rs", lib);
+        let bloom = BloomFilterCache::default();
+        let session = crate::session::Session::default();
+        let result = grok("wrapper", tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
+
+        // The delegate body field must be set.
+        assert!(
+            result.delegate_body.is_some(),
+            "thin wrapper must produce delegate_body"
+        );
+
+        // The callee's implementation line must be present in the delegate body,
+        // not just in the wrapper's own body (which only contains `do_work(x)`).
+        let (_, delegate_text) = result.delegate_body.as_ref().unwrap();
+        assert!(
+            delegate_text.contains("step1 = x * 2"),
+            "delegate body must contain callee implementation, got: {delegate_text:?}"
+        );
+
+        // The wrapper's own body does NOT contain `step1`.
+        assert!(
+            !result.body.contains("step1"),
+            "wrapper body should not contain callee internals, got: {:?}",
+            result.body
+        );
+
+        // format_grok must emit a `## delegate body` section between body and callees.
+        let rendered = format_grok(&result, tmp.path());
+        assert!(
+            rendered.contains("## delegate body"),
+            "formatted output must contain delegate body heading, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("step1 = x * 2"),
+            "formatted output must contain callee implementation line, got: {rendered}"
+        );
+        // Delegate body section must appear before the callees section.
+        let delegate_pos = rendered
+            .find("## delegate body")
+            .expect("## delegate body missing");
+        let callees_pos = rendered.find("## callees").expect("## callees missing");
+        assert!(
+            delegate_pos < callees_pos,
+            "delegate body must appear before callees section"
+        );
+    }
+
+    /// A non-wrapper function: body > WRAPPER_MAX_BODY_LINES. Must NOT expand.
+    #[test]
+    fn thinwrap_non_wrapper_does_not_expand() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Substantial function body (> 10 lines).
+        let mut lib = String::from("pub fn helper() -> u32 { 42 }\n\npub fn big_fn() {\n");
+        for i in 0..12u32 {
+            lib.push_str(&format!("    let v{i} = {i};\n"));
+        }
+        lib.push_str("    let _ = helper();\n}\n");
+        write_fixture(tmp.path(), "src/lib.rs", &lib);
+        let bloom = BloomFilterCache::default();
+        let session = crate::session::Session::default();
+        let result = grok("big_fn", tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
+
+        // Body is large — no delegate expansion.
+        assert!(
+            result.delegate_body.is_none(),
+            "large-body function must not produce delegate_body"
+        );
+        let rendered = format_grok(&result, tmp.path());
+        assert!(
+            !rendered.contains("## delegate body"),
+            "large-body function must not render delegate body section"
+        );
+    }
+
+    /// A function with multiple callees: must NOT expand even if body is short.
+    #[test]
+    fn thinwrap_multiple_callees_does_not_expand() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = r#"pub fn a() -> u32 { 1 }
+pub fn b() -> u32 { 2 }
+
+pub fn multi(x: u32) -> u32 {
+    a() + b()
+}
+"#;
+        write_fixture(tmp.path(), "src/lib.rs", lib);
+        let bloom = BloomFilterCache::default();
+        let session = crate::session::Session::default();
+        let result = grok("multi", tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
+
+        assert!(
+            result.delegate_body.is_none(),
+            "multi-callee function must not produce delegate_body"
+        );
+        let rendered = format_grok(&result, tmp.path());
+        assert!(
+            !rendered.contains("## delegate body"),
+            "multi-callee function must not render delegate body section"
+        );
+    }
+
+    /// No recursion: a wrapper whose single callee is itself a thin wrapper
+    /// must only expand ONE level — the immediate callee, not its callee too.
+    #[test]
+    fn thinwrap_no_recursion_one_level_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        // inner_impl is the real work; mid delegates to inner_impl (a wrapper);
+        // outer delegates to mid (another wrapper). We grok outer.
+        // Only mid's body should appear in the delegate body — not inner_impl's.
+        let lib = r#"pub fn inner_impl(x: u32) -> u32 {
+    let result = x * x + 1;
+    result
+}
+
+pub fn mid(x: u32) -> u32 {
+    inner_impl(x)
+}
+
+pub fn outer(x: u32) -> u32 {
+    mid(x)
+}
+"#;
+        write_fixture(tmp.path(), "src/lib.rs", lib);
+        let bloom = BloomFilterCache::default();
+        let session = crate::session::Session::default();
+        let result = grok("outer", tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
+
+        // Delegate body is set (outer is a thin wrapper around mid).
+        assert!(
+            result.delegate_body.is_some(),
+            "outer is a thin wrapper — must produce delegate_body"
+        );
+
+        let (callee, delegate_text) = result.delegate_body.as_ref().unwrap();
+        // The immediate callee is `mid`, not `inner_impl`.
+        assert_eq!(
+            callee.name, "mid",
+            "delegate callee should be 'mid', got {:?}",
+            callee.name
+        );
+        // mid's own body contains only the call to inner_impl.
+        assert!(
+            delegate_text.contains("inner_impl"),
+            "mid's body must contain the inner_impl call, got: {delegate_text:?}"
+        );
+        // inner_impl's internals (`result = x * x + 1`) must NOT appear —
+        // that would indicate two levels of expansion.
+        assert!(
+            !delegate_text.contains("x * x + 1"),
+            "two-level expansion must not occur — inner_impl body must not appear, got: {delegate_text:?}"
+        );
+    }
+
+    /// A large function (definition span > WRAPPER_MAX_BODY_LINES) that happens to
+    /// call exactly one internal helper must NOT be treated as a wrapper — even on a
+    /// re-grok where the body is dedup-degraded to a short preview. Guards against
+    /// measuring the degradable body instead of the true definition span.
+    #[test]
+    fn thinwrap_large_single_call_fn_not_expanded_even_on_regrok() {
+        let mut lib = String::from(
+            "pub fn helper(x: u32) -> u32 { x + 1 }\n\npub fn biggish(x: u32) -> u32 {\n",
+        );
+        // 18 trivial bindings push the span past BODY_DEGRADE_THRESHOLD so the body
+        // degrades on re-grok; the lone call is the single internal callee.
+        for i in 0..18 {
+            lib.push_str(&format!("    let v{i} = x;\n"));
+        }
+        lib.push_str("    helper(v17)\n}\n");
+
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(tmp.path(), "src/lib.rs", &lib);
+        let bloom = BloomFilterCache::default();
+        let session = crate::session::Session::default();
+
+        let r1 = grok("biggish", tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
+        assert!(
+            r1.delegate_body.is_none(),
+            "large fn must not expand on first grok"
+        );
+
+        // Re-grok: body is dedup-degraded to a short preview, but the definition
+        // span is unchanged (> WRAPPER_MAX_BODY_LINES) so it must still not expand.
+        let r2 = grok("biggish", tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
+        assert!(
+            r2.delegate_body.is_none(),
+            "large fn must not expand on re-grok despite degraded body"
+        );
+    }
+
+    // ── SAVINGS tests ───────────────────────────────────────────
+
+    /// First grok of a large body: no degradation, savings zero.
+    /// Second grok of the same body: degraded to preview, savings > 0.
+    #[test]
+    fn grok_degradation_records_savings() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(tmp.path(), "src/lib.rs", &long_body_fixture("savings_fn"));
+        let bloom = BloomFilterCache::default();
+        let session = crate::session::Session::default();
+
+        // First grok — full body, no degradation, no savings from body_with_dedup.
+        let _ = grok(
+            "savings_fn",
+            tmp.path(),
+            &bloom,
+            &session,
+            GrokCaps::default(),
+        )
+        .unwrap();
+        let (baseline_after_first, saved_after_first) = session.savings();
+        assert_eq!(
+            baseline_after_first, 0,
+            "first grok (full body, no degradation) must not record savings, got baseline={baseline_after_first}"
+        );
+        assert_eq!(
+            saved_after_first, 0,
+            "first grok must record no savings, got saved={saved_after_first}"
+        );
+
+        // Second grok — body_with_dedup degrades to preview.
+        let r2 = grok(
+            "savings_fn",
+            tmp.path(),
+            &bloom,
+            &session,
+            GrokCaps::default(),
+        )
+        .unwrap();
+        assert!(
+            r2.body.contains("shown earlier"),
+            "precondition: second grok must degrade"
+        );
+        let (baseline_after_second, saved_after_second) = session.savings();
+        assert!(
+            baseline_after_second > 0,
+            "degradation must record a non-zero baseline, got {baseline_after_second}"
+        );
+        assert!(
+            saved_after_second > 0,
+            "degradation must record tokens saved, got {saved_after_second}"
+        );
+    }
+
+    /// A short body (at or below BODY_DEGRADE_THRESHOLD) never degrades,
+    /// so savings remain zero across repeated calls.
+    #[test]
+    fn grok_short_body_degradation_records_no_savings() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(tmp.path(), "src/lib.rs", "pub fn tiny() { 1 }\n");
+        let bloom = BloomFilterCache::default();
+        let session = crate::session::Session::default();
+
+        let _ = grok("tiny", tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
+        let _ = grok("tiny", tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
+        let (baseline, saved) = session.savings();
+        assert_eq!(baseline, 0, "sub-threshold body must not record savings");
+        assert_eq!(saved, 0, "sub-threshold body must not record savings");
     }
 }

@@ -1,22 +1,24 @@
 mod definitions;
 mod deps;
 mod diff;
-mod edit;
 mod files;
 mod grok;
 mod read;
+mod savings;
 mod search;
 mod session;
+mod write;
 
 pub(super) use definitions::tool_definitions;
 pub(super) use deps::tool_deps;
 pub(super) use diff::tool_diff;
-pub(super) use edit::tool_edit;
 pub(super) use files::tool_files;
 pub(super) use grok::tool_grok;
 pub(super) use read::tool_read;
+pub(super) use savings::tool_savings;
 pub(super) use search::tool_search;
 pub(super) use session::tool_session;
+pub(super) use write::tool_write;
 
 use std::path::PathBuf;
 

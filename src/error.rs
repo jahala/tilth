@@ -12,6 +12,8 @@ pub enum TilthError {
     },
     #[error("{} [permission denied]", path.display())]
     PermissionDenied { path: PathBuf },
+    #[error("{} already exists — pass `overwrite: true` to replace it", path.display())]
+    AlreadyExists { path: PathBuf },
     #[error("invalid query \"{query}\": {reason}")]
     InvalidQuery { query: String, reason: String },
     #[error("{}: {source}", path.display())]
@@ -28,7 +30,7 @@ impl TilthError {
     #[must_use]
     pub fn exit_code(&self) -> i32 {
         match self {
-            Self::NotFound { .. } | Self::IoError { .. } => 2,
+            Self::NotFound { .. } | Self::IoError { .. } | Self::AlreadyExists { .. } => 2,
             Self::InvalidQuery { .. } | Self::ParseError { .. } => 3,
             Self::PermissionDenied { .. } => 4,
         }

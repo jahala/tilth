@@ -5,7 +5,8 @@
     clippy::cast_possible_wrap,        // u32→i32 for tree-sitter APIs
     clippy::module_name_repetitions,   // Rust naming conventions
     clippy::similar_names,             // common in parser/search code
-    clippy::too_many_lines,            // one complex function (find_definitions)
+    clippy::too_many_lines,            // crate-wide to cover find_definitions in src/search/symbol.rs;
+                                       // narrow to a per-function allow once a refactor shrinks that file
     clippy::too_many_arguments,        // internal recursive AST walker
     clippy::unnecessary_wraps,         // Result return for API consistency
     clippy::struct_excessive_bools,    // CLI struct derives clap
@@ -32,6 +33,7 @@ pub(crate) mod search;
 pub(crate) mod session;
 pub(crate) mod timeout;
 pub(crate) mod types;
+pub(crate) mod util;
 
 /// Re-exports for the fuzz harness. Not stable; do not depend on this.
 /// Items here are only `pub` so `fuzz/fuzz_targets/*.rs` can reach them

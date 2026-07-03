@@ -59,6 +59,7 @@ src/
 │   │                    kind:callers`); enclosing-scope annotation
 │   ├── callees.rs       Resolve function calls inside a definition
 │   ├── deps.rs          Blast-radius analysis (`tilth_deps`)
+│   ├── grok.rs          One-call symbol bundle (`tilth_grok`)
 │   ├── glob.rs          Glob query → file list (`tilth_files`)
 │   ├── blast.rs         Symbol-level blast radius
 │   ├── bloom_walk.rs    Shared walker preamble (size gating, mtime,
@@ -188,7 +189,7 @@ process-wide `ABANDONED_THREADS` counter logs to stderr once
 accumulation hits 3.
 
 Edit mode (`--edit`) appends an `EDIT_MODE_EXTRA` instruction block
-describing `tilth_edit` and unlocks the `tilth_edit` dispatch arm.
+describing `tilth_write` and unlocks the `tilth_write` dispatch arm.
 
 ## Query pipeline
 
@@ -556,7 +557,7 @@ Make.
 - `is_generated_by_name`, `is_generated_by_content` — lockfile names
   and `@generated`/`DO NOT EDIT`-style markers (12 variants).
 - `is_minified_by_name`, `is_minified_by_content` — naming convention
-  + density check.
+  - density check.
 
 `lang::treesitter::DEFINITION_KINDS` is the canonical list of
 tree-sitter node kinds tilth treats as definitions across all
@@ -733,7 +734,7 @@ strategic guidance every host gets at `initialize`. It lives in
 (`Bash(grep/cat/find)`) and provides `<bad>→<good>` rewrites because
 agents kept reaching for those despite earlier "DO NOT use
 Grep/Read/Glob" rules. Edit mode appends an `EDIT_MODE_EXTRA` block
-from `prompts/mcp-edit.md` with the `tilth_edit` instructions.
+from `prompts/mcp-edit.md` with the `tilth_write` instructions.
 `overview::fingerprint(cwd)` is prepended unless `TILTH_NO_OVERVIEW`
 is set — a brief summary of language counts, manifests, hot files,
 and git context.

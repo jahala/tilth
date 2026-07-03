@@ -1,3 +1,4 @@
+mod alloc;
 pub mod blast;
 pub mod callees;
 pub mod callers;
@@ -205,6 +206,7 @@ pub fn search_multi_symbol_expanded(
             result.definitions,
             result.usages,
         );
+        let mut segments: Vec<(i64, usize, usize)> = Vec::new();
         format_matches(
             &result.matches,
             &result.scope,
@@ -214,6 +216,7 @@ pub fn search_multi_symbol_expanded(
             &mut expand_remaining,
             &mut expanded_files,
             &mut out,
+            &mut segments,
         );
         if result.total_found > result.matches.len() {
             let omitted = result.total_found - result.matches.len();
@@ -222,6 +225,7 @@ pub fn search_multi_symbol_expanded(
                 "\n\n... and {omitted} more matches. Narrow with scope."
             );
         }
+        out = crate::search::alloc::fit_to_budget(&out, &segments, crate::budget::DEFAULT_BUDGET);
         sections.push(out);
     }
 
@@ -359,6 +363,7 @@ fn format_matches(
     expand_remaining: &mut usize,
     expanded_files: &mut HashSet<PathBuf>,
     out: &mut String,
+    segments: &mut Vec<(i64, usize, usize)>,
 ) {
     // Multi-file: one expand per unique file. Single-file: sequential per-match.
     // expanded_files may contain entries from prior queries (cross-query dedup).
@@ -373,6 +378,7 @@ fn format_matches(
     for group in &groups {
         if group.len() == 1 {
             // Single match — format as before
+            let start = out.len();
             format_single_match(
                 group[0],
                 scope,
@@ -384,9 +390,17 @@ fn format_matches(
                 multi_file,
                 out,
             );
+            segments.push((i64::from(group[0].def_weight), start, out.len()));
         } else {
             // Multiple usages collapsed into one entry
+            let start = out.len();
             format_grouped_usages(group, scope, cache, out);
+            let value = group
+                .iter()
+                .map(|m| i64::from(m.def_weight))
+                .max()
+                .unwrap_or(0);
+            segments.push((value, start, out.len()));
         }
     }
 }
@@ -503,6 +517,19 @@ fn format_line_list(lines: &[u32]) -> String {
         parts.push(format!("{run_start}"));
     }
     parts.join(",")
+}
+
+/// The symbol to feed query-aware truncation when expanding a match's body.
+///
+/// For `impl`/`implements` matches the user searched for the trait or interface,
+/// which is held in `impl_target` — `def_name` is the rendered label
+/// (`"impl Trait for Type"` / `"Type implements Trait"`) and never appears
+/// verbatim in the body, so boosting on it is a no-op. For plain definitions
+/// `impl_target` is `None` and the searched token is the symbol name in
+/// `def_name`. Preferring `impl_target` routes the real query into the boost for
+/// both shapes.
+fn boost_query(m: &Match) -> Option<&str> {
+    m.impl_target.as_deref().or(m.def_name.as_deref())
 }
 
 /// Format a single match entry (unchanged from original behavior).
@@ -641,15 +668,54 @@ fn format_single_match(
                     let mut skip_lines = strip::strip_noise(&content, &m.path, m.def_range);
 
                     if let Some((def_start, def_end)) = m.def_range {
-                        if let crate::types::FileType::Code(lang) = file_type {
-                            if let Some(keep) =
-                                truncate::select_diverse_lines(&content, def_start, def_end, lang)
-                            {
+                        if let crate::types::FileType::Code(_) = file_type {
+                            if let Some(keep) = truncate::select_diverse_lines(
+                                &content,
+                                def_start,
+                                def_end,
+                                boost_query(m),
+                            ) {
                                 let keep_set: HashSet<u32> = keep.into_iter().collect();
                                 for ln in def_start..=def_end {
                                     if !keep_set.contains(&ln) {
                                         skip_lines.insert(ln);
                                     }
+                                }
+
+                                // Record token savings: full def body vs kept lines.
+                                // Measure raw line content (bytes + 1 for newline each),
+                                // independent of any surrounding formatting.
+                                if let Some(sess) = session {
+                                    let body_lines: Vec<&str> = content
+                                        .lines()
+                                        .enumerate()
+                                        .filter_map(|(i, l)| {
+                                            let ln = (i as u32) + 1;
+                                            if ln >= def_start && ln <= def_end {
+                                                Some(l)
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                        .collect();
+                                    let full_bytes: u64 =
+                                        body_lines.iter().map(|l| l.len() as u64 + 1).sum();
+                                    let kept_bytes: u64 = body_lines
+                                        .iter()
+                                        .enumerate()
+                                        .filter_map(|(i, l)| {
+                                            let ln = def_start + i as u32;
+                                            if keep_set.contains(&ln) {
+                                                Some(l.len() as u64 + 1)
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                        .sum();
+                                    sess.record_savings(
+                                        crate::types::estimate_tokens(full_bytes),
+                                        crate::types::estimate_tokens(kept_bytes),
+                                    );
                                 }
                             }
                         }
@@ -830,6 +896,15 @@ fn find_basename_candidate(matches: &[Match], query_lower: &str) -> Option<PathB
     candidate.map(Path::to_path_buf)
 }
 
+/// Format a token count into a human-readable string (e.g. "~1.2k" or "~743").
+pub(crate) fn format_token_count(tokens: u64) -> String {
+    if tokens >= 1000 {
+        format!("~{}.{}k", tokens / 1000, (tokens % 1000) / 100)
+    } else {
+        format!("~{tokens}")
+    }
+}
+
 /// Fallback: lightweight directory walk to find a basename-matching file
 /// when it didn't survive ranking/truncation in the match set.
 fn find_basename_fallback(scope: &Path, query_lower: &str) -> Option<PathBuf> {
@@ -933,6 +1008,7 @@ fn format_search_result(
     let mut out = header;
     let mut expand_remaining = expand;
     let mut expanded_files = HashSet::new();
+    let mut segments: Vec<(i64, usize, usize)> = Vec::new();
 
     // File-level retrieval: when a file basename matches the query exactly,
     // prepend a compact outline so the agent gets file-level context first.
@@ -967,6 +1043,7 @@ fn format_search_result(
                 &mut expand_remaining,
                 &mut expanded_files,
                 &mut out,
+                &mut segments,
             );
             write_hidden_tail(
                 &mut out,
@@ -991,6 +1068,7 @@ fn format_search_result(
                 &mut expand_remaining,
                 &mut expanded_files,
                 &mut out,
+                &mut segments,
             );
             write_hidden_tail(
                 &mut out,
@@ -1034,6 +1112,7 @@ fn format_search_result(
                 &mut expand_remaining,
                 &mut expanded_files,
                 &mut out,
+                &mut segments,
             );
             write_hidden_tail(
                 &mut out,
@@ -1058,6 +1137,7 @@ fn format_search_result(
                 &mut expand_remaining,
                 &mut expanded_files,
                 &mut out,
+                &mut segments,
             );
             write_hidden_tail(
                 &mut out,
@@ -1077,6 +1157,7 @@ fn format_search_result(
             &mut expand_remaining,
             &mut expanded_files,
             &mut out,
+            &mut segments,
         );
 
         // Global hidden-tail only on the linear path. The faceted path emits
@@ -1091,12 +1172,12 @@ fn format_search_result(
         }
     }
 
+    // Apply value-based budget allocation before appending the token footer.
+    // Under-budget: byte-identical. Over-budget: drops lowest-value match blocks.
+    out = crate::search::alloc::fit_to_budget(&out, &segments, crate::budget::DEFAULT_BUDGET);
+
     let tokens = estimate_tokens(out.len() as u64);
-    let token_str = if tokens >= 1000 {
-        format!("~{}.{}k", tokens / 1000, (tokens % 1000) / 100)
-    } else {
-        format!("~{tokens}")
-    };
+    let token_str = format_token_count(tokens);
     let _ = write!(out, "\n\n({token_str} tokens)");
 
     Ok(out)
@@ -1927,6 +2008,46 @@ mod tests {
     }
 
     #[test]
+    fn boost_query_routes_impl_target_into_truncation() {
+        use crate::types::Match;
+
+        let base = Match {
+            path: PathBuf::from("x.rs"),
+            line: 1,
+            text: String::new(),
+            is_definition: true,
+            exact: true,
+            file_lines: 200,
+            mtime: SystemTime::now(),
+            def_range: Some((1, 200)),
+            def_name: None,
+            def_weight: 0,
+            impl_target: None,
+        };
+
+        // Plain definition: the searched token is the symbol name in def_name.
+        let plain = Match {
+            def_name: Some("handle_request".to_string()),
+            ..base.clone()
+        };
+        assert_eq!(boost_query(&plain), Some("handle_request"));
+
+        // impl match: def_name is the rendered label ("impl Iterator for Counter")
+        // which never appears in the body — the searched trait lives in
+        // impl_target. Regression guard for the dead-boost bug where def_name was
+        // passed and the boost matched nothing.
+        let impl_match = Match {
+            def_name: Some("impl Iterator for Counter".to_string()),
+            impl_target: Some("Iterator".to_string()),
+            ..base.clone()
+        };
+        assert_eq!(boost_query(&impl_match), Some("Iterator"));
+
+        // No names: no boost.
+        assert_eq!(boost_query(&base), None);
+    }
+
+    #[test]
     fn write_hidden_tail_emits_only_when_truncated() {
         let mut out = String::new();
         write_hidden_tail(&mut out, 3, 3, "definitions");
@@ -2206,5 +2327,187 @@ mod tests {
             !out.starts_with("\n\n## "),
             "grouped-usage heading must not be H2, got: {out:?}"
         );
+    }
+
+    // Verify that format_matches records segment byte ranges correctly.
+    // Each push must cover non-empty, non-overlapping ranges that index into `out`.
+    #[test]
+    fn format_matches_segments_record_correct_byte_ranges() {
+        use crate::index::bloom::BloomFilterCache;
+        use crate::types::Match;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("a.rs");
+        std::fs::write(&p, "fn alpha() {}\nfn beta() {}\nfn gamma() {}\n").unwrap();
+
+        let mk = |line: u32, weight: u16, name: &str| Match {
+            path: p.clone(),
+            line,
+            text: format!("fn {name}()"),
+            is_definition: true,
+            exact: true,
+            file_lines: 3,
+            mtime: SystemTime::now(),
+            def_range: Some((line, line)),
+            def_name: Some(name.to_string()),
+            def_weight: weight,
+            impl_target: None,
+        };
+
+        let matches = vec![mk(1, 30, "alpha"), mk(2, 10, "beta"), mk(3, 50, "gamma")];
+        let cache = OutlineCache::new();
+        let bloom = BloomFilterCache::new();
+        let mut out = String::from("HEADER");
+        let mut segments: Vec<(i64, usize, usize)> = Vec::new();
+        let mut expand_remaining = 0usize;
+        let mut expanded_files = HashSet::new();
+
+        format_matches(
+            &matches,
+            tmp.path(),
+            &cache,
+            None,
+            &bloom,
+            &mut expand_remaining,
+            &mut expanded_files,
+            &mut out,
+            &mut segments,
+        );
+
+        // One segment per match (all singletons — definitions are never grouped).
+        assert_eq!(segments.len(), 3, "expected one segment per match");
+
+        // Values must match def_weight casts.
+        assert_eq!(segments[0].0, 30i64);
+        assert_eq!(segments[1].0, 10i64);
+        assert_eq!(segments[2].0, 50i64);
+
+        // Ranges must be valid, non-empty, and non-overlapping.
+        let mut cursor = "HEADER".len();
+        for (i, &(_, start, end)) in segments.iter().enumerate() {
+            assert!(start >= cursor, "segment {i} start < cursor");
+            assert!(end > start, "segment {i} is empty");
+            assert!(end <= out.len(), "segment {i} end out of bounds");
+            // Slice must not panic (validates char-boundary alignment).
+            let _ = &out[start..end];
+            cursor = end;
+        }
+    }
+
+    // ── SAVINGS tests ───────────────────────────────────────────
+
+    /// A search that expands a definition large enough to trigger
+    /// `select_diverse_lines` (>= 80-line body) must record savings.
+    /// A search whose body is short records nothing extra from truncation.
+    #[test]
+    fn search_truncation_records_savings() {
+        use crate::session::Session;
+        use crate::types::Match;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("big.rs");
+
+        // Build a function body >= 80 lines so select_diverse_lines fires.
+        let mut src = String::from("pub fn big_fn() {\n");
+        for i in 0..85 {
+            src.push_str(&format!("    let v{i} = {i};\n"));
+        }
+        src.push_str("}\n");
+        std::fs::write(&p, &src).unwrap();
+
+        let total_lines = src.lines().count() as u32;
+        let m = Match {
+            path: p.clone(),
+            line: 1,
+            text: "pub fn big_fn() {".to_string(),
+            is_definition: true,
+            exact: true,
+            file_lines: total_lines,
+            mtime: std::time::SystemTime::now(),
+            def_range: Some((1, total_lines)),
+            def_name: Some("big_fn".to_string()),
+            def_weight: 0,
+            impl_target: None,
+        };
+
+        let cache = OutlineCache::new();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let session = Session::default();
+        let mut expand_remaining = 5usize;
+        let mut expanded_files: HashSet<PathBuf> = HashSet::new();
+        let mut out = String::new();
+
+        format_single_match(
+            &m,
+            tmp.path(),
+            &cache,
+            Some(&session),
+            &bloom,
+            &mut expand_remaining,
+            &mut expanded_files,
+            false,
+            &mut out,
+        );
+
+        let (baseline, saved) = session.savings();
+        assert!(
+            baseline > 0,
+            "truncation path must record a non-zero baseline, got baseline={baseline}"
+        );
+        assert!(
+            saved > 0,
+            "truncation must save tokens vs full body, got saved={saved}"
+        );
+    }
+
+    /// A search on a small definition (body < 80 lines) goes through
+    /// expand_match but never hits the truncation branch, so savings
+    /// remain zero.
+    #[test]
+    fn search_no_truncation_records_no_savings() {
+        use crate::session::Session;
+        use crate::types::Match;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("small.rs");
+        let src = "pub fn small_fn() {\n    let x = 1;\n    x\n}\n";
+        std::fs::write(&p, src).unwrap();
+
+        let m = Match {
+            path: p.clone(),
+            line: 1,
+            text: "pub fn small_fn() {".to_string(),
+            is_definition: true,
+            exact: true,
+            file_lines: 4,
+            mtime: std::time::SystemTime::now(),
+            def_range: Some((1, 4)),
+            def_name: Some("small_fn".to_string()),
+            def_weight: 0,
+            impl_target: None,
+        };
+
+        let cache = OutlineCache::new();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let session = Session::default();
+        let mut expand_remaining = 5usize;
+        let mut expanded_files: HashSet<PathBuf> = HashSet::new();
+        let mut out = String::new();
+
+        format_single_match(
+            &m,
+            tmp.path(),
+            &cache,
+            Some(&session),
+            &bloom,
+            &mut expand_remaining,
+            &mut expanded_files,
+            false,
+            &mut out,
+        );
+
+        let (baseline, saved) = session.savings();
+        assert_eq!(baseline, 0, "no truncation => no savings recorded");
+        assert_eq!(saved, 0, "no truncation => no savings recorded");
     }
 }
