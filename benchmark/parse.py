@@ -57,7 +57,7 @@ def parse_stream_json(raw_output: str) -> RunResult:
 
     session_id = ""
     turns: list[Turn] = []
-    result_text = ""
+    result_text_parts: list[str] = []
     final_summary = {}
     turn_index = 0
 
@@ -98,7 +98,7 @@ def parse_stream_json(raw_output: str) -> RunResult:
             turn_index += 1
 
             if text_blocks:
-                result_text = "\n".join(text_blocks)
+                result_text_parts.append("\n".join(text_blocks))
 
         elif event_type == "result":
             final_summary = event
@@ -114,7 +114,7 @@ def parse_stream_json(raw_output: str) -> RunResult:
         total_output_tokens=final_summary.get("usage", {}).get("output_tokens", 0),
         total_cache_creation_tokens=final_summary.get("usage", {}).get("cache_creation_input_tokens", 0),
         total_cache_read_tokens=final_summary.get("usage", {}).get("cache_read_input_tokens", 0),
-        result_text=result_text,
+        result_text="\n".join(result_text_parts),
     )
 
 
