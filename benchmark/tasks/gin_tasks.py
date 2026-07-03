@@ -49,7 +49,7 @@ class GinClientIPTask(Task):
                 "func (c *Context) ClientIP",
                 "RemoteIPHeaders",
                 "X-Forwarded-For",
-                "trustedCIDRs",
+                "isTrustedProxy",
             ],
         )
 

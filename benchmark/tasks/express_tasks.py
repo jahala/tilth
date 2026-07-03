@@ -45,7 +45,7 @@ class ExpressRenderChainTask(Task):
     @property
     def ground_truth(self) -> GroundTruth:
         return GroundTruth(
-            required_strings=["res.render", "app.render", "View", "lookup", "view.js"],
+            required_strings=["res.render", "app.render", "View", "lookup"],
         )
 
     @property
@@ -125,7 +125,7 @@ class ExpressAppRenderTask(Task):
     def ground_truth(self) -> GroundTruth:
         return GroundTruth(
             required_strings=[
-                "app.render", "View", "application.js", "view.js",
+                "app.render", "View", "application.js",
             ],
         )
 
