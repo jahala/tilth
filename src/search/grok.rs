@@ -997,6 +997,56 @@ mod tests {
         );
     }
 
+    // -- split_qualified ---------------------------------------------------
+
+    #[test]
+    fn split_qualified_double_colon() {
+        assert_eq!(split_qualified("Type::method"), "method");
+    }
+
+    #[test]
+    fn split_qualified_dot() {
+        assert_eq!(split_qualified("Type.method"), "method");
+    }
+
+    #[test]
+    fn split_qualified_multi_segment_double_colon() {
+        // Only the trailing segment matters — the retry is bounded to one hop.
+        assert_eq!(split_qualified("a::b::method"), "method");
+    }
+
+    #[test]
+    fn split_qualified_no_separator_is_identity() {
+        assert_eq!(split_qualified("method"), "method");
+    }
+
+    #[test]
+    fn split_qualified_trailing_separator_yields_empty() {
+        // `rfind` matches the last char in the string; the caller (`resolve_by_name`)
+        // guards on `!bare.is_empty()` so this never triggers a second lookup.
+        assert_eq!(split_qualified("Type::"), "");
+        assert_eq!(split_qualified("Type."), "");
+    }
+
+    #[test]
+    fn split_qualified_mixed_separators_uses_rightmost() {
+        // `rfind` scans for either separator and takes the last match overall,
+        // not the last match of a single separator kind.
+        assert_eq!(split_qualified("a.b::method"), "method");
+        assert_eq!(split_qualified("a::b.method"), "method");
+    }
+
+    #[test]
+    fn split_qualified_non_ascii_byte_boundary_safe() {
+        // The separator search is byte-based (`rfind` over `[':', '.']`, both
+        // single-byte ASCII), so slicing at `idx + 1` always lands on a UTF-8
+        // char boundary even when the segments themselves are multi-byte.
+        assert_eq!(split_qualified("café::méthode"), "méthode");
+        assert_eq!(split_qualified("类型.方法"), "方法");
+        // No separator at all — identity, and no panic on multi-byte input.
+        assert_eq!(split_qualified("メソッド"), "メソッド");
+    }
+
     // -- find_entry_at_line ----------------------------------------------
 
     #[test]
