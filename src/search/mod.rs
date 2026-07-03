@@ -622,27 +622,37 @@ fn format_single_match(
         }
     }
 
+    // Check session dedup for definitions with def_range. The mtime
+    // check ensures a post-edit search re-inlines the body rather than
+    // pointing at stale line numbers.
+    let current_mtime = std::fs::metadata(&m.path)
+        .ok()
+        .and_then(|md| md.modified().ok());
+    let deduped = m.is_definition
+        && m.def_range.is_some()
+        && session
+            .is_some_and(|s| current_mtime.is_some_and(|t| s.is_expanded(&m.path, m.line, t)));
+    // expand_match always prints a range containing m.line (def_range starts
+    // at m.line for definitions; the ±10 fallback for def_range: None / usages
+    // trivially contains it), so the raw "→ [line] text" preview would
+    // reprint m.text byte-for-byte inside the fence below. Only the
+    // structural outline_context (neighboring entries' signatures, not the
+    // matched line's own source) survives alongside an expansion.
+    let fence_will_follow =
+        *expand_remaining > 0 && !deduped && !(multi_file && expanded_files.contains(&m.path));
+
     // Skip outline for small files — the expanded code speaks for itself
     if m.file_lines < 50 {
-        let _ = write!(out, "\n→ [{}]   {}", m.line, m.text);
+        if !fence_will_follow {
+            let _ = write!(out, "\n→ [{}]   {}", m.line, m.text);
+        }
     } else if let Some(context) = outline_context_for_match(&m.path, m.line, cache) {
         out.push_str(&context);
-    } else {
+    } else if !fence_will_follow {
         let _ = write!(out, "\n→ [{}]   {}", m.line, m.text);
     }
 
     if *expand_remaining > 0 {
-        // Check session dedup for definitions with def_range. The mtime
-        // check ensures a post-edit search re-inlines the body rather than
-        // pointing at stale line numbers.
-        let current_mtime = std::fs::metadata(&m.path)
-            .ok()
-            .and_then(|md| md.modified().ok());
-        let deduped = m.is_definition
-            && m.def_range.is_some()
-            && session
-                .is_some_and(|s| current_mtime.is_some_and(|t| s.is_expanded(&m.path, m.line, t)));
-
         if deduped {
             if let Some((start, end)) = m.def_range {
                 let _ = write!(
@@ -2004,6 +2014,59 @@ mod tests {
         assert!(
             out.contains("[usage in function Foo.bar]"),
             "expected scope suffix in output, got: {out}"
+        );
+    }
+
+    #[test]
+    fn format_single_match_does_not_duplicate_expanded_line() {
+        use crate::types::Match;
+
+        // Small file (<50 lines) with no doc comment above the definition —
+        // the outline-context preview at line 627 prints `m.text` verbatim,
+        // and expand_match's whole-file expansion (small files expand fully,
+        // see EXPAND_FULL_FILE_THRESHOLD) includes that same source line
+        // again in the fence right below it.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("small.rs");
+        let src = "pub struct Thing;\n\nimpl Thing {\n    pub fn exit_code(&self) -> i32 {\n        0\n    }\n}\n";
+        std::fs::write(&p, src).unwrap();
+
+        let m = Match {
+            path: p.clone(),
+            line: 4,
+            text: "    pub fn exit_code(&self) -> i32 {".to_string(),
+            is_definition: true,
+            exact: true,
+            file_lines: 7,
+            mtime: SystemTime::now(),
+            def_range: Some((4, 6)),
+            def_name: Some("exit_code".to_string()),
+            def_weight: 100,
+            impl_target: None,
+        };
+        let cache = OutlineCache::new();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let mut expand_remaining = 1usize;
+        let mut expanded_files: HashSet<PathBuf> = HashSet::new();
+        let mut out = String::new();
+
+        format_single_match(
+            &m,
+            tmp.path(),
+            &cache,
+            None,
+            &bloom,
+            &mut expand_remaining,
+            &mut expanded_files,
+            false,
+            &mut out,
+        );
+
+        let needle = "pub fn exit_code(&self) -> i32 {";
+        let occurrences = out.matches(needle).count();
+        assert_eq!(
+            occurrences, 1,
+            "expanded line must appear exactly once, got {occurrences} in: {out}"
         );
     }
 
