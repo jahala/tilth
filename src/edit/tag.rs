@@ -8,6 +8,8 @@
 
 #![allow(dead_code)]
 
+use std::fmt::Write as _;
+
 use twox_hash::XxHash32;
 
 /// Number of hex characters in a content-derived file-hash tag.
@@ -64,6 +66,32 @@ pub fn parse_tag(raw: &str) -> Option<u16> {
 /// Format a hashline section header for a file path and tag: `[path#TAG]`.
 pub fn format_header(path: &str, tag: u16) -> String {
     format!("[{path}#{}]", format_tag(tag))
+}
+
+/// Render a whole file as `N:content` numbered lines, splitting on `'\n'`
+/// exactly the way [`crate::edit::apply::apply_line_ops`] does — the trailing
+/// phantom empty row of a newline-terminated file is rendered as its own
+/// numbered line. This keeps the displayed line numbers (and the recorded
+/// seen-lines set) identical to the ones `apply` operates on, so a tag-matched
+/// edit anchors the same rows the read displayed. Returns a trailing newline.
+pub fn render_numbered_whole(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 16);
+    for (i, line) in text.split('\n').enumerate() {
+        let _ = writeln!(out, "{}:{line}", i + 1);
+    }
+    out
+}
+
+/// Render a selected slice as `N:content` numbered lines starting at `start`,
+/// using `.lines()` so a slice that ends at a newline does not emit a spurious
+/// trailing phantom row (the phantom is only meaningful for whole-file reads).
+/// Returns a trailing newline.
+pub fn render_numbered_slice(text: &str, start: u32) -> String {
+    let mut out = String::with_capacity(text.len() + 16);
+    for (i, line) in text.lines().enumerate() {
+        let _ = writeln!(out, "{}:{line}", start as usize + i);
+    }
+    out
 }
 
 #[cfg(test)]

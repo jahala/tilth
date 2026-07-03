@@ -70,27 +70,31 @@ To check what changed, use tilth_diff instead of Bash(git diff/git log).
 Shell out only for tests, builds, and non-file-IO commands.
 DO NOT re-read files already shown in expanded search results.
 
-tilth_write: Batch write one or more files in one call. Replaces the host Edit and Write tools.
-ALWAYS group writes to multiple files into ONE tilth_write call (max 20 files). Never call tilth_write twice in a row.
-Modes per file (set via `mode`):
+tilth_write: Batch edit files with an op-grammar text blob (the `edits` string). Replaces the host Edit and Write tools.
+Read first (edit mode): tilth_read / tilth_search show a `[path#TAG]` header then `N:content` numbered lines. Copy the `[path#TAG]` header VERBATIM and reference the line numbers you see. NEVER invent a TAG.
+Send edits as ONE `edits` string of `[path#TAG]` sections, with op lines beneath each header. Line numbers are 1-based inclusive, from the numbered read:
+SWAP a.=b:  then payload — replace lines a..b (SWAP n: for a single line)
+DEL n | DEL a.=b — delete a line or range
+INS.PRE n: | INS.POST n:  then payload — insert before/after line n
+INS.HEAD: | INS.TAIL:  then payload — insert at start/end of file
+SWAP.BLK n: | SWAP.BLK #symbol:  then payload — replace the tree-sitter block at line n or named symbol
+DEL.BLK n | DEL.BLK #symbol — delete that block
+INS.BLK.POST n: | INS.BLK.POST #symbol:  then payload — insert after that block
+REM — delete the file
+MV dest — move/rename the file
+Payload: one row per line after the op header; prefix a row with `+` to force it literal (e.g. a row that itself looks like an op or a `[header]`).
+Example:
+[src/x.rs#1A2B]
+SWAP 2:
 
-- hash (default): replace lines at hash anchors. Copy anchors (<line>:<hash>) (BOTH line and hash required) from tilth_read, or from expanded tilth_search results (source lines render as <line>:<hash>|content in edit mode), then pass to tilth_write. Search hits with no expanded source have no hashes — tilth_read that file or section first.
-- overwrite: write the file from scratch. Default is **create-only** — an existing file is rejected so you don't clobber by accident. Pass `overwrite: true` to replace an existing file.
-- append: append `content` to the file (creates it if absent).
-
-Shape: {"files": [{"path": "a.rs", "mode": "hash", "edits": [...]}, {"path": "b.rs", "mode": "overwrite", "content": "..."}]}
-Hash edits: {"start": "<line>:<hash>", "content": "<new code>"} | {"start": "...", "end": "...", "content": "..."} | {"start": "...", "content": ""} to delete.
-Overwrite (new file): {"path": "new.rs", "mode": "overwrite", "content": "fn main(){}\n"}
-Overwrite (replace existing): {"path": "old.rs", "mode": "overwrite", "overwrite": true, "content": "..."}
-Append: {"path": "log.txt", "mode": "append", "content": "...\n"}
-overwrite responses echo the full file's hashlines; append echoes only the appended region (header reports `echoing last M of T lines`). Use tilth_read if you need anchors over pre-existing content above the appended block.
-Per-file results: each file is processed independently. A hash mismatch on one file does NOT block the others.
-isError is false whenever ≥1 file succeeded — always scan the per-file `## <path>` sections for failures rather than trusting the top-level status.
-Hash mismatch → file changed, re-read THAT file and retry it (other files in the batch already applied).
-A parse error on one edit invalidates ALL edits for that file (none applied); retry the whole file's edits after fixing the malformed entry.
-Each file path may appear at most once per call — group all edits for a file under its single entry.
-Large files: tilth_read shows outline — use section to get hashlined content.
-Pass diff: true to see a compact before/after diff per file.
-Pass root: "/abs/path" (absolute checkout dir) to anchor ALL relative file paths in the call. Required if any file path is relative; absolute paths need no root and are used as-is. The server cannot see your shell cwd, so a relative path without an absolute root is refused. Every successful write echoes its resolved absolute path so you can confirm where the edit landed.
-After editing a function signature, tilth_write shows callers that may need updating.
++ let y = 1;
+DEL 5
+INS.POST 8:
++// trailing note
+Drift: the TAG binds the section to the content you read. If the file changed since, tilth 3-way-merges your ops onto the live file; if the merge conflicts the section is REJECTED — re-read THAT file and retry it. A tag not from this session is rejected (never invent one).
+New file: a tagless `[path]` header (no #TAG) seeds a NEW file — use INS.HEAD for its content.
+Append cleanly: prefer `INS.POST <last-content-line>` over `INS.TAIL:` — INS.TAIL inserts after the file's trailing empty row, adding a blank line for newline-terminated files.
+Sections are independent (best-effort): a rejected section does NOT block the others; scan the per-`## <path>` results for failures. Max 20 sections.
+root: absolute checkout dir. Required if any section path is relative. RELATIVE section paths and MV destinations are anchored under root and confined to it; ABSOLUTE section paths are also confined to root (or to the server's startup directory when root is omitted) — `..` traversal or paths outside the confinement root are refused. The server cannot see your shell cwd.
+Pass diff: true for a compact before/after diff per section.
 DO NOT use the host Edit or Write tool. Use tilth_write for all writes.

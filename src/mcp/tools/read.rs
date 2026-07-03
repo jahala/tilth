@@ -134,9 +134,10 @@ pub(in crate::mcp) fn tool_read(
                         && mode_str == "auto"
                         && matches!(suffix, PathSuffix::None)
                         && should_auto_signature(path));
-                let body = if force_full && matches!(suffix, PathSuffix::None) {
-                    crate::read::read_file(path, None, true, cache, edit_mode)
-                        .unwrap_or_else(|e| format!("# {}\nerror: {}", path.display(), e))
+                let (body, spec) = if force_full && matches!(suffix, PathSuffix::None) {
+                    let b = crate::read::read_file(path, None, true, cache, edit_mode)
+                        .unwrap_or_else(|e| format!("# {}\nerror: {}", path.display(), e));
+                    (b, crate::read::SeenSpec::Whole)
                 } else {
                     read_single_with_suffix(
                         path,
@@ -147,6 +148,19 @@ pub(in crate::mcp) fn tool_read(
                         cache,
                     )
                 };
+                // Record the whole-file-tag snapshot so a follow-up tilth_write
+                // can verify the tag, using the seen-lines the view displayed.
+                if edit_mode
+                    && should_record_edit_snapshot(
+                        path,
+                        suffix,
+                        signature,
+                        force_stripped,
+                        force_full,
+                    )
+                {
+                    crate::read::record_edit_snapshot(session, path, &spec);
+                }
                 PerPath::Content(body)
             })
             .collect();
@@ -225,8 +239,13 @@ pub(in crate::mcp) fn tool_read(
     // mode flags are dropped here in favor of the explicit slice the LLM asked for.
     if !matches!(suffix, PathSuffix::None) {
         session.record_read(&path);
-        let body =
+        let (body, spec) =
             read_single_with_suffix(&path, &suffix, force_signature, false, edit_mode, cache);
+        if edit_mode
+            && should_record_edit_snapshot(&path, &suffix, force_signature, false, force_full)
+        {
+            crate::read::record_edit_snapshot(session, &path, &spec);
+        }
         // Suffix-driven reads carry no view-meta — the LLM declared the slice.
         // Cache token still rides along when if_modified_since was supplied.
         return Ok(finalize_response(
@@ -258,6 +277,13 @@ pub(in crate::mcp) fn tool_read(
     let mut output =
         crate::read::read_file_resolving(&path, None, force_full, cache, edit_mode, Path::new("."))
             .map_err(|e| e.to_string())?;
+    // An outlined view emits no `[path#TAG]` and no numbered lines, so it
+    // displayed nothing to anchor an edit against — recording whole-file
+    // seenLines here would poison the snapshot for a later range read of the
+    // same content and defeat the unseen-anchor gate. Record nothing.
+    if edit_mode && should_record_edit_snapshot(&path, &suffix, false, false, force_full) {
+        crate::read::record_edit_snapshot(session, &path, &crate::read::SeenSpec::Whole);
+    }
 
     // Append related-file hint for outlined code files.
     if crate::read::would_outline(&path) {
@@ -288,10 +314,15 @@ pub(in crate::mcp) fn tool_read(
     Ok(finalize_response(None, meta, &output, budget))
 }
 
-/// Resolve a single path+suffix to its read output. `signature` and
-/// `stripped` are whole-file shape modes; both are honored only for
-/// `PathSuffix::None` (any explicit suffix wins). They are mutually
-/// exclusive — `signature` takes precedence if both happen to be set.
+/// Resolve a single path+suffix to its read output plus the [`SeenSpec`] the
+/// view displayed (for the whole-file-tag snapshot's seen-lines provenance).
+/// Symbol and heading spans are resolved exactly once here and reused for the
+/// spec, so no caller re-parses to recover the same span. `signature` and
+/// `stripped` are whole-file shape modes honored only for `PathSuffix::None`
+/// (any explicit suffix wins); they are mutually exclusive — `signature` takes
+/// precedence if both happen to be set. The returned spec for signature/stripped
+/// views is `Whole`, but those views never record (see
+/// [`should_record_edit_snapshot`]).
 pub(crate) fn read_single_with_suffix(
     path: &Path,
     suffix: &PathSuffix,
@@ -299,37 +330,58 @@ pub(crate) fn read_single_with_suffix(
     stripped: bool,
     edit_mode: bool,
     cache: &OutlineCache,
-) -> String {
+) -> (String, crate::read::SeenSpec) {
+    use crate::read::SeenSpec;
+    let cast = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
     let render_err = |e: crate::error::TilthError| format!("# {}\nerror: {}", path.display(), e);
     match suffix {
         PathSuffix::LineRange(s, e) => {
             let range = format!("{s}-{e}");
-            crate::read::read_ranges(path, &[range.as_str()], edit_mode).unwrap_or_else(render_err)
+            let body = crate::read::read_ranges(path, &[range.as_str()], edit_mode)
+                .unwrap_or_else(render_err);
+            (body, SeenSpec::Ranges(vec![(cast(*s), cast(*e))]))
         }
         PathSuffix::FromLine(n) => {
             // Resolve total lines via metadata + count; cheap & avoids full read.
             let total = count_lines(path).map_or(*n, |t| t as usize);
-            let range = format!("{n}-{}", total.max(*n));
-            crate::read::read_ranges(path, &[range.as_str()], edit_mode).unwrap_or_else(render_err)
+            let end = total.max(*n);
+            let range = format!("{n}-{end}");
+            let body = crate::read::read_ranges(path, &[range.as_str()], edit_mode)
+                .unwrap_or_else(render_err);
+            (body, SeenSpec::Ranges(vec![(cast(*n), cast(end))]))
         }
         PathSuffix::Heading(h) => {
-            crate::read::read_ranges(path, &[h.as_str()], edit_mode).unwrap_or_else(render_err)
+            // Resolve the heading span once (like the symbol path) so the read
+            // and the seen-lines spec share a single resolution. Absent heading →
+            // read the raw anchor to surface the error and fall back to Whole.
+            if let Some((s, e)) = crate::read::resolve_heading_span(path, h) {
+                let range = format!("{s}-{e}");
+                let body = crate::read::read_ranges(path, &[range.as_str()], edit_mode)
+                    .unwrap_or_else(render_err);
+                (body, SeenSpec::Ranges(vec![(s, e)]))
+            } else {
+                let body = crate::read::read_ranges(path, &[h.as_str()], edit_mode)
+                    .unwrap_or_else(render_err);
+                (body, SeenSpec::Whole)
+            }
         }
         PathSuffix::Symbol(name) => {
-            // Resolve symbol via outline → range, then read that range.
+            // Resolve symbol via outline → range once, reused for read + spec.
             match resolve_symbol_range(path, name) {
                 Some((s, e)) => {
                     let range = format!("{s}-{e}");
-                    crate::read::read_ranges(path, &[range.as_str()], edit_mode)
-                        .unwrap_or_else(render_err)
+                    let body = crate::read::read_ranges(path, &[range.as_str()], edit_mode)
+                        .unwrap_or_else(render_err);
+                    (body, SeenSpec::Ranges(vec![(cast(s), cast(e))]))
                 }
-                None => {
+                None => (
                     format!(
                         "# {}\nerror: symbol '{}' not found in outline",
                         path.display(),
                         name
-                    )
-                }
+                    ),
+                    SeenSpec::Whole,
+                ),
             }
         }
         PathSuffix::None => {
@@ -340,27 +392,47 @@ pub(crate) fn read_single_with_suffix(
             if signature {
                 // Multi-file batch path: discard the line count — view-meta is
                 // not emitted for multi-file responses.
-                return read_signature_file(path, cache).map_or_else(render_err, |(body, _)| body);
+                let body =
+                    read_signature_file(path, cache).map_or_else(render_err, |(body, _)| body);
+                return (body, SeenSpec::Whole);
             }
             if stripped {
-                return read_stripped_file(path, cache)
-                    .map_or_else(render_err, |(body, _, _)| body);
+                let body =
+                    read_stripped_file(path, cache).map_or_else(render_err, |(body, _, _)| body);
+                return (body, SeenSpec::Whole);
             }
-            crate::read::read_file(path, None, false, cache, edit_mode).unwrap_or_else(render_err)
+            let body = crate::read::read_file(path, None, false, cache, edit_mode)
+                .unwrap_or_else(render_err);
+            (body, SeenSpec::Whole)
         }
     }
 }
 
-fn find_symbol_entry(entries: &[crate::types::OutlineEntry], name: &str) -> Option<(usize, usize)> {
-    for e in entries {
-        if e.name == name {
-            return Some((e.start_line as usize, e.end_line as usize));
-        }
-        if let Some(hit) = find_symbol_entry(&e.children, name) {
-            return Some(hit);
-        }
+/// Whether an edit-mode read of `path` with `suffix` should record a
+/// whole-file-tag snapshot (callers gate on `edit_mode` first). Returns `false`
+/// for signature and stripped views (non-editable, no tag emitted), and an
+/// outlined whole-file
+/// view (no numbered lines shown — recording whole-file seen-lines would poison
+/// the snapshot for a later range read and defeat the unseen-anchor gate). The
+/// single predicate the three `tool_read` dispatch sites share.
+fn should_record_edit_snapshot(
+    path: &Path,
+    suffix: &PathSuffix,
+    signature: bool,
+    stripped: bool,
+    force_full: bool,
+) -> bool {
+    if signature || stripped {
+        return false;
     }
-    None
+    if matches!(suffix, PathSuffix::None) && !force_full && crate::read::would_outline(path) {
+        return false;
+    }
+    true
+}
+
+fn find_symbol_entry(entries: &[crate::types::OutlineEntry], name: &str) -> Option<(usize, usize)> {
+    crate::lang::outline::find_entry_by_name(entries, name).map(|(s, e)| (s as usize, e as usize))
 }
 
 /// Outcome of looking up `name` in `path`'s outline. Distinguishes a
@@ -736,6 +808,207 @@ mod tests {
         assert!(
             err.contains("src/foo.rs") && err.contains("root"),
             "relative path without root must refuse with an actionable message: {err}"
+        );
+    }
+
+    /// A large non-code file reads as an OUTLINE in `mode:auto` — no
+    /// `[path#TAG]` and no numbered `N:content` rows are displayed. Recording
+    /// whole-file seenLines here poisons the snapshot so a later range read of
+    /// the same content inherits an all-lines seen set, defeating the
+    /// unseen-anchor gate. The outline read must record nothing.
+    #[test]
+    fn single_path_auto_outline_read_grants_no_whole_file_seen_lines() {
+        use crate::index::bloom::BloomFilterCache;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("big.md");
+        let mut content = String::new();
+        for i in 1..=2000 {
+            let _ = writeln!(
+                content,
+                "# Section {i} with enough padding text to bloat bytes"
+            );
+        }
+        std::fs::write(&p, &content).unwrap();
+        assert!(
+            crate::read::would_outline(&p),
+            "fixture must be large enough to outline"
+        );
+
+        let (session, cache) = services();
+
+        // Edit-mode auto read → outline (the path under test).
+        tool_read(
+            &serde_json::json!({"paths": [p.to_str().unwrap()]}),
+            &cache,
+            &session,
+            true,
+        )
+        .expect("edit-mode auto read");
+
+        // Range read of the same content records only lines 1-3.
+        let range = format!("{}#1-3", p.to_str().unwrap());
+        tool_read(
+            &serde_json::json!({"paths": [range]}),
+            &cache,
+            &session,
+            true,
+        )
+        .expect("edit-mode range read");
+
+        // An edit anchored on line 50 (never displayed) must be rejected.
+        let header = crate::edit::tag::format_header(
+            &p.display().to_string(),
+            crate::edit::tag::compute_file_hash(&content),
+        );
+        let blob = format!("{header}\nSWAP 50:\n+# edited line 50\n");
+        let bloom = Arc::new(BloomFilterCache::new());
+        let out = crate::mcp::tools::tool_write(
+            &serde_json::json!({"edits": blob, "root": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("write call");
+        assert!(
+            out.contains("never displayed"),
+            "outline read must not grant whole-file seenLines; line-50 edit must be rejected, got:\n{out}"
+        );
+        assert!(
+            !out.contains("applied"),
+            "edit on an unseen line must not apply, got:\n{out}"
+        );
+    }
+
+    /// A markdown `#heading` edit-mode read records only the heading's section
+    /// as seen (not the whole file): a tag-matched edit inside that section
+    /// applies, but one anchored on a line in a different, never-displayed
+    /// section is rejected by the seen-lines gate.
+    #[test]
+    fn heading_read_gates_edit_to_displayed_section() {
+        use crate::index::bloom::BloomFilterCache;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("doc.md");
+        let content = "# Section A\nalpha\nmore a\n\n# Section B\nbeta\nmore b\n";
+        std::fs::write(&p, content).unwrap();
+        let (session, cache) = services();
+
+        // Heading read displays only Section A (lines 1-4).
+        let out = tool_read(
+            &serde_json::json!({"paths": [format!("{}#{}", p.display(), "# Section A")]}),
+            &cache,
+            &session,
+            true,
+        )
+        .expect("heading read");
+        assert!(
+            out.contains("alpha"),
+            "heading read must display Section A, got:\n{out}"
+        );
+
+        let tag = crate::edit::tag::format_header(
+            &p.display().to_string(),
+            crate::edit::tag::compute_file_hash(content),
+        );
+        let bloom = Arc::new(BloomFilterCache::new());
+
+        // Edit on line 6 (inside Section B, never displayed) is rejected.
+        let reject = format!("{tag}\nSWAP 6:\n+BETA\n");
+        let out = crate::mcp::tools::tool_write(
+            &serde_json::json!({"edits": reject, "root": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("write call");
+        assert!(
+            out.contains("never displayed"),
+            "heading read must not grant whole-file seenLines; a Section-B edit must be rejected, got:\n{out}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            content,
+            "rejected edit must not touch the file"
+        );
+
+        // Edit on line 2 (inside the displayed Section A) applies.
+        let ok = format!("{tag}\nSWAP 2:\n+ALPHA\n");
+        let out = crate::mcp::tools::tool_write(
+            &serde_json::json!({"edits": ok, "root": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("write call");
+        assert!(
+            out.contains("applied"),
+            "in-section edit must apply, got:\n{out}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "# Section A\nALPHA\nmore a\n\n# Section B\nbeta\nmore b\n"
+        );
+    }
+
+    /// Same defect on the multi-path branch: an outlined file in a batch read
+    /// must not record whole-file seenLines either.
+    #[test]
+    fn multi_path_auto_outline_read_grants_no_whole_file_seen_lines() {
+        use crate::index::bloom::BloomFilterCache;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let big = root.join("big.md");
+        let small = root.join("small.md");
+        let mut content = String::new();
+        for i in 1..=2000 {
+            let _ = writeln!(
+                content,
+                "# Section {i} with enough padding text to bloat bytes"
+            );
+        }
+        std::fs::write(&big, &content).unwrap();
+        std::fs::write(&small, "# small\n").unwrap();
+        assert!(crate::read::would_outline(&big), "fixture must outline");
+
+        let (session, cache) = services();
+
+        // Multi-path edit-mode auto read → big.md outlines.
+        tool_read(
+            &serde_json::json!({"paths": [big.to_str().unwrap(), small.to_str().unwrap()]}),
+            &cache,
+            &session,
+            true,
+        )
+        .expect("edit-mode multi read");
+
+        let range = format!("{}#1-3", big.to_str().unwrap());
+        tool_read(
+            &serde_json::json!({"paths": [range]}),
+            &cache,
+            &session,
+            true,
+        )
+        .expect("edit-mode range read");
+
+        let header = crate::edit::tag::format_header(
+            &big.display().to_string(),
+            crate::edit::tag::compute_file_hash(&content),
+        );
+        let blob = format!("{header}\nSWAP 50:\n+# edited line 50\n");
+        let bloom = Arc::new(BloomFilterCache::new());
+        let out = crate::mcp::tools::tool_write(
+            &serde_json::json!({"edits": blob, "root": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("write call");
+        assert!(
+            out.contains("never displayed"),
+            "multi-path outline read must not grant whole-file seenLines, got:\n{out}"
         );
     }
 }

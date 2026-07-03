@@ -9,7 +9,7 @@
 use std::path::Path;
 
 use super::parser::BlockAnchor;
-use crate::lang::outline::get_outline_entries;
+use crate::lang::outline::{find_entry_by_name, get_outline_entries};
 use crate::types::{FileType, OutlineEntry};
 
 /// A resolved 1-based inclusive line span.
@@ -41,26 +41,12 @@ pub fn outline_for(path: &Path, text: &str) -> Option<Vec<OutlineEntry>> {
 pub fn resolve_block_in(entries: &[OutlineEntry], anchor: &BlockAnchor) -> Option<BlockSpan> {
     match anchor {
         BlockAnchor::Symbol(name) => {
-            find_by_name(entries, name).map(|(s, e)| BlockSpan { start: s, end: e })
+            find_entry_by_name(entries, name).map(|(s, e)| BlockSpan { start: s, end: e })
         }
         BlockAnchor::Line(line) => {
             resolve_line(entries, *line).map(|(s, e)| BlockSpan { start: s, end: e })
         }
     }
-}
-
-/// First outline entry named `name` (depth-first), matching the `#symbol` read
-/// selector's `find_symbol_entry`.
-fn find_by_name(entries: &[OutlineEntry], name: &str) -> Option<(u32, u32)> {
-    for e in entries {
-        if e.name == name {
-            return Some((e.start_line, e.end_line));
-        }
-        if let Some(hit) = find_by_name(&e.children, name) {
-            return Some(hit);
-        }
-    }
-    None
 }
 
 /// Resolve a line anchor: prefer a block that *begins* on `line` (oh-my-pi's
@@ -129,7 +115,7 @@ fn beta() {
         // The `#symbol` read selector resolves via the same outline entry, so
         // resolve_block must produce the identical (start,end).
         let entries = get_outline_entries(SRC, crate::types::Lang::Rust);
-        let expected = find_by_name(&entries, "beta").expect("beta in outline");
+        let expected = find_entry_by_name(&entries, "beta").expect("beta in outline");
         assert_eq!((span.start, span.end), expected);
         // And the span actually covers beta's opener line (line 6).
         assert_eq!(span.start, 6);

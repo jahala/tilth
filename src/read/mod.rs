@@ -226,8 +226,7 @@ pub fn read_file(
     if full || tokens <= TOKEN_THRESHOLD {
         let header = format::file_header(path, byte_len, line_count, ViewMode::Full);
         if edit_mode {
-            let numbered = format::hashlines(&content, 1);
-            return Ok(format!("{header}\n\n{numbered}"));
+            return Ok(edit_whole_view(path, &content, &header));
         }
         return Ok(format!("{header}\n\n{content}"));
     }
@@ -528,6 +527,71 @@ struct Block {
     text: String,
 }
 
+/// Edit-mode whole-file view: tilth's `# path (...) [full]` header, then the
+/// whole-file-tag section header `[path#TAG]` and `N:content` numbered lines
+/// (`split('\n')`, phantom trailing row included). Files over the per-file
+/// snapshot cap mint no tag (spec) — they render numbered lines with a plain
+/// `# <path>` marker so the model can read but not tag-verify an edit.
+fn edit_whole_view(path: &Path, content: &str, file_header: &str) -> String {
+    let numbered = crate::edit::tag::render_numbered_whole(content);
+    if content.len() > crate::edit::snapshots::DEFAULT_PER_FILE_CAP {
+        return format!(
+            "{file_header}\n\n# {} (too large to tag; edits cannot be tag-verified)\n{numbered}",
+            path.display()
+        );
+    }
+    let tag = crate::edit::tag::compute_file_hash(content);
+    let tag_header = crate::edit::tag::format_header(&path.display().to_string(), tag);
+    format!("{file_header}\n\n{tag_header}\n{numbered}")
+}
+
+/// Which lines an edit-mode read displayed, for the seen-lines provenance gate.
+pub enum SeenSpec {
+    /// The whole file was displayed (all `split('\n')` rows are seen).
+    Whole,
+    /// Only these 1-based inclusive ranges were displayed.
+    Ranges(Vec<(u32, u32)>),
+}
+
+/// Record the whole-file-tag snapshot for an edit-mode read into the session
+/// store, tagged by the file's live content and stamped with the line numbers
+/// the read displayed. Best-effort: an unreadable file (binary, deleted mid-
+/// call) records nothing. Keyed by canonical realpath so a later `tilth_write`
+/// finds the snapshot regardless of path spelling.
+pub fn record_edit_snapshot(session: &crate::session::Session, path: &Path, spec: &SeenSpec) {
+    // `SnapshotStore::record` drops anything over the per-file cap — skip
+    // the full-file read and seen materialization entirely for those.
+    let over_cap = fs::metadata(path)
+        .is_ok_and(|m| m.len() > crate::edit::snapshots::DEFAULT_PER_FILE_CAP as u64);
+    if over_cap {
+        return;
+    }
+    let Ok(text) = fs::read_to_string(path) else {
+        return;
+    };
+    let seen: Vec<u32> = match spec {
+        SeenSpec::Whole => {
+            let n = u32::try_from(text.split('\n').count()).unwrap_or(u32::MAX);
+            (1..=n).collect()
+        }
+        SeenSpec::Ranges(ranges) => ranges.iter().flat_map(|&(s, e)| s..=e.max(s)).collect(),
+    };
+    let key = crate::edit::normalize_path_key(path);
+    session.record_snapshot(&key, &text, seen);
+}
+
+/// Resolve a markdown `#heading` anchor to its 1-based inclusive line span,
+/// for the seen-lines provenance of an edit-mode heading read. Returns `None`
+/// when the file is unreadable or the heading is absent (caller falls back).
+pub fn resolve_heading_span(path: &Path, heading: &str) -> Option<(u32, u32)> {
+    let bytes = fs::read(path).ok()?;
+    let (start, end) = resolve_heading(&bytes, heading)?;
+    Some((
+        u32::try_from(start).unwrap_or(u32::MAX),
+        u32::try_from(end).unwrap_or(u32::MAX),
+    ))
+}
+
 /// Read one or more line ranges from a file. Each range is "start-end"
 /// (e.g. "45-89") or a heading anchor (e.g. "## Architecture") for
 /// markdown files. Mmaps the file once and emits a single `[section]`
@@ -562,6 +626,19 @@ pub fn read_ranges(path: &Path, ranges: &[&str], edit_mode: bool) -> Result<Stri
     }
     let total = line_offsets.len();
 
+    // Edit-mode sections carry the WHOLE-file content tag (not a per-slice
+    // tag) so a follow-up tilth_write verifies against live file content.
+    let tag_header = if edit_mode {
+        let whole = String::from_utf8_lossy(buf);
+        let tag = crate::edit::tag::compute_file_hash(&whole);
+        Some(crate::edit::tag::format_header(
+            &path.display().to_string(),
+            tag,
+        ))
+    } else {
+        None
+    };
+
     let mut blocks: Vec<Block> = Vec::with_capacity(ranges.len());
     let mut total_bytes: u64 = 0;
     let mut total_lines: u32 = 0;
@@ -586,7 +663,7 @@ pub fn read_ranges(path: &Path, ranges: &[&str], edit_mode: bool) -> Result<Stri
         total_bytes += selected.len() as u64;
         total_lines += (e - s) as u32;
         let formatted = if edit_mode {
-            format::hashlines(&selected, start as u32)
+            crate::edit::tag::render_numbered_slice(&selected, start as u32)
         } else {
             format::number_lines(&selected, start as u32)
         };
@@ -598,6 +675,11 @@ pub fn read_ranges(path: &Path, ranges: &[&str], edit_mode: bool) -> Result<Stri
     }
 
     let header = format::file_header(path, total_bytes, total_lines, ViewMode::Section);
+    // In edit mode the tag header sits between the file header and the blocks.
+    let header = match &tag_header {
+        Some(t) => format!("{header}\n\n{t}"),
+        None => header,
+    };
 
     if blocks.len() == 1 {
         let b = &blocks[0];
@@ -1150,27 +1232,36 @@ mod tests {
     }
 
     #[test]
-    fn read_ranges_edit_mode_emits_hashlines_per_block() {
-        // Edit-mode output must be hashlined inside every block, not just the first.
-        // Hashline format is `<line>:<3hex>|<content>`.
-        let path = write_temp(
-            "tilth_test_ranges_edit_mode.txt",
-            "alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\n",
-        );
+    fn read_ranges_edit_mode_emits_tag_header_and_numbered_lines_per_block() {
+        // Edit-mode section output carries the WHOLE-file tag header once, then
+        // per-block `N:content` numbered lines (no per-line hash — that is the
+        // whole-file-tag token win).
+        let content = "alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\n";
+        let path = write_temp("tilth_test_ranges_edit_mode.txt", content);
         let out = read_ranges(&path, &["1-2", "5-6"], true).unwrap();
-        // Both delimiters present
+        // Both delimiters present.
         assert!(out.contains("─── lines 1-2 ───"), "first delimiter: {out}");
         assert!(out.contains("─── lines 5-6 ───"), "second delimiter: {out}");
-        // Hashline anchors present for at least one line in each block (the
-        // exact hash depends on FNV-1a so just check the `<n>:<hex>|` shape).
-        let line_one_match = out
-            .lines()
-            .any(|l| l.starts_with("1:") && l.contains("|alpha"));
-        let line_six_match = out
-            .lines()
-            .any(|l| l.starts_with("6:") && l.contains("|zeta"));
-        assert!(line_one_match, "expected hashline for line 1: {out}");
-        assert!(line_six_match, "expected hashline for line 6: {out}");
+        // The whole-file tag header appears exactly once.
+        let expected_tag =
+            crate::edit::tag::format_tag(crate::edit::tag::compute_file_hash(content));
+        assert!(
+            out.contains(&format!("#{expected_tag}]")),
+            "expected whole-file [path#{expected_tag}] header: {out}"
+        );
+        // Numbered lines are `N:content`, no `|hash` prefix.
+        assert!(
+            out.lines().any(|l| l == "1:alpha"),
+            "expected `1:alpha` numbered line: {out}"
+        );
+        assert!(
+            out.lines().any(|l| l == "6:zeta"),
+            "expected `6:zeta` numbered line: {out}"
+        );
+        assert!(
+            !out.contains("|alpha"),
+            "per-line hash prefix must be gone in edit mode: {out}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

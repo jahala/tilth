@@ -23,6 +23,29 @@ pub enum TilthError {
     },
     #[error("parse error in {}: {reason}", path.display())]
     ParseError { path: PathBuf, reason: String },
+    /// A whole-file-tag edit was rejected: the section's tag no longer matches
+    /// live content and recovery declined (Drift), the tag was never minted this
+    /// session (Fabricated), or the edit anchored a line the read never
+    /// displayed (`UnseenAnchor`). Carries the already-actionable mismatch
+    /// message verbatim.
+    #[error("{0}")]
+    EditRejected(String),
+}
+
+impl From<crate::edit::mismatch::MismatchError> for TilthError {
+    fn from(e: crate::edit::mismatch::MismatchError) -> Self {
+        TilthError::EditRejected(e.to_string())
+    }
+}
+
+impl From<crate::edit::recovery::EditError> for TilthError {
+    fn from(e: crate::edit::recovery::EditError) -> Self {
+        use crate::edit::recovery::EditError;
+        match e {
+            EditError::Mismatch(m) => m.into(),
+            EditError::Apply(a) => TilthError::EditRejected(a.to_string()),
+        }
+    }
 }
 
 impl TilthError {
@@ -31,7 +54,7 @@ impl TilthError {
     pub fn exit_code(&self) -> i32 {
         match self {
             Self::NotFound { .. } | Self::IoError { .. } => 2,
-            Self::InvalidQuery { .. } | Self::ParseError { .. } => 3,
+            Self::InvalidQuery { .. } | Self::ParseError { .. } | Self::EditRejected(_) => 3,
             Self::PermissionDenied { .. } | Self::IgnoreDenied { .. } => 4,
         }
     }

@@ -240,88 +240,23 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
     if edit_mode {
         tools.push(serde_json::json!({
             "name": "tilth_write",
-            "description": "Batch write one or more files in one call. Replaces the host Edit and Write tools — DO NOT use those. Three per-file modes: `hash` (default — replace lines at hash anchors from tilth_read), `overwrite` (whole file; create-only by default — pass `overwrite: true` to replace an existing file), `append` (append `content`, creates if absent). overwrite/append responses echo the file's hashlines so you can chain anchored edits in the next call without re-reading. ALWAYS group writes to multiple files into a single tilth_write call — never call tilth_write twice in a row. Each file is processed independently (best-effort): a failure on one file does not block the others; results are reported per file. Partial success returns isError: false — scan the per-file `## <path>` sections for failures rather than trusting the top-level status. A parse error on one edit invalidates ALL edits for that file (none applied); retry the whole file after fixing the malformed entry. Each file path may appear at most once per call. Max 20 files per call. Example overwrite (new file): `tilth_write(files: [{path: \"src/new.rs\", mode: \"overwrite\", content: \"fn main(){}\\n\"}])`.",
+            "description": "Edit files by sending a text blob of `[path#TAG]` sections in tilth's op grammar. Replaces the host Edit and Write tools — DO NOT use those. Copy the `[path#TAG]` header and `N:content` numbered lines from a tilth_read/tilth_search edit-mode view, then write ops beneath the header. One op per line; multi-line payloads follow their op header, one payload line each (prefix `+` to force a line literal). Ops: `SWAP a.=b:` then payload (replace line range), `DEL n` / `DEL a.=b` (delete), `INS.PRE n:` / `INS.POST n:` then payload (insert before/after line n), `INS.HEAD:` / `INS.TAIL:` then payload (start/end of file), `SWAP.BLK n:` / `SWAP.BLK #symbol:` then payload (replace the tree-sitter block at a line or named symbol), `DEL.BLK n` / `DEL.BLK #symbol`, `INS.BLK.POST n:` / `INS.BLK.POST #symbol:` then payload, `REM` (delete file), `MV dest` (move/rename). Line numbers are 1-based inclusive and come from the numbered read. The TAG binds the section to the exact content you read: if the file drifted, tilth 3-way-merges your ops onto the live file; if it can't, the section is rejected — re-read and retry that file. A tagless `[path]` header seeds a NEW file (use INS.HEAD). Each section is independent (best-effort); results report per `## <path>`. Max 20 sections. Example: `tilth_write(edits: \"[src/x.rs#1A2B]\\nSWAP 2:\\n+    let y = 1;\\n\")`.",
             "inputSchema": {
                 "type": "object",
-                "required": ["files"],
+                "required": ["edits"],
                 "properties": {
-                    "files": {
-                        "type": "array",
-                        "minItems": 1,
-                        "maxItems": 20,
-                        "description": "One entry per file. Use a single-element array for a single-file write. Each path must be unique within the call.",
-                        "items": {
-                            "type": "object",
-                            "required": ["path"],
-                            "properties": {
-                                "path": {
-                                    "type": "string",
-                                    "description": "Absolute or relative file path."
-                                },
-                                "mode": {
-                                    "type": "string",
-                                    "enum": ["hash", "h", "overwrite", "w", "append", "a"],
-                                    "default": "hash",
-                                    "description": "Write mode. hash (default): replace lines at hash anchors via `edits`. overwrite: write whole file from `content`; create-only by default — set `overwrite: true` to replace existing. append: append `content`, creates if absent."
-                                },
-                                "edits": {
-                                    "type": "array",
-                                    "minItems": 1,
-                                    "description": "Hash-mode only: edit operations for this file, applied atomically per file.",
-                                    "items": {
-                                        "type": "object",
-                                        "required": ["start", "content"],
-                                        "properties": {
-                                            "start": {
-                                                "type": "string",
-                                                "description": "Start anchor: 'line:hash' (e.g. '42:a3f'). Hash from tilth_read hashline output."
-                                            },
-                                            "end": {
-                                                "type": "string",
-                                                "description": "End anchor: 'line:hash'. If omitted, replaces only the start line."
-                                            },
-                                            "content": {
-                                                "type": "string",
-                                                "description": "Replacement text (can be multi-line). Empty string to delete the line(s)."
-                                            }
-                                        }
-                                    }
-                                },
-                                "content": {
-                                    "type": "string",
-                                    "description": "overwrite / append mode only: the file contents (overwrite) or text to append (append)."
-                                },
-                                "overwrite": {
-                                    "type": "boolean",
-                                    "default": false,
-                                    "description": "overwrite mode only: when true, replace an existing file. Default false fails with `AlreadyExists` so you don't clobber by accident."
-                                }
-                            },
-                            "allOf": [
-                                {
-                                    "if": {"properties": {"mode": {"enum": ["hash", "h"]}}},
-                                    "then": {"required": ["edits"]}
-                                },
-                                {
-                                    "if": {
-                                        "required": ["mode"],
-                                        "properties": {
-                                            "mode": {"enum": ["overwrite", "w", "append", "a"]}
-                                        }
-                                    },
-                                    "then": {"required": ["content"]}
-                                }
-                            ]
-                        }
+                    "edits": {
+                        "type": "string",
+                        "description": "Op-grammar blob: one or more `[path#TAG]` sections, each followed by op lines. Copy the `[path#TAG]` header verbatim from the edit-mode read; never invent a TAG. To append cleanly to a newline-terminated file, prefer `INS.POST <last-content-line>` over `INS.TAIL:` (INS.TAIL inserts after the file's trailing empty row)."
                     },
                     "diff": {
                         "type": "boolean",
                         "default": false,
-                        "description": "Set true to include a compact diff of changes in the response per file."
+                        "description": "Set true to include a compact before/after diff per section."
                     },
                     "root": {
                         "type": "string",
-                        "description": "Absolute path to your checkout directory. REQUIRED unless every file path is absolute. Must be an absolute path. Every RELATIVE file path is anchored under `root`; absolute paths are used as-is. The server cannot see your shell cwd, so a relative path with no absolute `root` is refused."
+                        "description": "Absolute path to your checkout directory. REQUIRED unless every section path is absolute. Must be an absolute path. RELATIVE section paths (and MV destinations) are anchored under `root` and confined to it; ABSOLUTE section paths are also confined to `root` (or to the server's startup directory when `root` is omitted); `..` traversal and paths outside the confinement root are refused. The server cannot see your shell cwd."
                     }
                 }
             }
@@ -336,80 +271,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tilth_write_schema_requires_mode_specific_fields() {
+    fn tilth_write_schema_requires_edits_blob() {
         let tools = tool_definitions(true);
         let write = tools
             .iter()
             .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("tilth_write"))
             .expect("tilth_write tool definition present in edit mode");
-        let items = &write["inputSchema"]["properties"]["files"]["items"];
-        let all_of = items["allOf"]
-            .as_array()
-            .expect("items.allOf clauses present");
-        assert_eq!(all_of.len(), 2, "expected hash-branch + content-branch");
-        // Hash branch: when mode absent or in {hash, h}, require edits.
-        let hash_branch = &all_of[0];
-        assert_eq!(hash_branch["then"]["required"][0], "edits");
-        // Content branch: when mode in {overwrite, w, append, a}, require content.
-        let content_branch = &all_of[1];
-        assert_eq!(content_branch["then"]["required"][0], "content");
-        let content_modes = content_branch["if"]["properties"]["mode"]["enum"]
-            .as_array()
-            .expect("content-mode enum present");
-        let modes: Vec<&str> = content_modes.iter().filter_map(|v| v.as_str()).collect();
-        assert!(modes.contains(&"overwrite") && modes.contains(&"append"));
+        let schema = &write["inputSchema"];
+        assert_eq!(schema["required"][0], "edits", "edits blob is required");
+        assert_eq!(
+            schema["properties"]["edits"]["type"], "string",
+            "edits is a single op-grammar text blob"
+        );
+        // The old per-file `files` array surface is gone.
+        assert!(
+            schema["properties"].get("files").is_none(),
+            "the per-file `files` array must be replaced by the `edits` blob"
+        );
     }
 
-    /// Compile the per-file `items` sub-schema and exercise the mode-required
-    /// rules end-to-end. Structural assertions above protect against
-    /// silent shape changes; this protects against drift in semantics.
+    /// Compile the full inputSchema and exercise the required-blob rule
+    /// end-to-end: `{}` fails (edits missing), a bare blob passes.
     #[test]
-    fn tilth_write_items_schema_enforces_mode_required_fields() {
+    fn tilth_write_schema_enforces_required_edits() {
         let tools = tool_definitions(true);
         let write = tools
             .iter()
             .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("tilth_write"))
             .expect("tilth_write tool definition present in edit mode");
-        let items_schema = write["inputSchema"]["properties"]["files"]["items"].clone();
-        let compiled = jsonschema::JSONSchema::compile(&items_schema)
-            .expect("tilth_write items schema must be a valid JSON Schema");
+        let compiled = jsonschema::JSONSchema::compile(&write["inputSchema"])
+            .expect("tilth_write inputSchema must be a valid JSON Schema");
 
-        let valid_hash = serde_json::json!({
-            "path": "src/x.rs",
-            "mode": "hash",
-            "edits": [{"start": "1:abc", "content": "y"}],
-        });
-        let valid_default = serde_json::json!({
-            "path": "src/x.rs",
-            "edits": [{"start": "1:abc", "content": "y"}],
-        });
-        let valid_overwrite = serde_json::json!({
-            "path": "src/x.rs", "mode": "overwrite", "content": "y",
-        });
-        let valid_append = serde_json::json!({
-            "path": "src/x.rs", "mode": "append", "content": "y",
-        });
-        for v in [&valid_hash, &valid_default, &valid_overwrite, &valid_append] {
-            assert!(compiled.is_valid(v), "expected valid instance to pass: {v}");
-        }
-
-        // Mode-required field omissions must fail validation, not merely
-        // produce per-file dispatcher errors.
-        let hash_missing_edits = serde_json::json!({"path": "x.rs", "mode": "hash"});
-        let default_missing_edits = serde_json::json!({"path": "x.rs"});
-        let overwrite_missing_content = serde_json::json!({"path": "x.rs", "mode": "overwrite"});
-        let append_missing_content = serde_json::json!({"path": "x.rs", "mode": "append"});
-        for v in [
-            &hash_missing_edits,
-            &default_missing_edits,
-            &overwrite_missing_content,
-            &append_missing_content,
-        ] {
-            assert!(
-                !compiled.is_valid(v),
-                "expected invalid instance to fail: {v}"
-            );
-        }
+        assert!(
+            !compiled.is_valid(&serde_json::json!({})),
+            "empty args must fail: edits is required"
+        );
+        assert!(
+            compiled.is_valid(&serde_json::json!({"edits": "[a#0000]\nDEL 1\n"})),
+            "a bare edits blob must validate"
+        );
+        assert!(
+            compiled.is_valid(
+                &serde_json::json!({"edits": "[a#0000]\nDEL 1\n", "root": "/abs", "diff": true})
+            ),
+            "edits + root + diff must validate"
+        );
     }
 
     /// `tilth_search` schema must stay aligned with the runtime: `any` is a

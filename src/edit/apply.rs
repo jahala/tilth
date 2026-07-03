@@ -23,6 +23,45 @@ pub enum FileOp {
     Move(String),
 }
 
+impl FileOp {
+    /// Extract the file-level op (`REM`/`MV`) from `ops`, enforcing the same
+    /// conflict guard [`lower_ops`] applies: at most one file op per section,
+    /// and `REM` cannot combine with content edits. Returns `Ok(None)` for a
+    /// pure content edit. The canonical mapping every apply/recovery path shares
+    /// so no branch hand-derives a file op that bypasses these guards.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApplyError::FileOpConflict`] when two file ops appear, or `REM`
+    /// combines with a content op.
+    pub fn from_ops(ops: &[Op]) -> Result<Option<FileOp>, ApplyError> {
+        let mut file_op: Option<FileOp> = None;
+        let mut has_content = false;
+        for op in ops {
+            match op {
+                Op::Rem => {
+                    if file_op.is_some() {
+                        return Err(ApplyError::FileOpConflict);
+                    }
+                    file_op = Some(FileOp::Remove);
+                }
+                Op::Mv { dest } => {
+                    if file_op.is_some() {
+                        return Err(ApplyError::FileOpConflict);
+                    }
+                    file_op = Some(FileOp::Move(dest.clone()));
+                }
+                _ => has_content = true,
+            }
+        }
+        // REM deletes the whole file; it cannot combine with content edits.
+        if matches!(file_op, Some(FileOp::Remove)) && has_content {
+            return Err(ApplyError::FileOpConflict);
+        }
+        Ok(file_op)
+    }
+}
+
 /// Result of applying ops to a text body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApplyResult {
@@ -76,9 +115,10 @@ pub(super) fn lower_ops(
     text: &str,
     ops: &[Op],
 ) -> Result<(Vec<LineOp>, Option<FileOp>), ApplyError> {
+    // File ops (REM/MV) plus the one-file-op / REM-alone conflict guard live in
+    // the canonical `FileOp::from_ops`; the loop below handles only content ops.
+    let file_op = FileOp::from_ops(ops)?;
     let mut line_ops = Vec::new();
-    let mut file_op: Option<FileOp> = None;
-    let mut has_content = false;
 
     // Parse the outline once when any block ops need span resolution: each
     // `get_outline_entries` call re-parses the whole file, so resolving K block
@@ -95,7 +135,6 @@ pub(super) fn lower_ops(
                 end,
                 payload,
             } => {
-                has_content = true;
                 line_ops.push(LineOp::Swap {
                     start: *start,
                     end: *end,
@@ -103,14 +142,12 @@ pub(super) fn lower_ops(
                 });
             }
             Op::Del { start, end } => {
-                has_content = true;
                 line_ops.push(LineOp::Del {
                     start: *start,
                     end: *end,
                 });
             }
             Op::Ins { cursor, payload } => {
-                has_content = true;
                 line_ops.push(LineOp::Ins {
                     cursor: cursor.clone(),
                     payload: payload.clone(),
@@ -121,7 +158,6 @@ pub(super) fn lower_ops(
                 mode,
                 payload,
             } => {
-                has_content = true;
                 let span = outline
                     .as_deref()
                     .and_then(|entries| resolve_block_in(entries, anchor))
@@ -142,24 +178,8 @@ pub(super) fn lower_ops(
                     }),
                 }
             }
-            Op::Rem => {
-                if file_op.is_some() {
-                    return Err(ApplyError::FileOpConflict);
-                }
-                file_op = Some(FileOp::Remove);
-            }
-            Op::Mv { dest } => {
-                if file_op.is_some() {
-                    return Err(ApplyError::FileOpConflict);
-                }
-                file_op = Some(FileOp::Move(dest.clone()));
-            }
+            Op::Rem | Op::Mv { .. } => {}
         }
-    }
-
-    // REM deletes the whole file; it cannot combine with content edits.
-    if matches!(file_op, Some(FileOp::Remove)) && has_content {
-        return Err(ApplyError::FileOpConflict);
     }
 
     Ok((line_ops, file_op))

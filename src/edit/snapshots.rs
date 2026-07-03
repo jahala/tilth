@@ -41,7 +41,10 @@ struct ByteScale;
 impl WeightScale<String, Vec<Snapshot>> for ByteScale {
     #[allow(clippy::ptr_arg)]
     fn weight(&self, _key: &String, value: &Vec<Snapshot>) -> usize {
-        1 + value.iter().map(|s| s.text.len()).sum::<usize>()
+        1 + value
+            .iter()
+            .map(|s| s.text.len() + s.seen_lines.len() * std::mem::size_of::<u32>())
+            .sum::<usize>()
     }
 }
 

@@ -540,6 +540,10 @@ pub fn apply_batch(
 #[derive(Debug)]
 pub struct BatchOutcome {
     pub output: String,
+    // Read only by the old per-line `tilth_write` path (dead post-PR2 swap;
+    // PR3 removes the old model). Retained so `apply_batch`'s contract is
+    // unchanged for PR3's deletion pass.
+    #[allow(dead_code)]
     pub applied: Vec<PathBuf>,
 }
 

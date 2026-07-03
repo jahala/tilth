@@ -880,6 +880,23 @@ pub fn get_outline_entries(content: &str, lang: Lang) -> Vec<OutlineEntry> {
     walk_top_level(tree.root_node(), &lines, lang)
 }
 
+/// First outline entry named `name` (depth-first pre-order), returning its
+/// 1-based inclusive `(start_line, end_line)` span. This is the single
+/// canonical symbol-walk shared by the `#symbol` read selector
+/// (`src/mcp/tools/read.rs`) and block-anchor resolution
+/// (`src/edit/block.rs`); both previously carried their own copy.
+pub fn find_entry_by_name(entries: &[OutlineEntry], name: &str) -> Option<(u32, u32)> {
+    for e in entries {
+        if e.name == name {
+            return Some((e.start_line, e.end_line));
+        }
+        if let Some(hit) = find_entry_by_name(&e.children, name) {
+            return Some(hit);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod markdown_helper_tests {
     use super::{heading_level, heading_text, parse_markdown};

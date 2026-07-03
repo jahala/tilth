@@ -1,5 +1,10 @@
 //! `tilth_write` helpers: overwrite / append modes plus strict
 //! fingerprint-based auto-fix for hash-anchored edits.
+//!
+//! Dead post-PR2 swap: the whole-file-tag `tilth_write` no longer routes
+//! through these overwrite/append/relocation helpers. They are left in place
+//! for PR3 to delete alongside the rest of the per-line model.
+#![allow(dead_code)]
 
 use std::fs;
 use std::path::Path;

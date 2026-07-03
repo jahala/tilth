@@ -2,8 +2,10 @@ use std::collections::HashMap;
 use std::fmt::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::time::SystemTime;
+
+use crate::edit::snapshots::SnapshotStore;
 
 /// Tracks MCP activity across calls.
 /// Stored alongside `OutlineCache` in server state.
@@ -16,6 +18,11 @@ pub struct Session {
     /// `is_expanded` detect stale records when the file has been edited
     /// since the expansion was first shown.
     expanded: Mutex<HashMap<String, SystemTime>>,
+    /// Whole-file-tag snapshots bound to the content each edit-mode read
+    /// displayed. Persists across `tilth_read`→`tilth_write` within a session
+    /// so a follow-up edit can verify its tag and, on drift, 3-way-merge
+    /// recover. Keyed by canonical realpath.
+    snapshots: Mutex<SnapshotStore>,
 }
 
 impl Session {
@@ -26,7 +33,41 @@ impl Session {
             symbols: Mutex::new(HashMap::new()),
             dir_hits: Mutex::new(HashMap::new()),
             expanded: Mutex::new(HashMap::new()),
+            snapshots: Mutex::new(SnapshotStore::new()),
         }
+    }
+
+    /// Lock the per-session snapshot store. Callers hold the guard for the
+    /// duration of a record-or-recover operation. Prefer the narrow
+    /// `record_snapshot` / `invalidate_snapshot` / `relocate_snapshot` methods
+    /// for single operations; the raw guard is for the drift-recovery path,
+    /// which needs `by_tag` and `try_recover` under one lock.
+    pub fn snapshots(&self) -> MutexGuard<'_, SnapshotStore> {
+        self.snapshots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Record a whole-file-tag snapshot, returning the minted tag (`None` when
+    /// the file exceeds the per-file cap). Narrow read/emitter-side entrypoint —
+    /// hands out no other store surface.
+    pub fn record_snapshot(
+        &self,
+        key: &str,
+        text: &str,
+        seen_lines: impl IntoIterator<Item = u32>,
+    ) -> Option<u16> {
+        self.snapshots().record(key, text, seen_lines)
+    }
+
+    /// Drop the snapshot history for `key` (a removed file).
+    pub fn invalidate_snapshot(&self, key: &str) {
+        self.snapshots().invalidate(key);
+    }
+
+    /// Move the snapshot history from `from` to `to` (a renamed file).
+    pub fn relocate_snapshot(&self, from: &str, to: &str) {
+        self.snapshots().relocate(from, to);
     }
 
     pub fn record_read(&self, path: &Path) {
@@ -120,6 +161,7 @@ impl Session {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
+        self.snapshots().clear();
     }
 
     /// Return true only when this `(path, line)` was previously expanded
