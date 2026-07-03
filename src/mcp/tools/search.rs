@@ -53,6 +53,7 @@ pub(in crate::mcp) fn tool_search(
                     session.record_search(queries[0]);
                     crate::search::search_symbol_expanded(
                         queries[0], &scope, cache, session, bloom, expand, context, glob, false,
+                        budget,
                     )
                 }
                 2..=5 => {
@@ -61,6 +62,7 @@ pub(in crate::mcp) fn tool_search(
                     }
                     crate::search::search_multi_symbol_expanded(
                         &queries, &scope, cache, session, bloom, expand, context, glob, false,
+                        budget,
                     )
                 }
                 _ => {
@@ -74,7 +76,7 @@ pub(in crate::mcp) fn tool_search(
         "content" => {
             session.record_search(query);
             crate::search::search_content_expanded(
-                query, &scope, cache, session, expand, context, glob, false,
+                query, &scope, cache, session, expand, context, glob, false, budget,
             )
         }
         "regex" => {

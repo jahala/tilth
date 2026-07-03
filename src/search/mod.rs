@@ -158,7 +158,7 @@ pub fn search_symbol(
 ) -> Result<String, TilthError> {
     let result = symbol::search(query, scope, None, glob, false)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
-    format_search_result(&result, cache, None, &bloom, 0)
+    format_search_result(&result, cache, None, &bloom, 0, None)
 }
 
 pub fn search_symbol_expanded(
@@ -171,9 +171,10 @@ pub fn search_symbol_expanded(
     context: Option<&Path>,
     glob: Option<&str>,
     full: bool,
+    budget: Option<u64>,
 ) -> Result<String, TilthError> {
     let result = symbol::search(query, scope, context, glob, full)?;
-    format_search_result(&result, cache, Some(session), bloom, expand)
+    format_search_result(&result, cache, Some(session), bloom, expand, budget)
 }
 
 pub fn search_multi_symbol_expanded(
@@ -186,6 +187,7 @@ pub fn search_multi_symbol_expanded(
     context: Option<&Path>,
     glob: Option<&str>,
     full: bool,
+    budget: Option<u64>,
 ) -> Result<String, TilthError> {
     // Shared expand budget: at least 1 slot per query, or explicit expand if higher.
     // expand=0 means no expansion at all.
@@ -225,7 +227,10 @@ pub fn search_multi_symbol_expanded(
                 "\n\n... and {omitted} more matches. Narrow with scope."
             );
         }
-        out = crate::search::alloc::fit_to_budget(&out, &segments, crate::budget::DEFAULT_BUDGET);
+        // budget.unwrap_or(DEFAULT_BUDGET): keeps the no-budget path byte-
+        // identical to before this fix (see format_search_result's own comment).
+        let budget_tokens = budget.unwrap_or(crate::budget::DEFAULT_BUDGET);
+        out = crate::search::alloc::fit_to_budget(&out, &segments, budget_tokens);
         sections.push(out);
     }
 
@@ -241,7 +246,7 @@ pub fn search_content(
     let (pattern, is_regex) = parse_pattern(query);
     let result = content::search(pattern, scope, is_regex, None, glob, false)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
-    format_search_result(&result, cache, None, &bloom, 0)
+    format_search_result(&result, cache, None, &bloom, 0, None)
 }
 
 pub fn search_regex(
@@ -252,7 +257,7 @@ pub fn search_regex(
 ) -> Result<String, TilthError> {
     let result = content::search(pattern, scope, true, None, glob, false)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
-    format_search_result(&result, cache, None, &bloom, 0)
+    format_search_result(&result, cache, None, &bloom, 0, None)
 }
 
 pub fn search_content_expanded(
@@ -264,11 +269,12 @@ pub fn search_content_expanded(
     context: Option<&Path>,
     glob: Option<&str>,
     full: bool,
+    budget: Option<u64>,
 ) -> Result<String, TilthError> {
     let (pattern, is_regex) = parse_pattern(query);
     let result = content::search(pattern, scope, is_regex, context, glob, full)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
-    format_search_result(&result, cache, Some(session), &bloom, expand)
+    format_search_result(&result, cache, Some(session), &bloom, expand, budget)
 }
 
 /// Expanded regex search — takes raw pattern, no slash wrapping needed.
@@ -281,10 +287,11 @@ pub fn search_regex_expanded(
     context: Option<&Path>,
     glob: Option<&str>,
     full: bool,
+    budget: Option<u64>,
 ) -> Result<String, TilthError> {
     let result = content::search(pattern, scope, true, context, glob, full)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
-    format_search_result(&result, cache, Some(session), &bloom, expand)
+    format_search_result(&result, cache, Some(session), &bloom, expand, budget)
 }
 
 /// Raw symbol search — returns structured result for programmatic inspection.
@@ -321,7 +328,7 @@ pub fn format_raw_result(
     cache: &OutlineCache,
 ) -> Result<String, TilthError> {
     let bloom = crate::index::bloom::BloomFilterCache::new();
-    format_search_result(result, cache, None, &bloom, 0)
+    format_search_result(result, cache, None, &bloom, 0, None)
 }
 
 pub fn search_glob(pattern: &str, scope: &Path) -> Result<String, TilthError> {
@@ -997,6 +1004,7 @@ fn format_search_result(
     session: Option<&Session>,
     bloom: &crate::index::bloom::BloomFilterCache,
     expand: usize,
+    budget: Option<u64>,
 ) -> Result<String, TilthError> {
     let header = format::search_header(
         &result.query,
@@ -1174,7 +1182,11 @@ fn format_search_result(
 
     // Apply value-based budget allocation before appending the token footer.
     // Under-budget: byte-identical. Over-budget: drops lowest-value match blocks.
-    out = crate::search::alloc::fit_to_budget(&out, &segments, crate::budget::DEFAULT_BUDGET);
+    // budget.unwrap_or(DEFAULT_BUDGET) keeps the no-budget path byte-identical
+    // to before this fix — DEFAULT_BUDGET remains the default, it is simply no
+    // longer a hardcode that shadows a real caller-supplied budget.
+    let budget_tokens = budget.unwrap_or(crate::budget::DEFAULT_BUDGET);
+    out = crate::search::alloc::fit_to_budget(&out, &segments, budget_tokens);
 
     let tokens = estimate_tokens(out.len() as u64);
     let token_str = format_token_count(tokens);
@@ -2509,5 +2521,130 @@ mod tests {
         let (baseline, saved) = session.savings();
         assert_eq!(baseline, 0, "no truncation => no savings recorded");
         assert_eq!(saved, 0, "no truncation => no savings recorded");
+    }
+
+    /// Regression for the hardcoded-`DEFAULT_BUDGET` bug: `fit_to_budget` must
+    /// receive the caller's real `budget` instead of always being called with
+    /// `crate::budget::DEFAULT_BUDGET` (24_000). Fixture: one real definition
+    /// (`budget_probe_target`, high `def_weight`) plus a usage in a file named
+    /// after the query, so `rank::sort`'s `basename_boost` (+500) renders the
+    /// usage FIRST despite it being lower-value — this decouples render order
+    /// from value order exactly like the audit's live repro. At a small
+    /// explicit budget, the positional tail-cut (`budget::apply`) keeps
+    /// whatever rendered first (the low-value usage) and severs the
+    /// definition; value-based selection (`fit_to_budget`) keeps the
+    /// definition (highest value) and drops the usage instead.
+    #[test]
+    fn search_symbol_expanded_threads_real_budget_into_value_selection() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("definition.rs"),
+            "pub fn budget_probe_target() {\n    let _ = 1;\n}\n",
+        )
+        .unwrap();
+        // File stem == query triggers basename_boost(+500), outscoring the
+        // definition's own boosts (def_weight*10 + definition_name_boost) so
+        // this usage renders FIRST in the linear (<=5 match) format path.
+        // Padded with filler lines so its expanded block is large enough that
+        // budget 400 must drop ONE of the two blocks — proving which one a
+        // real budget drops (positional: whichever renders last; value-based:
+        // the lower-value one, regardless of render order).
+        let mut usage_body = String::from("fn calls_it() {\n    budget_probe_target();\n");
+        for i in 0..60 {
+            usage_body.push_str(&format!("    let filler_{i} = {i};\n"));
+        }
+        usage_body.push_str("}\n");
+        std::fs::write(tmp.path().join("budget_probe_target.rs"), &usage_body).unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+
+        let out = search_symbol_expanded(
+            "budget_probe_target",
+            tmp.path(),
+            &cache,
+            &session,
+            &bloom,
+            2,
+            None,
+            None,
+            false,
+            Some(400),
+        )
+        .unwrap();
+
+        assert!(
+            out.contains("fn budget_probe_target"),
+            "value-based selection must keep the highest-value block (the \
+             definition) even though it rendered last: {out}"
+        );
+        assert!(
+            out.contains("lower-value match(es) omitted to fit budget"),
+            "must show fit_to_budget's value-based omission marker, not \
+             budget::apply's positional \"... truncated\" marker: {out}"
+        );
+        assert!(
+            !out.contains("... truncated ("),
+            "positional tail-cut marker must not appear — the real budget \
+             was supposed to reach fit_to_budget directly: {out}"
+        );
+    }
+
+    /// Regression guard: omitting the budget (`None`) must produce byte-
+    /// identical output to before this fix — `DEFAULT_BUDGET` remains the
+    /// default, it is simply no longer a hardcode that shadows a real
+    /// caller-supplied budget.
+    #[test]
+    fn search_symbol_expanded_no_budget_matches_default_budget_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("definition.rs"),
+            "pub fn budget_probe_target() {\n    let _ = 1;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("budget_probe_target.rs"),
+            "fn calls_it() {\n    budget_probe_target();\n}\n",
+        )
+        .unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+
+        let with_none = search_symbol_expanded(
+            "budget_probe_target",
+            tmp.path(),
+            &cache,
+            &session,
+            &bloom,
+            2,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let session2 = Session::new();
+        let with_explicit_default = search_symbol_expanded(
+            "budget_probe_target",
+            tmp.path(),
+            &cache,
+            &session2,
+            &bloom,
+            2,
+            None,
+            None,
+            false,
+            Some(crate::budget::DEFAULT_BUDGET),
+        )
+        .unwrap();
+
+        assert_eq!(
+            with_none, with_explicit_default,
+            "omitting budget must be identical to explicitly passing DEFAULT_BUDGET"
+        );
     }
 }
