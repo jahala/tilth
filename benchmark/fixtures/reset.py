@@ -15,6 +15,14 @@ def ensure_repo_clean(repo_path: Path, pinned_sha: str | None = None) -> None:
     Handles both uncommitted changes (dirty working tree) and committed
     mutations (extra commits on top of the pinned SHA).
     """
+    # Restore `.git` if a no-git task (hide_git) moved it aside. Idempotent and
+    # crash-safe: runs before every reset, so a timed-out/crashed no-git run is
+    # recovered on the next task's pre-reset.
+    git_dir = Path(repo_path) / ".git"
+    hidden = Path(repo_path) / ".git_hidden"
+    if hidden.exists() and not git_dir.exists():
+        hidden.rename(git_dir)
+
     needs_reset = False
 
     # Check for dirty working tree

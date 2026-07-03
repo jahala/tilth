@@ -100,6 +100,13 @@ pub fn run(host: &str, edit: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Write `content` to `path` atomically: write to a sibling temp file first,
+/// then rename over the target so an interrupted write never truncates `path`.
+fn atomic_write(path: &std::path::Path, content: &str) -> Result<(), String> {
+    crate::util::atomic_write_bytes(path, content.as_bytes())
+        .map_err(|e| format!("failed to write {}: {e}", path.display()))
+}
+
 fn write_json_config(host_info: &HostInfo, edit: bool) -> Result<(), String> {
     let servers_key = match host_info.format {
         ConfigFormat::Json { servers_key } | ConfigFormat::JsonLocal { servers_key } => servers_key,
@@ -123,8 +130,7 @@ fn write_json_config(host_info: &HostInfo, edit: bool) -> Result<(), String> {
 
     let out =
         serde_json::to_string_pretty(&config).expect("serde_json::Value is always serializable");
-    fs::write(&host_info.path, &out)
-        .map_err(|e| format!("failed to write {}: {e}", host_info.path.display()))?;
+    atomic_write(&host_info.path, &out)?;
     Ok(())
 }
 
@@ -150,27 +156,104 @@ fn write_toml_config(host_info: &HostInfo, edit: bool) -> Result<(), String> {
         String::new()
     };
 
-    // Remove existing [mcp_servers.tilth] section if present
-    let output = if let Some(start) = existing.find("[mcp_servers.tilth]") {
-        // Find end of section: next [header] or EOF
-        let rest = &existing[start..];
-        let end = rest[1..] // skip the opening '['
-            .find("\n[")
-            .map_or(existing.len(), |i| start + 1 + i + 1);
-        format!("{}{}{}", &existing[..start], section, &existing[end..])
-    } else {
-        // Append with a blank line separator
+    let output = upsert_toml_section(&existing, "[mcp_servers.tilth]", &section);
+
+    atomic_write(&host_info.path, &output)?;
+    Ok(())
+}
+
+/// Finds a TOML table header anchored to a line start (or the file start),
+/// returning the byte offset of its opening `[`.
+///
+/// A bare substring search matches the header text inside a comment or string,
+/// then splices from that offset and corrupts a hand-edited config. Anchoring to
+/// `\n<header>` (or start-of-file) only matches a real table header.
+fn find_section_start(text: &str, header: &str) -> Option<usize> {
+    if text.starts_with(header) {
+        return Some(0);
+    }
+    let needle = format!("\n{header}");
+    text.find(&needle).map(|newline_at| newline_at + 1)
+}
+
+/// Replaces an existing `header` table with `section`, or appends `section`
+/// (blank-line separated) when the table is absent. The match is line-anchored
+/// via [`find_section_start`], and the section end is the next table header.
+fn upsert_toml_section(existing: &str, header: &str, section: &str) -> String {
+    let Some(start) = find_section_start(existing, header) else {
         let sep = if existing.is_empty() || existing.ends_with('\n') {
             ""
         } else {
             "\n"
         };
-        format!("{existing}{sep}\n{section}")
+        return format!("{existing}{sep}\n{section}");
     };
 
-    fs::write(&host_info.path, &output)
-        .map_err(|e| format!("failed to write {}: {e}", host_info.path.display()))?;
-    Ok(())
+    let rest = &existing[start..];
+    let end = start + toml_section_end(rest);
+    format!("{}{}{}", &existing[..start], section, &existing[end..])
+}
+
+/// Byte offset (within `rest`, which starts at the current table header) of the
+/// next top-level table header — a line-start `[` at array-bracket depth 0 and
+/// outside any string. A bare "line starts with `[`" test cannot distinguish a
+/// real header `[other]` from a multi-line array element like `["a", "b"],`, so
+/// we track bracket nesting (skipping bracket characters inside strings and
+/// comments). Returns `rest.len()` when no following header exists.
+fn toml_section_end(rest: &str) -> usize {
+    let bytes = rest.as_bytes();
+    let mut depth: u32 = 0;
+    let mut in_str: Option<u8> = None;
+    let mut escaped = false;
+    let mut at_line_start = true;
+    let mut past_header_line = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if let Some(quote) = in_str {
+            if escaped {
+                escaped = false;
+            } else if c == b'\\' && quote == b'"' {
+                escaped = true;
+            } else if c == quote {
+                in_str = None;
+            }
+            at_line_start = false;
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\n' => {
+                at_line_start = true;
+                past_header_line = true;
+            }
+            b'#' => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'"' | b'\'' => {
+                in_str = Some(c);
+                at_line_start = false;
+            }
+            b'[' => {
+                if at_line_start && depth == 0 && past_header_line {
+                    return i;
+                }
+                depth += 1;
+                at_line_start = false;
+            }
+            b']' => {
+                depth = depth.saturating_sub(1);
+                at_line_start = false;
+            }
+            _ if c.is_ascii_whitespace() => {}
+            _ => at_line_start = false,
+        }
+        i += 1;
+    }
+    rest.len()
 }
 
 /// Returns (command, args) for the tilth MCP server entry.
@@ -503,6 +586,113 @@ fn claude_desktop_path() -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TILTH_HEADER: &str = "[mcp_servers.tilth]";
+
+    #[test]
+    fn toml_section_appended_when_absent() {
+        let out = upsert_toml_section(
+            "[other]\nk = 1\n",
+            TILTH_HEADER,
+            "[mcp_servers.tilth]\ncommand = \"x\"\n",
+        );
+        assert!(out.contains("[other]"));
+        assert!(out.contains("[mcp_servers.tilth]\ncommand = \"x\""));
+    }
+
+    #[test]
+    fn toml_header_in_comment_is_not_spliced() {
+        let existing = "# legacy note about [mcp_servers.tilth] kept for humans\n[other]\nk = 1\n";
+        let out = upsert_toml_section(
+            existing,
+            TILTH_HEADER,
+            "[mcp_servers.tilth]\ncommand = \"x\"\n",
+        );
+        assert!(
+            out.contains("# legacy note about [mcp_servers.tilth] kept for humans"),
+            "comment corrupted by a substring splice: {out:?}"
+        );
+        assert!(out.contains("[other]"));
+        assert!(out.contains("command = \"x\""));
+    }
+
+    #[test]
+    fn toml_section_replaced_at_line_start() {
+        let existing = "[mcp_servers.tilth]\ncommand = \"old\"\nargs = []\n[other]\nk = 1\n";
+        let out = upsert_toml_section(
+            existing,
+            TILTH_HEADER,
+            "[mcp_servers.tilth]\ncommand = \"new\"\n",
+        );
+        assert!(out.contains("command = \"new\""));
+        assert!(!out.contains("\"old\""), "old section not removed: {out:?}");
+        assert!(out.contains("[other]"));
+    }
+
+    #[test]
+    fn toml_section_replaced_at_start_of_file() {
+        let existing = "[mcp_servers.tilth]\ncommand = \"old\"\n";
+        let out = upsert_toml_section(
+            existing,
+            TILTH_HEADER,
+            "[mcp_servers.tilth]\ncommand = \"new\"\n",
+        );
+        assert!(out.contains("\"new\""));
+        assert!(!out.contains("\"old\""));
+    }
+
+    #[test]
+    fn toml_section_replacement_handles_multiline_arrays_before_next_table() {
+        let existing = "[mcp_servers.tilth]\ncommand = \"old\"\nargs = [\n  \"old-a\",\n  \"old-b\",\n]\n[other]\nk = 1\n";
+        let out = upsert_toml_section(
+            existing,
+            TILTH_HEADER,
+            "[mcp_servers.tilth]\ncommand = \"new\"\nargs = [\"new\"]\n",
+        );
+
+        assert_eq!(
+            out,
+            "[mcp_servers.tilth]\ncommand = \"new\"\nargs = [\"new\"]\n[other]\nk = 1\n"
+        );
+    }
+
+    #[test]
+    fn toml_section_end_not_truncated_by_value_starting_with_bracket() {
+        // A value line that starts with '[' (array-of-arrays element) must NOT
+        // be treated as a table header when finding the section end.
+        let existing = "[mcp_servers.tilth]\ncommand = \"old\"\nmatrix = [\n[\"a\", \"b\"],\n[\"c\"],\n]\n[other]\nk = 1\n";
+        let out = upsert_toml_section(
+            existing,
+            TILTH_HEADER,
+            "[mcp_servers.tilth]\ncommand = \"new\"\n",
+        );
+        assert_eq!(
+            out, "[mcp_servers.tilth]\ncommand = \"new\"\n[other]\nk = 1\n",
+            "section end was truncated by a value line starting with '[': {out:?}"
+        );
+    }
+
+    #[test]
+    fn toml_section_end_unmatched_bracket_does_not_go_negative() {
+        // An unmatched ']' in a hand-edited config must not drive depth negative
+        // and must not truncate the rewritten section.
+        let existing = "[mcp_servers.tilth]\ncommand = \"old\"\nbad = ]\n[other]\nk = 1\n";
+        let out = upsert_toml_section(
+            existing,
+            TILTH_HEADER,
+            "[mcp_servers.tilth]\ncommand = \"new\"\n",
+        );
+        // The [other] table must still be present — section must not be truncated
+        // by a depth that went negative on the unmatched ']'.
+        assert!(
+            out.contains("[other]"),
+            "[other] was lost — unmatched ']' drove depth negative: {out:?}"
+        );
+        assert!(
+            out.contains("command = \"new\""),
+            "new section not written: {out:?}"
+        );
+    }
 
     #[test]
     fn amp_resolve_host() {

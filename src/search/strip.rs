@@ -15,6 +15,7 @@ enum StripLang {
     JsTs,
     JavaKotlinCSharp,
     CppC,
+    Bash,
 }
 
 /// Detect stripping language from file extension.
@@ -26,6 +27,7 @@ fn detect_lang(path: &Path) -> Option<StripLang> {
         "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" => Some(StripLang::JsTs),
         "java" | "kt" | "kts" | "cs" | "scala" | "sc" => Some(StripLang::JavaKotlinCSharp),
         "c" | "h" | "cpp" | "hpp" | "cc" | "cxx" => Some(StripLang::CppC),
+        "sh" | "bash" | "bats" => Some(StripLang::Bash),
         _ => None,
     }
 }
@@ -136,6 +138,10 @@ fn is_debug_log(trimmed: &str, lang: StripLang) -> bool {
                 || trimmed.starts_with("cout ")
                 || trimmed.starts_with("cout<<")
         }
+        // Only strip echo lines explicitly labelled DEBUG — plain echo is functional output.
+        StripLang::Bash => {
+            trimmed.starts_with("echo \"DEBUG") || trimmed.starts_with("echo 'DEBUG")
+        }
     }
 }
 
@@ -193,6 +199,13 @@ fn is_strippable_comment(trimmed: &str, lang: StripLang) -> bool {
                 return false;
             }
             trimmed.starts_with("//")
+        }
+        StripLang::Bash => {
+            // Keep shebangs (`#!`) and any line-comment starting with `#!`.
+            if trimmed.starts_with("#!") {
+                return false;
+            }
+            trimmed.starts_with('#')
         }
     };
 

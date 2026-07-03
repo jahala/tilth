@@ -1,7 +1,7 @@
 #![no_main]
 //! Fuzz `outline` rendering across every supported language.
 //!
-//! Iterates each input through all 18 `Lang` variants. The render path
+//! Iterates each input through all 19 `Lang` variants. The render path
 //! exercises tree-sitter parsing, AST traversal, signature extraction,
 //! and the formatter — i.e. tilth's primary input surface ("any file on
 //! disk in any language").
@@ -30,6 +30,7 @@ const LANGS: &[Lang] = &[
     Lang::Kotlin,
     Lang::CSharp,
     Lang::Elixir,
+    Lang::Bash,
     Lang::Dockerfile,
     Lang::Make,
 ];

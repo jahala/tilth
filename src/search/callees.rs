@@ -7,7 +7,7 @@ use crate::lang::outline::{get_outline_entries, outline_language};
 use crate::types::{Lang, OutlineEntry};
 
 /// A resolved callee: a function/method called from within an expanded definition.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ResolvedCallee {
     pub name: String,
     pub file: PathBuf,

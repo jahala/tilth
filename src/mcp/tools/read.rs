@@ -8,7 +8,7 @@ use crate::error::TilthError;
 use crate::lang::detect_file_type;
 use crate::lang::outline::get_outline_entries;
 use crate::session::Session;
-use crate::types::{FileType, OutlineEntry, ViewMode};
+use crate::types::{estimate_tokens, FileType, OutlineEntry, ViewMode};
 
 use super::apply_budget;
 
@@ -19,6 +19,13 @@ pub(in crate::mcp) fn tool_read(
     edit_mode: bool,
 ) -> Result<String, String> {
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
+    // Extract optional root for anchoring relative paths. A relative path
+    // without an absolute `root` is unresolvable (the server cannot see the
+    // caller's shell cwd) — propagate that refusal at each path-resolution site.
+    let root = args
+        .get("root")
+        .and_then(|v| v.as_str())
+        .map(std::path::Path::new);
     let full_flag = args
         .get("full")
         .and_then(serde_json::Value::as_bool)
@@ -69,7 +76,7 @@ pub(in crate::mcp) fn tool_read(
             }
 
             let path_str = p.as_str().ok_or("paths must be an array of strings")?;
-            let path = PathBuf::from(path_str);
+            let path = super::resolve_read_path(&PathBuf::from(path_str), root)?;
             session.record_read(&path);
             let read = if force_signature {
                 read_signature_file(&path, cache).map(|(body, _)| body)
@@ -92,7 +99,7 @@ pub(in crate::mcp) fn tool_read(
         .get("path")
         .and_then(|v| v.as_str())
         .ok_or("missing required parameter: path (or use paths for batch read)")?;
-    let path = PathBuf::from(path_str);
+    let path = super::resolve_read_path(&PathBuf::from(path_str), root)?;
     let section = args.get("section").and_then(|v| v.as_str());
     let sections_arr = args.get("sections").and_then(|v| v.as_array());
 
@@ -137,6 +144,22 @@ pub(in crate::mcp) fn tool_read(
     }
 
     session.record_read(&path);
+
+    // Only genuine AUTO reads are credited with savings — where tilth transparently
+    // returns an outline instead of the full file a naive `cat` would dump. An
+    // explicit section/signature/stripped/full read asked for a specific view, so
+    // crediting "saved vs the whole file" would overstate.
+    let auto_read = section.is_none() && !force_signature && !force_stripped && !force_full;
+    // Capture the file size up front, close to `read_file`'s own read. Statting
+    // after the read+format pipeline would let an external append in that window
+    // inflate the baseline and overstate savings; statting here means a concurrent
+    // grow can only *understate* it, keeping the number a conservative lower bound.
+    let savings_baseline = if auto_read {
+        std::fs::metadata(&path).map(|m| m.len()).ok()
+    } else {
+        None
+    };
+
     let mut output = if section.is_none() && force_signature {
         read_signature_file(&path, cache)
             .map(|(body, _)| body)
@@ -164,7 +187,15 @@ pub(in crate::mcp) fn tool_read(
         }
     }
 
-    Ok(apply_budget(&output, budget))
+    let response = apply_budget(&output, budget);
+    // Credit savings vs the full file using the baseline captured before the read.
+    if let Some(file_byte_len) = savings_baseline {
+        session.record_savings(
+            estimate_tokens(file_byte_len),
+            estimate_tokens(response.len() as u64),
+        );
+    }
+    Ok(response)
 }
 
 // `cache` is intentionally unwired on the tree-sitter path: OutlineCache stores
@@ -416,12 +447,22 @@ mod tests {
     fn tool_read_full_flag_is_legacy_alias_for_mode_full() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("aliased.rs");
-        // Body must exceed TOKEN_THRESHOLD (6k tokens ≈ 24KB) so `auto` outlines
-        // rather than dumping full — making the alias equivalence observable, not
-        // a trivial small-file match where auto and full coincide.
+        // Body must exceed TOKEN_THRESHOLD (6k tokens ≈ 24KB) AND compress well
+        // so `auto` returns an outline rather than full content — making the
+        // alias equivalence observable, not a trivial small-file match where
+        // auto and full coincide. Functions have large bodies so the outline
+        // (signatures only) is a small fraction of the full-file token cost,
+        // ensuring OGATE does not fire and auto != full.
         let mut src = String::from("// header comment\n");
-        for i in 0..1500 {
-            src.push_str(&format!("fn f_{i}() {{\n    let v_{i} = {i};\n}}\n"));
+        for i in 0..80 {
+            src.push_str(&format!("fn f_{i}() {{\n"));
+            // Large body: many statements so the outline compresses well
+            for j in 0..30 {
+                src.push_str(&format!(
+                    "    let local_var_{j}_in_fn_{i}: u64 = {j} + {i};\n"
+                ));
+            }
+            src.push_str("}\n");
         }
         std::fs::write(&path, &src).unwrap();
         let cache = OutlineCache::new();
@@ -534,5 +575,177 @@ mod tests {
             modes.iter().any(|v| v.as_str() == Some("stripped")),
             "mode enum must advertise stripped: {read}"
         );
+    }
+
+    #[test]
+    fn root_param_anchors_relative_path_under_root() {
+        // Guards #78: tilth_read with a relative path + root must read from
+        // <root>/<path>, not from <cwd>/<path>. Prevents worktree agents from
+        // silently reading the wrong checkout.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("hello.rs"), "fn hello() {}").unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let args = serde_json::json!({
+            "paths": ["hello.rs"],
+            "mode": "full",
+            "root": root.to_str().unwrap()
+        });
+        let result = tool_read(&args, &cache, &session, false).unwrap();
+        assert!(
+            result.contains("fn hello()"),
+            "expected file content via root-anchored path, got: {result}"
+        );
+    }
+
+    #[test]
+    fn root_param_absolute_path_unaffected() {
+        // Absolute paths must be used as-is even when root is set.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let abs_file = root.join("abs.rs");
+        std::fs::write(&abs_file, "fn abs() {}").unwrap();
+
+        let unrelated_root = tempfile::tempdir().unwrap();
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let args = serde_json::json!({
+            "paths": [abs_file.to_str().unwrap()],
+            "mode": "full",
+            "root": unrelated_root.path().to_str().unwrap()
+        });
+        let result = tool_read(&args, &cache, &session, false).unwrap();
+        assert!(
+            result.contains("fn abs()"),
+            "absolute path must resolve independently of root, got: {result}"
+        );
+    }
+
+    #[test]
+    fn no_root_reads_absolute_path_unchanged() {
+        // Omitting root must behave identically to before #78: absolute paths
+        // resolve as-is regardless of whether root is set or not.
+        let tmp = tempfile::tempdir().unwrap();
+        let abs_file = tmp.path().join("check.rs");
+        std::fs::write(&abs_file, "fn check() {}").unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let args = serde_json::json!({
+            "paths": [abs_file.to_str().unwrap()],
+            "mode": "full"
+        });
+        let result = tool_read(&args, &cache, &session, false).unwrap();
+        assert!(
+            result.contains("fn check()"),
+            "no-root regression: absolute path must be readable without root, got: {result}"
+        );
+    }
+
+    #[test]
+    fn relative_path_no_root_errors() {
+        // WHY: a relative path + no root silently resolved against the frozen
+        // server cwd before this spec — the worktree bug. It must now refuse
+        // with a message naming the path and the absolute-root escape hatch.
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let args = serde_json::json!({ "paths": ["src/foo.rs"], "mode": "full" });
+        let err = tool_read(&args, &cache, &session, false).unwrap_err();
+        assert!(
+            err.contains("src/foo.rs") && err.contains("root"),
+            "relative path without root must refuse with an actionable message: {err}"
+        );
+    }
+
+    // -- savings recording tests ------------------------------------------
+
+    /// A large file with large function bodies read in auto mode (outline) must record
+    /// saved > 0 and baseline > 0 on the session.
+    #[test]
+    fn tool_read_large_file_records_positive_savings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.rs");
+        // Build a file large enough to exceed TOKEN_THRESHOLD (6 000 tokens ≈ 24 KB)
+        // with functions that have substantial bodies so the outline compresses well.
+        let mut src = String::from("// header\n");
+        for i in 0..200 {
+            src.push_str(&format!("fn func_{i}() {{\n"));
+            // 20 lines of body per function so outline is much smaller than full content
+            for j in 0..20 {
+                src.push_str(&format!("    let v_{i}_{j}: u64 = {j} * {i} + 42;\n"));
+            }
+            src.push_str("}\n");
+        }
+        std::fs::write(&path, &src).unwrap();
+        let file_size = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            file_size > 24_000,
+            "test file must be large enough to trigger outline: {file_size} bytes"
+        );
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let args = serde_json::json!({ "path": path.to_str().unwrap() });
+
+        tool_read(&args, &cache, &session, false).expect("large file read");
+
+        let (baseline, saved) = session.savings();
+        assert!(
+            baseline > 0,
+            "baseline must be > 0 for a non-empty file: baseline={baseline}"
+        );
+        assert!(
+            saved > 0,
+            "large outlined file must record positive savings: saved={saved}, baseline={baseline}"
+        );
+    }
+
+    /// A small file read in auto mode (full content) must record baseline > 0
+    /// but saved == 0 (no reduction applied).
+    #[test]
+    fn tool_read_small_file_records_zero_savings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("small.rs");
+        std::fs::write(&path, "fn small() {}\n").unwrap();
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let args = serde_json::json!({ "path": path.to_str().unwrap() });
+
+        tool_read(&args, &cache, &session, false).expect("small file read");
+
+        let (baseline, saved) = session.savings();
+        assert!(baseline > 0, "baseline must be > 0 for a non-empty file");
+        assert_eq!(
+            saved, 0,
+            "small file returned in full must record zero savings"
+        );
+    }
+
+    /// A single-section read requested an explicit range — the naive baseline is
+    /// that range, not the whole file — so it must NOT record a (bogus) full-file
+    /// saving. Guards against over-counting explicit sub-view reads.
+    #[test]
+    fn tool_read_section_records_no_savings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sectioned.rs");
+        // Large file: a full-file baseline would book a big (bogus) "saving".
+        let mut src = String::new();
+        for i in 0..500 {
+            src.push_str(&format!("fn f_{i}() {{ let v = {i}; }}\n"));
+        }
+        std::fs::write(&path, &src).unwrap();
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let args = serde_json::json!({ "path": path.to_str().unwrap(), "section": "1-5" });
+
+        tool_read(&args, &cache, &session, false).expect("section read");
+
+        let (baseline, saved) = session.savings();
+        assert_eq!(
+            baseline, 0,
+            "section reads must not record a full-file baseline"
+        );
+        assert_eq!(saved, 0, "section reads must not record savings");
     }
 }

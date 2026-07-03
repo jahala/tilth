@@ -1,6 +1,6 @@
 //! Post-edit tree-sitter parse check.
 //!
-//! After `tilth_edit` writes a file, parse the pre- and post-edit content with
+//! After `tilth_write` (hash mode) writes a file, parse the pre- and post-edit content with
 //! the language's tree-sitter grammar and surface any *new* `ERROR` / `MISSING`
 //! nodes the edit introduced. Pre-existing errors stay silent.
 //!

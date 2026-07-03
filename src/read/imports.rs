@@ -65,6 +65,10 @@ pub(crate) fn is_import_line(line: &str, lang: Lang) -> bool {
                 || trimmed.starts_with("use ")
                 || trimmed.starts_with("require ")
         }
+        Lang::Bash => trimmed
+            .strip_prefix("source")
+            .or_else(|| trimmed.strip_prefix('.'))
+            .is_some_and(|rest| rest.starts_with(char::is_whitespace)),
         _ => false,
     }
 }
@@ -79,7 +83,8 @@ pub(crate) fn is_external(source: &str, lang: Lang) -> bool {
         Lang::TypeScript | Lang::Tsx | Lang::JavaScript => {
             !(source.starts_with('.') || source.starts_with("@/") || source.starts_with("~/"))
         }
-        Lang::Python => !source.starts_with('.'),
+        // Bash: dot-relative paths are local; anything else (bare name, /abs/path) is external.
+        Lang::Python | Lang::Bash => !source.starts_with('.'),
         Lang::C | Lang::Cpp => !source.starts_with('"'),
         // Elixir, Go, Java, Scala, Kotlin — can't resolve without build system knowledge.
         _ => true,
@@ -92,6 +97,7 @@ fn resolve(dir: &Path, source: &str, lang: Lang) -> Option<PathBuf> {
         Lang::TypeScript | Lang::Tsx | Lang::JavaScript => resolve_js(dir, source),
         Lang::Python => resolve_python(dir, source),
         Lang::C | Lang::Cpp => resolve_c_include(dir, source),
+        Lang::Bash => resolve_bash(dir, source),
         // Elixir, Go, Java, etc. — module-to-file mapping requires build system conventions.
         _ => None,
     };
@@ -243,6 +249,18 @@ fn resolve_c_include(dir: &Path, source: &str) -> Option<PathBuf> {
     }
 }
 
+// --- Bash ---
+
+fn resolve_bash(dir: &Path, source: &str) -> Option<PathBuf> {
+    // Only resolve literal relative paths — no extension inference. A single
+    // metadata() stat avoids the exists()+is_file() two-call TOCTOU; resolution
+    // is best-effort, so a stale result only ever costs a related-file hint.
+    let candidate = dir.join(source);
+    std::fs::metadata(&candidate)
+        .is_ok_and(|m| m.is_file())
+        .then_some(candidate)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,6 +323,31 @@ mod tests {
         assert_eq!(
             from_sibling, from_cousin,
             "different spellings should normalize to the same PathBuf"
+        );
+    }
+
+    #[test]
+    fn bash_is_import_line_tab_separated() {
+        // Tab between `source` and path is valid bash and must be detected.
+        assert!(
+            is_import_line("source\t./lib.sh", Lang::Bash),
+            "source<TAB>./lib.sh should be detected as an import line"
+        );
+        // False positives: `sourcefile=1` looks like it starts with `source` but
+        // has no whitespace separator.
+        assert!(
+            !is_import_line("sourcefile=1", Lang::Bash),
+            "sourcefile=1 must not be detected as an import line"
+        );
+        // `./script.sh` is a script execution, not a source directive.
+        assert!(
+            !is_import_line("./script.sh", Lang::Bash),
+            "./script.sh must not be detected as an import line"
+        );
+        // `.bashrc` — dot followed by non-whitespace, not a source directive.
+        assert!(
+            !is_import_line(".bashrc", Lang::Bash),
+            ".bashrc must not be detected as an import line"
         );
     }
 }

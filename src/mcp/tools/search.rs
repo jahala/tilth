@@ -19,7 +19,11 @@ pub(in crate::mcp) fn tool_search(
         .get("query")
         .and_then(|v| v.as_str())
         .ok_or("missing required parameter: query")?;
-    let (scope, scope_warning) = resolve_scope(args);
+    let root = args
+        .get("root")
+        .and_then(|v| v.as_str())
+        .map(std::path::Path::new);
+    let (scope, scope_warning) = resolve_scope(args, root)?;
     let kind = args
         .get("kind")
         .and_then(|v| v.as_str())
@@ -386,6 +390,49 @@ mod tests {
             out.contains("uses_beta"),
             "beta call site starved by alpha's hit-rich budget consumption \
              (early-quit budget was not scaled by target count): {out}"
+        );
+    }
+
+    /// WHY: the require-root discipline fires ONLY when a caller EXPLICITLY
+    /// passes a relative scope/path without an absolute root. A bare
+    /// `tilth_search(query)` call with no scope is the default flow of every
+    /// session and must keep working exactly as it does on main — refusing
+    /// here would break every session's default search. This inverts the PR's
+    /// original (too strict) assertion.
+    ///
+    /// Asserts only `is_ok()`, not the response body: the body is real search
+    /// output over whatever tree the test runs in (including this very source
+    /// file), so substring-matching it is not a reliable way to detect a
+    /// require-root refusal. `resolve_scope`'s own unit tests in
+    /// `mcp::tools::tests` already pin the exact refusal-vs-default-cwd
+    /// behavior directly; this test only pins that `tool_search` propagates
+    /// success through to its caller instead of swallowing it into an error.
+    #[test]
+    fn no_scope_no_root_defaults_to_cwd() {
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({ "query": "anything_unlikely_to_match_zzz" });
+        let result = tool_search(&args, &cache, &session, &bloom);
+        assert!(
+            result.is_ok(),
+            "bare search must default to cwd, not refuse: {result:?}"
+        );
+    }
+
+    /// An EXPLICITLY passed relative scope with no absolute root to anchor it
+    /// is unresolvable (the server cannot see the caller's shell cwd) — this
+    /// must still refuse.
+    #[test]
+    fn explicit_relative_scope_no_root_errors() {
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({ "query": "anything", "scope": "some/relative/dir" });
+        let err = tool_search(&args, &cache, &session, &bloom).unwrap_err();
+        assert!(
+            err.contains("relative scope") && err.contains("root"),
+            "explicit relative scope without root must refuse: {err}"
         );
     }
 }
