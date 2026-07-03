@@ -323,15 +323,18 @@ opinionated defaults:
 - **Always-skipped directories** (`SKIP_DIRS`): build artifacts,
   dependency caches, VCS internals — `.git`, `node_modules`, `target`,
   `dist`, `build`, `__pycache__`, `vendor`, `.next`, `.venv`,
-  `.mypy_cache`, etc. ~30 entries. Enforced even with
-  `TILTH_NO_IGNORE=1`.
-- **Per-repo `.gitignore`** is honored by default
-  (`apply_ignore_settings`).
-- **`.tilthignore`** — gitignore syntax — is layered on top.
-  `!path` lines re-include files that `.gitignore` would have excluded.
-- **Global gitignore** and `.git/info/exclude` are deliberately
-  **never** consulted; those tend to list per-engineer files (agent
-  state, editor scratch) that grep-style queries should still find.
+  `.mypy_cache`, etc. ~30 entries.
+- **`.gitignore`, global gitignore, `.git/info/exclude`, and custom
+  `.ignore` files are all deliberately never consulted**
+  (`git_ignore(false)`, `git_global(false)`, `git_exclude(false)`,
+  `ignore(false)`). This is not an oversight: grep-style queries need
+  to see gitignored-but-locally-relevant files (docs/, configs,
+  generated code, per-engineer agent state) that a `.gitignore` would
+  hide from a normal directory listing. A per-project `.tilthignore`
+  override was proposed and **rejected 2026-07-03** — it would
+  special-case one tool's walker instead of fixing the underlying
+  need (which is `SKIP_DIRS`-style unconditional exclusion, already
+  covered above).
 - **Symlinks are followed** (`follow_links(true)`). This is the
   upstream `feat: follow symlinks in all file walkers (#46)` change
   and creates a known duplicate-match problem when a path is reachable
