@@ -431,22 +431,19 @@ fn single_query_search(
     fuzzy_path_fallback(scope, text, text, cache)
 }
 
-/// Cold-path fuzzy fallback shared by the search `NotFound` sites. Attempts to
-/// resolve a path-like miss to a real file and auto-open it with a distinct
-/// header; otherwise enriches the `NotFound` with ranked suggestions, falling
-/// back to today's basename suggestion (`legacy_suggest_query`) when nothing
-/// subsequence-matches.
+/// Cold-path fuzzy fallback shared by the search `NotFound` sites. Never
+/// auto-opens a different file than was asked for — enriches the `NotFound`
+/// with ranked "did you mean" suggestions when a path-like miss has
+/// subsequence candidates, falling back to today's basename suggestion
+/// (`legacy_suggest_query`) when nothing subsequence-matches.
 fn fuzzy_path_fallback(
     scope: &Path,
     query: &str,
     legacy_suggest_query: &str,
-    cache: &cache::OutlineCache,
+    _cache: &cache::OutlineCache,
 ) -> Result<String, error::TilthError> {
-    use read::fuzzy_path::{
-        resolve_fuzzy_path, search_auto_open_body, FuzzyResolution, GateProfile,
-    };
+    use read::fuzzy_path::{resolve_fuzzy_path, FuzzyResolution, GateProfile};
     match resolve_fuzzy_path(scope, query, GateProfile::Search) {
-        FuzzyResolution::Resolved(hit) => search_auto_open_body(scope, &hit, query, cache),
         FuzzyResolution::Suggestions(s) => Err(error::TilthError::NotFound {
             path: scope.join(query),
             suggestion: Some(s.join(", ")),

@@ -599,16 +599,19 @@ mod tests {
         );
     }
 
-    // ── Finding 4 regressions (typo'd path resolution in batch + signature/stripped)
+    // ── suggest-only regressions (typo'd path resolution in batch + signature/stripped)
     //
     // The tool_read batch and signature/stripped paths call read_file_resolving
     // and read_with_fuzzy_retry. We test those underlying functions directly with
     // an explicit scope to avoid set_current_dir (process-global, races other tests).
+    // tilth never auto-opens a different file than was asked for: a typo'd path
+    // always errors with the real file surfaced as the top-ranked suggestion.
 
     #[test]
-    fn batch_underlying_typo_resolves_to_real_file() {
+    fn batch_underlying_typo_suggests_real_file_first() {
         // Simulates the batch loop: read_file_resolving is called for each path.
-        // A typo'd path must fuzzy-resolve to the real file's content.
+        // A typo'd path must error with the real file as the top suggestion —
+        // never silently return its content.
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("src");
         std::fs::create_dir_all(&src).unwrap();
@@ -616,7 +619,7 @@ mod tests {
         std::fs::write(&real, "fn the_symbol() {}\n").unwrap();
 
         let cache = OutlineCache::new();
-        let (body, opened) = crate::read::read_file_resolving(
+        let err = crate::read::read_file_resolving(
             &dir.path().join("src/symbl.rs"),
             None,
             false,
@@ -624,23 +627,24 @@ mod tests {
             false,
             dir.path(),
         )
-        .expect("batch: typo'd path should fuzzy-resolve");
-        assert!(
-            body.contains("corrected from"),
-            "batch: resolved content must have correction header: {body}"
-        );
-        assert!(
-            body.contains("the_symbol"),
-            "batch: resolved content must contain the real file's code: {body}"
-        );
-        assert_eq!(opened, real, "batch: opened path must be the real file");
+        .expect_err("batch: typo'd path must not auto-open — suggest-only");
+        match err {
+            crate::error::TilthError::NotFound {
+                suggestion: Some(s),
+                ..
+            } => assert!(
+                s.starts_with("src/symbol.rs"),
+                "batch: real file must be the top-ranked suggestion: {s}"
+            ),
+            other => panic!("batch: expected NotFound with a suggestion, got: {other}"),
+        }
     }
 
     #[test]
-    fn signature_mode_underlying_typo_resolves() {
+    fn signature_mode_underlying_typo_suggests_real_file_first() {
         // read_with_fuzzy_retry wraps read_signature_file in the signature branch.
-        // A typo'd path must fuzzy-resolve and emit only the signature view with a
-        // correction header, and the returned PathBuf must point to the real file.
+        // A typo'd path must error with the real file as the top suggestion,
+        // never silently emit its signature view.
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("src");
         std::fs::create_dir_all(&src).unwrap();
@@ -648,28 +652,28 @@ mod tests {
         std::fs::write(&real, "fn signature_fn() {\n    let body = 1;\n}\n").unwrap();
         let cache = OutlineCache::new();
 
-        let (content, opened) =
+        let err =
             crate::read::read_with_fuzzy_retry(&dir.path().join("src/symbl.rs"), dir.path(), |p| {
                 read_signature_file(p, &cache).map(|(body, _)| body)
             })
-            .expect("signature: typo'd path should fuzzy-resolve");
-        assert_eq!(opened, real, "signature: opened path must be the real file");
-        assert!(
-            content.contains("corrected from"),
-            "signature: correction header must be present: {content}"
-        );
-        assert!(
-            content.contains("signature_fn"),
-            "signature: resolved file must contain the expected function: {content}"
-        );
+            .expect_err("signature: typo'd path must not auto-open — suggest-only");
+        match err {
+            crate::error::TilthError::NotFound {
+                suggestion: Some(s),
+                ..
+            } => assert!(
+                s.starts_with("src/symbol.rs"),
+                "signature: real file must be the top-ranked suggestion: {s}"
+            ),
+            other => panic!("signature: expected NotFound with a suggestion, got: {other}"),
+        }
     }
 
-    // ── Finding 6 regression (resolved path used for would_outline hint)
-
     #[test]
-    fn read_file_resolving_returns_resolved_path() {
-        // When the path is missing but fuzzy-resolves, the returned PathBuf
-        // must point to the real file so callers can use it for would_outline.
+    fn read_file_resolving_suggests_real_file_first() {
+        // When the path is missing but fuzzy-resolves, the NotFound error must
+        // carry the real file as the top-ranked suggestion — read_file_resolving
+        // never substitutes a different file's content for the one requested.
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("src");
         std::fs::create_dir_all(&src).unwrap();
@@ -677,7 +681,7 @@ mod tests {
         std::fs::write(&real, "fn resolved_fn() {}\n").unwrap();
 
         let cache = OutlineCache::new();
-        let (content, opened) = crate::read::read_file_resolving(
+        let err = crate::read::read_file_resolving(
             &dir.path().join("src/symbl.rs"),
             None,
             false,
@@ -685,16 +689,17 @@ mod tests {
             false,
             dir.path(),
         )
-        .expect("fuzzy resolve must succeed for near-miss");
-        assert!(
-            content.contains("corrected from"),
-            "content must have correction header: {content}"
-        );
-        assert_eq!(
-            opened, real,
-            "opened path must be the real file, not the typo'd query path — \
-             callers use this for would_outline"
-        );
+        .expect_err("near-miss must not auto-open — suggest-only");
+        match err {
+            crate::error::TilthError::NotFound {
+                suggestion: Some(s),
+                ..
+            } => assert!(
+                s.starts_with("src/symbol.rs"),
+                "real file must be the top-ranked suggestion: {s}"
+            ),
+            other => panic!("expected NotFound with a suggestion, got: {other}"),
+        }
     }
 
     #[test]
@@ -734,6 +739,8 @@ mod tests {
                 panic!("expected NotFound, got: {other}");
             }
         }
+    }
+
     // -- savings recording tests ------------------------------------------
 
     /// A large file with large function bodies read in auto mode (outline) must record

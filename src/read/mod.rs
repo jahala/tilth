@@ -258,16 +258,15 @@ fn scope_relative_query<'a>(path: &'a Path, scope: &Path) -> std::borrow::Cow<'a
 }
 
 /// `read_file` wrapper that, on a `NotFound`, attempts fuzzy path resolution
-/// against the tree under `scope` and auto-opens the best-matching real file
-/// with a correction header. Only `NotFound` triggers the cold-path tree walk;
-/// every other outcome (success or other error) returns untouched, so a
-/// successful read never pays for the walk.
+/// against the tree under `scope` and enriches the error with ranked "did you
+/// mean" suggestions. Only `NotFound` triggers the cold-path tree walk; every
+/// other outcome (success or other error) returns untouched, so a successful
+/// read never pays for the walk.
 ///
-/// Returns `(content, opened_path)` where `opened_path` is the file that was
-/// actually read — the fuzzy-resolved path when resolution succeeded, otherwise
-/// the original `path`. Callers should use `opened_path` for any post-read
-/// operations (e.g. `would_outline`, `resolve_related_files`) so they operate
-/// on the real file rather than the missing one.
+/// Returns `(content, opened_path)` on success — `opened_path` is always
+/// `path` today (tilth never substitutes a different file than was asked
+/// for), kept as a tuple so callers' post-read operations (e.g.
+/// `would_outline`, `resolve_related_files`) have a stable path to key off.
 pub fn read_file_resolving(
     path: &Path,
     section: Option<&str>,
@@ -282,13 +281,11 @@ pub fn read_file_resolving(
 }
 
 /// Fuzzy-retry wrapper: runs `read_fn(path)`; on `NotFound` fuzzy-resolves the
-/// path under `scope` and retries `read_fn(real)`, prepending a correction header.
-/// `Suggestions` from the fuzzy resolver surface into `NotFound.suggestion` so
-/// callers see "did you mean" hints instead of a bare missing-path error.
-/// Every other outcome (success or non-`NotFound` error) is returned untouched.
-///
-/// Returns `(content, opened_path)` where `opened_path` is the actually-opened
-/// file — callers should use it for `would_outline` / `resolve_related_files`.
+/// path under `scope` and enriches the error with ranked "did you mean"
+/// suggestions instead of a bare missing-path error. tilth never auto-opens a
+/// different file than was asked for — the caller always sees the suggestion
+/// and chooses. Every other outcome (success or non-`NotFound` error) is
+/// returned untouched.
 pub fn read_with_fuzzy_retry<F>(
     path: &Path,
     scope: &Path,
@@ -304,17 +301,6 @@ where
     };
     let query = scope_relative_query(path, scope);
     match fuzzy_path::resolve_fuzzy_path(scope, &query, fuzzy_path::GateProfile::Read) {
-        fuzzy_path::FuzzyResolution::Resolved(hit) => {
-            hit.log_auto_open(&query);
-            let real = scope.join(&hit.path);
-            let body = read_fn(&real)?;
-            let content = format!(
-                "# {} (corrected from \"{query}\")\
-\n\n{body}",
-                hit.path.display()
-            );
-            Ok((content, real))
-        }
         fuzzy_path::FuzzyResolution::Suggestions(s) => Err(TilthError::NotFound {
             path: missing,
             suggestion: Some(s.join(", ")),
