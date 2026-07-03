@@ -644,7 +644,7 @@ fn format_single_match(
             .is_some_and(|s| current_mtime.is_some_and(|t| s.is_expanded(&m.path, m.line, t)));
     // expand_match always prints a range containing m.line (def_range starts
     // at m.line for definitions; the ±10 fallback for def_range: None / usages
-    // trivially contains it), so the raw "→ [line] text" preview would
+    // trivially contains it), so the raw "-> [line] text" preview would
     // reprint m.text byte-for-byte inside the fence below. Only the
     // structural outline_context (neighboring entries' signatures, not the
     // matched line's own source) survives alongside an expansion.
@@ -654,12 +654,12 @@ fn format_single_match(
     // Skip outline for small files — the expanded code speaks for itself
     if m.file_lines < 50 {
         if !fence_will_follow {
-            let _ = write!(out, "\n→ [{}]   {}", m.line, m.text);
+            let _ = write!(out, "\n-> [{}]   {}", m.line, m.text);
         }
     } else if let Some(context) = outline_context_for_match(&m.path, m.line, cache) {
         out.push_str(&context);
     } else if !fence_will_follow {
-        let _ = write!(out, "\n→ [{}]   {}", m.line, m.text);
+        let _ = write!(out, "\n-> [{}]   {}", m.line, m.text);
     }
 
     if *expand_remaining > 0 {
@@ -773,7 +773,7 @@ fn format_single_match(
                                 }
 
                                 if !nodes.is_empty() {
-                                    out.push_str("\n\n\u{2500}\u{2500} calls \u{2500}\u{2500}");
+                                    out.push_str("\n\n-- calls --");
                                     for n in &nodes {
                                         let c = &n.callee;
                                         let _ = write!(
@@ -790,7 +790,7 @@ fn format_single_match(
                                         for child in &n.children {
                                             let _ = write!(
                                                 out,
-                                                "\n    \u{2192} {}  {}:{}-{}",
+                                                "\n    -> {}  {}:{}-{}",
                                                 child.name,
                                                 rel(&child.file, scope),
                                                 child.start_line,
@@ -823,9 +823,7 @@ fn format_single_match(
                                         let resolved =
                                             siblings::resolve_siblings(&filtered, &parent.children);
                                         if !resolved.is_empty() {
-                                            out.push_str(
-                                                "\n\n\u{2500}\u{2500} siblings \u{2500}\u{2500}",
-                                            );
+                                            out.push_str("\n\n-- siblings --");
                                             for s in &resolved {
                                                 let _ = write!(
                                                     out,
@@ -1267,7 +1265,7 @@ fn expand_match(m: &Match, scope: &Path) -> Option<(String, String)> {
                 continue;
             }
 
-            let _ = write!(out, "\n{i:>4} │ {line}");
+            let _ = write!(out, "\n{i:>4} | {line}");
             prev_blank = is_blank;
         }
     }
@@ -1290,9 +1288,9 @@ fn filter_code_lines(code: &str, skip_lines: &HashSet<u32>) -> String {
             continue;
         }
 
-        // Extract line number from formatted line: "  42 │ content"
+        // Extract line number from formatted line: "  42 | content"
         let line_num = segment
-            .find('│')
+            .find('|')
             .and_then(|pos| segment[..pos].trim().parse::<u32>().ok());
 
         if let Some(num) = line_num {
@@ -1373,7 +1371,7 @@ fn outline_context_for_match(
     let mut context = String::new();
     for (i, line) in outline_lines.iter().enumerate().take(end).skip(start) {
         if i == match_idx {
-            let _ = write!(context, "\n→ {line}");
+            let _ = write!(context, "\n-> {line}");
         } else {
             let _ = write!(context, "\n  {line}");
         }
