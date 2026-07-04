@@ -279,17 +279,21 @@ tilth <path> --section 45-89      # exact line range
 tilth <path> --section "## Foo"   # markdown heading
 tilth <path> --full               # force full content
 tilth <symbol> --scope <dir>      # definitions + usages
+tilth <symbol> --scope src --scope tests  # search multiple scopes
 tilth <symbol> --expand=5         # inline source for top 5 matches
 tilth <symbol> --callers          # find call sites (structural)
 tilth <path> --deps               # imports + dependents
 tilth "TODO: fix" --scope <dir>   # content search
 tilth "/<regex>/" --scope <dir>   # regex search
 tilth "*.test.ts" --scope <dir>   # glob files
+tilth --respect-gitignore <symbol> --scope <dir>  # honor .gitignore/.ignore
 tilth diff HEAD~1                 # structural diff (function-level)
 tilth --map --scope <dir>         # codebase skeleton (CLI only)
 ```
 
 `--map` is available in the CLI but not exposed as an MCP tool — benchmarks showed AI agents overused it, hurting accuracy.
+
+Searches always honor `.tilthignore`. `.gitignore`, `.ignore`, git excludes, and global gitignore are opt-in via `--respect-gitignore` or `TILTH_RESPECT_GITIGNORE=1`.
 
 ## Speed
 
@@ -312,7 +316,7 @@ Rust. ~20,000 lines. No runtime dependencies.
 
 - **tree-sitter** — AST parsing for 16 languages (Rust, TypeScript, TSX, JavaScript, Python, Go, Java, Scala, C, C++, Ruby, PHP, C#, Swift, Kotlin, Elixir). Used for definition detection, callee extraction, callers query, and structural outlines.
 - **ripgrep internals** (`grep-regex`, `grep-searcher`) — fast content search
-- **ignore** crate — parallel directory walking, searches all files including gitignored
+- **ignore** crate — parallel directory walking, `.tilthignore` support, optional gitignore handling
 - **memmap2** — memory-mapped file reads (no buffers)
 - **DashMap** — concurrent outline cache, invalidated by mtime
 

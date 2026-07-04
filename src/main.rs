@@ -18,7 +18,11 @@ struct Cli {
 
     /// Directory to search within or resolve relative paths against.
     #[arg(long, default_value = ".")]
-    scope: PathBuf,
+    scope: Vec<PathBuf>,
+
+    /// Respect .gitignore, .ignore, and git exclude files while walking.
+    #[arg(long)]
+    respect_gitignore: bool,
 
     /// Line range or markdown heading (e.g. "45-89" or "## Architecture"). Bypasses smart view.
     #[arg(long)]
@@ -164,6 +168,10 @@ fn main() {
     configure_thread_pools();
     let cli = Cli::parse();
 
+    if cli.respect_gitignore {
+        std::env::set_var("TILTH_RESPECT_GITIGNORE", "1");
+    }
+
     // Shell completions
     if let Some(shell) = cli.completions {
         clap_complete::generate(shell, &mut Cli::command(), "tilth", &mut io::stdout());
@@ -256,14 +264,17 @@ fn main() {
             std::env::set_var("TILTH_NO_OVERVIEW", "1");
         }
         // Pass --scope to MCP if it's not the default "."
-        let mcp_scope = if cli.scope.as_os_str() == "." {
+        let mcp_scope = if scopes_are_default(&cli.scope) {
             None
-        } else {
+        } else if cli.scope.len() == 1 {
             Some(
-                cli.scope
+                cli.scope[0]
                     .canonicalize()
-                    .unwrap_or_else(|_| cli.scope.clone()),
+                    .unwrap_or_else(|_| cli.scope[0].clone()),
             )
+        } else {
+            eprintln!("mcp mode accepts only one --scope");
+            process::exit(2);
         };
         if let Err(e) = tilth::mcp::run(cli.edit, mcp_scope.as_deref()) {
             eprintln!("mcp error: {e}");
@@ -277,8 +288,10 @@ fn main() {
     // Map mode
     if cli.map {
         let cache = tilth::cache::OutlineCache::new();
-        let scope = cli.scope.canonicalize().unwrap_or(cli.scope);
-        let output = tilth::map::generate(&scope, 3, cli.budget, &cache);
+        let scopes = resolve_scopes(&cli.scope);
+        let output = run_for_scopes(&scopes, |scope| {
+            Ok(tilth::map::generate(scope, 3, cli.budget, &cache))
+        });
         emit_output(&output, is_tty);
         return;
     }
@@ -292,7 +305,7 @@ fn main() {
     };
 
     let cache = tilth::cache::OutlineCache::new();
-    let scope = cli.scope.canonicalize().unwrap_or(cli.scope);
+    let scopes = resolve_scopes(&cli.scope);
 
     // When piped (not a TTY), force full output — scripts expect raw content.
     // This promotion exists for FilePath queries (return full file instead of
@@ -314,73 +327,159 @@ fn main() {
 
     // Callers mode
     if cli.callers {
-        let result = tilth::run_callers(
-            &query,
-            &scope,
-            expand,
-            cli.budget,
-            cli.glob.as_deref(),
-            cli.full,
-        );
+        let result = run_query_for_scopes(&scopes, &query, |scope| {
+            tilth::run_callers(
+                &query,
+                scope,
+                expand,
+                cli.budget,
+                cli.glob.as_deref(),
+                cli.full,
+            )
+        });
         emit_result(result, &query, cli.json, is_tty);
         return;
     }
 
     // Deps mode
     if cli.deps {
-        let path = if Path::new(&query).is_absolute() {
-            PathBuf::from(&query)
-        } else {
-            let scope_path = scope.join(&query);
-            if scope_path.exists() {
-                scope_path
-            } else {
-                let cwd_path = std::env::current_dir().unwrap_or_default().join(&query);
-                if cwd_path.exists() {
-                    cwd_path
-                } else {
-                    scope_path // fall back, let analyze_deps report the error
-                }
-            }
-        };
-        let result = tilth::run_deps(&path, &scope, cli.budget);
+        let path = resolve_query_path(&query, &scopes);
+        let result = run_query_for_scopes(&scopes, &query, |scope| {
+            tilth::run_deps(&path, scope, cli.budget)
+        });
         emit_result(result, &query, cli.json, is_tty);
         return;
     }
 
-    let result = if expand > 0 {
-        tilth::run_expanded(
-            &query,
-            &scope,
-            cli.section.as_deref(),
-            cli.budget,
-            full,
-            expand,
-            cli.glob.as_deref(),
-            &cache,
-            cli.full,
-        )
-    } else if full {
-        tilth::run_full(
-            &query,
-            &scope,
-            cli.section.as_deref(),
-            cli.budget,
-            cli.glob.as_deref(),
-            &cache,
-        )
-    } else {
-        tilth::run(
-            &query,
-            &scope,
-            cli.section.as_deref(),
-            cli.budget,
-            cli.glob.as_deref(),
-            &cache,
-        )
-    };
+    let result = run_query_for_scopes(&scopes, &query, |scope| {
+        if expand > 0 {
+            tilth::run_expanded(
+                &query,
+                scope,
+                cli.section.as_deref(),
+                cli.budget,
+                full,
+                expand,
+                cli.glob.as_deref(),
+                &cache,
+                cli.full,
+            )
+        } else if full {
+            tilth::run_full(
+                &query,
+                scope,
+                cli.section.as_deref(),
+                cli.budget,
+                cli.glob.as_deref(),
+                &cache,
+            )
+        } else {
+            tilth::run(
+                &query,
+                scope,
+                cli.section.as_deref(),
+                cli.budget,
+                cli.glob.as_deref(),
+                &cache,
+            )
+        }
+    });
 
     emit_result(result, &query, cli.json, is_tty);
+}
+
+fn scopes_are_default(scopes: &[PathBuf]) -> bool {
+    scopes.len() == 1 && scopes[0].as_os_str() == "."
+}
+
+fn resolve_scopes(scopes: &[PathBuf]) -> Vec<PathBuf> {
+    if scopes.is_empty() {
+        return vec![PathBuf::from(".")
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from("."))];
+    }
+
+    scopes
+        .iter()
+        .map(|scope| scope.canonicalize().unwrap_or_else(|_| scope.clone()))
+        .collect()
+}
+
+fn resolve_query_path(query: &str, scopes: &[PathBuf]) -> PathBuf {
+    if Path::new(query).is_absolute() {
+        return PathBuf::from(query);
+    }
+
+    for scope in scopes {
+        let scoped = scope.join(query);
+        if scoped.exists() {
+            return scoped;
+        }
+    }
+
+    let cwd_path = std::env::current_dir().unwrap_or_default().join(query);
+    if cwd_path.exists() {
+        return cwd_path;
+    }
+
+    scopes
+        .first()
+        .map_or_else(|| PathBuf::from(query), |scope| scope.join(query))
+}
+
+fn run_for_scopes<F>(scopes: &[PathBuf], mut run: F) -> String
+where
+    F: FnMut(&Path) -> Result<String, tilth::error::TilthError>,
+{
+    if scopes.len() == 1 {
+        return run(&scopes[0]).unwrap_or_else(|e| e.to_string());
+    }
+
+    scopes
+        .iter()
+        .map(|scope| {
+            let output = run(scope).unwrap_or_else(|e| e.to_string());
+            format!("# Scope: {}\n\n{output}", scope.display())
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n---\n")
+}
+
+fn run_query_for_scopes<F>(
+    scopes: &[PathBuf],
+    query: &str,
+    mut run: F,
+) -> Result<String, tilth::error::TilthError>
+where
+    F: FnMut(&Path) -> Result<String, tilth::error::TilthError>,
+{
+    if scopes.len() == 1 {
+        return run(&scopes[0]);
+    }
+
+    let mut outputs = Vec::new();
+    let mut first_err = None;
+    for scope in scopes {
+        match run(scope) {
+            Ok(output) => outputs.push(format!("# Scope: {}\n\n{output}", scope.display())),
+            Err(err) => {
+                if first_err.is_none() {
+                    first_err = Some(err);
+                }
+            }
+        }
+    }
+
+    if outputs.is_empty() {
+        Err(
+            first_err.unwrap_or_else(|| tilth::error::TilthError::NotFound {
+                path: PathBuf::from(query),
+                suggestion: None,
+            }),
+        )
+    } else {
+        Ok(outputs.join("\n\n---\n"))
+    }
 }
 
 fn emit_result(
@@ -546,5 +645,15 @@ mod tests {
         // handling, but cli.full stays false. compute_expand must return 0.
         let cli_full = false; // user did NOT pass --full
         assert_eq!(compute_expand(None, cli_full), 0);
+    }
+
+    #[test]
+    fn repeated_scope_flags_accumulate() {
+        let cli = Cli::try_parse_from(["tilth", "foo", "--scope", "src", "--scope", "tests"])
+            .expect("parse repeated scopes");
+        assert_eq!(
+            cli.scope,
+            vec![PathBuf::from("src"), PathBuf::from("tests")]
+        );
     }
 }
