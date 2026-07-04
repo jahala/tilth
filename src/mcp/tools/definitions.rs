@@ -112,24 +112,27 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
             }
         }),
         serde_json::json!({
-            "name": "tilth_files",
+            "name": "tilth_list",
             "annotations": { "readOnlyHint": true },
-            "description": "Find files matching a glob pattern. Replaces find/ls/pwd and the host Glob tool — use this for all file discovery. Returns matched file paths sorted by relevance with token size estimates. Use `patterns` to run several globs in one call.",
+            "description": "List files matching glob patterns as a directory tree. Replaces find/ls/tree and the host Glob tool — use this to see project structure with per-directory token-size rollups. Pass `patterns` to combine several globs into one tree.",
             "inputSchema": {
                 "type": "object",
+                "required": ["patterns"],
                 "properties": {
-                    "pattern": {
-                        "type": "string",
-                        "description": "Glob pattern e.g. '*' (list directory), '*.rs', 'src/**/*.ts'. Use `patterns` for multiple globs."
-                    },
                     "patterns": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Multiple glob patterns to run in one call against the same scope. Each pattern emits its own `# Glob: ...` block, separated by a blank line. Mutually exclusive with `pattern`. Capped at 20."
+                        "minItems": 1,
+                        "maxItems": 20,
+                        "description": "Glob patterns rendered into one tree, e.g. ['*.rs'] or ['*.rs', '*.toml']. Capped at 20."
+                    },
+                    "depth": {
+                        "type": "number",
+                        "description": "Cap directory depth (1 = top-level only)."
                     },
                     "scope": {
                         "type": "string",
-                        "description": "Only use scope to list a specific subdirectory. DO NOT USE scope if you want to list the current working directory."
+                        "description": "Directory to root the tree at. DO NOT USE scope if you want to list the current working directory."
                     },
                     "budget": {
                         "type": "number",
@@ -397,5 +400,26 @@ mod tests {
             !names.contains(&"tilth_edit"),
             "tilth_edit must be renamed away"
         );
+    }
+
+    /// `tilth_files` was consolidated into `tilth_list`; the removed tool must
+    /// no longer be advertised and `tilth_list` must stay present in both modes.
+    #[test]
+    fn tilth_files_folded_into_tilth_list() {
+        for edit_mode in [false, true] {
+            let defs = tool_definitions(edit_mode);
+            let names: Vec<&str> = defs
+                .iter()
+                .filter_map(|t| t.get("name").and_then(|v| v.as_str()))
+                .collect();
+            assert!(
+                !names.contains(&"tilth_files"),
+                "tilth_files must not be advertised (folded into tilth_list)"
+            );
+            assert!(
+                names.contains(&"tilth_list"),
+                "tilth_list must remain advertised"
+            );
+        }
     }
 }

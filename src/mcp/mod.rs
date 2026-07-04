@@ -11,10 +11,11 @@ use crate::session::Session;
 use crate::timeout::{self, spawn_with_timeout, SpawnFailure, ThreadTracker};
 
 mod tools;
+pub(crate) mod tree;
 pub(crate) mod write;
 
 use tools::{
-    tool_definitions, tool_deps, tool_diff, tool_files, tool_grok, tool_read, tool_savings,
+    tool_definitions, tool_deps, tool_diff, tool_grok, tool_list, tool_read, tool_savings,
     tool_search, tool_session, tool_write,
 };
 
@@ -300,7 +301,7 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
     match tool {
         "tilth_read" => tool_read(args, services.cache(), services.session(), edit_mode),
         "tilth_search" => tool_search(args, services.cache(), services.session(), services.bloom()),
-        "tilth_files" => tool_files(args),
+        "tilth_list" => tool_list(args),
         "tilth_deps" => tool_deps(args, services.bloom()),
         "tilth_grok" => tool_grok(args, services.bloom(), services.session()),
         "tilth_diff" => tool_diff(args),
@@ -501,7 +502,7 @@ mod tests {
     fn server_instructions_byte_lock() {
         assert_eq!(
             SERVER_INSTRUCTIONS.len(),
-            1298,
+            1295,
             "SERVER_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(SERVER_INSTRUCTIONS
