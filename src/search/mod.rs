@@ -73,7 +73,7 @@ pub(crate) const SKIP_DIRS: &[&str] = &[
 const EXPAND_FULL_FILE_THRESHOLD: u64 = 800;
 
 const SECRET_REDACTION_NOTICE: &str =
-    "\n→ contents redacted (secrets denylist) — use tilth_read only if .tilthignore allows explicit reads";
+    "\n-> contents redacted (secrets denylist) — use tilth_read only if .tilthignore allows explicit reads";
 
 fn path_is_secret_file(path: &Path) -> bool {
     path.file_name()
@@ -847,7 +847,7 @@ fn format_single_match(
             .is_some_and(|s| current_mtime.is_some_and(|t| s.is_expanded(&m.path, m.line, t)));
     // expand_match always prints a range containing m.line (def_range starts
     // at m.line for definitions; the ±10 fallback for def_range: None / usages
-    // trivially contains it), so the raw "→ [line] text" preview would
+    // trivially contains it), so the raw "-> [line] text" preview would
     // reprint m.text byte-for-byte inside the fence below. Only the
     // structural outline_context (neighboring entries' signatures, not the
     // matched line's own source) survives alongside an expansion.
@@ -857,12 +857,12 @@ fn format_single_match(
     // Skip outline for small files — the expanded code speaks for itself
     if m.file_lines < 50 {
         if !fence_will_follow {
-            let _ = write!(out, "\n→ [{}]   {}", m.line, m.text);
+            let _ = write!(out, "\n-> [{}]   {}", m.line, m.text);
         }
     } else if let Some(context) = outline_context_for_match(&m.path, m.line, cache) {
         out.push_str(&context);
     } else if !fence_will_follow {
-        let _ = write!(out, "\n→ [{}]   {}", m.line, m.text);
+        let _ = write!(out, "\n-> [{}]   {}", m.line, m.text);
     }
 
     if *expand_remaining > 0 {
@@ -976,7 +976,7 @@ fn format_single_match(
                                 }
 
                                 if !nodes.is_empty() {
-                                    out.push_str("\n\n\u{2500}\u{2500} calls \u{2500}\u{2500}");
+                                    out.push_str("\n\n-- calls --");
                                     for n in &nodes {
                                         let c = &n.callee;
                                         let _ = write!(
@@ -993,7 +993,7 @@ fn format_single_match(
                                         for child in &n.children {
                                             let _ = write!(
                                                 out,
-                                                "\n    \u{2192} {}  {}:{}-{}",
+                                                "\n    -> {}  {}:{}-{}",
                                                 child.name,
                                                 rel(&child.file, scope),
                                                 child.start_line,
@@ -1026,9 +1026,7 @@ fn format_single_match(
                                         let resolved =
                                             siblings::resolve_siblings(&filtered, &parent.children);
                                         if !resolved.is_empty() {
-                                            out.push_str(
-                                                "\n\n\u{2500}\u{2500} siblings \u{2500}\u{2500}",
-                                            );
+                                            out.push_str("\n\n-- siblings --");
                                             for s in &resolved {
                                                 let _ = write!(
                                                     out,
@@ -1506,7 +1504,7 @@ fn expand_match(m: &Match, scope: &Path, edit_mode: bool) -> Option<(String, Str
             if edit_mode {
                 let _ = write!(out, "\n{i}:{line}");
             } else {
-                let _ = write!(out, "\n{i:>4} │ {line}");
+                let _ = write!(out, "\n{i:>4} | {line}");
             }
             prev_blank = is_blank;
         }
@@ -1531,7 +1529,7 @@ fn filter_code_lines(code: &str, skip_lines: &HashSet<u32>) -> String {
         }
 
         // Extract the line number from a formatted content line. Two gutter
-        // formats exist: the default `"  42 │ content"` (number before the `│`
+        // formats exist: the default `"  42 | content"` (number before the `|`
         // gutter) and edit-mode numbered lines `"42:content"` (number is the
         // `line:` prefix). Parse both so noise stripping/truncation works in
         // edit mode too.
@@ -1540,8 +1538,8 @@ fn filter_code_lines(code: &str, skip_lines: &HashSet<u32>) -> String {
                 .split_once(':')
                 .and_then(|(n, _)| n.trim().parse::<u32>().ok())
         };
-        let line_num = match segment.find('│') {
-            // Gutter format `"  42 │ content"`. The `│` may also appear inside
+        let line_num = match segment.find('|') {
+            // Gutter format `"  42 | content"`. The `|` may also appear inside
             // edit-mode content (a box-drawing char in a string), so when the
             // pre-gutter text isn't a number, fall back to the `N:` prefix.
             Some(pos) => segment[..pos]
@@ -1630,7 +1628,7 @@ fn outline_context_for_match(
     let mut context = String::new();
     for (i, line) in outline_lines.iter().enumerate().take(end).skip(start) {
         if i == match_idx {
-            let _ = write!(context, "\n→ {line}");
+            let _ = write!(context, "\n-> {line}");
         } else {
             let _ = write!(context, "\n  {line}");
         }
@@ -1819,18 +1817,18 @@ mod tests {
         let mut skip = HashSet::new();
         skip.insert(2u32);
 
-        // Default gutter format: "  N │ content".
-        let gutter = "```src/x.rs:1-3\n   1 │ a\n   2 │ b\n   3 │ c\n```";
+        // Default gutter format: "  N | content".
+        let gutter = "```src/x.rs:1-3\n   1 | a\n   2 | b\n   3 | c\n```";
         let filtered = filter_code_lines(gutter, &skip);
-        assert!(filtered.contains("│ a"), "{filtered}");
+        assert!(filtered.contains("| a"), "{filtered}");
         assert!(
-            !filtered.contains("│ b"),
+            !filtered.contains("| b"),
             "line 2 should be stripped: {filtered}"
         );
-        assert!(filtered.contains("│ c"), "{filtered}");
+        assert!(filtered.contains("| c"), "{filtered}");
 
         // Edit-mode whole-file-tag format: "N:content" (no per-line hash).
-        // Regression for the bug where filter_code_lines only recognized the │
+        // Regression for the bug where filter_code_lines only recognized the |
         // gutter, so stripping silently no-opped in edit mode.
         let edit = "```src/x.rs:1-3\n1:a\n2:b\n3:c\n```";
         let filtered = filter_code_lines(edit, &skip);
@@ -1867,22 +1865,22 @@ mod tests {
         );
     }
 
-    /// Boundary: in edit mode the content itself may contain a `│` (U+2502) — a
-    /// box-drawing char in a string literal. The gutter branch keys on `find('│')`,
-    /// so it fires on the content `│` and tries to parse the whole `N:...` prefix as
+    /// Boundary: in edit mode the content itself may contain a `|` — the same
+    /// char as the gutter separator. The gutter branch keys on `find('|')`, so it
+    /// fires on the content `|` and tries to parse the whole `N:...` prefix as
     /// a number, which fails. The parser must fall back to the `N:` prefix so a
-    /// skip-listed edit-mode line is still stripped. Locks the gutter→prefix fallback.
+    /// skip-listed edit-mode line is still stripped. Locks the gutter->prefix fallback.
     #[test]
     fn filter_code_lines_edit_mode_content_bar_falls_back_to_prefix() {
         let mut skip = HashSet::new();
         skip.insert(42u32);
 
-        // Line 42's content contains a `│`; line 43 is a plain kept line.
-        let edit = "```src/x.rs:42-43\n42:let g = \"│\";\n43:let h = 1;\n```";
+        // Line 42's content contains a `|`; line 43 is a plain kept line.
+        let edit = "```src/x.rs:42-43\n42:let g = \"|\";\n43:let h = 1;\n```";
         let filtered = filter_code_lines(edit, &skip);
         assert!(
             !filtered.contains("42:let g"),
-            "line 42 (│ in content) should be stripped via prefix fallback: {filtered}"
+            "line 42 (| in content) should be stripped via prefix fallback: {filtered}"
         );
         assert!(
             filtered.contains("43:let h = 1;"),
