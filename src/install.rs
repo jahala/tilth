@@ -54,19 +54,22 @@ const SUPPORTED_HOSTS: &[&str] = &[
 ];
 
 /// The tilth server entry as JSON. Format depends on the host's [`ConfigFormat`] variant.
-fn tilth_server_entry(edit: bool, format: &ConfigFormat) -> Value {
+fn tilth_server_entry(edit: bool, format: &ConfigFormat, hook_injected: &str) -> Value {
     let (command, args) = tilth_command_and_args(edit);
+    let env = json!({ "TILTH_MCP_CWD_HOOK_INJECTED": hook_injected });
     match format {
         ConfigFormat::Json { .. } => json!({
             "command": command,
-            "args": args
+            "args": args,
+            "env": env
         }),
         ConfigFormat::JsonLocal { .. } => {
             let mut command_arr = vec![command];
             command_arr.extend(args);
             json!({
                 "type": "local",
-                "command": command_arr
+                "command": command_arr,
+                "environment": env
             })
         }
         ConfigFormat::Toml => unreachable!("tilth_server_entry called for TOML host"),
@@ -76,6 +79,9 @@ fn tilth_server_entry(edit: bool, format: &ConfigFormat) -> Value {
 /// Write MCP config for the given host, preserving existing config.
 pub fn run(host: &str, edit: bool) -> Result<(), String> {
     let host_info = resolve_host(host)?;
+    // Claude Code ships the cwd-injection hook (plugin/claude/), so its schema
+    // tells the model NOT to set cwd; every other host sets it explicitly.
+    let hook_injected = if host == "claude-code" { "1" } else { "0" };
 
     if let Some(parent) = host_info.path.parent() {
         fs::create_dir_all(parent)
@@ -84,9 +90,9 @@ pub fn run(host: &str, edit: bool) -> Result<(), String> {
 
     match host_info.format {
         ConfigFormat::Json { .. } | ConfigFormat::JsonLocal { .. } => {
-            write_json_config(&host_info, edit)?;
+            write_json_config(&host_info, edit, hook_injected)?;
         }
-        ConfigFormat::Toml => write_toml_config(&host_info, edit)?,
+        ConfigFormat::Toml => write_toml_config(&host_info, edit, hook_injected)?,
     }
 
     if edit {
@@ -107,7 +113,7 @@ fn atomic_write(path: &std::path::Path, content: &str) -> Result<(), String> {
         .map_err(|e| format!("failed to write {}: {e}", path.display()))
 }
 
-fn write_json_config(host_info: &HostInfo, edit: bool) -> Result<(), String> {
+fn write_json_config(host_info: &HostInfo, edit: bool, hook_injected: &str) -> Result<(), String> {
     let servers_key = match host_info.format {
         ConfigFormat::Json { servers_key } | ConfigFormat::JsonLocal { servers_key } => servers_key,
         ConfigFormat::Toml => unreachable!("write_json_config called for TOML host"),
@@ -125,7 +131,7 @@ fn write_json_config(host_info: &HostInfo, edit: bool) -> Result<(), String> {
     upsert_json_server(
         &mut config,
         servers_key,
-        tilth_server_entry(edit, &host_info.format),
+        tilth_server_entry(edit, &host_info.format, hook_injected),
     )?;
 
     let out =
@@ -134,8 +140,8 @@ fn write_json_config(host_info: &HostInfo, edit: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// Writes a `[mcp_servers.tilth]` section into a TOML config file.
-fn write_toml_config(host_info: &HostInfo, edit: bool) -> Result<(), String> {
+/// Renders the `[mcp_servers.tilth]` TOML table for `write_toml_config`.
+fn toml_server_section(edit: bool, hook_injected: &str) -> String {
     let (command, args) = tilth_command_and_args(edit);
 
     // Escape backslashes for TOML basic strings (Windows paths like C:\Users\...).
@@ -144,10 +150,15 @@ fn write_toml_config(host_info: &HostInfo, edit: bool) -> Result<(), String> {
         .iter()
         .map(|a| format!("\"{}\"", a.replace('\\', "\\\\")))
         .collect();
-    let section = format!(
-        "[mcp_servers.tilth]\ncommand = \"{command_escaped}\"\nargs = [{}]\n",
+    format!(
+        "[mcp_servers.tilth]\ncommand = \"{command_escaped}\"\nargs = [{}]\nenv = {{ TILTH_MCP_CWD_HOOK_INJECTED = \"{hook_injected}\" }}\n",
         args_toml.join(", ")
-    );
+    )
+}
+
+/// Writes a `[mcp_servers.tilth]` section into a TOML config file.
+fn write_toml_config(host_info: &HostInfo, edit: bool, hook_injected: &str) -> Result<(), String> {
+    let section = toml_server_section(edit, hook_injected);
 
     let existing = if host_info.path.exists() {
         fs::read_to_string(&host_info.path)
@@ -308,7 +319,7 @@ fn resolve_host(host: &str) -> Result<HostInfo, String> {
             format: ConfigFormat::Json {
                 servers_key: "mcpServers",
             },
-            note: Some("User scope — available in all projects."),
+            note: Some("User scope. Install the cwd-injection hook from plugin/claude/ so cwd is set automatically."),
         }),
 
         // Cursor global: ~/.cursor/mcp.json → mcpServers
@@ -1110,7 +1121,7 @@ mod tests {
 
     #[test]
     fn opencode_entry_uses_local_shape() {
-        let entry = tilth_server_entry(false, &ConfigFormat::JsonLocal { servers_key: "mcp" });
+        let entry = tilth_server_entry(false, &ConfigFormat::JsonLocal { servers_key: "mcp" }, "0");
         assert_eq!(entry["type"], json!("local"));
         assert!(entry["command"].is_array());
         assert!(entry.get("args").is_none());
@@ -1118,7 +1129,7 @@ mod tests {
 
     #[test]
     fn opencode_entry_with_edit() {
-        let entry = tilth_server_entry(true, &ConfigFormat::JsonLocal { servers_key: "mcp" });
+        let entry = tilth_server_entry(true, &ConfigFormat::JsonLocal { servers_key: "mcp" }, "0");
         assert_eq!(entry["type"], json!("local"));
         let cmd = entry["command"].as_array().unwrap();
         assert!(cmd.iter().any(|v| v == "--edit"));
@@ -1132,6 +1143,7 @@ mod tests {
             &ConfigFormat::Json {
                 servers_key: "mcpServers",
             },
+            "0",
         );
         assert!(entry.get("type").is_none());
         assert!(entry["command"].is_string());
@@ -1141,12 +1153,61 @@ mod tests {
     #[test]
     fn opencode_upserts_under_mcp_key() {
         let mut config = json!({});
-        let entry = tilth_server_entry(false, &ConfigFormat::JsonLocal { servers_key: "mcp" });
+        let entry = tilth_server_entry(false, &ConfigFormat::JsonLocal { servers_key: "mcp" }, "0");
         upsert_json_server(&mut config, "mcp", entry).unwrap();
 
         assert!(config.get("mcp").is_some());
         assert!(config.get("mcpServers").is_none());
         assert_eq!(config["mcp"]["tilth"]["type"], json!("local"));
         assert!(config["mcp"]["tilth"]["command"].is_array());
+    }
+
+    /// `tilth install` writes the cwd-hook env var into the server entry: "1"
+    /// for claude-code (the hook injects cwd), "0" for every other host.
+    #[test]
+    fn server_entry_carries_hook_injected_env() {
+        let claude = tilth_server_entry(
+            false,
+            &ConfigFormat::Json {
+                servers_key: "mcpServers",
+            },
+            "1",
+        );
+        assert_eq!(claude["env"]["TILTH_MCP_CWD_HOOK_INJECTED"], json!("1"));
+
+        let other = tilth_server_entry(
+            false,
+            &ConfigFormat::Json {
+                servers_key: "mcpServers",
+            },
+            "0",
+        );
+        assert_eq!(other["env"]["TILTH_MCP_CWD_HOOK_INJECTED"], json!("0"));
+
+        let local = tilth_server_entry(true, &ConfigFormat::JsonLocal { servers_key: "mcp" }, "0");
+        assert_eq!(
+            local["environment"]["TILTH_MCP_CWD_HOOK_INJECTED"],
+            json!("0")
+        );
+    }
+
+    /// The TOML config path (codex — the host that most depends on the
+    /// explicit-cwd posture) emits the hook-injected env var as an inline
+    /// table that parses as valid TOML with the right value.
+    #[test]
+    fn toml_section_carries_hook_injected_env() {
+        for hook_injected in ["0", "1"] {
+            let section = toml_server_section(false, hook_injected);
+            let parsed: toml::Table = section
+                .parse()
+                .expect("generated [mcp_servers.tilth] section must be valid TOML");
+            assert_eq!(
+                parsed["mcp_servers"]["tilth"]["env"]["TILTH_MCP_CWD_HOOK_INJECTED"]
+                    .as_str()
+                    .expect("env var must be a TOML string"),
+                hook_injected,
+                "TOML env emission must carry the hook-injected flag"
+            );
+        }
     }
 }

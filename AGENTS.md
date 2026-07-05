@@ -3,9 +3,9 @@ tilth — code intelligence MCP server. Replaces grep, cat, find, ls with AST-aw
 
 Call tools by their full MCP name — prefix `mcp__tilth__`, e.g. `mcp__tilth__tilth_search`, `mcp__tilth__tilth_read`. The bare names below (tilth_search, tilth_read, …) are shorthand. DO NOT call a bare name — it is not a registered tool.
 
-PATHS: pass an ABSOLUTE path/scope, or set `root` to your ABSOLUTE checkout directory. DO NOT pass a relative path/scope without an absolute `root` — the server's cwd is frozen at startup and is NOT your shell's cwd, so a relative path is refused. A relative `root` is also refused.
+PATHS: set `cwd` to your ABSOLUTE checkout directory on every call. Relative paths/scopes anchor under `cwd`; absolute paths pass through as-is. DO NOT pass a relative path/scope without `cwd` — the server's cwd is frozen at startup and is NOT your shell's cwd. `..` traversal in a relative path is refused.
 
-REQUIRED arrays per verb: tilth_read → paths: [...]; tilth_write → files: [...]; tilth_list → patterns: [...]; tilth_search → queries: [{query}]. Pass an absolute `root` whenever paths/scope are relative — the server's cwd is frozen at startup and refuses a relative scope without an absolute `root`.
+REQUIRED arrays per verb: tilth_read → paths: [...]; tilth_list → patterns: [...]; tilth_search → queries: [{query}]. tilth_write takes edits: "..." — a single op-grammar string, NOT an array. Every tool also REQUIRES `cwd` — your absolute checkout directory.
 
 To explore code, always search first. tilth_search finds definitions, usages, and file locations in one call.
 Usage: tilth_search(queries: [{query: "handleRequest"}]).
@@ -21,7 +21,7 @@ Comma-OR is for kind any/symbol/callers: "symbol1,symbol2" (max 5). DO NOT comma
 expand (default 2): inline full source for top matches.
 context: path to file being edited — boosts nearby results.
 glob: file pattern filter — "*.rs" (whitelist), "!*.test.ts" (exclude).
-root: absolute checkout dir. Required if `scope` is relative (or omitted); absolute `scope` needs no root. The server cannot see your shell cwd.
+cwd: required (see PATHS).
 Output per match:
 ## <path>:<start>-<end> [definition|usage|impl]
 <outline context>
@@ -38,22 +38,22 @@ Suffix grammar per path: path#n-m (line range), path#n (from line n), path### He
 mode: auto (default) | full (force full content) | signature (outline, no bodies) | stripped (comments/logs/blank lines removed).
 if_modified_since: ISO-8601 ts — unchanged files return (unchanged @ <ts>) stubs.
 Output: N:content numbered lines (in edit mode, under a [path#TAG] header).
-root: absolute checkout dir. Required if any path in `paths` is relative; absolute paths need no root and are used as-is. The server cannot see your shell cwd.
+cwd: required (see PATHS).
 
 tilth_list: List files by glob patterns as a directory tree with token-cost rollups. Replaces find, ls, tree, and the host Glob tool.
 Batch-only: ALWAYS pass patterns: [...] as an array, even for one glob (e.g. patterns: ["*.rs"] or ["*.rs", "*.toml"]). A singular `pattern` is not accepted.
 depth: cap directory depth (1 = top-level only).
-root: absolute checkout dir. Required if `scope` is relative (or omitted); absolute `scope` needs no root. The server cannot see your shell cwd.
+cwd: required (see PATHS).
 Output: tree with per-file (~<token_count> tokens) and per-directory rollups.
 
 tilth_deps: Blast-radius check — what imports this file and what it imports.
 Use ONLY before renaming, removing, or changing an export's signature.
-root: absolute checkout dir. Required if `path`/`scope` are relative; absolute ones need no root. The server cannot see your shell cwd.
+cwd: required (see PATHS).
 
 tilth_grok: Everything structural about a symbol in one call — def + body + signature + doc + callees + callers + siblings + tests.
 Usage: tilth_grok(target: "parse_unified_diff"). Also accepts "src/file.rs:7" or "Type::method".
 scope: narrow when the name is ambiguous. full: widen caps from 5/5/8/8 to 50/30/30/30.
-root: absolute checkout dir. Required if `scope` is relative (or omitted); absolute `scope` needs no root. The server cannot see your shell cwd.
+cwd: required (see PATHS).
 Use ONLY for "understand this symbol" questions — replaces the search → expand → callers chain.
 DO NOT use for concept search (use tilth_search) or reading file contents (use tilth_read).
 
@@ -63,6 +63,7 @@ scope: "file.rs" or "file.rs:fn_name". log: "HEAD~5..HEAD" for per-commit summar
 search: filter to lines matching a term. blast: true to show callers of changed signatures.
 Output: [+] added, [-] deleted, [~] body changed, [~:sig] signature changed.
 DO NOT use Bash(git diff) or Bash(git log --patch). Use tilth_diff instead.
+cwd: your absolute checkout dir (REQUIRED). git-based sources (uncommitted/staged/refs) diff the server's project directory; only patch/a/b anchor under cwd.
 
 DO NOT `cat`/`head`/`tail`/`sed -n` a file via the shell → use tilth_read.
 DO NOT `grep`/`rg`/`ls`/`find`/`fd` on repo files via the shell → use tilth_search or tilth_list.
@@ -93,6 +94,6 @@ Drift: the TAG binds the section to the content you read. If the file changed si
 New file: OMIT `tag` to seed a NEW file — use prepend for its content.
 Sections are independent (best-effort): a rejected section does NOT block the others; scan the per-`## <path>` results for failures. Max 20 sections.
 DO NOT pass `edits` as a string (the old `[path#TAG]` text grammar or a JSON-encoded string) — it is rejected. Pass the array itself.
-root: absolute checkout dir. Required if any section path is relative. RELATIVE section paths and move_file destinations are anchored under root and confined to it; ABSOLUTE section paths are also confined to root (or to the server's startup directory when root is omitted) — `..` traversal or paths outside the confinement root are refused. The server cannot see your shell cwd.
+cwd: your absolute checkout dir (REQUIRED). RELATIVE section paths and move_file destinations anchor under `cwd`; absolute paths pass through as-is. `..` traversal in a relative path is refused.
 Pass diff: true for a compact before/after diff per section.
 DO NOT use the host Edit or Write tool. Use tilth_write for all writes.

@@ -2,6 +2,7 @@ use serde_json::Value;
 
 pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
     let read_desc = include_str!("../../../prompts/tools/read.md");
+    let cwd_prop = cwd_property();
     let mut tools = vec![
         serde_json::json!({
             "name": "tilth_search",
@@ -9,7 +10,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
             "description": "Search for symbols, text, or regex patterns in code. Replaces grep/rg and the host Grep tool — use this for all code search. Symbol search returns definitions first (via tree-sitter AST), then usages, with full source code inlined for top matches. Content search finds literal text. Regex search supports full regex patterns. For cross-file tracing, pass comma-separated symbol names (max 5). Omitting `kind` runs a merged default search — symbol, content, and caller results in one call (`## symbol/content/caller results`); set `kind` to narrow to a single mode.",
             "inputSchema": {
                 "type": "object",
-                "required": ["queries"],
+                "required": ["queries", "cwd"],
                 "properties": {
                     "queries": {
                         "type": "array",
@@ -57,10 +58,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "type": "string",
                         "description": "ISO-8601 timestamp. Result sections for files unchanged since this return `(unchanged @ <ts>)` stubs instead of bodies."
                     },
-                    "root": {
-                        "type": "string",
-                        "description": "Absolute path to your checkout directory. REQUIRED unless `scope` is absolute. Must be an absolute path. A RELATIVE `scope` is anchored under `root`; an absolute `scope` is used as-is. The server cannot see your shell cwd, so a relative `scope` with no absolute `root` is refused."
-                    }
+                    "cwd": cwd_prop.clone()
                 }
             }
         }),
@@ -70,7 +68,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
             "description": read_desc,
             "inputSchema": {
                 "type": "object",
-                "required": ["paths"],
+                "required": ["paths", "cwd"],
                 "properties": {
                     "paths": {
                         "type": "array",
@@ -89,10 +87,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "type": "string",
                         "description": "ISO-8601 timestamp. Files unchanged since this return `(unchanged @ <ts>)` stubs."
                     },
-                    "root": {
-                        "type": "string",
-                        "description": "Absolute path to your checkout directory. REQUIRED unless every path in `paths` is absolute. Must be an absolute path. Every RELATIVE file path is anchored under `root`; absolute paths are used as-is. The server cannot see your shell cwd, so a relative path with no absolute `root` is refused."
-                    },
+                    "cwd": cwd_prop.clone(),
                     "budget": {
                         "type": "number",
                         "description": "Max tokens in response."
@@ -106,7 +101,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
             "description": "List files matching glob patterns as a directory tree. Replaces `ls -R`/`tree` — use this to see project structure with token-size rollups per directory. Pass `patterns` to combine several globs into one tree.",
             "inputSchema": {
                 "type": "object",
-                "required": ["patterns"],
+                "required": ["patterns", "cwd"],
                 "properties": {
                     "patterns": {
                         "type": "array",
@@ -127,10 +122,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "type": "number",
                         "description": "Max tokens in response."
                     },
-                    "root": {
-                        "type": "string",
-                        "description": "Absolute path to your checkout directory. REQUIRED unless `scope` is absolute. Must be an absolute path. A RELATIVE `scope` (the tree root) is anchored under `root`; an absolute `scope` is used as-is. The server cannot see your shell cwd, so a relative `scope` with no absolute `root` is refused."
-                    }
+                    "cwd": cwd_prop.clone()
                 }
             }
         }),
@@ -140,7 +132,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
             "description": "Blast-radius check before breaking changes. Shows what a file imports (local + external) and what other files call its exports, with symbol-level detail. Use ONLY when your planned edit changes a function signature, removes/renames an export, or modifies behavior that callers rely on. Do NOT use for reading files, adding new code, or internal-only changes — use tilth_read instead.",
             "inputSchema": {
                 "type": "object",
-                "required": ["path"],
+                "required": ["path", "cwd"],
                 "properties": {
                     "path": {
                         "type": "string",
@@ -154,10 +146,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "type": "number",
                         "description": "Max tokens. Truncates 'Used by' first."
                     },
-                    "root": {
-                        "type": "string",
-                        "description": "Absolute path to your checkout directory. REQUIRED unless `path` and `scope` are absolute. Must be an absolute path. RELATIVE `path`/`scope` are anchored under `root`; absolute ones are used as-is. The server cannot see your shell cwd, so a relative `path`/`scope` with no absolute `root` is refused."
-                    }
+                    "cwd": cwd_prop.clone()
                 }
             }
         }),
@@ -167,7 +156,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
             "description": "Get everything structural about a symbol in one call — definition, body, signature, doc, callees, callers, siblings, tests. Use ONLY for 'understand this symbol' questions. Do NOT use for concept search (use tilth_search) or reading file contents (use tilth_read).",
             "inputSchema": {
                 "type": "object",
-                "required": ["target"],
+                "required": ["target", "cwd"],
                 "properties": {
                     "target": {
                         "type": "string",
@@ -182,20 +171,19 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "default": false,
                         "description": "Widen caps: 50 callers, 30 callees, 30 siblings, 30 tests (default 5/5/8/8)."
                     },
-                    "root": {
-                        "type": "string",
-                        "description": "Absolute path to your checkout directory. REQUIRED unless `scope` is absolute. Must be an absolute path. A RELATIVE `scope` is anchored under `root`; an absolute `scope` is used as-is. The server cannot see your shell cwd, so a relative `scope` with no absolute `root` is refused."
-                    }
+                    "cwd": cwd_prop.clone()
                 }
             }
         }),
         serde_json::json!({
             "name": "tilth_diff",
             "annotations": { "readOnlyHint": true },
-            "description": "Structural diff showing function-level changes. Replaces git diff. Call with no args for uncommitted changes overview.",
+            "description": "Structural diff showing function-level changes. Replaces git diff. Call with no args for uncommitted changes overview. git-based sources (uncommitted/staged/refs) diff the server's project directory; only patch/a/b anchor under cwd.",
             "inputSchema": {
                 "type": "object",
+                "required": ["cwd"],
                 "properties": {
+                    "cwd": cwd_prop.clone(),
                     "source": {
                         "type": "string",
                         "description": "Diff source: 'uncommitted' (default), 'staged', or a git ref (e.g. 'HEAD~1', 'main..feat'). Ignored when a, b, patch, or log is set."
@@ -259,7 +247,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
             "description": "Edit files with a JSON `edits` array of `{path, tag?, ops}` section objects. Replaces the host Edit and Write tools — DO NOT use those. Read first: tilth_read/tilth_search emit a `[path#TAG]` header then `N:content` lines; copy the 4-hex TAG into `tag` and reference those 1-based line numbers. Each op is an object tagged by `op`: replace {start,end,content}, delete {start,end}, insert_before/insert_after {line,content}, prepend/append {content}, replace_block/insert_after_block {at,content} and delete_block {at} where `at` is a line number or a \"#symbol\" string (the leading `#` is optional), delete_file, move_file {dest}. `content` is a single string with embedded newlines. Omit `tag` to seed a NEW file. The TAG binds the section to the content you read: if the file drifted tilth 3-way-merges your ops onto it; if it can't the section is rejected — re-read that file. Sections are independent (best-effort); results report per `## <path>`. Max 20 sections.",
             "inputSchema": {
                 "type": "object",
-                "required": ["edits"],
+                "required": ["edits", "cwd"],
                 "properties": {
                     "edits": {
                         "type": "array",
@@ -268,7 +256,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                             "type": "object",
                             "required": ["path", "ops"],
                             "properties": {
-                                "path": { "type": "string", "description": "File path, absolute or relative to `root`." },
+                                "path": { "type": "string", "description": "File path, absolute or relative to `cwd`." },
                                 "tag": { "type": "string", "description": "4-hex whole-file tag from the edit-mode read. Omit to seed a new file." },
                                 "ops": {
                                     "type": "array",
@@ -298,16 +286,32 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "default": false,
                         "description": "Set true to include a compact before/after diff per section."
                     },
-                    "root": {
-                        "type": "string",
-                        "description": "Absolute path to your checkout directory. REQUIRED unless every section path is absolute. Must be an absolute path. RELATIVE section paths (and MV destinations) are anchored under `root` and confined to it; ABSOLUTE section paths are also confined to `root` (or to the server's startup directory when `root` is omitted); `..` traversal and paths outside the confinement root are refused. The server cannot see your shell cwd."
-                    }
+                    "cwd": cwd_prop.clone()
                 }
             }
         }));
     }
 
     tools
+}
+
+/// The description for the shared `cwd` property, chosen by whether the Claude
+/// Code `PreToolUse` hook injects cwd automatically (`injected == true`) or the
+/// model is expected to set it explicitly (Codex and every other host).
+fn cwd_description(injected: bool) -> &'static str {
+    if injected {
+        "Your absolute checkout directory. Injected automatically by the Claude Code hook — do NOT set it."
+    } else {
+        "Your absolute checkout directory — always set this explicitly. Relative paths/scopes anchor under it; absolute paths pass through. The server cannot see your shell cwd."
+    }
+}
+
+/// The shared `cwd` schema property. The description flips on the
+/// `TILTH_MCP_CWD_HOOK_INJECTED` env var (`"1"` → hook-injected on Claude Code;
+/// anything else → set explicitly), which `tilth install` writes per host.
+fn cwd_property() -> Value {
+    let injected = std::env::var("TILTH_MCP_CWD_HOOK_INJECTED").as_deref() == Ok("1");
+    serde_json::json!({ "type": "string", "description": cwd_description(injected) })
 }
 
 #[cfg(test)]
@@ -393,7 +397,7 @@ mod tests {
                 "tag": "1A2B",
                 "ops": [{ "op": "replace", "start": 1, "end": 2, "content": "x" }]
             }],
-            "root": "/abs",
+            "cwd": "/abs",
             "diff": true
         });
         assert!(
@@ -496,8 +500,14 @@ mod tests {
             !compiled.is_valid(&serde_json::json!({"query": "x"})),
             "the singular `query` key was dropped — only `queries` is accepted"
         );
-        assert!(compiled.is_valid(&serde_json::json!({"queries": [{"query": "x"}]})));
-        assert!(compiled.is_valid(&serde_json::json!({"queries": [{"query": "x", "kind": "any"}]})));
+        assert!(
+            !compiled.is_valid(&serde_json::json!({"queries": [{"query": "x"}]})),
+            "queries without cwd must fail: cwd is required"
+        );
+        assert!(compiled.is_valid(&serde_json::json!({"queries": [{"query": "x"}], "cwd": "/abs"})));
+        assert!(compiled.is_valid(
+            &serde_json::json!({"queries": [{"query": "x", "kind": "any"}], "cwd": "/abs"})
+        ));
     }
 
     /// Regression for issue #47: OpenAI/Codex's strict function-schema
@@ -564,5 +574,70 @@ mod tests {
                 "duplicate tool definition: {name}"
             );
         }
+    }
+
+    /// Every path-taking tool must carry a required `cwd` property, and the old
+    /// `root` property must be gone from every tool. The seven path-taking tools
+    /// in edit mode (`tilth_diff` included) require cwd; the no-path
+    /// `tilth_savings` counter is exempt from cwd but still carries no `root`.
+    #[test]
+    fn every_tool_requires_cwd_and_drops_root() {
+        let tools = tool_definitions(true);
+        let path_taking: Vec<_> = tools
+            .iter()
+            .filter(|t| t["name"].as_str() != Some("tilth_savings"))
+            .collect();
+        assert_eq!(
+            path_taking.len(),
+            7,
+            "edit mode advertises 7 path-taking tools"
+        );
+        for tool in &tools {
+            let name = tool["name"].as_str().expect("tool name");
+            let schema = &tool["inputSchema"];
+            assert!(
+                schema["properties"].get("root").is_none(),
+                "{name}: root property must be gone (renamed to cwd)"
+            );
+            if name == "tilth_savings" {
+                assert!(
+                    schema["properties"].get("cwd").is_none(),
+                    "tilth_savings takes no paths — cwd must be absent"
+                );
+                continue;
+            }
+            assert!(
+                schema["properties"].get("cwd").is_some(),
+                "{name}: cwd property must be present"
+            );
+            let required: Vec<&str> = schema["required"]
+                .as_array()
+                .expect("required array present")
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect();
+            assert!(
+                required.contains(&"cwd"),
+                "{name}: cwd must be in required, got {required:?}"
+            );
+        }
+    }
+
+    /// The `cwd` description flips between the hook-injected and explicit
+    /// variants. Tested through the pure helper so no process-global env var
+    /// has to be mutated (which would race the parallel test runner).
+    #[test]
+    fn cwd_description_flips_on_hook_injection() {
+        assert!(
+            cwd_description(true).contains("do NOT set"),
+            "hook-injected variant must tell the model not to set cwd: {}",
+            cwd_description(true)
+        );
+        assert!(
+            cwd_description(false).contains("always set this explicitly"),
+            "explicit variant must tell the model to set cwd: {}",
+            cwd_description(false)
+        );
+        assert_ne!(cwd_description(true), cwd_description(false));
     }
 }

@@ -9,11 +9,8 @@ use serde_json::Value;
 
 pub(crate) fn tool_list(args: &Value) -> Result<String, String> {
     use globset::Glob;
-    let root = args
-        .get("root")
-        .and_then(|v| v.as_str())
-        .map(std::path::Path::new);
-    let (scope, scope_warning) = super::resolve_scope(args, root)?;
+    let cwd = super::require_cwd(args)?;
+    let (scope, scope_warning) = super::resolve_scope(args, cwd)?;
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
 
     let patterns_arr = args
@@ -106,23 +103,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn no_scope_no_root_errors() {
-        // WHY: tilth_list defaults `scope` to "." — relative. Before this spec it
-        // silently walked the server's frozen cwd (the worktree bug). The `?` on
-        // resolve_scope must propagate the refusal out of tool_list, not swallow it.
+    fn no_cwd_refused() {
+        // tilth_list requires cwd — the server cannot see the caller's shell cwd,
+        // so a bare list must refuse with the teaching error rather than walk the
+        // server's frozen process directory (the worktree bug).
         let args = serde_json::json!({ "patterns": ["*.rs"] });
         let err = tool_list(&args).unwrap_err();
         assert!(
-            err.contains("relative scope") && err.contains("root"),
-            "bare list must refuse without a root: {err}"
+            err.contains("cwd") && err.contains("absolute checkout directory"),
+            "bare list must refuse without cwd: {err}"
         );
     }
 
     #[test]
-    fn relative_scope_absolute_root_resolves() {
-        // Regression guard: a relative scope anchored to an absolute root must
-        // resolve under root (not error), so the refusal above is scoped to the
-        // unresolvable case only.
+    fn relative_scope_anchors_under_cwd() {
+        // A relative scope anchored to cwd must resolve under cwd (not error).
         let tmp = tempfile::tempdir().unwrap();
         let sub = tmp.path().join("sub");
         std::fs::create_dir(&sub).unwrap();
@@ -130,12 +125,12 @@ mod tests {
         let args = serde_json::json!({
             "patterns": ["*.rs"],
             "scope": "sub",
-            "root": tmp.path().to_str().unwrap(),
+            "cwd": tmp.path().to_str().unwrap(),
         });
-        let out = tool_list(&args).expect("relative scope + absolute root resolves");
+        let out = tool_list(&args).expect("relative scope + cwd resolves");
         assert!(
             out.contains("a.rs"),
-            "expected listing under anchored root: {out}"
+            "expected listing under anchored cwd: {out}"
         );
     }
 }

@@ -73,7 +73,7 @@ pub(in crate::mcp) fn tool_search(
         if let Some(kind) = kind {
             sub.insert("kind".into(), Value::String(kind.to_string()));
         }
-        for k in ["expand", "scope", "root", "if_modified_since", "context"] {
+        for k in ["expand", "scope", "cwd", "if_modified_since", "context"] {
             if let Some(v) = args.get(k) {
                 sub.insert(k.into(), v.clone());
             }
@@ -84,11 +84,8 @@ pub(in crate::mcp) fn tool_search(
         parts.push(crate::budget::apply_item(&headed, per_query, budget));
     }
     let combined = parts.join("\n\n---\n\n");
-    let root = args
-        .get("root")
-        .and_then(|v| v.as_str())
-        .map(std::path::Path::new);
-    let (scope, _) = resolve_scope(args, root)?;
+    let cwd = super::require_cwd(args)?;
+    let (scope, _) = resolve_scope(args, cwd)?;
     let combined = since
         .map(|s| redact_unchanged_search_sections(&combined, &scope, s))
         .unwrap_or(combined);
@@ -115,11 +112,8 @@ fn tool_search_single(
         .get("query")
         .and_then(|v| v.as_str())
         .ok_or("missing required parameter: query (or queries array)")?;
-    let root = args
-        .get("root")
-        .and_then(|v| v.as_str())
-        .map(std::path::Path::new);
-    let (scope, scope_warning) = resolve_scope(args, root)?;
+    let cwd = super::require_cwd(args)?;
+    let (scope, scope_warning) = resolve_scope(args, cwd)?;
     let kind = args.get("kind").and_then(|v| v.as_str());
     let expand = args
         .get("expand")
@@ -379,19 +373,18 @@ mod tests {
     use crate::index::bloom::BloomFilterCache;
     use crate::session::Session;
 
-    /// WHY: a bare `tilth_search` defaults `scope` to "." and silently searched
-    /// the server's frozen cwd — the worktree bug. No scope + no root must now
-    /// refuse with an actionable message naming the root option.
+    /// A bare `tilth_search` with no cwd must refuse: the server cannot see the
+    /// caller's shell cwd, so it must be told the absolute checkout directory.
     #[test]
-    fn no_scope_no_root_errors() {
+    fn no_cwd_refused() {
         let cache = OutlineCache::new();
         let session = Session::new();
         let bloom = std::sync::Arc::new(BloomFilterCache::new());
         let args = serde_json::json!({ "queries": [{"query": "anything"}] });
         let err = tool_search(&args, &cache, &session, &bloom, false).unwrap_err();
         assert!(
-            err.contains("relative scope") && err.contains("root"),
-            "bare search must refuse without a root: {err}"
+            err.contains("cwd") && err.contains("absolute checkout directory"),
+            "bare search must refuse without cwd: {err}"
         );
     }
     /// Regression for P0-3: `kind=callers` with a comma query must search each
@@ -415,6 +408,7 @@ mod tests {
         let args = serde_json::json!({
             "queries": [{"query": "alpha,beta", "kind": "callers"}],
             "scope": tmp.path().to_str().unwrap(),
+            "cwd": tmp.path().to_str().unwrap(),
         });
 
         let out = tool_search(&args, &cache, &session, &bloom, false).unwrap();
@@ -465,6 +459,7 @@ mod tests {
         let args = serde_json::json!({
             "queries": [{"query": "serch/symbol.rs"}],
             "scope": tmp.path().to_str().unwrap(),
+            "cwd": tmp.path().to_str().unwrap(),
         });
 
         let err = tool_search(&args, &cache, &session, &bloom, false)
@@ -497,6 +492,7 @@ mod tests {
         let args = serde_json::json!({
             "queries": [{"query": "symbol"}],
             "scope": tmp.path().to_str().unwrap(),
+            "cwd": tmp.path().to_str().unwrap(),
         });
 
         let out = tool_search(&args, &cache, &session, &bloom, false).unwrap();
@@ -528,6 +524,7 @@ mod tests {
         let args = serde_json::json!({
             "queries": [{"query": "alpha,beta"}],
             "scope": tmp.path().to_str().unwrap(),
+            "cwd": tmp.path().to_str().unwrap(),
         });
 
         let out = tool_search(&args, &cache, &session, &bloom, false).unwrap();
@@ -561,6 +558,7 @@ mod tests {
         let args = serde_json::json!({
             "queries": [{"query": "alpha,alpha", "kind": "callers"}],
             "scope": tmp.path().to_str().unwrap(),
+            "cwd": tmp.path().to_str().unwrap(),
         });
 
         let out = tool_search(&args, &cache, &session, &bloom, false).unwrap();
@@ -605,6 +603,7 @@ mod tests {
         let single_args = serde_json::json!({
             "queries": [{"query": "alpha", "kind": "callers"}],
             "scope": tmp.path().to_str().unwrap(),
+            "cwd": tmp.path().to_str().unwrap(),
         });
         let single_out = tool_search(&single_args, &cache, &session, &bloom, false).unwrap();
         assert!(
@@ -618,6 +617,7 @@ mod tests {
         let multi_args = serde_json::json!({
             "queries": [{"query": "alpha,beta", "kind": "callers"}],
             "scope": tmp.path().to_str().unwrap(),
+            "cwd": tmp.path().to_str().unwrap(),
         });
         let multi_out = tool_search(&multi_args, &cache, &session, &bloom, false).unwrap();
         assert!(
@@ -655,12 +655,14 @@ mod tests {
         let single_args = serde_json::json!({
             "queries": [{"query": "alpha", "kind": "callers"}],
             "scope": tmp.path().to_str().unwrap(),
+            "cwd": tmp.path().to_str().unwrap(),
         });
         let single_out = tool_search(&single_args, &cache, &session, &bloom, false).unwrap();
 
         let multi_args = serde_json::json!({
             "queries": [{"query": "alpha,beta", "kind": "callers"}],
             "scope": tmp.path().to_str().unwrap(),
+            "cwd": tmp.path().to_str().unwrap(),
         });
         let multi_out = tool_search(&multi_args, &cache, &session, &bloom, false).unwrap();
 
@@ -735,6 +737,7 @@ mod tests {
         let args = serde_json::json!({
             "queries": [{"query": "alpha,beta", "kind": "callers"}],
             "scope": tmp.path().to_str().unwrap(),
+            "cwd": tmp.path().to_str().unwrap(),
         });
 
         let out = tool_search(&args, &cache, &session, &bloom, false).unwrap();

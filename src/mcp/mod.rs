@@ -116,6 +116,15 @@ fn current_dir_or_log() -> PathBuf {
     }
 }
 
+/// The startup warning emitted when the Claude Code cwd-injection hook is
+/// expected (`TILTH_MCP_CWD_HOOK_INJECTED=1`) so an operator without the hook
+/// installed has a grep-able stderr line. `None` for any other env value.
+fn hook_injection_warning(env_value: Option<&str>) -> Option<&'static str> {
+    (env_value == Some("1")).then_some(
+        "tilth: cwd hook injection expected (TILTH_MCP_CWD_HOOK_INJECTED=1) — ensure the plugin/claude hook is installed",
+    )
+}
+
 /// MCP server over stdio. When `edit_mode` is true, exposes `tilth_write` and
 /// switches `tilth_read` to whole-file-tag (`[path#TAG]` + numbered lines) output.
 ///
@@ -123,10 +132,10 @@ fn current_dir_or_log() -> PathBuf {
 /// at startup so all tools, git commands, and searches use the correct project root.
 /// This fixes MCP hosts that launch tilth with cwd=/ (e.g., Codex).
 pub fn run(edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
-    let scope_is_explicit = scope.is_some();
-
     // Resolve the project root and chdir to it.
-    // Priority: explicit --scope > MCP roots (handled later) > package_root(cwd) > cwd
+    // Priority: explicit --scope > package_root(cwd) > cwd. The server never
+    // chdirs on client roots — path anchoring is driven entirely by the
+    // per-call `cwd` parameter.
     if let Some(s) = scope {
         if s.is_dir() {
             chdir_or_log(s);
@@ -138,15 +147,23 @@ pub fn run(edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
         }
     }
 
+    if let Some(msg) =
+        hook_injection_warning(std::env::var("TILTH_MCP_CWD_HOOK_INJECTED").ok().as_deref())
+    {
+        eprintln!("{msg}");
+    }
     let services = Services::new(edit_mode);
     let stdin = io::stdin();
     let stdout = io::stdout();
-    let mut stdout = stdout.lock();
+    serve(stdin.lock(), stdout.lock(), &services)
+}
 
-    // Track pending roots/list request (for MCP roots protocol)
-    let mut pending_roots_id: Option<Value> = None;
-
-    for line in stdin.lock().lines() {
+/// The JSON-RPC stdio loop, extracted from [`run`] for testability. Reads one
+/// message per line, dispatches requests through [`handle_request`], and writes
+/// each response. The server never initiates a request of its own — there is no
+/// `roots/list` handshake, so nothing is emitted that the client did not ask for.
+fn serve(reader: impl BufRead, mut writer: impl Write, services: &Services) -> io::Result<()> {
+    for line in reader.lines() {
         let line = match line {
             Ok(line) => line,
             Err(e) => {
@@ -158,30 +175,16 @@ pub fn run(edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
             continue;
         }
 
-        // Parse as generic JSON first — could be a request, notification, or response
+        // Parse as generic JSON first — could be a request or a notification.
         let msg: Value = match serde_json::from_str(&line) {
             Ok(v) => v,
             Err(e) => {
-                write_error(&mut stdout, None, -32700, &format!("parse error: {e}"))?;
+                write_error(&mut writer, None, -32700, &format!("parse error: {e}"))?;
                 continue;
             }
         };
 
-        // Check if this is a response to our roots/list request
-        if let Some(ref roots_id) = pending_roots_id {
-            if msg.get("id") == Some(roots_id) {
-                pending_roots_id = None;
-                // Only apply roots on success and if --scope was NOT explicitly provided
-                if !scope_is_explicit {
-                    if let Some(root_path) = extract_root_from_response(&msg) {
-                        chdir_or_log(&root_path);
-                    }
-                }
-                continue;
-            }
-        }
-
-        // Must have "method" to be a request or notification
+        // Must have "method" to be a request or notification.
         let method = match msg.get("method").and_then(Value::as_str) {
             Some(m) => m.to_string(),
             None => continue, // Not a request — skip (could be an unexpected response)
@@ -189,78 +192,26 @@ pub fn run(edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
 
         let id = msg.get("id").cloned();
         if id.is_none() {
-            // Notifications have no id — silently drop them per JSON-RPC spec
+            // Notifications have no id — silently drop them per JSON-RPC spec.
             continue;
         }
 
-        // Parse params
         let params = msg.get("params").cloned().unwrap_or(Value::Null);
 
         let req = JsonRpcRequest {
             _jsonrpc: "2.0".to_string(),
             id,
-            method: method.clone(),
+            method,
             params,
         };
 
-        let response = handle_request(&req, &services);
-        serde_json::to_writer(&mut stdout, &response)?;
-        stdout.write_all(b"\n")?;
-        stdout.flush()?;
-
-        // After initialize response: send roots/list if client supports it
-        // and we don't already have an explicit --scope
-        if method == "initialize" && !scope_is_explicit && pending_roots_id.is_none() {
-            let client_caps = req.params.get("capabilities").unwrap_or(&Value::Null);
-            if client_caps.get("roots").is_some() {
-                let roots_id = Value::String("tilth_roots_1".to_string());
-                let roots_req = serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": roots_id,
-                    "method": "roots/list"
-                });
-                serde_json::to_writer(&mut stdout, &roots_req)?;
-                stdout.write_all(b"\n")?;
-                stdout.flush()?;
-                pending_roots_id = Some(roots_id);
-            }
-        }
+        let response = handle_request(&req, services);
+        serde_json::to_writer(&mut writer, &response)?;
+        writer.write_all(b"\n")?;
+        writer.flush()?;
     }
 
     Ok(())
-}
-
-/// Extract the first root directory path from a roots/list response.
-/// Parses `file://` URIs and returns the path, or None if no valid roots.
-fn extract_root_from_response(msg: &Value) -> Option<PathBuf> {
-    let roots = msg.get("result")?.get("roots")?.as_array()?;
-    for root in roots {
-        let uri = root.get("uri")?.as_str()?;
-        let raw_path = uri.strip_prefix("file://").unwrap_or(uri);
-        // Drop authority (host) component: file://host/path → /path.
-        // file:///abs already starts with '/' after stripping "file://".
-        let raw_path = if raw_path.starts_with('/') {
-            raw_path
-        } else {
-            // Authority-only forms (file://host with no '/' after the host)
-            // have no path component — skip them rather than fall back to the
-            // bare authority as a relative path.
-            match raw_path.find('/') {
-                Some(i) => &raw_path[i..],
-                None => continue,
-            }
-        };
-        // On invalid UTF-8 in a percent-encoded path, fall back to the
-        // original input rather than substituting U+FFFD replacements.
-        let decoded = percent_encoding::percent_decode_str(raw_path)
-            .decode_utf8()
-            .map_or_else(|_| raw_path.to_string(), std::borrow::Cow::into_owned);
-        let path = PathBuf::from(decoded);
-        if path.is_dir() {
-            return Some(path);
-        }
-    }
-    None
 }
 
 #[derive(Deserialize)]
@@ -488,84 +439,102 @@ mod tests {
     use super::*;
     use std::fmt::Write as _;
 
-    // -- extract_root_from_response -------------------------------------------
-
     #[test]
-    fn extract_root_valid_file_uri() {
-        // Claude Code sends: {"result":{"roots":[{"uri":"file:///Users/x/project"}]}}
-        let tmp = tempfile::tempdir().unwrap();
-        let uri = format!("file://{}", tmp.path().display());
-        let msg = serde_json::json!({
-            "result": { "roots": [{ "uri": uri }] }
-        });
-        let path = extract_root_from_response(&msg);
-        assert_eq!(path, Some(tmp.path().to_path_buf()));
+    fn hook_injection_warning_fires_only_on_one() {
+        assert_eq!(
+            hook_injection_warning(Some("1")),
+            Some("tilth: cwd hook injection expected (TILTH_MCP_CWD_HOOK_INJECTED=1) — ensure the plugin/claude hook is installed")
+        );
+        assert_eq!(hook_injection_warning(Some("0")), None);
+        assert_eq!(hook_injection_warning(Some("true")), None);
+        assert_eq!(hook_injection_warning(None), None);
     }
 
-    #[test]
-    fn extract_root_percent_encoded_uri() {
-        let tmp = tempfile::tempdir().unwrap();
-        let space_dir = tmp.path().join("my project");
-        std::fs::create_dir(&space_dir).unwrap();
-        let encoded =
-            format!("file://{}", tmp.path().display()).replace(' ', "%20") + "/my%20project";
-        let msg = serde_json::json!({
-            "result": { "roots": [{ "uri": encoded }] }
-        });
-        let path = extract_root_from_response(&msg);
-        assert_eq!(path, Some(space_dir));
+    /// Tool handlers now require an absolute `cwd`. Injects a default so the
+    /// behavior tests below can focus on the handler under test: absolute paths
+    /// in the fixtures pass through unchanged; relative names anchor under this
+    /// root. Tests that assert the missing-`cwd` refusal live in the per-tool
+    /// modules (read.rs, search.rs, …) and build their args without this helper.
+    fn tc(args: &Value) -> Value {
+        let mut a = args.clone();
+        if a.get("cwd").is_none() {
+            a["cwd"] = serde_json::json!("/");
+        }
+        a
     }
 
+    /// Integration seam: the real JSON-RPC dispatch path (`dispatch_tool`) must
+    /// refuse a missing `cwd` for EVERY advertised path-taking tool, not just the
+    /// per-handler unit helpers. Each tool is given its other required params so
+    /// the refusal is specifically the cwd teaching error, not a different
+    /// missing-param error. Guards against a future tool being wired into
+    /// dispatch without the `require_cwd` gate.
     #[test]
-    fn extract_root_empty_roots() {
-        // Codex sends: {"result":{"roots":[]}}
-        let msg = serde_json::json!({
-            "result": { "roots": [] }
-        });
-        assert_eq!(extract_root_from_response(&msg), None);
+    fn dispatch_refuses_missing_cwd_for_every_path_tool() {
+        let services = Services::new(true); // edit_mode=true so tilth_write dispatches
+        let cases = [
+            ("tilth_read", serde_json::json!({ "paths": ["x.rs"] })),
+            (
+                "tilth_search",
+                serde_json::json!({ "queries": [{ "query": "x" }] }),
+            ),
+            ("tilth_list", serde_json::json!({ "patterns": ["*.rs"] })),
+            ("tilth_deps", serde_json::json!({ "path": "x.rs" })),
+            ("tilth_grok", serde_json::json!({ "target": "x" })),
+            ("tilth_diff", serde_json::json!({})),
+            (
+                "tilth_write",
+                serde_json::json!({ "edits": [{ "path": "a.rs", "ops": [{ "op": "delete", "start": 1, "end": 1 }] }] }),
+            ),
+        ];
+        for (tool, args) in cases {
+            let err = dispatch_tool(tool, &args, &services)
+                .expect_err(&format!("{tool} must refuse a missing cwd, got Ok"));
+            assert!(
+                err.contains("cwd") && err.contains("absolute checkout directory"),
+                "{tool} dispatch must refuse missing cwd with the teaching error: {err}"
+            );
+        }
     }
 
-    #[test]
-    fn extract_root_nonexistent_path() {
-        let msg = serde_json::json!({
-            "result": { "roots": [{ "uri": "file:///nonexistent/path/that/does/not/exist" }] }
-        });
-        assert_eq!(extract_root_from_response(&msg), None);
-    }
+    // -- serve: no unsolicited roots/list handshake ---------------------------
 
+    /// After the roots removal, `serve` must never emit a request of its own.
+    /// Feeding an `initialize` that advertises the `roots` capability must yield
+    /// exactly one message — the initialize response — and never a `roots/list`
+    /// request. Guards the deleted post-initialize handshake.
     #[test]
-    fn extract_root_no_result() {
-        let msg = serde_json::json!({"error": {"code": -1, "message": "nope"}});
-        assert_eq!(extract_root_from_response(&msg), None);
+    fn serve_emits_no_roots_list_after_initialize() {
+        let services = Services::new(false);
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","#,
+            r#""params":{"capabilities":{"roots":{"listChanged":true}}}}"#,
+            "\n"
+        );
+        let mut out: Vec<u8> = Vec::new();
+        serve(input.as_bytes(), &mut out, &services).expect("serve drains cleanly on EOF");
+        let out = String::from_utf8(out).expect("utf8 output");
+        assert!(
+            !out.contains("roots/list"),
+            "server must not emit a roots/list request: {out}"
+        );
+        // Exactly one JSON message (the initialize response) is written.
+        let lines: Vec<&str> = out.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "exactly one response line expected: {out:?}"
+        );
+        let resp: serde_json::Value = serde_json::from_str(lines[0]).expect("valid JSON response");
+        assert_eq!(
+            resp["id"], 1,
+            "the one message must be the initialize response"
+        );
+        assert!(
+            resp.get("result").is_some(),
+            "initialize must succeed: {resp}"
+        );
     }
-
-    #[test]
-    fn extract_root_multiple_roots_takes_first_valid() {
-        let tmp = tempfile::tempdir().unwrap();
-        let uri = format!("file://{}", tmp.path().display());
-        let msg = serde_json::json!({
-            "result": { "roots": [
-                { "uri": "file:///nonexistent" },
-                { "uri": uri },
-            ]}
-        });
-        // First root is invalid, second is valid — should return second
-        let path = extract_root_from_response(&msg);
-        assert_eq!(path, Some(tmp.path().to_path_buf()));
-    }
-
-    #[test]
-    fn extract_root_authority_form_strips_host() {
-        // file://host/path (RFC 8089 authority) must resolve to /path, not host/path.
-        let tmp = tempfile::tempdir().unwrap();
-        let uri = format!("file://localhost{}", tmp.path().display());
-        let msg = serde_json::json!({
-            "result": { "roots": [{ "uri": uri }] }
-        });
-        let path = extract_root_from_response(&msg);
-        assert_eq!(path, Some(tmp.path().to_path_buf()));
-    }
-
     // -- package_root fallback from subdirectory ------------------------------
 
     #[test]
@@ -600,7 +569,7 @@ mod tests {
     fn server_instructions_byte_lock() {
         assert_eq!(
             SERVER_INSTRUCTIONS.len(),
-            6141,
+            5687,
             "SERVER_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(SERVER_INSTRUCTIONS
@@ -613,9 +582,8 @@ mod tests {
         );
         assert!(SERVER_INSTRUCTIONS.contains("Comma-OR is for kind any/symbol/callers"));
         assert!(
-            SERVER_INSTRUCTIONS
-                .contains("DO NOT pass a relative path/scope without an absolute `root`"),
-            "require-root path discipline must lead the file-I/O guidance"
+            SERVER_INSTRUCTIONS.contains("DO NOT pass a relative path/scope without `cwd`"),
+            "require-cwd path discipline must lead the file-I/O guidance"
         );
         assert!(SERVER_INSTRUCTIONS
             .contains("Re-expanding a previously shown definition returns [shown earlier]"));
@@ -637,7 +605,7 @@ mod tests {
     fn edit_mode_extra_byte_lock() {
         assert_eq!(
             EDIT_MODE_EXTRA.len(),
-            2692,
+            2505,
             "EDIT_MODE_EXTRA byte count drifted from refactor baseline"
         );
         assert!(
@@ -698,7 +666,7 @@ mod tests {
         let args = serde_json::json!({ "paths": "a.rs" });
         let cache = OutlineCache::new();
         let session = Session::new();
-        let err = tool_read(&args, &cache, &session, false)
+        let err = tool_read(&tc(&args), &cache, &session, false)
             .expect_err("scalar `paths` must be rejected as wrong type");
         assert!(
             err.contains("paths must be an array"),
@@ -718,8 +686,8 @@ mod tests {
         });
         let cache = OutlineCache::new();
         let session = Session::new();
-        let err =
-            tool_read(&args, &cache, &session, false).expect_err("unknown mode must be rejected");
+        let err = tool_read(&tc(&args), &cache, &session, false)
+            .expect_err("unknown mode must be rejected");
         assert!(err.contains("unknown read mode"), "unexpected error: {err}");
     }
 
@@ -747,7 +715,8 @@ mod tests {
         let cache = OutlineCache::new();
         let session = Session::new();
 
-        let result = tool_read(&args, &cache, &session, false).expect("batch read must succeed");
+        let result =
+            tool_read(&tc(&args), &cache, &session, false).expect("batch read must succeed");
 
         for i in 0..file_count {
             assert!(
@@ -775,7 +744,7 @@ mod tests {
         });
         let cache = OutlineCache::new();
         let session = Session::new();
-        let out = tool_read(&args, &cache, &session, false).expect("batch full read ok");
+        let out = tool_read(&tc(&args), &cache, &session, false).expect("batch full read ok");
         assert!(
             out.contains("padding padding"),
             "large body must be included: {out}"
@@ -800,7 +769,7 @@ mod tests {
         });
         let cache = OutlineCache::new();
         let session = Session::new();
-        let out = tool_read(&args, &cache, &session, false)
+        let out = tool_read(&tc(&args), &cache, &session, false)
             .expect("batch read must succeed with mixed valid/missing");
 
         assert!(
@@ -838,7 +807,7 @@ mod tests {
         });
         let cache = OutlineCache::new();
         let session = Session::new();
-        let out = tool_read(&args, &cache, &session, false)
+        let out = tool_read(&tc(&args), &cache, &session, false)
             .expect("all-missing batch must succeed (Ok), not error the whole call");
 
         assert!(
@@ -869,7 +838,7 @@ mod tests {
         });
         let cache = OutlineCache::new();
         let session = Session::new();
-        let out = tool_read(&args, &cache, &session, false).expect("mixed batch succeeds");
+        let out = tool_read(&tc(&args), &cache, &session, false).expect("mixed batch succeeds");
 
         let content_idx = out.find("x = 1").expect("real file content present");
         let nf_idx = out
@@ -899,7 +868,7 @@ mod tests {
         let args = serde_json::json!({ "paths": [missing.to_str().unwrap()] });
         let cache = OutlineCache::new();
         let session = Session::new();
-        let result = tool_read(&args, &cache, &session, false);
+        let result = tool_read(&tc(&args), &cache, &session, false);
         assert!(
             result.is_err(),
             "single missing path must surface as Err, not as a not-found section"
@@ -925,7 +894,7 @@ mod tests {
         let args = serde_json::json!({ "paths": [target_real, target_miss] });
         let cache = OutlineCache::new();
         let session = Session::new();
-        let out = tool_read(&args, &cache, &session, false)
+        let out = tool_read(&tc(&args), &cache, &session, false)
             .expect("batch with symbol miss must succeed (Ok)");
 
         let nf_idx = out
@@ -975,7 +944,7 @@ mod tests {
         let args = serde_json::json!({ "paths": [target_real, target_precondition] });
         let cache = OutlineCache::new();
         let session = Session::new();
-        let out = tool_read(&args, &cache, &session, false)
+        let out = tool_read(&tc(&args), &cache, &session, false)
             .expect("batch with non-code symbol target must succeed (Ok)");
 
         // The non-code path must NOT appear in the not-found footer — if it
@@ -1001,7 +970,7 @@ mod tests {
         let args = serde_json::json!({ "paths": [spec] });
         let cache = OutlineCache::new();
         let session = Session::new();
-        let out = tool_read(&args, &cache, &session, false).expect("suffix accepted");
+        let out = tool_read(&tc(&args), &cache, &session, false).expect("suffix accepted");
         assert!(out.contains("l2"), "expected l2 in output: {out}");
         assert!(out.contains("l4"), "expected l4 in output: {out}");
         assert!(!out.contains("l5"), "must not include l5: {out}");
@@ -1022,7 +991,7 @@ mod tests {
         let args = serde_json::json!({ "paths": [spec_heading] });
         let cache = OutlineCache::new();
         let session = Session::new();
-        let out = tool_read(&args, &cache, &session, false).expect("heading suffix");
+        let out = tool_read(&tc(&args), &cache, &session, false).expect("heading suffix");
         assert!(out.contains("bar body"), "expected heading content: {out}");
     }
 
@@ -1040,7 +1009,7 @@ mod tests {
         });
         let cache = OutlineCache::new();
         let session = Session::new();
-        let out = tool_read(&args, &cache, &session, false).expect("stub ok");
+        let out = tool_read(&tc(&args), &cache, &session, false).expect("stub ok");
         assert!(out.contains("unchanged"), "expected stub marker: {out}");
         assert!(
             !out.contains("contents you should NOT see"),
@@ -1065,7 +1034,7 @@ mod tests {
         });
         let cache = OutlineCache::new();
         let session = Session::new();
-        let out = tool_read(&args, &cache, &session, false).expect("content ok");
+        let out = tool_read(&tc(&args), &cache, &session, false).expect("content ok");
         assert!(out.contains("hello world"), "expected body: {out}");
     }
 
@@ -1079,7 +1048,7 @@ mod tests {
         let args = serde_json::json!({ "paths": [spec] });
         let cache = OutlineCache::new();
         let session = Session::new();
-        let out = tool_read(&args, &cache, &session, false).expect("from-line suffix ok");
+        let out = tool_read(&tc(&args), &cache, &session, false).expect("from-line suffix ok");
         assert!(out.contains("l3"), "line 3 expected: {out}");
         assert!(out.contains("l4"), "line 4 expected: {out}");
         assert!(!out.contains("l1"), "line 1 must be excluded: {out}");
@@ -1101,7 +1070,7 @@ mod tests {
         });
         let cache = OutlineCache::new();
         let session = Session::new();
-        let out = tool_read(&args, &cache, &session, false).expect("signature ok");
+        let out = tool_read(&tc(&args), &cache, &session, false).expect("signature ok");
         assert!(
             out.contains("[signature]"),
             "signature header missing: {out}"
@@ -1130,7 +1099,7 @@ mod tests {
         let args = serde_json::json!({ "paths": [p.to_str().unwrap()] });
         let cache = OutlineCache::new();
         let session = Session::new();
-        let out = tool_read(&args, &cache, &session, false).expect("auto signature ok");
+        let out = tool_read(&tc(&args), &cache, &session, false).expect("auto signature ok");
         assert!(
             out.contains("[signature]"),
             "signature header missing: {out}"
@@ -1156,7 +1125,7 @@ mod tests {
         let args = serde_json::json!({ "paths": [p.to_str().unwrap()] });
         let cache = OutlineCache::new();
         let session = Session::new();
-        let out = tool_read(&args, &cache, &session, false).expect("auto small-code ok");
+        let out = tool_read(&tc(&args), &cache, &session, false).expect("auto small-code ok");
         assert!(out.contains("[full]"), "expected `[full]` header: {out}");
         assert!(
             out.contains("body_marker"),
@@ -1174,7 +1143,7 @@ mod tests {
         let args = serde_json::json!({ "paths": [p.to_str().unwrap()] });
         let cache = OutlineCache::new();
         let session = Session::new();
-        let out = tool_read(&args, &cache, &session, false).expect("auto small-md ok");
+        let out = tool_read(&tc(&args), &cache, &session, false).expect("auto small-md ok");
         assert!(out.contains("[full]"), "expected `[full]` header: {out}");
         assert!(
             out.contains("Body paragraph that must appear verbatim"),
@@ -1194,7 +1163,7 @@ mod tests {
         let args = serde_json::json!({ "paths": [p.to_str().unwrap()] });
         let cache = OutlineCache::new();
         let session = Session::new();
-        let out = tool_read(&args, &cache, &session, false).expect("auto large-md ok");
+        let out = tool_read(&tc(&args), &cache, &session, false).expect("auto large-md ok");
         assert!(
             out.contains("[outline]"),
             "expected `[outline]` header: {out}"
@@ -1229,7 +1198,7 @@ mod tests {
         let args = serde_json::json!({ "paths": [p.to_str().unwrap()] });
         let cache = OutlineCache::new();
         let session = Session::new();
-        let out = tool_read(&args, &cache, &session, false).expect("auto structured ok");
+        let out = tool_read(&tc(&args), &cache, &session, false).expect("auto structured ok");
         assert!(out.contains("[keys]"), "expected `[keys]` header: {out}");
         assert!(
             out.contains("top_level_marker"),
@@ -1250,7 +1219,7 @@ mod tests {
         let args = serde_json::json!({ "paths": [p.to_str().unwrap()] });
         let cache = OutlineCache::new();
         let session = Session::new();
-        let out = tool_read(&args, &cache, &session, false).expect("auto other-text ok");
+        let out = tool_read(&tc(&args), &cache, &session, false).expect("auto other-text ok");
         assert!(
             !out.contains("[signature]"),
             "non-code file must never use signature mode: {out}"
@@ -1277,7 +1246,7 @@ mod tests {
         });
         let cache = OutlineCache::new();
         let session = Session::new();
-        let out = tool_read(&args, &cache, &session, false).expect("stripped ok");
+        let out = tool_read(&tc(&args), &cache, &session, false).expect("stripped ok");
 
         let meta = parse_first_line_json(&out).expect("JSON view-meta header expected");
         assert_eq!(meta.get("view").and_then(|v| v.as_str()), Some("stripped"));
@@ -1332,7 +1301,7 @@ mod tests {
         });
         let cache = OutlineCache::new();
         let session = Session::new();
-        let out = tool_read(&args, &cache, &session, false).expect("stripped ok");
+        let out = tool_read(&tc(&args), &cache, &session, false).expect("stripped ok");
         // Lines 1, 3, 5 survive; gutter shows the original numbers.
         assert!(
             out.contains("1  fn alpha()")
@@ -1357,7 +1326,7 @@ mod tests {
         let cache = OutlineCache::new();
         let session = Session::new();
         // edit_mode = true intentionally — stripped MUST still suppress editable anchors.
-        let out = tool_read(&args, &cache, &session, true).expect("stripped+edit ok");
+        let out = tool_read(&tc(&args), &cache, &session, true).expect("stripped+edit ok");
         // Stripped output is non-contiguous with disk, so it must NOT present
         // editable `<line>:<content>` numbered anchors for the `fn keep()` line.
         assert!(
@@ -1390,7 +1359,7 @@ mod tests {
         });
         let cache = OutlineCache::new();
         let session = Session::new();
-        let out = tool_read(&args, &cache, &session, false).expect("stripped+suffix ok");
+        let out = tool_read(&tc(&args), &cache, &session, false).expect("stripped+suffix ok");
         assert!(
             out.contains("this comment must NOT be stripped"),
             "suffix wins; comments survive in raw slice: {out}"
@@ -1413,7 +1382,8 @@ mod tests {
         });
         let cache = OutlineCache::new();
         let session = Session::new();
-        let err = tool_read(&args, &cache, &session, false).expect_err("unknown mode rejected");
+        let err =
+            tool_read(&tc(&args), &cache, &session, false).expect_err("unknown mode rejected");
         assert!(err.contains("stripped"), "error must list new mode: {err}");
     }
 
@@ -1430,7 +1400,7 @@ mod tests {
         let args = serde_json::json!({ "paths": [p.to_str().unwrap()] });
         let cache = OutlineCache::new();
         let session = Session::new();
-        let out = tool_read(&args, &cache, &session, false).expect("auto sig ok");
+        let out = tool_read(&tc(&args), &cache, &session, false).expect("auto sig ok");
         let meta = parse_first_line_json(&out).expect("view-meta JSON header expected");
         assert_eq!(meta.get("view").and_then(|v| v.as_str()), Some("signature"));
         assert_eq!(
@@ -1459,7 +1429,7 @@ mod tests {
         });
         let cache = OutlineCache::new();
         let session = Session::new();
-        let out = tool_read(&args, &cache, &session, false).expect("explicit sig ok");
+        let out = tool_read(&tc(&args), &cache, &session, false).expect("explicit sig ok");
         let meta = parse_first_line_json(&out).expect("view-meta JSON header expected");
         assert_eq!(meta.get("view").and_then(|v| v.as_str()), Some("signature"));
         assert!(
@@ -1478,7 +1448,7 @@ mod tests {
         let args = serde_json::json!({ "paths": [p.to_str().unwrap()] });
         let cache = OutlineCache::new();
         let session = Session::new();
-        let out = tool_read(&args, &cache, &session, false).expect("auto small ok");
+        let out = tool_read(&tc(&args), &cache, &session, false).expect("auto small ok");
         // First line must NOT be a JSON header — the file's `# path` markdown header should lead.
         let first = out.lines().next().expect("at least one line");
         assert!(
@@ -1498,7 +1468,7 @@ mod tests {
         let args = serde_json::json!({ "paths": [p.to_str().unwrap()] });
         let cache = OutlineCache::new();
         let session = Session::new();
-        let out = tool_read(&args, &cache, &session, false).expect("auto large md ok");
+        let out = tool_read(&tc(&args), &cache, &session, false).expect("auto large md ok");
         let meta = parse_first_line_json(&out).expect("view-meta JSON header expected");
         assert_eq!(meta.get("view").and_then(|v| v.as_str()), Some("outline"));
         assert_eq!(meta.get("next_view").and_then(|v| v.as_str()), Some("full"));
@@ -1525,7 +1495,7 @@ mod tests {
         });
         let cache = OutlineCache::new();
         let session = Session::new();
-        let out = tool_read(&args, &cache, &session, false).expect("budget read ok");
+        let out = tool_read(&tc(&args), &cache, &session, false).expect("budget read ok");
         let meta = parse_first_line_json(&out).expect("view-meta JSON header expected");
         assert_eq!(
             meta.get("truncated").and_then(serde_json::Value::as_bool),
@@ -1565,7 +1535,7 @@ mod tests {
         });
         let cache = OutlineCache::new();
         let session = Session::new();
-        let out = tool_read(&args, &cache, &session, false).expect("budget read ok");
+        let out = tool_read(&tc(&args), &cache, &session, false).expect("budget read ok");
         let meta = parse_first_line_json(&out).expect("view-meta JSON header expected");
         assert_eq!(
             meta.get("truncated").and_then(serde_json::Value::as_bool),
@@ -1582,7 +1552,7 @@ mod tests {
 
     // -- tilth_write tool: whole-file-tag op-grammar dispatch --------------
     // PR2 swapped tilth_write to the op-grammar blob surface; the deep
-    // behaviour (round-trip, drift recovery, confinement, file ops) is covered
+    // behaviour (round-trip, drift recovery, anchoring, file ops) is covered
     // in `mcp::tools::write::tests`. These lock the dispatch seam.
 
     fn edit_services() -> (Session, Arc<BloomFilterCache>) {
@@ -1600,7 +1570,7 @@ mod tests {
 
         // Read in edit mode records the snapshot and emits the tag header.
         let read_out = tool_read(
-            &serde_json::json!({"paths": [p.to_str().unwrap()], "mode": "full"}),
+            &serde_json::json!({"paths": [p.to_str().unwrap()], "mode": "full", "cwd": root.to_str().unwrap()}),
             &cache,
             &session,
             true,
@@ -1615,7 +1585,7 @@ mod tests {
 
         let edits = serde_json::json!([{ "path": p.to_str().unwrap(), "tag": tag, "ops": [{ "op": "replace", "start": 2, "end": 2, "content": "TWO" }] }]);
         let out = tool_write(
-            &serde_json::json!({"edits": edits, "root": root.to_str().unwrap()}),
+            &serde_json::json!({"edits": edits, "cwd": root.to_str().unwrap()}),
             &session,
             &bloom,
         )
@@ -1714,12 +1684,12 @@ mod tests {
         );
         assert_eq!(
             build_instructions(false, "").len(),
-            6141,
+            5687,
             "non-edit composed instructions byte count drifted"
         );
         assert_eq!(
             edit.len(),
-            8833,
+            8192,
             "edit-mode composed instructions byte count drifted (double-blank-line regression?)"
         );
     }
@@ -1744,7 +1714,8 @@ mod tests {
         std::fs::write(dir.path().join("src/b.rs"), "fn b() {}").unwrap();
         let args = serde_json::json!({
             "patterns": ["**/*.rs"],
-            "scope": dir.path().to_str().unwrap()
+            "scope": dir.path().to_str().unwrap(),
+            "cwd": dir.path().to_str().unwrap()
         });
         let out = tool_list(&args).expect("list ok");
         assert!(
@@ -1766,7 +1737,7 @@ mod tests {
     #[test]
     fn tool_list_empty_patterns_rejected() {
         let cwd = std::env::current_dir().unwrap();
-        let args = serde_json::json!({ "patterns": [], "scope": cwd.to_str().unwrap() });
+        let args = serde_json::json!({ "patterns": [], "scope": cwd.to_str().unwrap(), "cwd": cwd.to_str().unwrap() });
         let err = tool_list(&args).expect_err("empty must error");
         assert!(err.contains("at least one"), "unexpected: {err}");
     }
@@ -1779,7 +1750,7 @@ mod tests {
             ps.push(serde_json::json!("*.rs"));
         }
         let cwd = std::env::current_dir().unwrap();
-        let args = serde_json::json!({ "patterns": ps, "scope": cwd.to_str().unwrap() });
+        let args = serde_json::json!({ "patterns": ps, "scope": cwd.to_str().unwrap(), "cwd": cwd.to_str().unwrap() });
         let err = tool_list(&args).expect_err(">20 must error");
         assert!(err.contains("limited to 20"), "unexpected: {err}");
     }
@@ -1793,7 +1764,8 @@ mod tests {
         std::fs::write(dir.path().join("src/b.rs"), "fn b() {}").unwrap();
         let args = serde_json::json!({
             "patterns": ["*.rs"],
-            "scope": dir.path().to_str().unwrap()
+            "scope": dir.path().to_str().unwrap(),
+            "cwd": dir.path().to_str().unwrap()
         });
         let out = tool_list(&args).expect("list ok");
         assert!(out.contains("src/"), "expected src/ in tree: {out}");
@@ -1814,7 +1786,8 @@ mod tests {
         std::fs::write(dir.path().join("node_modules/skip.js"), "x").unwrap();
         let args = serde_json::json!({
             "patterns": ["**/*"],
-            "scope": dir.path().to_str().unwrap()
+            "scope": dir.path().to_str().unwrap(),
+            "cwd": dir.path().to_str().unwrap()
         });
         let out = tool_list(&args).expect("list ok");
         assert!(
@@ -1840,7 +1813,8 @@ mod tests {
         std::fs::write(dir.path().join(".tilthignore"), "denied.rs\n").unwrap();
         let args = serde_json::json!({
             "patterns": ["*.rs"],
-            "scope": dir.path().to_str().unwrap()
+            "scope": dir.path().to_str().unwrap(),
+            "cwd": dir.path().to_str().unwrap()
         });
 
         let out = tool_list(&args).expect("list ok");
@@ -1866,7 +1840,8 @@ mod tests {
         let args = serde_json::json!({
             "queries": [{ "query": "build_instructions" }],
             "expand": 0,
-            "scope": scope.to_str().unwrap()
+            "scope": scope.to_str().unwrap(),
+            "cwd": scope.to_str().unwrap()
         });
         let cache = OutlineCache::new();
         let session = Session::new();
@@ -1909,7 +1884,8 @@ mod tests {
             "queries": [{ "query": "foo" }],
             "budget": 5000,
             "expand": 0,
-            "scope": env!("CARGO_MANIFEST_DIR")
+            "scope": env!("CARGO_MANIFEST_DIR"),
+            "cwd": env!("CARGO_MANIFEST_DIR")
         });
         assert!(
             dispatch_tool("tilth_search", &ok, &services).is_ok(),
@@ -1960,6 +1936,7 @@ mod tests {
                 { "query": "use", "kind": "content" }
             ],
             "scope": tmp.path().to_str().unwrap(),
+            "cwd": tmp.path().to_str().unwrap(),
             "budget": 300
         });
         let cache = OutlineCache::new();
@@ -2005,7 +1982,7 @@ mod tests {
         });
         let cache = OutlineCache::new();
         let session = Session::new();
-        let out = tool_read(&args, &cache, &session, false).expect("batch read");
+        let out = tool_read(&tc(&args), &cache, &session, false).expect("batch read");
         for name in names {
             assert!(
                 out.contains(name),
@@ -2071,6 +2048,7 @@ mod tests {
         let args = serde_json::json!({
             "queries": [{"query": "handleAuth"}],
             "scope": dir.path().to_str().unwrap(),
+            "cwd": dir.path().to_str().unwrap(),
             "context": "src/old.rs"
         });
         let out = tool_search(&args, &cache, &session, &bloom, false)
@@ -2095,6 +2073,7 @@ mod tests {
         let args = serde_json::json!({
             "queries": [{"query": "needle_unique", "kind": "content"}],
             "scope": dir.path().to_str().unwrap(),
+            "cwd": dir.path().to_str().unwrap(),
             "expand": 1,
             "if_modified_since": "2099-01-01T00:00:00Z"
         });
@@ -2126,7 +2105,8 @@ mod tests {
         let bloom = Arc::new(BloomFilterCache::new());
         let args = serde_json::json!({
             "queries": [{"query": "handleAuth"}],
-            "scope": dir.path().to_str().unwrap()
+            "scope": dir.path().to_str().unwrap(),
+            "cwd": dir.path().to_str().unwrap()
         });
         let out = tool_search(&args, &cache, &session, &bloom, false).expect("search ok");
         let first = out.lines().next().expect("response has a first line");
@@ -2159,6 +2139,7 @@ mod tests {
         let args = serde_json::json!({
             "queries": [{"query": "target_fn"}],
             "scope": dir.path().to_str().unwrap(),
+            "cwd": dir.path().to_str().unwrap(),
             "expand": 0
         });
         let out = tool_search(&args, &cache, &session, &bloom, false).expect("merged search ok");
@@ -2207,6 +2188,7 @@ mod tests {
             ],
             "kind": "symbol",
             "scope": dir.path().to_str().unwrap(),
+            "cwd": dir.path().to_str().unwrap(),
             "expand": 1
         });
         let out = tool_search(&args, &cache, &session, &bloom, false).expect("override search ok");
@@ -2267,6 +2249,7 @@ mod tests {
                 {"query": "new_target", "kind": "content"}
             ],
             "scope": dir.path().to_str().unwrap(),
+            "cwd": dir.path().to_str().unwrap(),
             "expand": 1,
             "if_modified_since": crate::mcp::iso::iso_ts(since)
         });
@@ -2304,6 +2287,7 @@ mod tests {
             "queries": [{"query": "unique_symbol_for_hashline_test"}],
             "expand": 1,
             "scope": dir.path().to_str().unwrap(),
+            "cwd": dir.path().to_str().unwrap(),
         });
         let cache = OutlineCache::new();
         let session = Session::new();
@@ -2349,7 +2333,8 @@ mod tests {
         let bloom = Arc::new(BloomFilterCache::new());
         let args = serde_json::json!({
             "queries": [{"query": "zZxQyN_no_such_symbol", "kind": "content"}],
-            "scope": dir.path().to_str().unwrap()
+            "scope": dir.path().to_str().unwrap(),
+            "cwd": dir.path().to_str().unwrap()
         });
         let out = tool_search(&args, &cache, &session, &bloom, false).expect("search ok");
         assert!(out.contains("0 matches"), "empty header missing: {out}");
@@ -2383,7 +2368,8 @@ mod tests {
         // Glob matches nothing in the scope → files_matched_glob == 0.
         let args = serde_json::json!({
             "queries": [{"query": "anything", "kind": "symbol", "glob": "*.bogus_ext_does_not_exist"}],
-            "scope": dir.path().to_str().unwrap()
+            "scope": dir.path().to_str().unwrap(),
+            "cwd": dir.path().to_str().unwrap()
         });
         let out = tool_search(&args, &cache, &session, &bloom, false).expect("search ok");
         assert!(out.contains("0 matches"), "empty header missing: {out}");

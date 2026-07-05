@@ -1362,7 +1362,6 @@ dependencies = [
  "memchr",
  "memmap2",
  "nucleo-matcher",
- "percent-encoding",
  "rayon",
  "regex-syntax",
  "serde",

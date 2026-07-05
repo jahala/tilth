@@ -1,28 +1,28 @@
 # MCP cwd / workspace-root binding
 
-How tilth resolves relative paths to the *right* checkout, why it uses a **required** per-call `root` param instead of the MCP `roots` capability, and the git-worktree gotcha that motivated it. Full cited research lives at `.cheese/research/mcp-cwd-root-binding/` (local, gitignored). Tracked in issue #78 / PR #79; the hard-refuse follow-up is `tilth-require-root` (v0.9.0).
+How tilth resolves relative paths to the *right* checkout, why it uses a **required per-call `cwd` param** instead of the MCP `roots` capability, and the git-worktree gotcha that motivated it. Full cited research at `.cheese/research/mcp-cwd-root-binding/` and `.cheese/research/mcp-roots-trust-signal/` (local, gitignored). History: issue #78 / PR #79 (`root`, required-for-relatives) → **PR #113 `cwd-param-posture` (2026-07-04, current law)**.
+
+## Current law (PR #113, spec `cwd-param-posture`)
+
+- The param is named **`cwd`** (renamed from `root`) and is **schema-required on all seven path-taking tools** — `tilth_read`, `tilth_search`, `tilth_write`, `tilth_list`, `tilth_deps`, `tilth_grok`, `tilth_diff` (diff gained it for the first time; git-based sources still diff in the server's frozen dir, but the file-path params `patch`/`a`/`b` anchor relative spellings under `cwd` like every other tool).
+- **Posture is trust-absolute**: relative paths anchor under `cwd` with `..` traversal refused (`Component::ParentDir`, leading and embedded); absolute paths pass through untouched — no confinement refusal. `resolve_confined`/`resolve_write_path`/`path_within_scope` were deleted; the shared helpers are `require_cwd` (teaching refusal on missing/relative `cwd`) and `resolve_anchored` in `src/mcp/tools/mod.rs`.
+- **MCP roots support is gone entirely** — the one-shot post-initialize `roots/list` request and `extract_root_from_response` were deleted; the server never chdirs on client roots. (Rejected after round-5 adjudication; research at `.cheese/research/mcp-roots-trust-signal/`.)
+- **Claude Code hook plugin** ships in-repo at `plugin/claude/`: a PreToolUse hook (`hooks/inject-cwd.js`, matcher `mcp__tilth__.*` — matchers are unanchored **regex**) injects the live session cwd via `hookSpecificOutput.updatedInput = {...tool_input, cwd}`; a model-set `cwd` wins. Field shape verified against <https://code.claude.com/docs/en/hooks.md> (merge-vs-replace is undocumented there; spreading the full input is correct under either).
+- **`TILTH_MCP_CWD_HOOK_INJECTED`** env var flips the `cwd` schema description at definition time: `tilth install claude-code` writes `1` ("injected automatically, do NOT set"), codex and all other hosts write `0` ("always set explicitly"). When `1`, the server emits one stderr line at startup so an operator without the hook installed has something to grep — the server cannot observe actual hook presence, only the flag; a missing hook self-heals via the teaching error within a call or two.
+- **Fork law** (CLAUDE.md): the `root`→`cwd` rename and trust-absolute posture are permanent fork patches with an accepted permanent sync-conflict surface; version stays 0.8.4.
+- Haiku bench sanity on the hard tasks after the prompt rewrite: 8/9 new vs 8/9 old, identical per-task profile — required-`cwd` did not regress weak-model pass rates.
 
 ## The problem: a long-lived server can't learn the live cwd
 
-tilth is a long-lived stdio MCP server, spawned once per session. It cannot *pull* the caller's current directory:
-
-- The OS cwd of the tilth process is frozen at spawn; no other process's `cd` changes it.
-- The MCP `tools/call` frame carries no cwd field.
-- The directory the agent "is in" lives in a different process (the harness's Bash shell) or only in the agent's intent — nothing tilth can query.
-
-So the live cwd must be *pushed* by the caller. The only universally reliable push is an explicit argument on each call.
+tilth is a long-lived stdio MCP server, spawned once per session. It cannot *pull* the caller's current directory: the OS cwd of the tilth process is frozen at spawn; the MCP `tools/call` frame carries no cwd field; the directory the agent "is in" lives in another process or only in the agent's intent. So the live cwd must be *pushed* by the caller — an explicit argument on each call (or the Claude Code hook injecting it).
 
 ## The git-worktree gotcha (issue #78)
 
-Server launched at `/repo` (main checkout); agent works in `/repo/.worktrees/<slug>/`. Relative reads/writes resolve against the **main checkout**, not the worktree. The read *succeeds* (reads the parent copy) so hash anchors match and the edit looks correct — the only tell is `git status` in the worktree coming up empty. Silent and dangerous.
+Server launched at `/repo` (main checkout); agent works in `/repo/.worktrees/<slug>/`. Relative reads/writes resolve against the **main checkout**, not the worktree. The read *succeeds* (reads the parent copy) so hash anchors match and the edit looks correct — the only tell is `git status` in the worktree coming up empty. Silent and dangerous. This is why omission is a hard teaching refusal, not a cwd fallback: a silent fallback is indistinguishable from a correct read until `git status` comes up empty.
 
-## Decision: per-call `root` param, now REQUIRED for relatives (not MCP roots)
+## Why not the MCP `roots` capability
 
-The file-I/O tools take a `root`: an absolute path/scope is used as-is; a relative path/scope anchors under an absolute `root`. As of `tilth-require-root` (v0.9.0) the silent cwd fallback is **removed** — a relative path/scope with no absolute `root` (and a relative `root`) is a **hard tool error**, not a cwd-relative read. This intentionally **breaks** the #78 promise that "omitting `root` is byte-identical to cwd-relative"; that byte-identical behavior *was* the worktree bug. The MCP-only refusal carries an actionable message naming the offending path and the absolute-`root` escape hatch. The CLI is unchanged — its cwd *is* the user's shell cwd.
-
-Why hard-refuse instead of fall back to cwd? A silent fallback is indistinguishable from a correct read until `git status` comes up empty — exactly the failure #78 documented. Refusing is fail-fast and loud (Rule 4 in the robustness ladder of `~/mcproots.md`: "never resolve relatives against process cwd" is the Best tier).
-
-Why not the MCP `roots` capability (the spec-blessed channel)? Cross-client research across 8 harnesses found **no client fires `notifications/roots/list_changed` for a git-worktree `cd`** — it's a terminal action, not a workspace-folder event. Adoption is also patchy:
+Cross-client research across 8 harnesses found **no client fires `notifications/roots/list_changed` for a git-worktree `cd`** — it's a terminal action, not a workspace-folder event. Adoption is patchy:
 
 | Harness | roots | listChanged | Notes |
 |---|---|---|---|
@@ -31,29 +31,15 @@ Why not the MCP `roots` capability (the spec-blessed channel)? Cross-client rese
 | Cursor | declares, broken | no | `roots/list` → `-32601 Method not found` |
 | Zed / Codex / Cline / Continue / Windsurf | no | no | spawn-cwd at best, frozen at launch |
 
-So per-call `root` is the only channel that fixes the worktree case on any client — and it matches the dominant peer-server pattern: `mcp-server-git` takes `repo_path` per call; the official `filesystem` server and DesktopCommander mandate per-call absolute paths.
+Per-call `cwd` is the only channel that fixes the worktree case on any client — matching the dominant peer-server pattern (`mcp-server-git` takes `repo_path` per call; the official `filesystem` server and DesktopCommander mandate per-call absolute paths). Round 5 went further than #79: even the one-shot startup `roots/list` was removed as a trust signal not worth keeping.
 
-## Implementation state
+## Superseded designs (kept for archaeology)
 
-- `tilth_write` gained `root` in #73/#76 (`resolve_write_path`, `src/mcp/tools/write.rs`).
-- `tilth_read` / `tilth_search` / `tilth_list` / `tilth_deps` gained `root` in #78 / PR #79: a shared `resolve_read_path` helper + `resolve_scope(args, Option<&Path>)` (`src/mcp/tools/mod.rs`, `read.rs`, `search.rs`, `list.rs`, `deps.rs`).
-- `tilth-require-root` (v0.9.0) made the resolvers **fallible** behind one shared `anchor_path(raw, root, label)` predicate (`src/mcp/tools/mod.rs`): absolute → ok; relative + absolute root → join; relative + relative root → `Err`; relative + no root → `Err`. `resolve_read_path` / `resolve_scope` / `resolve_write_path` all route through it and propagate `?` into `tool_read` / `tool_search` / `tool_list` / `tool_deps` / `tool_write` / `tool_grok`. `tilth_grok` gained a `root` param for parity (its scope shares the hazard). The write **scope guard** (overwrite/append containment boundary) keeps its cwd default on purpose — it bounds *where a write may land*, separate from the path-resolution channel.
-- MCP `roots/list` is handled **one-shot at startup only** (chdir on first valid root, `src/mcp/mod.rs`); there is **no** `roots/listChanged` handler (notifications are dropped). **Rule-4 resolution:** the generic `~/mcproots.md` advice favors implementing `roots/listChanged`, but our cross-client research (table below) found no client fires it for a worktree `cd`. The more-tested, more-recent finding wins: `listChanged` stays unimplemented; per-call absolute `root` is the only channel that fixes the worktree case on any client.
-- No git / `GIT_DIR` / `rev-parse` worktree auto-detection anywhere.
-- `tilth_search`'s `context` param (a ranking-proximity hint) is intentionally **not** anchored under `root` — it's not a path to read.
-
-## Deliberately not done (lower value)
-
-- A stateful `set_default_root` tool (Serena `activate_project` / cyanheads `set_filesystem_default` precedent) — open design question; lower per-call friction but invisible session state that can drift.
-- A `roots/listChanged` handler — no client fires it for worktree switches (Rule-4 resolution above: our cross-client research beats the generic `~/mcproots.md` recommendation here).
-- Path-boundary sandboxing — tilth is a local single-user tool with no allow-list to enforce.
-
-## Caveat
-
-One sub-agent claimed MCP `roots` is deprecated in a "2026-07-28 spec RC"; this was **not** verifiable (the date is in the future) and is not load-bearing for the decision above. Re-check before relying on it.
+- #78/#79 era: optional `root`, required only for relative paths, with confinement on writes (`resolve_confined`). Both halves replaced by PR #113.
+- A stateful `set_default_root` tool — still rejected: invisible session state that can drift.
+- Path-boundary sandboxing — rejected; trust-absolute is the adjudicated posture (B-prime cross-repo-only refuse was offered and declined, round 5).
 
 ## Related
 
-- Issue: <https://github.com/paulnsorensen/tilth/issues/78>
-- PR: <https://github.com/paulnsorensen/tilth/pull/79>
-- Full cited research (local, gitignored): `.cheese/research/mcp-cwd-root-binding/`
+- Issue <https://github.com/paulnsorensen/tilth/issues/78> · PR <https://github.com/paulnsorensen/tilth/pull/79> · **PR <https://github.com/paulnsorensen/tilth/pull/113>** (current)
+- Spec: `cwd-param-posture` (durable corpus); decisions log in the spec is the adjudication record.

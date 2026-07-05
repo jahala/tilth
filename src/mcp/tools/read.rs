@@ -70,18 +70,16 @@ pub(in crate::mcp) fn tool_read(
         .and_then(|v| v.as_str())
         .and_then(crate::mcp::iso::parse_iso_utc);
 
-    // Extract optional root for anchoring relative paths (mirrors tilth_write.root).
-    let root_str = args.get("root").and_then(|v| v.as_str());
-    let root = root_str.map(std::path::Path::new);
+    // The absolute checkout directory anchors every relative path.
+    let cwd = super::require_cwd(args)?;
 
-    // Resolve suffix grammar on each path spec into (PathBuf, Suffix). A
-    // relative path without an absolute `root` is unresolvable (the server
-    // cannot see the caller's shell cwd) — propagate that refusal.
+    // Resolve suffix grammar on each path spec into (PathBuf, Suffix). Relative
+    // paths anchor under `cwd`; absolute paths pass through (trust-absolute).
     let parsed: Vec<(PathBuf, PathSuffix)> = raw_paths
         .iter()
         .map(|s| {
             let (p, suffix) = crate::mcp::path_suffix::parse_path_with_suffix(s);
-            Ok((super::resolve_read_path(&p, root)?, suffix))
+            Ok((super::resolve_anchored(&p, cwd)?, suffix))
         })
         .collect::<Result<_, String>>()?;
     let paths: Vec<PathBuf> = parsed.iter().map(|(p, _)| p.clone()).collect();
@@ -773,10 +771,9 @@ mod tests {
     }
 
     #[test]
-    fn root_param_anchors_relative_path_under_root() {
-        // Guards #78: tilth_read with a relative path + root must read from
-        // <root>/<path>, not from <cwd>/<path>. Prevents worktree agents from
-        // silently reading the wrong checkout.
+    fn read_relative_path_anchors_under_cwd() {
+        // A relative path + cwd reads from <cwd>/<path>, not <server-cwd>/<path>.
+        // Prevents worktree agents from silently reading the wrong checkout.
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         std::fs::write(root.join("hello.rs"), "fn hello() {}").unwrap();
@@ -785,68 +782,85 @@ mod tests {
         let args = serde_json::json!({
             "paths": ["hello.rs"],
             "mode": "full",
-            "root": root.to_str().unwrap()
+            "cwd": root.to_str().unwrap()
         });
         let result = tool_read(&args, &cache, &session, false).unwrap();
         assert!(
             result.contains("fn hello()"),
-            "expected file content via root-anchored path, got: {result}"
+            "expected file content via cwd-anchored path, got: {result}"
         );
     }
 
     #[test]
-    fn root_param_absolute_path_unaffected() {
-        // Absolute paths must be used as-is even when root is set.
+    fn read_absolute_path_ignores_cwd() {
+        // Absolute paths are used as-is even when cwd points elsewhere.
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        let abs_file = root.join("abs.rs");
+        let abs_file = tmp.path().join("abs.rs");
         std::fs::write(&abs_file, "fn abs() {}").unwrap();
 
-        let unrelated_root = tempfile::tempdir().unwrap();
+        let unrelated = tempfile::tempdir().unwrap();
         let (session, cache) = services();
         let args = serde_json::json!({
             "paths": [abs_file.to_str().unwrap()],
             "mode": "full",
-            "root": unrelated_root.path().to_str().unwrap()
+            "cwd": unrelated.path().to_str().unwrap()
         });
         let result = tool_read(&args, &cache, &session, false).unwrap();
         assert!(
             result.contains("fn abs()"),
-            "absolute path must resolve independently of root, got: {result}"
+            "absolute path must resolve independently of cwd, got: {result}"
         );
     }
 
     #[test]
-    fn no_root_reads_absolute_path_unchanged() {
-        // Omitting root must behave identically to before #78: absolute paths
-        // resolve as-is regardless of whether root is set or not.
-        let tmp = tempfile::tempdir().unwrap();
-        let abs_file = tmp.path().join("check.rs");
+    fn read_absolute_path_outside_cwd_succeeds() {
+        // Trust-absolute posture: an absolute path OUTSIDE cwd (e.g. a linked
+        // worktree) is honored, not refused. cwd is still required as the anchor.
+        let checkout = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let abs_file = elsewhere.path().join("check.rs");
         std::fs::write(&abs_file, "fn check() {}").unwrap();
 
         let (session, cache) = services();
         let args = serde_json::json!({
             "paths": [abs_file.to_str().unwrap()],
-            "mode": "full"
+            "mode": "full",
+            "cwd": checkout.path().to_str().unwrap()
         });
         let result = tool_read(&args, &cache, &session, false).unwrap();
         assert!(
             result.contains("fn check()"),
-            "no-root regression: absolute path must be readable without root, got: {result}"
+            "absolute path outside cwd must read (trust-absolute), got: {result}"
         );
     }
 
     #[test]
-    fn relative_path_no_root_errors() {
-        // WHY: a relative path + no root silently resolved against the frozen
-        // server cwd before this spec — the worktree bug. It must now refuse
-        // with a message naming the path and the absolute-root escape hatch.
+    fn read_missing_cwd_refused_with_teaching_error() {
+        // A read without cwd is refused before any path resolution — the server
+        // cannot see the caller's shell cwd, so it must be told the checkout dir.
         let (session, cache) = services();
         let args = serde_json::json!({ "paths": ["src/foo.rs"], "mode": "full" });
         let err = tool_read(&args, &cache, &session, false).unwrap_err();
         assert!(
-            err.contains("src/foo.rs") && err.contains("root"),
-            "relative path without root must refuse with an actionable message: {err}"
+            err.contains("cwd") && err.contains("absolute checkout directory"),
+            "missing cwd must refuse with the teaching error: {err}"
+        );
+    }
+
+    #[test]
+    fn read_relative_dotdot_path_refused() {
+        // A relative `..` path must not climb out of cwd.
+        let tmp = tempfile::tempdir().unwrap();
+        let (session, cache) = services();
+        let args = serde_json::json!({
+            "paths": ["../escape.rs"],
+            "mode": "full",
+            "cwd": tmp.path().to_str().unwrap()
+        });
+        let err = tool_read(&args, &cache, &session, false).unwrap_err();
+        assert!(
+            err.contains("escapes") && err.contains(".."),
+            "relative `..` path must be refused: {err}"
         );
     }
 
@@ -883,10 +897,11 @@ mod tests {
         );
 
         let (session, cache) = services();
+        let cwd = root.to_str().unwrap();
 
         // Edit-mode auto read → outline (the path under test).
         tool_read(
-            &serde_json::json!({"paths": [p.to_str().unwrap()]}),
+            &serde_json::json!({"paths": [p.to_str().unwrap()], "cwd": cwd}),
             &cache,
             &session,
             true,
@@ -896,7 +911,7 @@ mod tests {
         // Range read of the same content records only lines 1-3.
         let range = format!("{}#1-3", p.to_str().unwrap());
         tool_read(
-            &serde_json::json!({"paths": [range]}),
+            &serde_json::json!({"paths": [range], "cwd": cwd}),
             &cache,
             &session,
             true,
@@ -908,7 +923,7 @@ mod tests {
         let edits = serde_json::json!([{ "path": p.to_str().unwrap(), "tag": tag, "ops": [{ "op": "replace", "start": 50, "end": 50, "content": "# edited line 50" }] }]);
         let bloom = Arc::new(BloomFilterCache::new());
         let out = crate::mcp::tools::tool_write(
-            &serde_json::json!({"edits": edits, "root": root.to_str().unwrap()}),
+            &serde_json::json!({"edits": edits, "cwd": cwd}),
             &session,
             &bloom,
         )
@@ -938,10 +953,11 @@ mod tests {
         let content = "# Section A\nalpha\nmore a\n\n# Section B\nbeta\nmore b\n";
         std::fs::write(&p, content).unwrap();
         let (session, cache) = services();
+        let cwd = root.to_str().unwrap();
 
         // Heading read displays only Section A (lines 1-4).
         let out = tool_read(
-            &serde_json::json!({"paths": [format!("{}#{}", p.display(), "# Section A")]}),
+            &serde_json::json!({"paths": [format!("{}#{}", p.display(), "# Section A")], "cwd": cwd}),
             &cache,
             &session,
             true,
@@ -958,7 +974,7 @@ mod tests {
         // Edit on line 6 (inside Section B, never displayed) is rejected.
         let reject = serde_json::json!([{ "path": p.to_str().unwrap(), "tag": tag, "ops": [{ "op": "replace", "start": 6, "end": 6, "content": "BETA" }] }]);
         let out = crate::mcp::tools::tool_write(
-            &serde_json::json!({"edits": reject, "root": root.to_str().unwrap()}),
+            &serde_json::json!({"edits": reject, "cwd": cwd}),
             &session,
             &bloom,
         )
@@ -976,7 +992,7 @@ mod tests {
         // Edit on line 2 (inside the displayed Section A) applies.
         let ok = serde_json::json!([{ "path": p.to_str().unwrap(), "tag": tag, "ops": [{ "op": "replace", "start": 2, "end": 2, "content": "ALPHA" }] }]);
         let out = crate::mcp::tools::tool_write(
-            &serde_json::json!({"edits": ok, "root": root.to_str().unwrap()}),
+            &serde_json::json!({"edits": ok, "cwd": cwd}),
             &session,
             &bloom,
         )
@@ -1014,10 +1030,11 @@ mod tests {
         assert!(crate::read::would_outline(&big), "fixture must outline");
 
         let (session, cache) = services();
+        let cwd = root.to_str().unwrap();
 
         // Multi-path edit-mode auto read → big.md outlines.
         tool_read(
-            &serde_json::json!({"paths": [big.to_str().unwrap(), small.to_str().unwrap()]}),
+            &serde_json::json!({"paths": [big.to_str().unwrap(), small.to_str().unwrap()], "cwd": cwd}),
             &cache,
             &session,
             true,
@@ -1026,7 +1043,7 @@ mod tests {
 
         let range = format!("{}#1-3", big.to_str().unwrap());
         tool_read(
-            &serde_json::json!({"paths": [range]}),
+            &serde_json::json!({"paths": [range], "cwd": cwd}),
             &cache,
             &session,
             true,
@@ -1037,7 +1054,7 @@ mod tests {
         let edits = serde_json::json!([{ "path": big.to_str().unwrap(), "tag": tag, "ops": [{ "op": "replace", "start": 50, "end": 50, "content": "# edited line 50" }] }]);
         let bloom = Arc::new(BloomFilterCache::new());
         let out = crate::mcp::tools::tool_write(
-            &serde_json::json!({"edits": edits, "root": root.to_str().unwrap()}),
+            &serde_json::json!({"edits": edits, "cwd": cwd}),
             &session,
             &bloom,
         )
@@ -1075,7 +1092,7 @@ mod tests {
         );
         let cache = OutlineCache::new();
         let session = Session::new();
-        let args = serde_json::json!({ "paths": [path.to_str().unwrap()] });
+        let args = serde_json::json!({ "paths": [path.to_str().unwrap()], "cwd": dir.path().to_str().unwrap() });
 
         tool_read(&args, &cache, &session, false).expect("large file read");
 
@@ -1099,7 +1116,7 @@ mod tests {
         std::fs::write(&path, "fn small() {}\n").unwrap();
         let cache = OutlineCache::new();
         let session = Session::new();
-        let args = serde_json::json!({ "paths": [path.to_str().unwrap()] });
+        let args = serde_json::json!({ "paths": [path.to_str().unwrap()], "cwd": dir.path().to_str().unwrap() });
 
         tool_read(&args, &cache, &session, false).expect("small file read");
 
@@ -1126,7 +1143,7 @@ mod tests {
         std::fs::write(&path, &src).unwrap();
         let cache = OutlineCache::new();
         let session = Session::new();
-        let args = serde_json::json!({ "paths": [format!("{}#1-5", path.display())] });
+        let args = serde_json::json!({ "paths": [format!("{}#1-5", path.display())], "cwd": dir.path().to_str().unwrap() });
 
         tool_read(&args, &cache, &session, false).expect("section read");
 

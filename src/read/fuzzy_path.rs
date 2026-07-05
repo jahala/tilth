@@ -249,7 +249,9 @@ mod tests {
                 assert!(s.len() >= 2, "expected both mod.rs candidates: {s:?}");
                 assert!(s.iter().any(|p| p.contains('a')) && s.iter().any(|p| p.contains('b')));
             }
-            other => panic!("expected Suggestions for ambiguous basename, got {other:?}"),
+            other @ FuzzyResolution::None => {
+                panic!("expected Suggestions for ambiguous basename, got {other:?}")
+            }
         }
     }
 
@@ -262,9 +264,11 @@ mod tests {
         let res = resolve_fuzzy_path(dir.path(), "a/mod.rs", GateProfile::Search);
         match res {
             FuzzyResolution::Suggestions(s) => {
-                assert!(s.len() >= 2, "expected both a/mod.rs candidates: {s:?}")
+                assert!(s.len() >= 2, "expected both a/mod.rs candidates: {s:?}");
             }
-            other => panic!("expected Suggestions for ambiguous basename, got {other:?}"),
+            other @ FuzzyResolution::None => {
+                panic!("expected Suggestions for ambiguous basename, got {other:?}")
+            }
         }
     }
 
@@ -279,7 +283,9 @@ mod tests {
                 SUGGESTION_K,
                 "ambiguous candidates must be capped at k={SUGGESTION_K}, got {s:?}"
             ),
-            other => panic!("expected Suggestions for 5-way tie, got {other:?}"),
+            other @ FuzzyResolution::None => {
+                panic!("expected Suggestions for 5-way tie, got {other:?}")
+            }
         }
     }
 

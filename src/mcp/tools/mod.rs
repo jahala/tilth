@@ -22,89 +22,71 @@ use std::path::PathBuf;
 
 use serde_json::Value;
 
-/// Anchor a caller-supplied path/scope under the absolute-path discipline:
-/// the server's process cwd is frozen at spawn and cannot track the caller's
-/// live directory, so a relative path is only resolvable when an absolute
-/// `root` is supplied to anchor it.
+/// Extract the required `cwd` — the caller's absolute checkout directory. The
+/// server's process cwd is frozen at spawn and cannot track the caller's live
+/// shell, so every path-taking tool must be told where the checkout is. A
+/// missing or relative `cwd` is refused with a teaching error naming the fix.
+pub(super) fn require_cwd(args: &Value) -> Result<&std::path::Path, String> {
+    let cwd = args.get("cwd").and_then(|v| v.as_str()).ok_or_else(|| {
+        "missing required parameter \"cwd\": pass cwd: <absolute checkout directory> \
+         (the server cannot see your shell's cwd)."
+            .to_string()
+    })?;
+    let path = std::path::Path::new(cwd);
+    if !path.is_absolute() {
+        return Err(format!(
+            "\"cwd\" \"{cwd}\" is relative: pass cwd: <absolute checkout directory> \
+             (the server cannot see your shell's cwd)."
+        ));
+    }
+    Ok(path)
+}
+
+/// Anchor a caller-supplied path/scope under the trust-absolute posture:
 ///
-/// - **Absolute** path → used as-is (`root` ignored).
-/// - **Relative** path + **absolute** `root` → joined under `root`.
-/// - **Relative** path + **relative** `root` → `Err` (a relative root
-///   reintroduces the cwd hazard it was meant to remove).
-/// - **Relative** path + **no** `root` → `Err`.
-///
-/// `label` names the offending input in the error (e.g. `path` / `scope`).
-fn anchor_path(
+/// - **Absolute** path → used as-is (trusted as explicit intent, no confinement).
+/// - **Relative** path → joined under `cwd`; `..` traversal is refused so a
+///   relative spelling cannot climb out of the checkout.
+pub(super) fn resolve_anchored(
     raw: &std::path::Path,
-    root: Option<&std::path::Path>,
-    label: &str,
+    cwd: &std::path::Path,
 ) -> Result<PathBuf, String> {
     if raw.is_absolute() {
         return Ok(raw.to_path_buf());
     }
-    match root {
-        Some(r) if r.is_absolute() => Ok(r.join(raw)),
-        Some(r) => Err(format!(
-            "relative {label} \"{}\" cannot be resolved: \"root\" is itself relative (\"{}\"). \
-             Set \"root\" to an absolute checkout directory (the server cannot see your shell's cwd).",
+    if raw
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(format!(
+            "relative path \"{}\" escapes cwd via \"..\": pass a path under cwd or an absolute path.",
             raw.display(),
-            r.display(),
-        )),
-        None => Err(format!(
-            "relative {label} \"{}\" cannot be resolved: pass an absolute {label}, or set \"root\" \
-             to an absolute checkout directory (the server cannot see your shell's cwd).",
-            raw.display(),
-        )),
+        ));
     }
+    Ok(cwd.join(raw))
 }
 
-/// Resolve the `scope` arg under the absolute-path discipline (`anchor_path`).
-/// An omitted scope defaults to `"."`, which is relative — so a bare repo-wide
-/// search now requires an absolute `root` (or an absolute `scope`). When the
-/// anchored path does not resolve to an existing directory:
-///
-/// - If an absolute `root` is available, fall back to `root` with a soft warning
-///   (the caller's checkout exists; the scope subdir simply does not).
-/// - If no absolute `root` is available, return `Err` — there is no safe anchor
-///   to fall back to, and silently searching the server cwd is the worktree hazard.
+/// Resolve the `scope` arg under the trust-absolute posture (`resolve_anchored`).
+/// An omitted scope defaults to `"."` → `cwd`. When the anchored path does not
+/// resolve to an existing directory, fall back to `cwd` (the caller's checkout,
+/// always absolute) with a soft warning.
 pub(super) fn resolve_scope(
     args: &Value,
-    root: Option<&std::path::Path>,
+    cwd: &std::path::Path,
 ) -> Result<(PathBuf, Option<String>), String> {
     let raw_str = args.get("scope").and_then(|v| v.as_str()).unwrap_or(".");
     let raw: PathBuf = raw_str.into();
-    let anchored = anchor_path(&raw, root, "scope")?;
+    let anchored = resolve_anchored(&raw, cwd)?;
     let resolved = anchored.canonicalize().unwrap_or(anchored);
     if !resolved.is_dir() {
-        // A missing-dir fallback to "." (server cwd) is the exact worktree hazard
-        // this PR closes: the server cwd is frozen at spawn and may point at the
-        // wrong checkout. Use root when available (that IS the caller's checkout);
-        // error when there is no safe anchor.
-        return match root {
-            Some(r) if r.is_absolute() => Ok((
-                r.to_path_buf(),
-                Some(format!(
-                    "scope \"{raw_str}\" is not a valid directory, searching the root/checkout directory instead.\n\n"
-                )),
+        return Ok((
+            cwd.to_path_buf(),
+            Some(format!(
+                "scope \"{raw_str}\" is not a valid directory, searching the cwd/checkout directory instead.\n\n"
             )),
-            _ => Err(format!(
-                "scope \"{raw_str}\" is not a valid directory and no absolute root was provided to fall back to. \
-                 Pass an absolute scope or set \"root\" to an absolute checkout directory."
-            )),
-        };
+        ));
     }
     Ok((resolved, None))
-}
-
-/// Resolve a relative read path under the absolute-path discipline
-/// (`anchor_path`). Absolute paths are used as-is; a relative path requires an
-/// absolute `root`, otherwise it is unresolvable (the server cannot see the
-/// caller's shell cwd).
-pub(super) fn resolve_read_path(
-    path: &std::path::Path,
-    root: Option<&std::path::Path>,
-) -> Result<PathBuf, String> {
-    anchor_path(path, root, "path")
 }
 
 pub(super) fn apply_budget(output: &str, budget: Option<u64>) -> String {
@@ -119,72 +101,104 @@ mod tests {
     use super::*;
 
     #[test]
+    fn require_cwd_missing_refused_with_teaching_error() {
+        let args = serde_json::json!({});
+        let err = require_cwd(&args).unwrap_err();
+        assert!(
+            err.contains("cwd") && err.contains("absolute checkout directory"),
+            "missing cwd must teach the fix: {err}"
+        );
+    }
+
+    #[test]
+    fn require_cwd_relative_refused_with_teaching_error() {
+        let args = serde_json::json!({ "cwd": "relative/dir" });
+        let err = require_cwd(&args).unwrap_err();
+        assert!(
+            err.contains("relative") && err.contains("absolute checkout directory"),
+            "relative cwd must be refused with the teaching error: {err}"
+        );
+    }
+
+    #[test]
+    fn require_cwd_absolute_returns_path() {
+        let args = serde_json::json!({ "cwd": "/abs/checkout" });
+        assert_eq!(
+            require_cwd(&args).unwrap(),
+            std::path::Path::new("/abs/checkout")
+        );
+    }
+
+    #[test]
+    fn resolve_anchored_relative_joins_under_cwd() {
+        // A relative path anchors under cwd, never against the server's cwd.
+        let cwd = std::path::Path::new("/checkout");
+        let out = resolve_anchored(std::path::Path::new("src/foo.rs"), cwd).unwrap();
+        assert_eq!(out, std::path::Path::new("/checkout/src/foo.rs"));
+    }
+
+    #[test]
+    fn resolve_anchored_absolute_passes_through_untouched() {
+        // Trust-absolute: an absolute path OUTSIDE cwd is used as-is, no refusal.
+        let cwd = std::path::Path::new("/checkout");
+        let abs = std::path::Path::new("/elsewhere/worktree/file.rs");
+        assert_eq!(resolve_anchored(abs, cwd).unwrap(), abs);
+    }
+
+    #[test]
+    fn resolve_anchored_dotdot_traversal_refused() {
+        // A relative `..` spelling must not climb out of the checkout.
+        let cwd = std::path::Path::new("/checkout");
+        let err = resolve_anchored(std::path::Path::new("../escape.rs"), cwd).unwrap_err();
+        assert!(
+            err.contains("..") && err.contains("escapes"),
+            "relative `..` traversal must be refused: {err}"
+        );
+    }
+
+    #[test]
     fn resolve_scope_explicit_absolute_arg() {
         let tmp = tempfile::tempdir().unwrap();
         let args = serde_json::json!({ "scope": tmp.path().to_str().unwrap() });
-        let (scope, warning) = resolve_scope(&args, None).unwrap();
+        let (scope, warning) = resolve_scope(&args, std::path::Path::new("/unused/cwd")).unwrap();
         assert_eq!(scope, tmp.path().canonicalize().unwrap());
         assert!(warning.is_none());
     }
 
     #[test]
-    fn resolve_scope_no_arg_no_root_errors() {
-        // WHY: an omitted scope defaults to "." — relative. The server's cwd is
-        // frozen at spawn, so silently anchoring "." to it is the worktree bug.
-        // A bare repo-wide search must now demand an absolute `root`.
-        let args = serde_json::json!({});
-        let err = resolve_scope(&args, None).unwrap_err();
-        assert!(
-            err.contains("relative scope") && err.contains("root"),
-            "omitted scope + no root must error and name root: {err}"
-        );
-    }
-
-    #[test]
-    fn resolve_scope_relative_arg_no_root_errors() {
-        // A relative scope with no root is unresolvable (same hazard as omitted).
-        let args = serde_json::json!({ "scope": "src" });
-        let err = resolve_scope(&args, None).unwrap_err();
-        assert!(err.contains("relative scope"), "got: {err}");
-    }
-
-    #[test]
-    fn resolve_scope_relative_arg_relative_root_errors() {
-        // A relative root reintroduces the cwd hazard, so it must be refused.
-        let args = serde_json::json!({ "scope": "src" });
-        let err = resolve_scope(&args, Some(std::path::Path::new("relative/root"))).unwrap_err();
-        assert!(
-            err.contains("root") && err.contains("relative"),
-            "relative root must be refused: {err}"
-        );
-    }
-
-    #[test]
-    fn resolve_scope_missing_dir_with_root_warns_and_returns_root() {
-        // WHY: a missing anchored scope must fall back to the caller's root, NOT
-        // to "." (server cwd). "." is the server's frozen process-cwd — in a
-        // worktree setup this is the wrong checkout. root IS the caller's checkout
-        // and is safe to use as the fallback.
+    fn resolve_scope_omitted_defaults_to_cwd() {
+        // An omitted scope defaults to "." → cwd. cwd is always absolute
+        // (require_cwd guarantees it), so this is a safe repo-wide search.
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
+        let args = serde_json::json!({});
+        let (scope, warning) = resolve_scope(&args, tmp.path()).unwrap();
+        assert_eq!(scope, tmp.path().canonicalize().unwrap());
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn resolve_scope_anchors_relative_scope_under_cwd() {
+        // A relative scope resolves under cwd, not the server's cwd.
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let args = serde_json::json!({ "scope": "sub" });
+        let (scope, warning) = resolve_scope(&args, tmp.path()).unwrap();
+        assert_eq!(scope, sub.canonicalize().unwrap());
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn resolve_scope_missing_dir_falls_back_to_cwd() {
+        // A missing anchored scope falls back to cwd (the caller's checkout,
+        // always absolute), with a soft warning — never to the server cwd.
+        let tmp = tempfile::tempdir().unwrap();
         let args = serde_json::json!({ "scope": "/nonexistent/directory/zzz" });
-        let (scope, warning) = resolve_scope(&args, Some(root)).unwrap();
-        assert_eq!(scope, root, "fallback must be root, not server cwd");
+        let (scope, warning) = resolve_scope(&args, tmp.path()).unwrap();
+        assert_eq!(scope, tmp.path(), "fallback must be cwd");
         assert!(
             warning.is_some() && warning.unwrap().contains("not a valid directory"),
-            "a soft warning must be present naming the issue"
-        );
-    }
-
-    #[test]
-    fn resolve_scope_missing_dir_no_root_errors() {
-        // WHY: with no root there is no safe fallback — falling back to server cwd
-        // is the worktree wrong-checkout hazard this PR closes. Must be a hard error.
-        let args = serde_json::json!({ "scope": "/nonexistent/directory/zzz" });
-        let err = resolve_scope(&args, None).unwrap_err();
-        assert!(
-            err.contains("/nonexistent/directory/zzz") && err.contains("not a valid directory"),
-            "error must name the missing scope: {err}"
+            "a soft warning must name the issue"
         );
     }
 
@@ -207,67 +221,5 @@ mod tests {
             "truncation notice should be present: {}",
             &capped[capped.len().saturating_sub(120)..]
         );
-    }
-
-    #[test]
-    fn resolve_read_path_relative_anchors_under_absolute_root() {
-        // Guards the spec contract: a relative path + absolute root resolves under
-        // root, not under the server's cwd. Prevents worktree agents from silently
-        // reading the parent checkout.
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        let result = resolve_read_path(std::path::Path::new("src/foo.rs"), Some(root)).unwrap();
-        assert_eq!(result, root.join("src/foo.rs"));
-    }
-
-    #[test]
-    fn resolve_read_path_absolute_unaffected_by_root() {
-        // Absolute paths must be used as-is regardless of root.
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        let abs = std::path::Path::new("/tmp/other/file.rs");
-        let result = resolve_read_path(abs, Some(root)).unwrap();
-        assert_eq!(result, abs);
-    }
-
-    #[test]
-    fn resolve_read_path_relative_no_root_errors() {
-        // WHY (inverted from the old "no root → cwd-relative" guard): the old
-        // behavior WAS the worktree bug — a relative path silently resolved
-        // against the frozen server cwd. It must now refuse with an actionable
-        // message naming the path and the absolute-root escape hatch.
-        let err = resolve_read_path(std::path::Path::new("src/foo.rs"), None).unwrap_err();
-        assert!(
-            err.contains("src/foo.rs") && err.contains("root"),
-            "refusal must name the path and the root option: {err}"
-        );
-    }
-
-    #[test]
-    fn resolve_read_path_relative_relative_root_errors() {
-        // A relative root reintroduces the cwd hazard, so it must be refused too.
-        let err = resolve_read_path(
-            std::path::Path::new("src/foo.rs"),
-            Some(std::path::Path::new("relative/root")),
-        )
-        .unwrap_err();
-        assert!(
-            err.contains("root") && err.contains("relative"),
-            "relative root must be refused: {err}"
-        );
-    }
-
-    #[test]
-    fn resolve_scope_with_absolute_root_anchors_relative_scope() {
-        // resolve_scope(Some(abs_root)) must resolve a relative scope under root,
-        // not under cwd — same contract as resolve_read_path.
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        let sub = root.join("sub");
-        std::fs::create_dir(&sub).unwrap();
-        let args = serde_json::json!({ "scope": "sub" });
-        let (scope, warning) = resolve_scope(&args, Some(root)).unwrap();
-        assert_eq!(scope, sub.canonicalize().unwrap());
-        assert!(warning.is_none());
     }
 }

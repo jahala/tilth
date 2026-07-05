@@ -1,0 +1,6 @@
+{
+  "name": "tilth-cwd-inject",
+  "version": "0.1.0",
+  "description": "Injects the live Claude Code session cwd into every tilth MCP tool call so tilth anchors relative paths to the agent's real working directory.",
+  "hooks": "./hooks/hooks.json"
+}
