@@ -113,9 +113,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           # Each runner produces exactly one artifact (unix → tar.gz, windows → zip);
-          # upload whichever exists so the missing one doesn't fail the step.
+          # upload whichever exists. Use `if` (not `[ -f ] && …`) so the loop's
+          # final iteration on the absent extension exits 0 instead of failing
+          # the step.
           for f in tilth-${{ matrix.target }}.tar.gz tilth-${{ matrix.target }}.zip; do
-            [ -f "$f" ] && gh release upload "$NIGHTLY_TAG" "$f" --clobber
+            if [ -f "$f" ]; then
+              gh release upload "$NIGHTLY_TAG" "$f" --clobber
+            fi
           done
 
   publish-npm:
@@ -140,4 +144,7 @@ jobs:
         working-directory: ./npm-nightly
         run: |
           npm pkg set version="0.0.0-experimental.${{ github.run_number }}.${{ github.run_attempt }}"
-          npm publish --access public
+          # Prerelease versions need an explicit dist-tag. This package IS the
+          # nightly channel, so its newest build is `latest` — keeps
+          # `npx @paulnsorensen/tilth-nightly` resolving to the current main.
+          npm publish --tag latest --access public
