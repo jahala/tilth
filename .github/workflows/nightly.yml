@@ -1,0 +1,143 @@
+name: Nightly (main)
+
+# Fork-side rolling build: every push to main cross-compiles the binaries,
+# refreshes the `nightly` GitHub prerelease, and publishes the npm wrapper
+# under a fork-owned scope so `npx @paulnsorensen/tilth-nightly` runs the latest
+# main. The upstream tag-triggered release.yml is untouched.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# One nightly run at a time; a newer push cancels an in-flight build.
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  NIGHTLY_TAG: nightly
+
+jobs:
+  # Recreate the rolling prerelease first so the matrix jobs only upload assets
+  # (race-free: the release exists before any build finishes).
+  prepare-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # ratchet:actions/checkout@v7
+      - name: Refresh nightly prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete "$NIGHTLY_TAG" --yes --cleanup-tag || true
+          gh release create "$NIGHTLY_TAG" \
+            --target "$GITHUB_SHA" \
+            --title "nightly (main)" \
+            --notes "Rolling build of main @ ${GITHUB_SHA}. Prerelease — not a stable version." \
+            --prerelease
+
+  build:
+    needs: prepare-release
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            cross: false
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            cross: false
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            cross: false
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # ratchet:actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # ratchet:dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # ratchet:Swatinem/rust-cache@v2
+        with:
+          key: nightly-${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --locked
+
+      - name: Build
+        shell: bash
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --locked --target ${{ matrix.target }}
+          else
+            cargo build --release --locked --target ${{ matrix.target }}
+          fi
+
+      - name: Package (unix)
+        if: matrix.os != 'windows-latest'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../tilth-${{ matrix.target }}.tar.gz tilth
+          cd ../../..
+
+      - name: Package (windows)
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/release
+          7z a ../../../tilth-${{ matrix.target }}.zip tilth.exe
+          cd ../../..
+
+      - name: Upload asset to nightly release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Each runner produces exactly one artifact (unix → tar.gz, windows → zip);
+          # upload whichever exists so the missing one doesn't fail the step.
+          for f in tilth-${{ matrix.target }}.tar.gz tilth-${{ matrix.target }}.zip; do
+            [ -f "$f" ] && gh release upload "$NIGHTLY_TAG" "$f" --clobber
+          done
+
+  publish-npm:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # OIDC trusted publishing — no NPM_TOKEN secret needed
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # ratchet:actions/checkout@v7
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # ratchet:actions/setup-node@v6
+        with:
+          node-version: 22 # OIDC requires Node >= 22.14.0
+          registry-url: https://registry.npmjs.org
+      # Trusted publishing needs npm >= 11.5.1 — newer than Node 22's bundled npm.
+      - name: Upgrade npm for OIDC trusted publishing
+        run: npm install -g npm@latest
+      # Stamp a unique experimental prerelease version per run (run_number is
+      # monotonic). Decoupled from Cargo.toml — fork law keeps that at 0.8.4.
+      # OIDC injects auth automatically; provenance is attached on publish.
+      - name: Stamp version and publish
+        working-directory: ./npm-nightly
+        run: |
+          npm pkg set version="0.0.0-experimental.${{ github.run_number }}.${{ github.run_attempt }}"
+          npm publish --access public

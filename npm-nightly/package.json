@@ -1,0 +1,27 @@
+{
+  "name": "@paulnsorensen/tilth-nightly",
+  "version": "0.0.0-experimental.0",
+  "description": "EXPERIMENTAL rolling build of paulnsorensen/tilth off main — unofficial fork, NOT the official `tilth` package",
+  "bin": {
+    "tilth": "run.js"
+  },
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "files": [
+    "install.js",
+    "run.js"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/paulnsorensen/tilth.git"
+  },
+  "keywords": [
+    "mcp",
+    "code-search",
+    "tree-sitter",
+    "developer-tools",
+    "ai-agents"
+  ],
+  "license": "MIT"
+}
