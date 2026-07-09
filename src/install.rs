@@ -168,26 +168,61 @@ fn write_json_config(host_info: &HostInfo, edit: bool, hook_injected: &str) -> R
     Ok(())
 }
 
-/// Renders the `[mcp_servers.tilth]` TOML table for `write_toml_config`.
-fn toml_server_section(edit: bool, hook_injected: &str) -> String {
-    let (command, args) = tilth_command_and_args(edit);
+/// Builds the `[mcp_servers.tilth]` TOML table for the given command/args/env.
+/// Split from `upsert_toml_tilth_table` so a test can feed it arbitrary
+/// strings (e.g. containing `"`) without going through `tilth_command_and_args`.
+fn build_tilth_toml_table(command: &str, args: &[String], hook_injected: &str) -> toml_edit::Table {
+    let mut table = toml_edit::Table::new();
+    table["command"] = toml_edit::value(command);
 
-    // Escape backslashes for TOML basic strings (Windows paths like C:\Users\...).
-    let command_escaped = command.replace('\\', "\\\\");
-    let args_toml: Vec<String> = args
-        .iter()
-        .map(|a| format!("\"{}\"", a.replace('\\', "\\\\")))
-        .collect();
-    format!(
-        "[mcp_servers.tilth]\ncommand = \"{command_escaped}\"\nargs = [{}]\nenv = {{ TILTH_MCP_CWD_HOOK_INJECTED = \"{hook_injected}\" }}\n",
-        args_toml.join(", ")
-    )
+    let mut args_arr = toml_edit::Array::new();
+    for a in args {
+        args_arr.push(a.as_str());
+    }
+    table["args"] = toml_edit::value(args_arr);
+
+    let mut env = toml_edit::InlineTable::new();
+    env.insert("TILTH_MCP_CWD_HOOK_INJECTED", hook_injected.into());
+    table["env"] = toml_edit::value(env);
+
+    table
 }
 
-/// Writes a `[mcp_servers.tilth]` section into a TOML config file.
-fn write_toml_config(host_info: &HostInfo, edit: bool, hook_injected: &str) -> Result<(), String> {
-    let section = toml_server_section(edit, hook_injected);
+/// Inserts `table` as `[mcp_servers.tilth]` under `root`, creating an
+/// implicit `mcp_servers` parent table if absent so it renders as a bare
+/// `[mcp_servers.tilth]` header rather than an empty `[mcp_servers]` one.
+/// Plain `doc["mcp_servers"]["tilth"] = ...` auto-vivifies as a dotted inline
+/// table instead of a real header, which does not round-trip through the
+/// `toml` crate parser used elsewhere in this crate.
+fn insert_tilth_table(root: &mut toml_edit::Table, table: toml_edit::Table) -> Result<(), String> {
+    if !root.contains_key("mcp_servers") {
+        let mut parent = toml_edit::Table::new();
+        parent.set_implicit(true);
+        root.insert("mcp_servers", toml_edit::Item::Table(parent));
+    }
+    let mcp_servers = root["mcp_servers"]
+        .as_table_mut()
+        .ok_or("mcp_servers is not a TOML table")?;
+    mcp_servers.insert("tilth", toml_edit::Item::Table(table));
+    Ok(())
+}
 
+/// Inserts/replaces the `[mcp_servers.tilth]` table in a parsed TOML document,
+/// preserving every other table, key, and comment via `toml_edit`'s
+/// format-preserving edit model.
+fn upsert_toml_tilth_table(
+    doc: &mut toml_edit::DocumentMut,
+    edit: bool,
+    hook_injected: &str,
+) -> Result<(), String> {
+    let (command, args) = tilth_command_and_args(edit);
+    let table = build_tilth_toml_table(&command, &args, hook_injected);
+    insert_tilth_table(doc.as_table_mut(), table)
+}
+
+/// Writes a `[mcp_servers.tilth]` section into a TOML config file, preserving
+/// the rest of the document (formatting, comments, other tables) untouched.
+fn write_toml_config(host_info: &HostInfo, edit: bool, hook_injected: &str) -> Result<(), String> {
     let existing = if host_info.path.exists() {
         fs::read_to_string(&host_info.path)
             .map_err(|e| format!("failed to read {}: {e}", host_info.path.display()))?
@@ -195,104 +230,14 @@ fn write_toml_config(host_info: &HostInfo, edit: bool, hook_injected: &str) -> R
         String::new()
     };
 
-    let output = upsert_toml_section(&existing, "[mcp_servers.tilth]", &section);
+    let mut doc: toml_edit::DocumentMut = existing
+        .parse()
+        .map_err(|e| format!("invalid TOML in {}: {e}", host_info.path.display()))?;
 
-    atomic_write(&host_info.path, &output)?;
+    upsert_toml_tilth_table(&mut doc, edit, hook_injected)?;
+
+    atomic_write(&host_info.path, &doc.to_string())?;
     Ok(())
-}
-
-/// Finds a TOML table header anchored to a line start (or the file start),
-/// returning the byte offset of its opening `[`.
-///
-/// A bare substring search matches the header text inside a comment or string,
-/// then splices from that offset and corrupts a hand-edited config. Anchoring to
-/// `\n<header>` (or start-of-file) only matches a real table header.
-fn find_section_start(text: &str, header: &str) -> Option<usize> {
-    if text.starts_with(header) {
-        return Some(0);
-    }
-    let needle = format!("\n{header}");
-    text.find(&needle).map(|newline_at| newline_at + 1)
-}
-
-/// Replaces an existing `header` table with `section`, or appends `section`
-/// (blank-line separated) when the table is absent. The match is line-anchored
-/// via [`find_section_start`], and the section end is the next table header.
-fn upsert_toml_section(existing: &str, header: &str, section: &str) -> String {
-    let Some(start) = find_section_start(existing, header) else {
-        let sep = if existing.is_empty() || existing.ends_with('\n') {
-            ""
-        } else {
-            "\n"
-        };
-        return format!("{existing}{sep}\n{section}");
-    };
-
-    let rest = &existing[start..];
-    let end = start + toml_section_end(rest);
-    format!("{}{}{}", &existing[..start], section, &existing[end..])
-}
-
-/// Byte offset (within `rest`, which starts at the current table header) of the
-/// next top-level table header — a line-start `[` at array-bracket depth 0 and
-/// outside any string. A bare "line starts with `[`" test cannot distinguish a
-/// real header `[other]` from a multi-line array element like `["a", "b"],`, so
-/// we track bracket nesting (skipping bracket characters inside strings and
-/// comments). Returns `rest.len()` when no following header exists.
-fn toml_section_end(rest: &str) -> usize {
-    let bytes = rest.as_bytes();
-    let mut depth: u32 = 0;
-    let mut in_str: Option<u8> = None;
-    let mut escaped = false;
-    let mut at_line_start = true;
-    let mut past_header_line = false;
-    let mut i = 0;
-    while i < bytes.len() {
-        let c = bytes[i];
-        if let Some(quote) = in_str {
-            if escaped {
-                escaped = false;
-            } else if c == b'\\' && quote == b'"' {
-                escaped = true;
-            } else if c == quote {
-                in_str = None;
-            }
-            at_line_start = false;
-            i += 1;
-            continue;
-        }
-        match c {
-            b'\n' => {
-                at_line_start = true;
-                past_header_line = true;
-            }
-            b'#' => {
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
-                continue;
-            }
-            b'"' | b'\'' => {
-                in_str = Some(c);
-                at_line_start = false;
-            }
-            b'[' => {
-                if at_line_start && depth == 0 && past_header_line {
-                    return i;
-                }
-                depth += 1;
-                at_line_start = false;
-            }
-            b']' => {
-                depth = depth.saturating_sub(1);
-                at_line_start = false;
-            }
-            _ if c.is_ascii_whitespace() => {}
-            _ => at_line_start = false,
-        }
-        i += 1;
-    }
-    rest.len()
 }
 
 /// Returns (command, args) for the tilth MCP server entry.
@@ -700,105 +645,82 @@ fn claude_desktop_path() -> Result<PathBuf, String> {
 mod tests {
     use super::*;
 
-    const TILTH_HEADER: &str = "[mcp_servers.tilth]";
-
     #[test]
     fn toml_section_appended_when_absent() {
-        let out = upsert_toml_section(
-            "[other]\nk = 1\n",
-            TILTH_HEADER,
-            "[mcp_servers.tilth]\ncommand = \"x\"\n",
-        );
+        let mut doc: toml_edit::DocumentMut = "[other]\nk = 1\n".parse().unwrap();
+        upsert_toml_tilth_table(&mut doc, false, "0").unwrap();
+        let out = doc.to_string();
         assert!(out.contains("[other]"));
-        assert!(out.contains("[mcp_servers.tilth]\ncommand = \"x\""));
+        assert!(out.contains("[mcp_servers.tilth]"));
+        assert_eq!(doc["other"]["k"].as_integer(), Some(1));
     }
 
     #[test]
-    fn toml_header_in_comment_is_not_spliced() {
+    fn toml_preserves_comments_and_unrelated_section() {
         let existing = "# legacy note about [mcp_servers.tilth] kept for humans\n[other]\nk = 1\n";
-        let out = upsert_toml_section(
-            existing,
-            TILTH_HEADER,
-            "[mcp_servers.tilth]\ncommand = \"x\"\n",
-        );
+        let mut doc: toml_edit::DocumentMut = existing.parse().unwrap();
+        upsert_toml_tilth_table(&mut doc, false, "0").unwrap();
+        let out = doc.to_string();
         assert!(
             out.contains("# legacy note about [mcp_servers.tilth] kept for humans"),
-            "comment corrupted by a substring splice: {out:?}"
+            "comment lost during upsert: {out:?}"
         );
         assert!(out.contains("[other]"));
-        assert!(out.contains("command = \"x\""));
+        assert_eq!(
+            doc["other"]["k"].as_integer(),
+            Some(1),
+            "unrelated section survived"
+        );
+        assert!(doc["mcp_servers"]["tilth"]["command"].as_str().is_some());
     }
 
     #[test]
-    fn toml_section_replaced_at_line_start() {
+    fn toml_section_replaces_existing_tilth_table() {
         let existing = "[mcp_servers.tilth]\ncommand = \"old\"\nargs = []\n[other]\nk = 1\n";
-        let out = upsert_toml_section(
-            existing,
-            TILTH_HEADER,
-            "[mcp_servers.tilth]\ncommand = \"new\"\n",
-        );
-        assert!(out.contains("command = \"new\""));
-        assert!(!out.contains("\"old\""), "old section not removed: {out:?}");
+        let mut doc: toml_edit::DocumentMut = existing.parse().unwrap();
+        upsert_toml_tilth_table(&mut doc, true, "1").unwrap();
+        let out = doc.to_string();
+        assert!(!out.contains("\"old\""), "old command not removed: {out:?}");
         assert!(out.contains("[other]"));
-    }
-
-    #[test]
-    fn toml_section_replaced_at_start_of_file() {
-        let existing = "[mcp_servers.tilth]\ncommand = \"old\"\n";
-        let out = upsert_toml_section(
-            existing,
-            TILTH_HEADER,
-            "[mcp_servers.tilth]\ncommand = \"new\"\n",
-        );
-        assert!(out.contains("\"new\""));
-        assert!(!out.contains("\"old\""));
-    }
-
-    #[test]
-    fn toml_section_replacement_handles_multiline_arrays_before_next_table() {
-        let existing = "[mcp_servers.tilth]\ncommand = \"old\"\nargs = [\n  \"old-a\",\n  \"old-b\",\n]\n[other]\nk = 1\n";
-        let out = upsert_toml_section(
-            existing,
-            TILTH_HEADER,
-            "[mcp_servers.tilth]\ncommand = \"new\"\nargs = [\"new\"]\n",
-        );
-
+        assert_eq!(doc["other"]["k"].as_integer(), Some(1));
         assert_eq!(
-            out,
-            "[mcp_servers.tilth]\ncommand = \"new\"\nargs = [\"new\"]\n[other]\nk = 1\n"
+            doc["mcp_servers"]["tilth"]["env"]["TILTH_MCP_CWD_HOOK_INJECTED"].as_str(),
+            Some("1")
         );
     }
 
     #[test]
-    fn toml_section_end_not_truncated_by_value_starting_with_bracket() {
-        // A value line that starts with '[' (array-of-arrays element) must NOT
-        // be treated as a table header when finding the section end.
-        let existing = "[mcp_servers.tilth]\ncommand = \"old\"\nmatrix = [\n[\"a\", \"b\"],\n[\"c\"],\n]\n[other]\nk = 1\n";
-        let out = upsert_toml_section(
-            existing,
-            TILTH_HEADER,
-            "[mcp_servers.tilth]\ncommand = \"new\"\n",
-        );
-        assert_eq!(
-            out, "[mcp_servers.tilth]\ncommand = \"new\"\n[other]\nk = 1\n",
-            "section end was truncated by a value line starting with '[': {out:?}"
-        );
-    }
+    fn toml_quoted_command_and_arg_round_trip() {
+        // A `"` in the resolved command path or an arg must not corrupt the
+        // emitted TOML — toml_edit escapes it, and re-parsing must recover
+        // the exact original string.
+        let command = "C:\\Program Files\\has \"quotes\"\\tilth.exe";
+        let args = vec!["--mcp".to_string(), "say \"hi\"".to_string()];
+        let table = build_tilth_toml_table(command, &args, "0");
 
-    #[test]
-    fn toml_section_end_unmatched_bracket_does_not_truncate_following_table() {
-        // An unmatched ']' (e.g. a malformed or unconventional value) must NOT
-        // drive depth negative and cause the next table header to be missed.
-        // u32 + saturating_sub floors at 0 so the depth==0 check still fires.
-        let existing = "[mcp_servers.tilth]\ncommand = \"old\"\n]\n[other]\nk = 1\n";
-        let out = upsert_toml_section(
-            existing,
-            TILTH_HEADER,
-            "[mcp_servers.tilth]\ncommand = \"new\"\n",
-        );
+        let mut doc = toml_edit::DocumentMut::new();
+        insert_tilth_table(doc.as_table_mut(), table).unwrap();
+        let text = doc.to_string();
+
+        let reparsed: toml_edit::DocumentMut = text.parse().expect("emitted TOML must parse");
         assert_eq!(
-            out, "[mcp_servers.tilth]\ncommand = \"new\"\n[other]\nk = 1\n",
-            "unmatched ']' must not prevent the following [other] table from being preserved: {out:?}"
+            reparsed["mcp_servers"]["tilth"]["command"].as_str(),
+            Some(command)
+        );
+        let reparsed_args: Vec<&str> = reparsed["mcp_servers"]["tilth"]["args"]
+            .as_array()
+            .expect("args must be an array")
+            .iter()
+            .map(|v| v.as_str().expect("arg must be a string"))
+            .collect();
+        assert_eq!(reparsed_args, vec!["--mcp", "say \"hi\""]);
+
+        // Also verify via the standalone `toml` crate (used elsewhere in this
+        // crate) so the fix isn't just self-consistent with toml_edit.
+        let via_toml: toml::Value = toml::from_str(&text).expect("toml crate must also parse it");
+        assert_eq!(
+            via_toml["mcp_servers"]["tilth"]["command"].as_str(),
+            Some(command)
         );
     }
 
@@ -1299,8 +1221,12 @@ mod tests {
     #[test]
     fn toml_section_carries_hook_injected_env() {
         for hook_injected in ["0", "1"] {
-            let section = toml_server_section(false, hook_injected);
-            let parsed: toml::Table = section
+            let (command, args) = tilth_command_and_args(false);
+            let table = build_tilth_toml_table(&command, &args, hook_injected);
+            let mut doc = toml_edit::DocumentMut::new();
+            insert_tilth_table(doc.as_table_mut(), table).unwrap();
+            let parsed: toml::Table = doc
+                .to_string()
                 .parse()
                 .expect("generated [mcp_servers.tilth] section must be valid TOML");
             assert_eq!(
