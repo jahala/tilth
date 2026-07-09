@@ -522,7 +522,7 @@ diff --git a/query.sql b/query.sql
 --- a/query.sql
 +++ b/query.sql
 @@ -1,2 +1,1 @@
--- a comment
+--- a comment
 -select 1;
 +select 2;
 ";
@@ -533,7 +533,7 @@ diff --git a/query.sql b/query.sql
         let lines = &f.hunks[0].lines;
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0].kind, DiffLineKind::Removed);
-        assert_eq!(lines[0].content, "- a comment");
+        assert_eq!(lines[0].content, "-- a comment");
         assert_eq!(lines[1].kind, DiffLineKind::Removed);
         assert_eq!(lines[1].content, "select 1;");
         assert_eq!(lines[2].kind, DiffLineKind::Added);
