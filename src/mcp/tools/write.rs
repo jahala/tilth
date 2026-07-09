@@ -153,9 +153,8 @@ fn commit_section(section: &Section, path: &Path, ctx: &SectionCtx) -> Result<St
     session.record_read(path);
 
     // Record the fresh snapshot so a chained edit in a later call verifies.
-    let key = crate::edit::normalize_path_key(path);
     let line_count = u32::try_from(new_text.split('\n').count()).unwrap_or(u32::MAX);
-    let new_tag = session.record_snapshot(&key, &new_text, 1..=line_count);
+    let new_tag = session.record_snapshot(path, &new_text, 1..=line_count);
 
     let mut block = format!("## {}\napplied", path.display());
     match new_tag {
@@ -275,19 +274,26 @@ fn commit_file_op(
     ctx: &SectionCtx,
 ) -> Result<String, TilthError> {
     let session = ctx.session;
-    let key = crate::edit::normalize_path_key(path);
     match op {
         FileOp::Remove => {
             std::fs::remove_file(path).map_err(|e| TilthError::IoError {
                 path: path.to_path_buf(),
                 source: e,
             })?;
-            session.invalidate_snapshot(&key);
+            session.invalidate_snapshot(path);
             Ok(format!("## {}\nremoved", path.display()))
         }
         FileOp::Move(dest_raw) => {
             let dest = super::resolve_anchored(std::path::Path::new(dest_raw), ctx.cwd)
                 .map_err(TilthError::EditRejected)?;
+            if dest.exists()
+                && crate::edit::normalize_path_key(&dest) != crate::edit::normalize_path_key(path)
+            {
+                return Err(TilthError::EditRejected(format!(
+                    "move destination already exists: {} — delete it or choose another destination",
+                    dest.display()
+                )));
+            }
             // If the move also carried content edits, land them before renaming.
             if new_text != live {
                 crate::util::atomic_write_bytes(path, new_text.as_bytes()).map_err(|e| {
@@ -307,8 +313,7 @@ fn commit_file_op(
                 path: dest.clone(),
                 source: e,
             })?;
-            let dest_key = crate::edit::normalize_path_key(&dest);
-            session.relocate_snapshot(&key, &dest_key);
+            session.relocate_snapshot(path, &dest);
             Ok(format!("## {}\nmoved → {}", path.display(), dest.display()))
         }
     }
@@ -880,6 +885,35 @@ mod tests {
             std::fs::read_to_string(&dest).unwrap(),
             "a\nb\nc\nd\n",
             "rejected edit must not touch dest"
+        );
+    }
+
+    #[test]
+    fn mv_onto_existing_different_file_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let src = root.join("src.rs");
+        let dest = root.join("dest.rs");
+        std::fs::write(&src, "source content\n").unwrap();
+        std::fs::write(&dest, "dest content\n").unwrap();
+        let (session, bloom) = services();
+        let tag = read_for_tag(&session, &src);
+        let ops = json!([{ "op": "move_file", "dest": "dest.rs" }]);
+        let out = tool_write(
+            &json!({"edits": edits(&src, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("per-section error returns Ok");
+        assert!(
+            out.contains("already exists"),
+            "move onto an existing different file must be rejected, got:\n{out}"
+        );
+        assert!(src.exists(), "source must remain after a rejected move");
+        assert_eq!(
+            std::fs::read_to_string(&dest).unwrap(),
+            "dest content\n",
+            "destination content must be untouched by the rejected move"
         );
     }
 

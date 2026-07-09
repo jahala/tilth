@@ -22,7 +22,7 @@ fn parse_apply_pipeline_multi_op_on_unchanged_content() {
     let orig = "a\nb\nc\nd\n";
 
     let mut store = SnapshotStore::new();
-    let tag = store.record(&key, orig, [1, 2, 3, 4]).unwrap();
+    let tag = store.record(path, orig, [1, 2, 3, 4]).unwrap();
 
     let blob = format!(
         "[{key}#{}]\nSWAP 1:\n+A\nINS.POST 2:\n+X\nDEL 4\n",
@@ -60,7 +60,7 @@ fn parse_apply_recover_pipeline_after_external_drift() {
     let orig = "alpha\nbeta\nTARGET\ndelta\nepsilon\n";
 
     let mut store = SnapshotStore::new();
-    let tag = store.record(&key, orig, [1, 2, 3, 4, 5]).unwrap();
+    let tag = store.record(path, orig, [1, 2, 3, 4, 5]).unwrap();
 
     let blob = format!("[{key}#{}]\nSWAP 3:\n+RECOVERED\n", format_tag(tag));
     let section = parse_sections(&blob).expect("parse").pop().unwrap();

@@ -294,10 +294,10 @@ pub(in crate::mcp) fn tool_read(
         return respond_stripped(&path, cache, budget);
     }
 
-    // Cold-path fuzzy resolution: the server has chdir'd to the project root, so
-    // the current directory is the scope for the gitignore-aware tree walk.
+    // Cold-path fuzzy resolution: scope the gitignore-aware tree walk to the
+    // per-call `cwd`, not the server's own process directory.
     let mut output =
-        crate::read::read_file_resolving(&path, None, force_full, cache, edit_mode, Path::new("."))
+        crate::read::read_file_resolving(&path, None, force_full, cache, edit_mode, cwd)
             .map_err(|e| e.to_string())?;
     // An outlined view emits no `[path#TAG]` and no numbered lines, so it
     // displayed nothing to anchor an edit against — recording whole-file

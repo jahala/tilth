@@ -5,14 +5,16 @@
 //! Backed by a byte-weighted `clru` LRU: a 64 MiB total ceiling across all
 //! paths, at most 30 tracked paths (LRU eviction), a 4-version ring per path
 //! (oldest dropped), and a 4 MiB per-file cap — a file over the cap mints no
-//! tag (`record` returns `None`). Keys are canonical realpaths (caller's
-//! responsibility to canonicalize).
+//! tag (`record` returns `None`). Keys are canonical realpaths — `record`,
+//! `invalidate`, and `relocate` normalize internally via
+//! `crate::edit::normalize_path_key`.
 
 #![allow(dead_code)]
 
 use std::collections::hash_map::RandomState;
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
+use std::path::Path;
 
 use clru::{CLruCache, CLruCacheConfig, WeightScale};
 
@@ -93,19 +95,20 @@ impl SnapshotStore {
     /// when the file exceeds the per-file cap (no tag is minted).
     pub fn record(
         &mut self,
-        path: &str,
+        path: impl AsRef<Path>,
         full_text: &str,
         seen_lines: impl IntoIterator<Item = u32>,
     ) -> Option<u16> {
         if full_text.len() > self.per_file_cap {
             return None;
         }
+        let key = crate::edit::normalize_path_key(path.as_ref());
         let tag = compute_file_hash(full_text);
         self.seq += 1;
         let seq = self.seq;
         let seen: HashSet<u32> = seen_lines.into_iter().collect();
 
-        let mut history = self.versions.pop(path).unwrap_or_default();
+        let mut history = self.versions.pop(&key).unwrap_or_default();
         if let Some(pos) = history
             .iter()
             .position(|s| s.tag == tag && s.text == full_text)
@@ -120,7 +123,7 @@ impl SnapshotStore {
             history.insert(
                 0,
                 Snapshot {
-                    path: path.to_string(),
+                    path: key.clone(),
                     text: full_text.to_string(),
                     tag,
                     recorded_at: seq,
@@ -132,7 +135,7 @@ impl SnapshotStore {
         // Best-effort store; if the single history exceeds the byte ceiling
         // (cannot happen under the per-file/version caps) the tag is still
         // returned but the snapshot is not retained.
-        let _ = self.versions.put_with_weight(path.to_string(), history);
+        let _ = self.versions.put_with_weight(key, history);
         self.enforce_path_cap();
         Some(tag)
     }
@@ -187,13 +190,16 @@ impl SnapshotStore {
     }
 
     /// Drop the version history for a single path.
-    pub fn invalidate(&mut self, path: &str) {
-        self.versions.pop(path);
+    pub fn invalidate(&mut self, path: impl AsRef<Path>) {
+        self.versions
+            .pop(&crate::edit::normalize_path_key(path.as_ref()));
     }
 
     /// Move retained version history from `from` to `to`.
-    pub fn relocate(&mut self, from: &str, to: &str) {
-        let Some(source) = self.versions.pop(from) else {
+    pub fn relocate(&mut self, from: impl AsRef<Path>, to: impl AsRef<Path>) {
+        let from_key = crate::edit::normalize_path_key(from.as_ref());
+        let to_key = crate::edit::normalize_path_key(to.as_ref());
+        let Some(source) = self.versions.pop(&from_key) else {
             return;
         };
         if source.is_empty() {
@@ -202,11 +208,11 @@ impl SnapshotStore {
         let relocated: Vec<Snapshot> = source
             .into_iter()
             .map(|s| Snapshot {
-                path: to.to_string(),
+                path: to_key.clone(),
                 ..s
             })
             .collect();
-        let dest = self.versions.pop(to);
+        let dest = self.versions.pop(&to_key);
         let merged = match dest {
             None => relocated,
             Some(dest) => {
@@ -221,7 +227,7 @@ impl SnapshotStore {
                 out
             }
         };
-        let _ = self.versions.put_with_weight(to.to_string(), merged);
+        let _ = self.versions.put_with_weight(to_key, merged);
         self.enforce_path_cap();
     }
 
@@ -257,7 +263,9 @@ mod tests {
     #[test]
     fn record_and_retrieve_by_tag() {
         let mut store = SnapshotStore::new();
-        let tag = store.record("a.rs", "hello\nworld\n", [1, 2]).unwrap();
+        let tag = store
+            .record(Path::new("a.rs"), "hello\nworld\n", [1, 2])
+            .unwrap();
         let snap = store.by_tag("a.rs", tag).expect("retained");
         assert_eq!(snap.text, "hello\nworld\n");
         assert_eq!(snap.tag, tag);
@@ -279,8 +287,8 @@ mod tests {
         let colliding = colliding.expect("16-bit collision found within search budget");
 
         let mut store = SnapshotStore::new();
-        let t1 = store.record("a.rs", base, [1]).unwrap();
-        let t2 = store.record("a.rs", &colliding, [1]).unwrap();
+        let t1 = store.record(Path::new("a.rs"), base, [1]).unwrap();
+        let t2 = store.record(Path::new("a.rs"), &colliding, [1]).unwrap();
         assert_eq!(t1, t2, "both versions mint the same colliding tag");
 
         // The colliding-but-different version must be stored distinctly; by_tag
@@ -291,8 +299,8 @@ mod tests {
     #[test]
     fn head_is_latest_version() {
         let mut store = SnapshotStore::new();
-        store.record("a.rs", "v1\n", []).unwrap();
-        let t2 = store.record("a.rs", "v2\n", []).unwrap();
+        store.record(Path::new("a.rs"), "v1\n", []).unwrap();
+        let t2 = store.record(Path::new("a.rs"), "v2\n", []).unwrap();
         let head = store.head("a.rs").unwrap();
         assert_eq!(head.tag, t2);
         assert_eq!(head.text, "v2\n");
@@ -301,12 +309,12 @@ mod tests {
     #[test]
     fn four_version_ring_drops_oldest() {
         let mut store = SnapshotStore::new();
-        let t1 = store.record("a.rs", "1\n", []).unwrap();
-        store.record("a.rs", "2\n", []).unwrap();
-        store.record("a.rs", "3\n", []).unwrap();
-        store.record("a.rs", "4\n", []).unwrap();
+        let t1 = store.record(Path::new("a.rs"), "1\n", []).unwrap();
+        store.record(Path::new("a.rs"), "2\n", []).unwrap();
+        store.record(Path::new("a.rs"), "3\n", []).unwrap();
+        store.record(Path::new("a.rs"), "4\n", []).unwrap();
         // Fifth distinct version evicts the oldest (t1).
-        let t5 = store.record("a.rs", "5\n", []).unwrap();
+        let t5 = store.record(Path::new("a.rs"), "5\n", []).unwrap();
         assert!(store.by_tag("a.rs", t1).is_none(), "oldest version dropped");
         let head = store.head("a.rs").expect("head retained");
         assert_eq!(head.tag, t5, "head is the newest version");
@@ -316,10 +324,10 @@ mod tests {
     #[test]
     fn ring_retains_exactly_the_newest_four() {
         let mut store = SnapshotStore::new();
-        let t1 = store.record("a.rs", "1\n", []).unwrap();
-        let t2 = store.record("a.rs", "2\n", []).unwrap();
-        let t3 = store.record("a.rs", "3\n", []).unwrap();
-        let t4 = store.record("a.rs", "4\n", []).unwrap();
+        let t1 = store.record(Path::new("a.rs"), "1\n", []).unwrap();
+        let t2 = store.record(Path::new("a.rs"), "2\n", []).unwrap();
+        let t3 = store.record(Path::new("a.rs"), "3\n", []).unwrap();
+        let t4 = store.record(Path::new("a.rs"), "4\n", []).unwrap();
         // At exactly 4 versions, all are retained.
         for t in [t1, t2, t3, t4] {
             assert!(
@@ -328,7 +336,7 @@ mod tests {
             );
         }
         // The 5th evicts only the oldest; the newest four remain.
-        let t5 = store.record("a.rs", "5\n", []).unwrap();
+        let t5 = store.record(Path::new("a.rs"), "5\n", []).unwrap();
         assert!(store.by_tag("a.rs", t1).is_none(), "oldest evicted");
         for t in [t2, t3, t4, t5] {
             assert!(
@@ -344,13 +352,13 @@ mod tests {
         let mut store = SnapshotStore::with_limits(64 * 1024 * 1024, 30, 4, 10);
         let at_cap = "x".repeat(10);
         let tag = store
-            .record("at.rs", &at_cap, [])
+            .record(Path::new("at.rs"), &at_cap, [])
             .expect("len == cap records");
         assert_eq!(store.by_tag("at.rs", tag).unwrap().text, at_cap);
 
         let over_cap = "x".repeat(11);
         assert_eq!(
-            store.record("over.rs", &over_cap, []),
+            store.record(Path::new("over.rs"), &over_cap, []),
             None,
             "len == cap + 1 mints no tag"
         );
@@ -364,10 +372,10 @@ mod tests {
     fn per_file_cap_mints_no_tag() {
         let mut store = SnapshotStore::with_limits(64 * 1024 * 1024, 30, 4, 8);
         let big = "x".repeat(9); // > 8-byte cap
-        assert_eq!(store.record("big.rs", &big, []), None);
+        assert_eq!(store.record(Path::new("big.rs"), &big, []), None);
         assert!(store.by_tag("big.rs", compute_file_hash(&big)).is_none());
         // A file under the cap still records.
-        assert!(store.record("small.rs", "xy", []).is_some());
+        assert!(store.record(Path::new("small.rs"), "xy", []).is_some());
     }
 
     #[test]
@@ -375,7 +383,7 @@ mod tests {
         let mut store = SnapshotStore::new();
         for i in 0..30 {
             store
-                .record(&format!("f{i}.rs"), &format!("c{i}\n"), [])
+                .record(Path::new(&format!("f{i}.rs")), &format!("c{i}\n"), [])
                 .unwrap();
         }
         assert_eq!(store.len(), 30);
@@ -383,8 +391,8 @@ mod tests {
         let _ = store.head("f0.rs");
         // head() uses peek (non-mutating), so f0 is still coldest — but we can
         // bump recency with by_tag? by_tag also peeks. Record f0 again to bump.
-        store.record("f0.rs", "c0\n", []).unwrap();
-        store.record("f30.rs", "c30\n", []).unwrap();
+        store.record(Path::new("f0.rs"), "c0\n", []).unwrap();
+        store.record(Path::new("f30.rs"), "c30\n", []).unwrap();
         assert_eq!(store.len(), 30, "path count capped at 30");
         assert!(store.head("f0.rs").is_some(), "recently-used path retained");
         assert!(store.head("f1.rs").is_none(), "coldest path evicted");
@@ -396,7 +404,7 @@ mod tests {
         let mut store = SnapshotStore::with_limits(100, 30, 4, 4 * 1024 * 1024);
         for i in 0..10 {
             store
-                .record(&format!("f{i}.rs"), &"z".repeat(40), [])
+                .record(Path::new(&format!("f{i}.rs")), &"z".repeat(40), [])
                 .unwrap();
         }
         assert!(
@@ -418,8 +426,8 @@ mod tests {
     #[test]
     fn relocate_moves_history() {
         let mut store = SnapshotStore::new();
-        let tag = store.record("old.rs", "content\n", [3]).unwrap();
-        store.relocate("old.rs", "new.rs");
+        let tag = store.record(Path::new("old.rs"), "content\n", [3]).unwrap();
+        store.relocate(Path::new("old.rs"), Path::new("new.rs"));
         assert!(store.by_tag("old.rs", tag).is_none(), "source cleared");
         let moved = store.by_tag("new.rs", tag).expect("history at dest");
         assert_eq!(moved.path, "new.rs");
@@ -429,7 +437,9 @@ mod tests {
     #[test]
     fn record_seen_lines_merges() {
         let mut store = SnapshotStore::new();
-        let tag = store.record("a.rs", "l1\nl2\nl3\n", [1]).unwrap();
+        let tag = store
+            .record(Path::new("a.rs"), "l1\nl2\nl3\n", [1])
+            .unwrap();
         store.record_seen_lines("a.rs", tag, [2, 3]);
         let snap = store.by_tag("a.rs", tag).unwrap();
         assert_eq!(snap.seen_lines, HashSet::from([1, 2, 3]));
@@ -438,9 +448,9 @@ mod tests {
     #[test]
     fn find_by_tag_across_paths() {
         let mut store = SnapshotStore::new();
-        let tag = store.record("a.rs", "same\n", []).unwrap();
+        let tag = store.record(Path::new("a.rs"), "same\n", []).unwrap();
         // b.rs with identical content mints the same tag.
-        assert_eq!(store.record("b.rs", "same\n", []).unwrap(), tag);
+        assert_eq!(store.record(Path::new("b.rs"), "same\n", []).unwrap(), tag);
         let hits = store.find_by_tag(tag);
         assert_eq!(hits.len(), 2, "both paths carry the tag");
     }
@@ -448,22 +458,22 @@ mod tests {
     #[test]
     fn invalidate_drops_path() {
         let mut store = SnapshotStore::new();
-        let tag = store.record("a.rs", "x\n", []).unwrap();
-        store.invalidate("a.rs");
+        let tag = store.record(Path::new("a.rs"), "x\n", []).unwrap();
+        store.invalidate(Path::new("a.rs"));
         assert!(store.by_tag("a.rs", tag).is_none());
     }
 
     #[test]
     fn same_content_rerecord_merges_seen_and_keeps_ring() {
         let mut store = SnapshotStore::new();
-        let t1 = store.record("a.rs", "v1\n", []).unwrap();
-        store.record("a.rs", "v2\n", []).unwrap();
-        store.record("a.rs", "v3\n", []).unwrap();
-        let t4 = store.record("a.rs", "v4\n", [1]).unwrap();
+        let t1 = store.record(Path::new("a.rs"), "v1\n", []).unwrap();
+        store.record(Path::new("a.rs"), "v2\n", []).unwrap();
+        store.record(Path::new("a.rs"), "v3\n", []).unwrap();
+        let t4 = store.record(Path::new("a.rs"), "v4\n", [1]).unwrap();
 
         // Re-recording identical content refreshes the SAME version in place
         // rather than inserting a duplicate.
-        let again = store.record("a.rs", "v4\n", [2]).unwrap();
+        let again = store.record(Path::new("a.rs"), "v4\n", [2]).unwrap();
         assert_eq!(again, t4, "identical content mints the same tag");
 
         let snap = store.by_tag("a.rs", t4).unwrap();

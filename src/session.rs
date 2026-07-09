@@ -59,20 +59,20 @@ impl Session {
     /// hands out no other store surface.
     pub fn record_snapshot(
         &self,
-        key: &str,
+        path: &Path,
         text: &str,
         seen_lines: impl IntoIterator<Item = u32>,
     ) -> Option<u16> {
-        self.snapshots().record(key, text, seen_lines)
+        self.snapshots().record(path, text, seen_lines)
     }
 
-    /// Drop the snapshot history for `key` (a removed file).
-    pub fn invalidate_snapshot(&self, key: &str) {
-        self.snapshots().invalidate(key);
+    /// Drop the snapshot history for `path` (a removed file).
+    pub fn invalidate_snapshot(&self, path: &Path) {
+        self.snapshots().invalidate(path);
     }
 
     /// Move the snapshot history from `from` to `to` (a renamed file).
-    pub fn relocate_snapshot(&self, from: &str, to: &str) {
+    pub fn relocate_snapshot(&self, from: &Path, to: &Path) {
         self.snapshots().relocate(from, to);
     }
 

@@ -586,8 +586,7 @@ pub fn record_edit_snapshot(session: &crate::session::Session, path: &Path, spec
         }
         SeenSpec::Ranges(ranges) => ranges.iter().flat_map(|&(s, e)| s..=e.max(s)).collect(),
     };
-    let key = crate::edit::normalize_path_key(path);
-    session.record_snapshot(&key, &text, seen);
+    session.record_snapshot(path, &text, seen);
 }
 
 /// Resolve a markdown `#heading` anchor to its 1-based inclusive line span,

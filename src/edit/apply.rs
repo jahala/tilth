@@ -271,7 +271,13 @@ pub(super) fn apply_line_ops(text: &str, line_ops: &[LineOp]) -> Result<ApplyRes
                         *n as usize
                     }
                     Cursor::Head => 0,
-                    Cursor::Tail => total,
+                    Cursor::Tail => {
+                        if text.ends_with('\n') {
+                            total - 1
+                        } else {
+                            total
+                        }
+                    }
                 };
                 splices.push(Splice {
                     idx,
@@ -296,7 +302,16 @@ pub(super) fn apply_line_ops(text: &str, line_ops: &[LineOp]) -> Result<ApplyRes
             // insert so the insert lands relative to the post-splice rows rather
             // than mid-range (e.g. `INS.PRE 2` + `SWAP 2.=3`, order-independent).
             let rank = |s: &Splice| usize::from(s.range.is_none());
-            rank(&splices[a]).cmp(&rank(&splices[b]))
+            rank(&splices[a]).cmp(&rank(&splices[b])).then_with(|| {
+                // Among equal-idx zero-width inserts, apply the later
+                // original op first so sequential same-idx splices land in
+                // author order (each later splice pushes earlier ones back).
+                if splices[a].range.is_none() && splices[b].range.is_none() {
+                    b.cmp(&a)
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
         })
     });
 
@@ -701,5 +716,58 @@ mod tests {
         assert_eq!(swap_first.text, "a\nmid\nX\nd\n");
 
         assert_eq!(insert_first.text, swap_first.text);
+    }
+
+    #[test]
+    fn ins_tail_on_newline_terminated_file_appends_as_new_line() {
+        // "a\nb\n" splits into ["a","b",""] — Tail must resolve to the phantom
+        // empty row's index so append lands as new content, not after it.
+        let r = apply(
+            "a\nb\n",
+            &[Op::Ins {
+                cursor: Cursor::Tail,
+                payload: vec!["x".into()],
+            }],
+        )
+        .unwrap();
+        assert_eq!(r.text, "a\nb\nx\n");
+    }
+
+    #[test]
+    fn multiple_appends_land_in_author_order() {
+        let r = apply(
+            "a\n",
+            &[
+                Op::Ins {
+                    cursor: Cursor::Tail,
+                    payload: vec!["x".into()],
+                },
+                Op::Ins {
+                    cursor: Cursor::Tail,
+                    payload: vec!["y".into()],
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(r.text, "a\nx\ny\n");
+    }
+
+    #[test]
+    fn multiple_insert_befores_at_same_line_land_in_author_order() {
+        let r = apply(
+            "a\nb\n",
+            &[
+                Op::Ins {
+                    cursor: Cursor::Pre(2),
+                    payload: vec!["x".into()],
+                },
+                Op::Ins {
+                    cursor: Cursor::Pre(2),
+                    payload: vec!["y".into()],
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(r.text, "a\nx\ny\nb\n");
     }
 }
