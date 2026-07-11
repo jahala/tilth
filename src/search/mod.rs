@@ -1633,7 +1633,7 @@ mod tests {
     #[test]
     fn walker_brace_expansion_matches_multiple_extensions() {
         let scope = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let filtered = walk_paths(&scope, Some("*.{rs,toml}"));
+        let filtered = walk_paths(scope, Some("*.{rs,toml}"));
         let exts = extensions(&filtered);
         assert!(
             exts.contains("rs"),
@@ -1656,8 +1656,8 @@ mod tests {
         // Use project root (not src/) — project root has .toml, .md, .lock etc.
         // alongside .rs files, so *.rs is guaranteed to be a strict subset.
         let scope = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let all = walk_paths(&scope, None);
-        let rs_only = walk_paths(&scope, Some("*.rs"));
+        let all = walk_paths(scope, None);
+        let rs_only = walk_paths(scope, Some("*.rs"));
         assert!(
             rs_only.len() < all.len(),
             "whitelist ({}) should find fewer files than unfiltered ({})",
@@ -1669,7 +1669,7 @@ mod tests {
     #[test]
     fn walker_path_pattern_restricts_directory() {
         let scope = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let filtered = walk_paths(&scope, Some("src/**/*.rs"));
+        let filtered = walk_paths(scope, Some("src/**/*.rs"));
         assert!(!filtered.is_empty(), "path pattern should find files");
         let src_dir = scope.join("src");
         for p in &filtered {
@@ -1947,7 +1947,7 @@ mod tests {
         assert_eq!(label, "§Outer");
     }
 
-    /// CommonMark §4.6.1 caps ATX headings at 6 leading `#`s. 7+ hashes is
+    /// `CommonMark` §4.6.1 caps ATX headings at 6 leading `#`s. 7+ hashes is
     /// raw text, not a heading, and must not surface as the enclosing scope.
     /// Pre-AST migration the regex matched `#######` and produced a bogus
     /// `§# Fake Heading 7` label.
@@ -1972,7 +1972,7 @@ mod tests {
         );
     }
 
-    /// CommonMark §4.6.1 requires whitespace after the leading `#`s. `##NoSpace`
+    /// `CommonMark` §4.6.1 requires whitespace after the leading `#`s. `##NoSpace`
     /// is paragraph text, not a heading. Pre-AST migration the regex accepted
     /// it and produced `§NoSpace`.
     #[test]
@@ -2225,7 +2225,7 @@ mod tests {
         // Heading on line 1, then 60 body lines.
         let mut content = String::from("## Big Section\n");
         for i in 0..60 {
-            let _ = write!(content, "body line {i}\n");
+            let _ = writeln!(content, "body line {i}");
         }
         std::fs::write(&p, &content).unwrap();
 
@@ -2297,7 +2297,7 @@ mod tests {
         let p = tmp.path().join("long.md");
         let mut content = String::from("## Big Section\n");
         for i in 0..60 {
-            let _ = write!(content, "body line {i}\n");
+            let _ = writeln!(content, "body line {i}");
         }
         std::fs::write(&p, &content).unwrap();
 
@@ -2349,7 +2349,7 @@ mod tests {
         );
     }
 
-    /// Worst-case bound: with MAX_MATCHES = 10 markdown-heading defs each
+    /// Worst-case bound: with `MAX_MATCHES` = 10 markdown-heading defs each
     /// hitting the 40-line preview cap, total inlined preview content is at
     /// most 10 × 40 = 400 lines. This pins the bound by exercising the cap
     /// and asserting the truncation shape, so a future bump of either
@@ -2493,7 +2493,7 @@ mod tests {
         // Build a function body >= 80 lines so select_diverse_lines fires.
         let mut src = String::from("pub fn big_fn() {\n");
         for i in 0..85 {
-            src.push_str(&format!("    let v{i} = {i};\n"));
+            let _ = writeln!(src, "    let v{i} = {i};");
         }
         src.push_str("}\n");
         std::fs::write(&p, &src).unwrap();
@@ -2544,7 +2544,7 @@ mod tests {
     }
 
     /// A search on a small definition (body < 80 lines) goes through
-    /// expand_match but never hits the truncation branch, so savings
+    /// `expand_match` but never hits the truncation branch, so savings
     /// remain zero.
     #[test]
     fn search_no_truncation_records_no_savings() {
@@ -2596,7 +2596,7 @@ mod tests {
 
     /// Regression for the hardcoded-`DEFAULT_BUDGET` bug: `fit_to_budget` must
     /// receive the caller's real `budget` instead of always being called with
-    /// `crate::budget::DEFAULT_BUDGET` (24_000). Fixture: one real definition
+    /// `crate::budget::DEFAULT_BUDGET` (`24_000`). Fixture: one real definition
     /// (`budget_probe_target`, high `def_weight`) plus a usage in a file named
     /// after the query, so `rank::sort`'s `basename_boost` (+500) renders the
     /// usage FIRST despite it being lower-value — this decouples render order
@@ -2622,7 +2622,7 @@ mod tests {
         // the lower-value one, regardless of render order).
         let mut usage_body = String::from("fn calls_it() {\n    budget_probe_target();\n");
         for i in 0..60 {
-            usage_body.push_str(&format!("    let filler_{i} = {i};\n"));
+            let _ = writeln!(usage_body, "    let filler_{i} = {i};");
         }
         usage_body.push_str("}\n");
         std::fs::write(tmp.path().join("budget_probe_target.rs"), &usage_body).unwrap();
