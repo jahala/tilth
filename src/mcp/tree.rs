@@ -29,9 +29,14 @@ impl DirNode {
     }
 }
 
+/// Compact human token count, matching `map.rs::fmt_tokens`'s k/M scale and rounding.
 fn fmt_tokens(t: u64) -> String {
-    if t >= 1000 {
-        format!("~{}.{}k tokens", t / 1000, (t % 1000) / 100)
+    #[allow(clippy::cast_precision_loss)] // display-only; mantissa loss is fine for summaries
+    let f = t as f64;
+    if f >= 999_950.0 {
+        format!("~{:.1}M tokens", f / 1_000_000.0)
+    } else if t >= 1000 {
+        format!("~{:.1}k tokens", f / 1_000.0)
     } else {
         format!("~{t} tokens")
     }
@@ -115,5 +120,20 @@ mod tests {
         assert!(out.contains("src/"));
         assert!(out.contains("a.rs"));
         assert!(out.contains("README.md"));
+    }
+
+    #[test]
+    fn render_tree_dir_rollup_equals_sum_of_child_tokens() {
+        let scope = PathBuf::from("/tmp/proj2");
+        let files = vec![
+            (scope.join("src/a.rs"), 4000),
+            (scope.join("src/b.rs"), 8000),
+        ];
+        let out = render_tree(&scope, &files);
+        let expected = fmt_tokens(estimate_tokens(4000) + estimate_tokens(8000));
+        assert!(
+            out.contains(&format!("src/      {expected}")),
+            "dir rollup should equal sum of child tokens: {out}"
+        );
     }
 }

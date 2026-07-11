@@ -146,7 +146,7 @@ v0.5.0 improves Haiku accuracy by 19pp and reduces cost per correct answer by 38
 
 ### Tool adoption by model (tilth mode)
 
-| Model | tilth_search/run | tilth_read/run | tilth_files/run | Host tools/run | Adoption rate |
+| Model | tilth_search/run | tilth_read/run | tilth_list/run | Host tools/run | Adoption rate |
 |---|---|---|---|---|---|
 | Haiku 4.5 | ~1.5 | ~4.0 | ~0.5 | ~1.0 | ~85% |
 | Sonnet 4.6 | ~2.5 | ~3.0 | ~0.5 | ~0.2 | ~95% |

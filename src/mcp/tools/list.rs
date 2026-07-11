@@ -3,6 +3,7 @@
 //! Resolves each glob against a walk of `scope`, collects `(path, byte_len)`
 //! pairs, and renders them as a single tree rooted at scope.
 
+use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use serde_json::Value;
@@ -40,10 +41,11 @@ pub(in crate::mcp) fn tool_list(args: &Value) -> Result<String, String> {
         })
         .collect::<Result<_, _>>()?;
 
-    let depth = args
-        .get("depth")
-        .and_then(serde_json::Value::as_u64)
-        .map(|d| d as usize);
+    let depth = args.get("depth").and_then(|v| {
+        v.as_u64()
+            .map(|d| d as usize)
+            .or_else(|| v.as_f64().map(|f| f as usize))
+    });
 
     let matchers: Vec<_> = patterns
         .iter()
@@ -53,10 +55,17 @@ pub(in crate::mcp) fn tool_list(args: &Value) -> Result<String, String> {
         return Err("no valid globs provided".into());
     }
 
-    // Walk the scope directory (shared junk-dir policy) and collect every file
-    // matching any pattern, then render as one token-rolled-up tree.
+    // Walk the scope directory (shared junk-dir policy), bounding the walk itself
+    // by `depth` (ignore's max_depth: root=0, direct children=1 — matches
+    // rel.components().count() for a top-level file, so depth:1 keeps it),
+    // and collect every file matching any pattern into one token-rolled-up tree.
+    let mut builder = crate::search::base_walk_builder(&scope);
+    if let Some(d) = depth {
+        builder.max_depth(Some(d));
+    }
+    let walker = builder.build();
     let mut entries: Vec<(PathBuf, u64)> = Vec::new();
-    let walker = crate::search::base_walk_builder(&scope).build();
+    let mut extensions: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for entry in walker.filter_map(Result::ok) {
         let Some(ft) = entry.file_type() else {
             continue;
@@ -66,10 +75,8 @@ pub(in crate::mcp) fn tool_list(args: &Value) -> Result<String, String> {
         }
         let path = entry.path();
         let rel = path.strip_prefix(&scope).unwrap_or(path);
-        if let Some(d) = depth {
-            if rel.components().count() > d {
-                continue;
-            }
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            extensions.insert(ext.to_string());
         }
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         let matched = matchers.iter().any(|m| m.is_match(name) || m.is_match(rel));
@@ -82,6 +89,18 @@ pub(in crate::mcp) fn tool_list(args: &Value) -> Result<String, String> {
     let tree = crate::mcp::tree::render_tree(&scope, &entries);
     let mut result = scope_warning.unwrap_or_default();
     result.push_str(&apply_budget(&tree, budget));
+    if entries.is_empty() {
+        if extensions.is_empty() {
+            result.push_str("\nno matches\n");
+        } else {
+            let exts: Vec<String> = extensions.into_iter().take(10).collect();
+            let _ = write!(
+                result,
+                "\nno matches; found extensions: {}\n",
+                exts.join(", ")
+            );
+        }
+    }
     Ok(result)
 }
 
@@ -186,6 +205,35 @@ mod tests {
         assert!(
             err.contains("relative scope") && err.contains("root"),
             "explicit relative scope without root must refuse: {err}"
+        );
+    }
+
+    #[test]
+    fn tool_list_budget_truncates_output() {
+        let project = scratch_project();
+        let args = serde_json::json!({
+            "patterns": ["*.rs"],
+            "scope": project.path().to_str().unwrap(),
+            "budget": 1,
+        });
+        let out = tool_list(&args).expect("tool_list should succeed");
+        assert!(
+            out.contains("truncated ("),
+            "expected truncation note: {out}"
+        );
+    }
+
+    #[test]
+    fn tool_list_no_match_hints_available_extensions() {
+        let project = scratch_project();
+        let args = serde_json::json!({
+            "patterns": ["*.md"],
+            "scope": project.path().to_str().unwrap(),
+        });
+        let out = tool_list(&args).expect("tool_list should succeed");
+        assert!(
+            out.contains("no matches; found extensions:") && out.contains("rs"),
+            "expected no-match extension hint: {out}"
         );
     }
 }
