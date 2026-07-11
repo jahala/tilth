@@ -50,27 +50,7 @@ impl Lang {
     /// Lexers that scan `'` must disambiguate a lifetime from a single-quoted
     /// literal; only Rust needs the lifetime branch.
     pub(crate) fn has_lifetimes(self) -> bool {
-        match self {
-            Lang::Rust => true,
-            Lang::TypeScript
-            | Lang::Tsx
-            | Lang::JavaScript
-            | Lang::Python
-            | Lang::Go
-            | Lang::Java
-            | Lang::Scala
-            | Lang::C
-            | Lang::Cpp
-            | Lang::Ruby
-            | Lang::Php
-            | Lang::Swift
-            | Lang::Kotlin
-            | Lang::CSharp
-            | Lang::Elixir
-            | Lang::Bash
-            | Lang::Dockerfile
-            | Lang::Make => false,
-        }
+        crate::lang::spec::spec(self).has_lifetimes
     }
 }
 

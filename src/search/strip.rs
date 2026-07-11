@@ -6,28 +6,27 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-/// Language classification for stripping rules.
-#[derive(Debug, Clone, Copy)]
-enum StripLang {
-    Rust,
-    Python,
-    Go,
-    JsTs,
-    JavaKotlinCSharp,
-    CppC,
-    Bash,
-}
+use crate::lang::detect_file_type;
+use crate::lang::spec::{spec, StripFamily};
+use crate::types::FileType;
 
-/// Detect stripping language from file extension.
-fn detect_lang(path: &Path) -> Option<StripLang> {
+/// Detect the stripping comment-syntax family for a file.
+///
+/// Routes through `detect_file_type` → `spec(lang).strip_family` for every
+/// extension the detector recognises. The `.mjs` / `.cjs` extensions are
+/// JavaScript that `detect_file_type` does not classify (it treats them as
+/// non-code), so they are mapped to the JS/TS family here to preserve the
+/// historical strip behavior for those files.
+fn detect_lang(path: &Path) -> Option<StripFamily> {
+    if path.extension().is_some() {
+        if let FileType::Code(lang) = detect_file_type(path) {
+            if let Some(family) = spec(lang).strip_family {
+                return Some(family);
+            }
+        }
+    }
     match path.extension()?.to_str()? {
-        "rs" => Some(StripLang::Rust),
-        "py" | "pyi" => Some(StripLang::Python),
-        "go" => Some(StripLang::Go),
-        "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" => Some(StripLang::JsTs),
-        "java" | "kt" | "kts" | "cs" | "scala" | "sc" => Some(StripLang::JavaKotlinCSharp),
-        "c" | "h" | "cpp" | "hpp" | "cc" | "cxx" => Some(StripLang::CppC),
-        "sh" | "bash" | "bats" => Some(StripLang::Bash),
+        "mjs" | "cjs" => Some(StripFamily::JsTs),
         _ => None,
     }
 }
@@ -93,9 +92,9 @@ pub(crate) fn strip_noise(
 /// Returns `true` if the line is a debug/trace logging statement that should
 /// be stripped. Only matches lines that are *only* a log call (not part of a
 /// larger expression).
-fn is_debug_log(trimmed: &str, lang: StripLang) -> bool {
+fn is_debug_log(trimmed: &str, lang: StripFamily) -> bool {
     match lang {
-        StripLang::Rust => {
+        StripFamily::Rust => {
             trimmed.starts_with("log::debug!")
                 || trimmed.starts_with("log::trace!")
                 || trimmed.starts_with("tracing::debug!")
@@ -104,14 +103,14 @@ fn is_debug_log(trimmed: &str, lang: StripLang) -> bool {
                 || trimmed.starts_with("trace!(")
                 || trimmed.starts_with("dbg!(")
         }
-        StripLang::Python => {
+        StripFamily::Python => {
             trimmed.starts_with("logger.debug(")
                 || trimmed.starts_with("logging.debug(")
                 || trimmed.starts_with("print(")
                 || trimmed.starts_with("pprint(")
                 || trimmed.starts_with("pprint.pprint(")
         }
-        StripLang::Go => {
+        StripFamily::Go => {
             trimmed.starts_with("log.Printf(")
                 || trimmed.starts_with("log.Println(")
                 || trimmed.starts_with("log.Print(")
@@ -119,12 +118,12 @@ fn is_debug_log(trimmed: &str, lang: StripLang) -> bool {
                 || trimmed.starts_with("fmt.Println(")
                 || trimmed.starts_with("fmt.Print(")
         }
-        StripLang::JsTs => {
+        StripFamily::JsTs => {
             trimmed.starts_with("console.log(")
                 || trimmed.starts_with("console.debug(")
                 || trimmed.starts_with("console.trace(")
         }
-        StripLang::JavaKotlinCSharp => {
+        StripFamily::JavaKotlinCSharp => {
             // Java: System.out.println, logger.debug, log.debug
             trimmed.starts_with("System.out.print")
                 || trimmed.starts_with("logger.debug(")
@@ -132,14 +131,14 @@ fn is_debug_log(trimmed: &str, lang: StripLang) -> bool {
                 || trimmed.starts_with("Log.d(")
                 || trimmed.starts_with("println(") // Kotlin, Scala
         }
-        StripLang::CppC => {
+        StripFamily::CppC => {
             trimmed.starts_with("printf(")
                 || trimmed.starts_with("std::cout")
                 || trimmed.starts_with("cout ")
                 || trimmed.starts_with("cout<<")
         }
         // Only strip echo lines explicitly labelled DEBUG — plain echo is functional output.
-        StripLang::Bash => {
+        StripFamily::Bash => {
             trimmed.starts_with("echo \"DEBUG") || trimmed.starts_with("echo 'DEBUG")
         }
     }
@@ -155,9 +154,9 @@ const KEEP_MARKERS: &[&str] = &["TODO", "FIXME", "NOTE", "HACK", "SAFETY", "WARN
 /// in any language — matching is per-line on the trimmed prefix, so a block
 /// comment's interior lines have no comment prefix and survive. Stripping them
 /// needs multi-line state tracking across lines, which this pass does not do.
-fn is_strippable_comment(trimmed: &str, lang: StripLang) -> bool {
+fn is_strippable_comment(trimmed: &str, lang: StripFamily) -> bool {
     let is_comment = match lang {
-        StripLang::Rust => {
+        StripFamily::Rust => {
             // Doc comments: `///`, `//!`, `/** */`, `#[doc`
             if trimmed.starts_with("///")
                 || trimmed.starts_with("//!")
@@ -168,29 +167,29 @@ fn is_strippable_comment(trimmed: &str, lang: StripLang) -> bool {
             }
             trimmed.starts_with("//")
         }
-        StripLang::Python => {
+        StripFamily::Python => {
             // Doc strings: `"""`, `'''`
             if trimmed.starts_with("\"\"\"") || trimmed.starts_with("'''") {
                 return false;
             }
             trimmed.starts_with('#')
         }
-        StripLang::Go => trimmed.starts_with("//"),
-        StripLang::JsTs => {
+        StripFamily::Go => trimmed.starts_with("//"),
+        StripFamily::JsTs => {
             // Doc comments: `/**`, `* ` (JSDoc continuation)
             if trimmed.starts_with("/**") || trimmed.starts_with("* ") || trimmed == "*/" {
                 return false;
             }
             trimmed.starts_with("//")
         }
-        StripLang::JavaKotlinCSharp => {
+        StripFamily::JavaKotlinCSharp => {
             // Doc comments: `/**`, `///` (C#)
             if trimmed.starts_with("/**") || trimmed.starts_with("///") {
                 return false;
             }
             trimmed.starts_with("//")
         }
-        StripLang::CppC => {
+        StripFamily::CppC => {
             // Doxygen: `/**`, `///`, `//!`
             if trimmed.starts_with("/**")
                 || trimmed.starts_with("///")
@@ -200,7 +199,7 @@ fn is_strippable_comment(trimmed: &str, lang: StripLang) -> bool {
             }
             trimmed.starts_with("//")
         }
-        StripLang::Bash => {
+        StripFamily::Bash => {
             // Keep shebangs (`#!`) and any line-comment starting with `#!`.
             if trimmed.starts_with("#!") {
                 return false;
@@ -298,6 +297,13 @@ mod tests {
     fn ruby_not_supported() {
         let content = "def foo\n  puts 'hi'\nend\n";
         let skip = strip_noise(content, &path("rb"), Some((1, 3)));
+        assert!(skip.is_empty());
+    }
+
+    #[test]
+    fn extensionless_bash_dotfile_not_stripped() {
+        let content = "# just a comment\necho hi\n";
+        let skip = strip_noise(content, &PathBuf::from(".bashrc"), Some((1, 2)));
         assert!(skip.is_empty());
     }
 

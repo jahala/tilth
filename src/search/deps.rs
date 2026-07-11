@@ -364,101 +364,10 @@ fn is_placeholder_name(name: &str) -> bool {
     false
 }
 
-/// Root (first `/`-segment) of each Go stdlib package. A Go import is stdlib
-/// when its first path segment is one of these — covering both single-segment
-/// (`fmt`) and multi-segment (`net/http`, `encoding/json`) forms. Matching the
-/// root (not the whole path) avoids misclassifying a local package like
-/// `mypackage` while still suppressing the noisy multi-segment stdlib paths.
-const GO_STDLIB_ROOTS: &[&str] = &[
-    "archive",
-    "bufio",
-    "bytes",
-    "cmp",
-    "compress",
-    "container",
-    "context",
-    "crypto",
-    "database",
-    "debug",
-    "embed",
-    "encoding",
-    "errors",
-    "flag",
-    "fmt",
-    "go",
-    "hash",
-    "html",
-    "image",
-    "index",
-    "io",
-    "log",
-    "maps",
-    "math",
-    "mime",
-    "net",
-    "os",
-    "path",
-    "plugin",
-    "reflect",
-    "regexp",
-    "runtime",
-    "slices",
-    "sort",
-    "strconv",
-    "strings",
-    "sync",
-    "syscall",
-    "testing",
-    "text",
-    "time",
-    "unicode",
-    "unsafe",
-    // Go 1.23+ additions
-    "iter",
-    "unique",
-];
-
 /// Returns true if the import source is a standard library module.
 /// Agents can't navigate into stdlib — showing these is noise.
 fn is_stdlib(source: &str, lang: crate::types::Lang) -> bool {
-    use crate::types::Lang;
-    match lang {
-        Lang::Rust => {
-            source.starts_with("std::")
-                || source.starts_with("core::")
-                || source.starts_with("alloc::")
-        }
-        Lang::Python => {
-            // Common stdlib modules — not exhaustive but covers the noisy ones
-            matches!(
-                source.split('.').next().unwrap_or(""),
-                "os" | "sys"
-                    | "re"
-                    | "json"
-                    | "math"
-                    | "time"
-                    | "datetime"
-                    | "pathlib"
-                    | "typing"
-                    | "collections"
-                    | "functools"
-                    | "itertools"
-                    | "abc"
-                    | "io"
-                    | "logging"
-                    | "unittest"
-                    | "dataclasses"
-                    | "enum"
-                    | "copy"
-                    | "hashlib"
-                    | "subprocess"
-                    | "threading"
-                    | "asyncio"
-            )
-        }
-        Lang::Go => GO_STDLIB_ROOTS.contains(&source.split('/').next().unwrap_or(source)),
-        _ => false,
-    }
+    crate::lang::spec::spec(lang).stdlib.matches(source)
 }
 
 /// Returns true if the string looks like a valid module/package path.

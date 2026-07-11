@@ -1,5 +1,8 @@
 //! Shared tree-sitter utilities used by symbol search and caller search.
 
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
+
 /// Definition node kinds across tree-sitter grammars.
 pub(crate) const DEFINITION_KINDS: &[&str] = &[
     // Functions
@@ -50,12 +53,12 @@ pub(crate) fn extract_definition_name(node: tree_sitter::Node, lines: &[&str]) -
     // Try standard field names
     for field in &["name", "identifier", "declarator"] {
         if let Some(child) = node.child_by_field_name(field) {
-            let text = node_text_simple(child, lines);
+            let text = node_text_simple(child, lines, NodeTextMode::Full);
             if !text.is_empty() {
                 // For variable_declarator, get the identifier inside
                 if child.kind().contains("declarator") {
                     if let Some(id) = child.child_by_field_name("name") {
-                        return Some(node_text_simple(id, lines));
+                        return Some(node_text_simple(id, lines, NodeTextMode::Full));
                     }
                 }
                 return Some(text);
@@ -82,7 +85,7 @@ pub(crate) fn extract_definition_name(node: tree_sitter::Node, lines: &[&str]) -
         for child in node.children(&mut cursor) {
             if child.kind() == "variable_declarator" {
                 if let Some(name_node) = child.child_by_field_name("name") {
-                    let text = node_text_simple(name_node, lines);
+                    let text = node_text_simple(name_node, lines, NodeTextMode::Full);
                     if !text.is_empty() {
                         return Some(text);
                     }
@@ -94,11 +97,26 @@ pub(crate) fn extract_definition_name(node: tree_sitter::Node, lines: &[&str]) -
     None
 }
 
-/// Get the text of a single-line node from pre-split source lines.
+/// Controls how [`node_text_simple`] renders a node that spans multiple lines.
+#[derive(Clone, Copy)]
+pub(crate) enum NodeTextMode {
+    /// Return the node's start line untruncated.
+    Full,
+    /// Truncate the node's start line to roughly 80 characters.
+    Truncated,
+}
+
+/// Returns a node's text from pre-split source lines.
 ///
-/// Returns the text slice for single-line nodes, or the text from the start
-/// column to end-of-line for multi-line nodes.
-pub(crate) fn node_text_simple(node: tree_sitter::Node, lines: &[&str]) -> String {
+/// For a single-line node, returns its exact slice. For a multi-line node,
+/// returns only the start line (start column to end-of-line) — never the full
+/// multi-line span; `mode` then decides whether that start line is returned in
+/// full or truncated.
+pub(crate) fn node_text_simple(
+    node: tree_sitter::Node,
+    lines: &[&str],
+    mode: NodeTextMode,
+) -> String {
     let row = node.start_position().row;
     let col_start = node.start_position().column;
     let end_row = node.end_position().row;
@@ -106,7 +124,17 @@ pub(crate) fn node_text_simple(node: tree_sitter::Node, lines: &[&str]) -> Strin
         let col_end = node.end_position().column.min(lines[row].len());
         lines[row][col_start..col_end].to_string()
     } else if row < lines.len() {
-        lines[row][col_start..].to_string()
+        let text = &lines[row][col_start..];
+        match mode {
+            NodeTextMode::Full => text.to_string(),
+            NodeTextMode::Truncated => {
+                if text.len() > 80 {
+                    format!("{}...", crate::types::truncate_str(text, 77))
+                } else {
+                    text.to_string()
+                }
+            }
+        }
     } else {
         String::new()
     }
@@ -116,13 +144,13 @@ pub(crate) fn node_text_simple(node: tree_sitter::Node, lines: &[&str]) -> Strin
 /// Returns None for inherent impls (no trait).
 pub(crate) fn extract_impl_trait(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
     let trait_node = node.child_by_field_name("trait")?;
-    Some(node_text_simple(trait_node, lines))
+    Some(node_text_simple(trait_node, lines, NodeTextMode::Full))
 }
 
 /// Extract implementing type from Rust `impl ... for Type` node.
 pub(crate) fn extract_impl_type(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
     let type_node = node.child_by_field_name("type")?;
-    Some(node_text_simple(type_node, lines))
+    Some(node_text_simple(type_node, lines, NodeTextMode::Full))
 }
 
 /// Extract implemented interface names from TS/Java class declaration.
@@ -138,7 +166,7 @@ pub(crate) fn extract_implemented_interfaces(
             let mut inner = child.walk();
             for ident in child.children(&mut inner) {
                 if ident.kind().contains("identifier") {
-                    let text = node_text_simple(ident, lines);
+                    let text = node_text_simple(ident, lines, NodeTextMode::Full);
                     if !text.is_empty() {
                         interfaces.push(text);
                     }
@@ -153,27 +181,6 @@ pub(crate) fn extract_implemented_interfaces(
 // Elixir-specific definition helpers
 // ---------------------------------------------------------------------------
 
-/// Elixir call-node target identifiers that define named symbols.
-/// This is the complete set used for definition detection in symbol search/index.
-/// See also `ELIXIR_DEF_KEYWORDS` in `outline.rs` which is the subset of
-/// function-like keywords (excludes container keywords like `defmodule`,
-/// `defprotocol`, `defimpl`, `defstruct`, `defexception` that have their own
-/// outline handling).
-const ELIXIR_DEFINITION_TARGETS: &[&str] = &[
-    "defmodule",
-    "def",
-    "defp",
-    "defmacro",
-    "defmacrop",
-    "defguard",
-    "defguardp",
-    "defdelegate",
-    "defstruct",
-    "defexception",
-    "defprotocol",
-    "defimpl",
-];
-
 /// Find the `arguments` child of an Elixir `call` node.
 /// In tree-sitter-elixir, `arguments` is a node kind, not a named field,
 /// so `child_by_field_name("arguments")` doesn't work.
@@ -182,70 +189,6 @@ pub(crate) fn elixir_arguments(node: tree_sitter::Node) -> Option<tree_sitter::N
     // Node is Copy (arena index) — the returned node survives cursor drop.
     let result = node.children(&mut cursor).find(|c| c.kind() == "arguments");
     result
-}
-
-/// Check if a tree-sitter node is an Elixir definition.
-/// In Elixir all definitions are `call` nodes whose `target` identifier
-/// is one of `defmodule`, `def`, `defp`, etc.
-pub(crate) fn is_elixir_definition(node: tree_sitter::Node, lines: &[&str]) -> bool {
-    if node.kind() != "call" {
-        return false;
-    }
-    let Some(target) = node.child_by_field_name("target") else {
-        return false;
-    };
-    let kw = node_text_simple(target, lines);
-    ELIXIR_DEFINITION_TARGETS.contains(&kw.as_str())
-}
-
-/// Extract the defined name from an Elixir definition `call` node.
-///
-/// - `defmodule Foo.Bar do...end` → `"Foo.Bar"`
-/// - `def greet(name) do...end`  → `"greet"`
-/// - `defstruct [:a, :b]`       → `"defstruct"`
-pub(crate) fn extract_elixir_definition_name(
-    node: tree_sitter::Node,
-    lines: &[&str],
-) -> Option<String> {
-    let target = node.child_by_field_name("target")?;
-    let kw = node_text_simple(target, lines);
-    let args = elixir_arguments(node)?;
-
-    match kw.as_str() {
-        "defmodule" | "defprotocol" | "defimpl" => {
-            // First named child of arguments is the module/protocol alias.
-            // For `defimpl Printable, for: User`, this returns "Printable" (the
-            // protocol name), not "User" (the implementing type). Searching for
-            // the protocol name will find both the protocol and all its impls.
-            let mut cursor = args.walk();
-            for child in args.children(&mut cursor) {
-                if child.is_named() {
-                    return Some(node_text_simple(child, lines));
-                }
-            }
-            None
-        }
-        "def" | "defp" | "defmacro" | "defmacrop" | "defguard" | "defguardp" | "defdelegate" => {
-            // First named child is:
-            //   `call`              — normal: `def greet(name)`
-            //   `identifier`        — no-arg: `def bar, do: :ok`
-            //   `binary_operator`   — guard:  `def foo(x) when x > 0`
-            let mut cursor = args.walk();
-            for child in args.children(&mut cursor) {
-                if !child.is_named() {
-                    continue;
-                }
-                return elixir_extract_func_head_name(child, lines);
-            }
-            None
-        }
-        // In Elixir, a struct IS its enclosing module (`%MyModule{}`), and only
-        // one struct per module is allowed. There's no standalone struct name to
-        // extract, so we index the keyword itself. Search for the struct by its
-        // module name instead.
-        "defstruct" | "defexception" => Some(kw.clone()),
-        _ => None,
-    }
 }
 
 /// Extract function name from the first argument of a `def`/`defp`/`defmacro` call.
@@ -261,29 +204,14 @@ pub(crate) fn elixir_extract_func_head_name(
     match node.kind() {
         "call" => node
             .child_by_field_name("target")
-            .map(|t| node_text_simple(t, lines)),
-        "identifier" => Some(node_text_simple(node, lines)),
+            .map(|t| node_text_simple(t, lines, NodeTextMode::Full)),
+        "identifier" => Some(node_text_simple(node, lines, NodeTextMode::Full)),
         "binary_operator" => {
             // Guard clause: `foo(x) when x > 0` → left is the function head
             let left = node.child_by_field_name("left")?;
             elixir_extract_func_head_name(left, lines)
         }
         _ => None,
-    }
-}
-
-/// Semantic weight for Elixir definition keywords.
-pub(crate) fn elixir_definition_weight(node: tree_sitter::Node, lines: &[&str]) -> u16 {
-    let Some(target) = node.child_by_field_name("target") else {
-        return 50;
-    };
-    let kw = node_text_simple(target, lines);
-    match kw.as_str() {
-        "defmodule" | "defprotocol" | "def" | "defp" | "defmacro" | "defmacrop" | "defguard"
-        | "defguardp" | "defdelegate" => 100,
-        "defimpl" => 90,
-        "defstruct" | "defexception" => 80,
-        _ => 50,
     }
 }
 
@@ -319,6 +247,34 @@ pub(crate) fn definition_weight(kind: &str) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn node_text_mode_controls_multiline_truncation() {
+        let first_line =
+            "pub fn very_long_function_name_with_enough_characters_to_force_truncation_for_outline_test() {";
+        let source = format!("{first_line}\n}}\n");
+        let lines: Vec<&str> = source.lines().collect();
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("rust parser should load");
+        let tree = parser
+            .parse(&source, None)
+            .expect("rust source should parse");
+        let node = tree
+            .root_node()
+            .named_child(0)
+            .expect("source should contain a function node");
+
+        assert_eq!(
+            node_text_simple(node, &lines, NodeTextMode::Full),
+            first_line
+        );
+        assert_eq!(
+            node_text_simple(node, &lines, NodeTextMode::Truncated),
+            format!("{}...", &first_line[..77])
+        );
+    }
     use crate::lang::outline::outline_language;
     use crate::types::Lang;
 
@@ -438,4 +394,44 @@ mod tests {
         let node = find_by_kind(tree.root_node(), "impl_item");
         assert_eq!(extract_definition_name(node, &lines), None);
     }
+}
+
+/// Global cache of compiled tree-sitter queries, shared by symbol/caller
+/// search (`search::siblings`) and per-language extractors (e.g. Go's
+/// receiver-name lookup). Keyed by `(node_kind_count, field_count,
+/// query_str_ptr)` so that distinct query strings for the same language are
+/// stored under separate keys. We avoid `Language::name()` because ABI < 15
+/// grammars (e.g. tree-sitter-kotlin-ng) return `None`.
+#[allow(clippy::type_complexity)]
+static QUERY_CACHE: LazyLock<Mutex<HashMap<(usize, usize, usize), tree_sitter::Query>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Look up or compile `query_str` for `ts_lang`, then invoke `f` with a
+/// reference to the cached `Query`. Returns `None` if compilation fails.
+///
+/// `query_str` must be `'static` so its pointer address is stable across
+/// calls and can serve as part of the cache key.
+pub(crate) fn with_query<R>(
+    ts_lang: &tree_sitter::Language,
+    query_str: &'static str,
+    f: impl FnOnce(&tree_sitter::Query) -> R,
+) -> Option<R> {
+    use std::collections::hash_map::Entry;
+    // Pointer address distinguishes different queries for the same language.
+    let key = (
+        ts_lang.node_kind_count(),
+        ts_lang.field_count(),
+        query_str.as_ptr() as usize,
+    );
+    let mut cache = QUERY_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let query = match cache.entry(key) {
+        Entry::Occupied(e) => e.into_mut(),
+        Entry::Vacant(e) => {
+            let q = tree_sitter::Query::new(ts_lang, query_str).ok()?;
+            e.insert(q)
+        }
+    };
+    Some(f(query))
 }

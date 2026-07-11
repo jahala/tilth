@@ -178,10 +178,8 @@ fn find_git_root(path: &Path) -> Option<PathBuf> {
         if dir.join(".git").exists() {
             return Some(dir);
         }
-        match dir.parent() {
-            Some(p) => dir = p.to_path_buf(),
-            None => return None,
-        }
+        let p = dir.parent()?;
+        dir = p.to_path_buf();
     }
 }
 
