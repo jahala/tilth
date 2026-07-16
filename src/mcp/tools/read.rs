@@ -370,7 +370,7 @@ mod tests {
         );
         assert!(!out.contains("dbg!"), "debug log should be stripped: {out}");
         assert!(
-            !out.lines().any(|l| l.contains(":") && l.contains("|")),
+            !out.lines().any(|l| l.contains(':') && l.contains('|')),
             "stripped output must not expose hash anchors: {out}"
         );
     }
@@ -455,12 +455,10 @@ mod tests {
         // ensuring OGATE does not fire and auto != full.
         let mut src = String::from("// header comment\n");
         for i in 0..80 {
-            src.push_str(&format!("fn f_{i}() {{\n"));
+            let _ = writeln!(src, "fn f_{i}() {{");
             // Large body: many statements so the outline compresses well
             for j in 0..30 {
-                src.push_str(&format!(
-                    "    let local_var_{j}_in_fn_{i}: u64 = {j} + {i};\n"
-                ));
+                let _ = writeln!(src, "    let local_var_{j}_in_fn_{i}: u64 = {j} + {i};");
             }
             src.push_str("}\n");
         }
@@ -671,10 +669,10 @@ mod tests {
         // with functions that have substantial bodies so the outline compresses well.
         let mut src = String::from("// header\n");
         for i in 0..200 {
-            src.push_str(&format!("fn func_{i}() {{\n"));
+            let _ = writeln!(src, "fn func_{i}() {{");
             // 20 lines of body per function so outline is much smaller than full content
             for j in 0..20 {
-                src.push_str(&format!("    let v_{i}_{j}: u64 = {j} * {i} + 42;\n"));
+                let _ = writeln!(src, "    let v_{i}_{j}: u64 = {j} * {i} + 42;");
             }
             src.push_str("}\n");
         }
@@ -732,7 +730,7 @@ mod tests {
         // Large file: a full-file baseline would book a big (bogus) "saving".
         let mut src = String::new();
         for i in 0..500 {
-            src.push_str(&format!("fn f_{i}() {{ let v = {i}; }}\n"));
+            let _ = writeln!(src, "fn f_{i}() {{ let v = {i}; }}");
         }
         std::fs::write(&path, &src).unwrap();
         let cache = OutlineCache::new();

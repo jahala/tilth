@@ -60,6 +60,7 @@ pub fn apply(output: &str, budget: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
 
     #[test]
     fn apply_roomy_budget_returns_input_unchanged() {
@@ -73,7 +74,7 @@ mod tests {
         // Build a multi-line body large enough to force truncation.
         let mut input = String::from("# header\n");
         for i in 1..=200 {
-            input.push_str(&format!("line {i}\n"));
+            let _ = writeln!(input, "line {i}");
         }
         let out = apply(&input, 80);
         assert!(out.contains("... truncated"), "marker line missing: {out}");
@@ -121,7 +122,7 @@ mod tests {
         // real content survives.
         let mut input = String::from("# src/foo.rs (200 lines, ~2k tokens) [full]\n\n");
         for i in 1..=200 {
-            input.push_str(&format!("{i}:abc|let x_{i} = {i};\n"));
+            let _ = writeln!(input, "{i}:abc|let x_{i} = {i};");
         }
         // Tight budget — must truncate, but should leave room for many lines.
         let out = apply(&input, 400);
