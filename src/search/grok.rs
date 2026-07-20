@@ -152,16 +152,25 @@ fn resolve_by_path_line(
 /// Read `path` and detect its language. Errors if the file isn't a code file —
 /// grok requires source-level analysis, not a markdown / config / data file.
 fn read_code_file(path: &Path) -> Result<(String, Lang), TilthError> {
-    let content = fs::read_to_string(path).map_err(|e| TilthError::IoError {
-        path: path.to_path_buf(),
-        source: e,
-    })?;
     let FileType::Code(lang) = detect_file_type(path) else {
         return Err(TilthError::InvalidQuery {
             query: path.display().to_string(),
             reason: "not a code file — grok needs source code".to_string(),
         });
     };
+    let bytes = fs::read(path).map_err(|e| TilthError::IoError {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    // Match the read path: refuse binary content instead of letting a strict
+    // UTF-8 decode surface a raw "stream did not contain valid UTF-8" error.
+    if crate::lang::detection::is_binary(&bytes) {
+        return Err(TilthError::InvalidQuery {
+            query: path.display().to_string(),
+            reason: "binary file — grok needs source code".to_string(),
+        });
+    }
+    let content = String::from_utf8_lossy(&bytes).into_owned();
     Ok((content, lang))
 }
 
@@ -1159,6 +1168,37 @@ mod tests {
         let path = tmp.path().join("nope.rs");
         let err = resolve_by_path_line(&path, 1).unwrap_err();
         assert!(matches!(err, TilthError::IoError { .. }));
+    }
+
+    #[test]
+    fn resolve_by_path_line_rejects_binary_code_file() {
+        // A .rs with a null byte is binary; the old strict read surfaced a raw
+        // "stream did not contain valid UTF-8" error. Now it's a clean refusal.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("tainted.rs");
+        fs::write(&path, b"fn alpha() {}\n\x00\x01\x02").unwrap();
+        let err = resolve_by_path_line(&path, 1).unwrap_err();
+        match err {
+            TilthError::InvalidQuery { reason, .. } => {
+                assert!(
+                    reason.contains("binary"),
+                    "expected binary refusal: {reason}"
+                );
+            }
+            other => panic!("expected InvalidQuery, got {other}"),
+        }
+    }
+
+    #[test]
+    fn resolve_by_path_line_reads_non_utf8_code_file_lossily() {
+        // Invalid UTF-8, no null byte — the read path shows this as text, so
+        // grok must outline it lossily rather than error.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("latin1.rs");
+        fs::write(&path, b"fn alpha() {} // caf\xff\n").unwrap();
+        let (target, _content, lang) = resolve_by_path_line(&path, 1).unwrap();
+        assert_eq!(target.name, "alpha");
+        assert_eq!(lang, Lang::Rust);
     }
 
     // -- resolve_target — full spec dispatch -----------------------------
