@@ -43,7 +43,7 @@ pub fn search_header(
 }
 
 /// Human-readable file size. Integer math only — no floats.
-fn format_size(bytes: u64) -> String {
+pub(crate) fn format_size(bytes: u64) -> String {
     match bytes {
         b if b < 1024 => format!("{b}B"),
         b if b < 1024 * 1024 => format!("{}KB", b / 1024),

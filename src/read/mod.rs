@@ -633,7 +633,7 @@ fn edit_distance(a: &str, b: &str) -> usize {
 }
 
 /// Guess MIME type from extension for binary file headers.
-fn mime_from_ext(path: &Path) -> &'static str {
+pub(crate) fn mime_from_ext(path: &Path) -> &'static str {
     match path.extension().and_then(|e| e.to_str()) {
         Some("png") => "image/png",
         Some("jpg" | "jpeg") => "image/jpeg",

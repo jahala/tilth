@@ -108,9 +108,54 @@ pub fn search(pattern: &str, scope: &Path) -> Result<GlobResult, TilthError> {
     })
 }
 
-/// Quick preview: token estimate, or "test file", or "module" based on exports.
+/// Quick preview: binary type + size, or a token estimate.
 fn file_preview(path: &Path) -> Option<String> {
     let meta = std::fs::metadata(path).ok()?;
+    // A byte/4 token estimate is meaningless for binary content (a PNG is not
+    // ~N tokens of text). Classify like the read path and show size + type.
+    if is_binary_file(path) {
+        let size = crate::format::format_size(meta.len());
+        let mime = crate::read::mime_from_ext(path);
+        return Some(format!("binary, {size}, {mime}"));
+    }
     let tokens = estimate_tokens(meta.len());
     Some(format!("~{tokens} tokens"))
+}
+
+/// Classify by content the way the read path does: a null byte in the first
+/// 512 bytes marks binary.
+fn is_binary_file(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut head = [0u8; 512];
+    let Ok(n) = file.read(&mut head) else {
+        return false;
+    };
+    crate::lang::detection::is_binary(&head[..n])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_preview_renders_binary_type_not_tokens() {
+        let tmp = tempfile::tempdir().unwrap();
+        let png = tmp.path().join("logo.png");
+        std::fs::write(&png, b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0d").unwrap();
+        let src = tmp.path().join("main.rs");
+        std::fs::write(&src, "fn main() {}\n").unwrap();
+
+        assert_eq!(
+            file_preview(&png).as_deref(),
+            Some("binary, 12B, image/png"),
+            "binary files show size + MIME, not a token estimate"
+        );
+        assert!(
+            file_preview(&src).unwrap().ends_with("tokens"),
+            "text files still show a token estimate"
+        );
+    }
 }
