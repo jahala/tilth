@@ -99,9 +99,21 @@ fn resolve_by_name(name: &str, scope: &Path) -> Result<(ResolvedTarget, String, 
             return Ok(resolved);
         }
     }
+    let suggestion = (bare == name)
+        .then(|| crate::search::fuzzy_symbol::suggestions(scope, name))
+        .flatten()
+        .map(|(names, truncated)| {
+            let list = names.join(", ");
+            let note = "Scope too large to fully search — narrow scope for a better match.";
+            match (list.is_empty(), truncated) {
+                (_, false) => list,
+                (true, true) => note.to_string(),
+                (false, true) => format!("{list}. {note}"),
+            }
+        });
     Err(TilthError::NotFound {
         path: PathBuf::from(name),
-        suggestion: None,
+        suggestion,
     })
 }
 
@@ -1557,6 +1569,127 @@ impl<T> Foo<T> {
     }
 
     #[test]
+    fn resolve_plain_name_typo_suggests_real_symbol() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(tmp.path(), "src/requests.rs", "fn handle_request() {}\n");
+
+        let err = resolve_with_source("handle_requst", tmp.path()).unwrap_err();
+        match err {
+            TilthError::NotFound { suggestion, .. } => assert!(
+                suggestion
+                    .as_deref()
+                    .is_some_and(|s| s.contains("handle_request")),
+                "typo should suggest the real symbol: {suggestion:?}"
+            ),
+            other => panic!("expected NotFound with a suggestion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_plain_name_garbage_has_no_suggestion() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(tmp.path(), "src/requests.rs", "fn handle_request() {}\n");
+
+        let err = resolve_with_source("zzzzzzzz", tmp.path()).unwrap_err();
+        match err {
+            TilthError::NotFound { suggestion, .. } => {
+                assert!(
+                    suggestion.is_none(),
+                    "garbage should not suggest a symbol: {suggestion:?}"
+                );
+            }
+            other => panic!("expected NotFound without a suggestion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_plain_name_suggestions_are_scope_bounded_and_capped() {
+        let tmp = tempfile::tempdir().unwrap();
+        for name in [
+            "handle_request_one",
+            "handle_request_two",
+            "handle_request_three",
+            "handle_request_four",
+        ] {
+            write_fixture(
+                tmp.path(),
+                &format!("src/{name}.rs"),
+                &format!("fn {name}() {{}}\n"),
+            );
+        }
+        write_fixture(tmp.path(), "outside.rs", "fn handle_request_outside() {}\n");
+
+        let scope = tmp.path().join("src");
+        let err = resolve_with_source("handle_requst", &scope).unwrap_err();
+        let suggestion = match err {
+            TilthError::NotFound { suggestion, .. } => {
+                suggestion.expect("a typo with four in-scope matches should suggest")
+            }
+            other => panic!("expected NotFound with suggestions, got {other:?}"),
+        };
+        let names: Vec<_> = suggestion.split(", ").collect();
+        assert_eq!(
+            names.len(),
+            3,
+            "suggestions must be capped at three: {suggestion}"
+        );
+        assert!(
+            names.iter().all(|name| name.starts_with("handle_request_")),
+            "suggestions must come from the requested scope: {suggestion}"
+        );
+        assert!(
+            !suggestion.contains("outside"),
+            "sibling directories outside the requested scope must not be suggested: {suggestion}"
+        );
+    }
+
+    #[test]
+    fn resolve_plain_name_suggestions_ranked_best_match_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        for name in ["handle_request", "handle_request_two"] {
+            write_fixture(
+                tmp.path(),
+                &format!("src/{name}.rs"),
+                &format!("fn {name}() {{}}\n"),
+            );
+        }
+        write_fixture(tmp.path(), "src/unrelated.rs", "fn unrelated_thing() {}\n");
+        write_fixture(tmp.path(), "src/other.rs", "fn zzz_other() {}\n");
+
+        let err = resolve_with_source("handle_requst", tmp.path()).unwrap_err();
+        let suggestion = match err {
+            TilthError::NotFound { suggestion, .. } => {
+                suggestion.expect("a close typo should suggest real symbols")
+            }
+            other => panic!("expected NotFound with a suggestion, got {other:?}"),
+        };
+        assert_eq!(
+            suggestion, "handle_request, handle_request_two",
+            "best match must sort first, in exact rank order: {suggestion}"
+        );
+    }
+
+    #[test]
+    fn resolve_plain_name_poor_subsequence_match_still_suggests() {
+        // Nucleo's fuzzy match has no score floor: it returns `Some` for ANY
+        // query that is a subsequence of a candidate, however poor the match.
+        // Mirrors the contract documented at `read/fuzzy_path.rs`'s
+        // `resolve_fuzzy_path`.
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(tmp.path(), "src/requests.rs", "fn handle_request() {}\n");
+
+        let err = resolve_with_source("her", tmp.path()).unwrap_err();
+        match err {
+            TilthError::NotFound { suggestion, .. } => assert_eq!(
+                suggestion.as_deref(),
+                Some("handle_request"),
+                "a subsequence match, however poor, must still suggest"
+            ),
+            other => panic!("expected NotFound with a suggestion, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn resolve_qualified_target_zero_owner_match_404s_with_suggestion() {
         // No `dispatch` is owned by Alpha — only Beta has one. Rather than return
         // Beta's body (the silent-wrong-owner bug), grok returns NotFound with a
@@ -1579,6 +1712,25 @@ impl<T> Foo<T> {
                 );
             }
             other => panic!("expected NotFound with suggestion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_qualified_target_bare_name_absent_everywhere_404s_without_suggestion() {
+        // `dispatch` doesn't exist anywhere in scope, under any owner, so
+        // `resolve_by_name`'s `(bare == name)` gate at grok.rs:102 must suppress
+        // fuzzy suggestions here (they only fire for genuinely bare targets),
+        // not fuzz-match the full qualified spec against unrelated symbols.
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(tmp.path(), "src/other.rs", "fn distributed_patch() {}\n");
+
+        let err = resolve_with_source("Alpha::dispatch", tmp.path()).unwrap_err();
+        match err {
+            TilthError::NotFound { suggestion, .. } => assert_eq!(
+                suggestion, None,
+                "a qualified target whose bare name doesn't exist anywhere must not fuzz-suggest"
+            ),
+            other => panic!("expected NotFound without a suggestion, got {other:?}"),
         }
     }
 

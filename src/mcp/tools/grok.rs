@@ -15,7 +15,9 @@ pub(in crate::mcp) fn tool_grok(
     let target = args
         .get("target")
         .and_then(|v| v.as_str())
-        .ok_or("missing required parameter: target")?;
+        .ok_or(
+            "missing required parameter: target (symbol name or \"path:line\", e.g. \"Type::method\" or \"src/file.rs:7\")",
+        )?;
     let cwd = super::require_cwd(args)?;
     let (scope, scope_warning) = resolve_scope(args, cwd)?;
     let budget = args
@@ -54,6 +56,38 @@ mod tests {
             err.contains("cwd") && err.contains("absolute checkout directory"),
             "grok without cwd must refuse with the teaching error: {err}"
         );
+    }
+
+    #[test]
+    fn missing_target_teaches_grok_target_grammar() {
+        let err = tool_grok(&serde_json::json!({}), &bloom(), &Session::new()).unwrap_err();
+        assert!(
+            err.contains("missing required parameter: target")
+                && err.contains("\"Type::method\"")
+                && err.contains("\"src/file.rs:7\""),
+            "missing target should teach the target grammar: {err}"
+        );
+    }
+
+    #[test]
+    fn non_string_target_uses_same_teaching_error() {
+        let expected = tool_grok(&serde_json::json!({}), &bloom(), &Session::new()).unwrap_err();
+        for target in [
+            serde_json::Value::Null,
+            serde_json::json!(42),
+            serde_json::json!(true),
+        ] {
+            let err = tool_grok(
+                &serde_json::json!({ "target": target }),
+                &bloom(),
+                &Session::new(),
+            )
+            .unwrap_err();
+            assert_eq!(
+                err, expected,
+                "invalid target {target} should teach the same call"
+            );
+        }
     }
 
     #[test]

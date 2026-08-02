@@ -4,6 +4,7 @@ pub mod callers;
 pub mod content;
 pub mod deps;
 pub mod facets;
+mod fuzzy_symbol;
 pub mod glob;
 pub mod grok;
 pub mod rank;
