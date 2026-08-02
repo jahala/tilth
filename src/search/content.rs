@@ -17,6 +17,9 @@ const FULL_MAX_MATCHES: usize = 100;
 const FULL_EARLY_QUIT_THRESHOLD: usize = FULL_MAX_MATCHES * 3;
 
 /// Content search using ripgrep crates. Literal by default, regex if `is_regex`.
+/// Returns the result plus, when a regex pattern failed to compile and was
+/// retried as an escaped literal, the parse-failure reason (`None` on the
+/// literal path, which is unaffected).
 pub fn search(
     pattern: &str,
     scope: &Path,
@@ -24,21 +27,32 @@ pub fn search(
     context: Option<&Path>,
     glob: Option<&str>,
     full: bool,
-) -> Result<SearchResult, TilthError> {
+) -> Result<(SearchResult, Option<String>), TilthError> {
     let (max_matches, early_quit) = if full {
         (FULL_MAX_MATCHES, FULL_EARLY_QUIT_THRESHOLD)
     } else {
         (MAX_MATCHES, EARLY_QUIT_THRESHOLD)
     };
-    let matcher = if is_regex {
-        RegexMatcher::new(pattern)
-    } else {
-        RegexMatcher::new(&regex_syntax::escape(pattern))
-    }
-    .map_err(|e| TilthError::InvalidQuery {
+    let invalid_query = |reason: String| TilthError::InvalidQuery {
         query: pattern.to_string(),
-        reason: e.to_string(),
-    })?;
+        reason,
+    };
+    let (matcher, fallback_reason) = if is_regex {
+        match RegexMatcher::new(pattern) {
+            Ok(m) => (m, None),
+            Err(e) => {
+                let reason = e.to_string();
+                let literal = RegexMatcher::new(&regex_syntax::escape(pattern)).map_err(|e2| {
+                    invalid_query(format!("{reason}; escaped-literal retry also failed: {e2}"))
+                })?;
+                (literal, Some(reason))
+            }
+        }
+    } else {
+        let m = RegexMatcher::new(&regex_syntax::escape(pattern))
+            .map_err(|e| invalid_query(e.to_string()))?;
+        (m, None)
+    };
 
     let matches: Mutex<Vec<Match>> = Mutex::new(Vec::new());
     // Relaxed is correct: walker.run() joins all threads before we read the final value.
@@ -127,13 +141,16 @@ pub fn search(
     rank::sort(&mut all_matches, pattern, scope, context);
     all_matches.truncate(max_matches);
 
-    Ok(SearchResult {
-        query: pattern.to_string(),
-        scope: scope.to_path_buf(),
-        matches: all_matches,
-        total_found: total,
-        definitions: 0,
-        usages: total,
-        facet_totals: FacetTotals::default(),
-    })
+    Ok((
+        SearchResult {
+            query: pattern.to_string(),
+            scope: scope.to_path_buf(),
+            matches: all_matches,
+            total_found: total,
+            definitions: 0,
+            usages: total,
+            facet_totals: FacetTotals::default(),
+        },
+        fallback_reason,
+    ))
 }

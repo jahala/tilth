@@ -3,6 +3,7 @@
 //! (symbol / any / content / regex / callers) and `if_modified_since`
 //! redaction of unchanged result sections.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -13,6 +14,24 @@ use crate::index::bloom::BloomFilterCache;
 use crate::session::Session;
 
 use super::resolve_scope;
+
+/// Builds a disclosure note for symbols/targets dropped by the 5-per-call
+/// soft cap; callers prepend it to the executed section's body so it
+/// survives both budget truncation (which cuts from the end) and
+/// `if_modified_since` redaction (which only stubs trailing per-file
+/// sections).
+fn dropped_queries_note(dropped: &[&str]) -> String {
+    const SHOWN: usize = 10;
+    let shown = dropped.len().min(SHOWN);
+    let mut names = dropped[..shown].join(", ");
+    if dropped.len() > SHOWN {
+        let _ = write!(names, ", and {} more", dropped.len() - SHOWN);
+    }
+    format!(
+        "{} more dropped (5 per call max): {names}. Run a second search for the rest.",
+        dropped.len()
+    )
+}
 
 pub(in crate::mcp) fn tool_search(
     args: &Value,
@@ -146,20 +165,20 @@ fn tool_search_single(
                         edit_mode, budget,
                     )
                 }
-                2..=5 => {
-                    for q in &symbols {
+                2.. => {
+                    let (run, dropped) = symbols.split_at(symbols.len().min(5));
+                    for q in run {
                         session.record_search(q);
                     }
-                    crate::search::search_multi_symbol_expanded(
-                        &symbols, &scope, cache, session, bloom, expand, context, glob, false,
+                    let result = crate::search::search_multi_symbol_expanded(
+                        run, &scope, cache, session, bloom, expand, context, glob, false,
                         edit_mode, budget,
-                    )
-                }
-                _ => {
-                    return Err(format!(
-                        "multi-symbol search limited to 5 queries (got {})",
-                        symbols.len()
-                    ))
+                    );
+                    if dropped.is_empty() {
+                        result
+                    } else {
+                        result.map(|body| format!("{}\n\n{}", dropped_queries_note(dropped), body))
+                    }
                 }
             }
         }
@@ -178,20 +197,20 @@ fn tool_search_single(
                         edit_mode, budget,
                     )
                 }
-                2..=5 => {
-                    for q in &queries {
+                2.. => {
+                    let (run, dropped) = queries.split_at(queries.len().min(5));
+                    for q in run {
                         session.record_search(q);
                     }
-                    crate::search::search_multi_symbol_expanded(
-                        &queries, &scope, cache, session, bloom, expand, context, glob, false,
+                    let result = crate::search::search_multi_symbol_expanded(
+                        run, &scope, cache, session, bloom, expand, context, glob, false,
                         edit_mode, budget,
-                    )
-                }
-                _ => {
-                    return Err(format!(
-                        "multi-symbol search limited to 5 queries (got {})",
-                        queries.len()
-                    ))
+                    );
+                    if dropped.is_empty() {
+                        result
+                    } else {
+                        result.map(|body| format!("{}\n\n{}", dropped_queries_note(dropped), body))
+                    }
                 }
             }
         }
@@ -221,19 +240,19 @@ fn tool_search_single(
                         targets[0], &scope, bloom, expand, context, glob, false,
                     )
                 }
-                2..=5 => {
-                    for t in &targets {
+                2.. => {
+                    let (run, dropped) = targets.split_at(targets.len().min(5));
+                    for t in run {
                         session.record_search(t);
                     }
-                    crate::search::callers::search_callers_multi_expanded(
-                        &targets, &scope, bloom, expand, context, glob, false,
-                    )
-                }
-                _ => {
-                    return Err(format!(
-                        "multi-target callers search limited to 5 queries (got {})",
-                        targets.len()
-                    ))
+                    let result = crate::search::callers::search_callers_multi_expanded(
+                        run, &scope, bloom, expand, context, glob, false,
+                    );
+                    if dropped.is_empty() {
+                        result
+                    } else {
+                        result.map(|body| format!("{}\n\n{}", dropped_queries_note(dropped), body))
+                    }
                 }
             }
         }
@@ -746,6 +765,215 @@ mod tests {
             out.contains("uses_beta"),
             "beta call site starved by alpha's hit-rich budget consumption \
              (early-quit budget was not scaled by target count): {out}"
+        );
+    }
+
+    /// A 6-symbol query must run the first 5 and disclose the dropped 6th
+    /// with an actionable note, not hard-error — same contract under the
+    /// default (`any`) kind and the explicit `symbol` kind.
+    #[test]
+    fn six_symbols_runs_first_five_and_notes_dropped() {
+        for kind in [None, Some("symbol")] {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(
+                tmp.path().join("lib.rs"),
+                "fn a() {}\nfn b() {}\nfn c() {}\nfn d() {}\nfn e() {}\nfn f() {}\n",
+            )
+            .unwrap();
+
+            let cache = OutlineCache::new();
+            let session = Session::new();
+            let bloom = std::sync::Arc::new(BloomFilterCache::new());
+            let scope_str = tmp.path().to_str().unwrap().to_string();
+            let mut query = serde_json::json!({"query": "a,b,c,d,e,f"});
+            if let Some(kind) = kind {
+                query["kind"] = serde_json::Value::String(kind.to_string());
+            }
+            let args = serde_json::json!({
+                "queries": [query],
+                "scope": scope_str,
+                "cwd": scope_str,
+            });
+
+            let out = tool_search(&args, &cache, &session, &bloom, false).unwrap();
+
+            for name in ["a", "b", "c", "d", "e"] {
+                assert!(
+                    out.contains(&format!("# Search: \"{name}\" in ")),
+                    "expected a section for symbol {name} under kind {kind:?}: {out}"
+                );
+            }
+            // Teeth: the five executed sections must each report a real hit,
+            // not the zero-match header (which also echoes the symbol name).
+            assert_eq!(
+                out.matches("— 1 matches").count(),
+                5,
+                "expected 5 sections each reporting a real match under kind {kind:?}: {out}"
+            );
+            assert!(
+                !out.contains("# Search: \"f\""),
+                "dropped symbol f must not have been searched under kind {kind:?}: {out}"
+            );
+            assert!(
+                out.contains("dropped (5 per call max): f") && out.contains("second search"),
+                "missing dropped-names note for f under kind {kind:?}: {out}"
+            );
+        }
+    }
+
+    /// Same soft-cap contract under `kind: callers`.
+    #[test]
+    fn callers_kind_six_targets_runs_first_five_and_notes_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("lib.rs"),
+            "fn a() {}\nfn b() {}\nfn c() {}\nfn d() {}\nfn e() {}\nfn f() {}\n\
+             fn uses_a() { a(); }\nfn uses_b() { b(); }\nfn uses_c() { c(); }\n\
+             fn uses_d() { d(); }\nfn uses_e() { e(); }\nfn uses_f() { f(); }\n",
+        )
+        .unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = std::sync::Arc::new(BloomFilterCache::new());
+        let scope_str = tmp.path().to_str().unwrap().to_string();
+        let args = serde_json::json!({
+            "queries": [{"query": "a,b,c,d,e,f", "kind": "callers"}],
+            "scope": scope_str,
+            "cwd": scope_str,
+        });
+
+        let out = tool_search(&args, &cache, &session, &bloom, false).unwrap();
+
+        for name in ["a", "b", "c", "d", "e"] {
+            assert!(
+                out.contains(&format!("Callers of \"{name}\" in ")),
+                "missing a callers section for {name}: {out}"
+            );
+        }
+        // Teeth: each executed target must report a real call site, not an
+        // empty section (which also echoes the target name in its header).
+        assert_eq!(
+            out.matches("— 1 call site").count(),
+            5,
+            "expected 5 targets each reporting a real call site: {out}"
+        );
+        assert!(
+            !out.contains("Callers of \"f\""),
+            "dropped target f must not have been searched: {out}"
+        );
+        assert!(
+            out.contains("dropped (5 per call max): f") && out.contains("second search"),
+            "missing dropped-names note for f: {out}"
+        );
+    }
+
+    /// Exactly 5 symbols is under the cap: no note, no panic.
+    #[test]
+    fn five_symbols_runs_all_no_note_no_panic() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("lib.rs"),
+            "fn a() {}\nfn b() {}\nfn c() {}\nfn d() {}\nfn e() {}\n",
+        )
+        .unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = std::sync::Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "queries": [{"query": "a,b,c,d,e"}],
+            "scope": tmp.path().to_str().unwrap(),
+            "cwd": tmp.path().to_str().unwrap(),
+        });
+
+        let out = tool_search(&args, &cache, &session, &bloom, false).unwrap();
+
+        for name in ["a", "b", "c", "d", "e"] {
+            assert!(
+                out.contains(&format!("\"{name}\"")),
+                "missing symbol {name}: {out}"
+            );
+        }
+        assert!(
+            !out.contains("dropped"),
+            "no note expected for exactly-5: {out}"
+        );
+    }
+
+    /// HIGH regression: the dropped-names note must survive budget
+    /// truncation, which cuts a section's body from the end. Before the fix
+    /// the note was appended at the tail and truncated away first.
+    #[test]
+    fn dropped_note_survives_tight_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body: String = (0..40).fold(String::new(), |mut acc, i| {
+            let _ = writeln!(acc, "    line_{i}();");
+            acc
+        });
+        std::fs::write(
+            tmp.path().join("lib.rs"),
+            format!(
+                "fn a() {{\n{body}}}\nfn b() {{}}\nfn c() {{}}\nfn d() {{}}\nfn e() {{}}\nfn f() {{}}\n"
+            ),
+        )
+        .unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = std::sync::Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "queries": [{"query": "a,b,c,d,e,f"}],
+            "scope": tmp.path().to_str().unwrap(),
+            "cwd": tmp.path().to_str().unwrap(),
+            "budget": 300,
+        });
+
+        let out = tool_search(&args, &cache, &session, &bloom, false).unwrap();
+
+        assert!(
+            out.contains("truncated"),
+            "test setup failed to force truncation: {out}"
+        );
+        assert!(
+            out.contains("dropped (5 per call max): f") && out.contains("second search"),
+            "dropped-names note did not survive budget truncation: {out}"
+        );
+    }
+
+    /// HIGH regression: the dropped-names note must survive
+    /// `if_modified_since` redaction, which stubs out trailing per-file
+    /// sections for unchanged files. Before the fix the note — appended at
+    /// the tail — was grouped into the last file's section and replaced by
+    /// the unchanged stub.
+    #[test]
+    fn dropped_note_survives_if_modified_since_redaction() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("lib.rs"),
+            "fn a() {}\nfn b() {}\nfn c() {}\nfn d() {}\nfn e() {}\nfn f() {}\n",
+        )
+        .unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = std::sync::Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "queries": [{"query": "a,b,c,d,e,f"}],
+            "scope": tmp.path().to_str().unwrap(),
+            "cwd": tmp.path().to_str().unwrap(),
+            "if_modified_since": "2030-01-01T00:00:00Z",
+        });
+
+        let out = tool_search(&args, &cache, &session, &bloom, false).unwrap();
+
+        assert!(
+            out.contains("unchanged"),
+            "test setup failed to trigger if_modified_since redaction: {out}"
+        );
+        assert!(
+            out.contains("dropped (5 per call max): f") && out.contains("second search"),
+            "dropped-names note did not survive if_modified_since redaction: {out}"
         );
     }
 }
