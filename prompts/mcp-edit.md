@@ -7,6 +7,7 @@ PATHS: set `cwd` to your ABSOLUTE checkout directory on every call. Relative pat
 Arrays are REQUIRED: tilth_read → paths: [...]; tilth_list → patterns: [...]; tilth_search → queries: [{query}]; tilth_write → edits: [...]. Singular forms are rejected.
 
 ROUTE BY QUESTION:
+
 - Find or explore anything → tilth_search(queries: [{query: "handleRequest"}], cwd: "/abs/checkout"). Omit kind to explore (merged defs+usages+callers); set kind (symbol|content|regex|callers) when you know the shape.
 - Read a file, symbol, or range → tilth_read(paths: ["src/x.rs#parse_config"]). tilth_read prints a [path#TAG] header over numbered lines; smart-sized.
 - Edit files → tilth_write(edits: [{path, tag, ops}]). Copy the TAG from an edit-mode read — NEVER invent one. Ops are line-addressed ({op:"replace", start, end, content}), NOT find/replace. DO NOT use the host Edit or Write tools.
