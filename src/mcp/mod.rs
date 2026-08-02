@@ -642,21 +642,39 @@ mod tests {
     }
 
     #[test]
-    fn tool_read_paths_wrong_type_reports_type_error() {
-        // A scalar (or any non-array) value for `paths` should produce a
-        // type-specific error, not the generic "missing" message.
-        let args = serde_json::json!({ "paths": "a.rs" });
+    fn tool_read_paths_bare_string_coerces_and_nudges() {
+        // A bare-string `paths` coerces to a single-element array and reads
+        // the file; the response teaches batching via a nudge note.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.rs");
+        std::fs::write(&p, "fn a() {}\n").unwrap();
+        let args = serde_json::json!({ "paths": p.to_str().unwrap() });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let out = tool_read(&tc(&args), &cache, &session, false)
+            .expect("bare-string paths must coerce and read, not error");
+        assert!(
+            out.contains("fn a()"),
+            "coerced read must return file content: {out}"
+        );
+        assert!(
+            out.contains("paths: [\"a.rs\", \"b.rs\"]"),
+            "response must teach batching via a nudge note: {out}"
+        );
+    }
+
+    #[test]
+    fn tool_read_paths_non_string_element_shows_corrected_shape() {
+        // Arrays with non-string elements still error, but now the error
+        // shows the corrected shape rather than a bare type complaint.
+        let args = serde_json::json!({ "paths": [{"bad": true}] });
         let cache = OutlineCache::new();
         let session = Session::new();
         let err = tool_read(&tc(&args), &cache, &session, false)
-            .expect_err("scalar `paths` must be rejected as wrong type");
+            .expect_err("non-string array element must still error");
         assert!(
-            err.contains("paths must be an array"),
-            "unexpected error: {err}"
-        );
-        assert!(
-            !err.contains("missing required parameter"),
-            "wrong-type error must not claim the param is missing: {err}"
+            err.contains("paths: [\"a.rs\", \"b.rs\"]"),
+            "error must show the corrected shape: {err}"
         );
     }
 
@@ -671,6 +689,37 @@ mod tests {
         let err = tool_read(&tc(&args), &cache, &session, false)
             .expect_err("unknown mode must be rejected");
         assert!(err.contains("unknown read mode"), "unexpected error: {err}");
+        assert!(
+            err.contains("auto, full, signature, stripped"),
+            "error must name all valid modes: {err}"
+        );
+        assert!(
+            err.contains("edit mode"),
+            "error must explain tagged/edit reads happen automatically in edit mode: {err}"
+        );
+    }
+
+    /// `mode: "edit"` was never a valid mode value — tagged/editable reads
+    /// happen automatically when the server runs in edit mode, so the error
+    /// must redirect the caller rather than just name it "unknown".
+    #[test]
+    fn tool_read_mode_edit_teaches_server_mode() {
+        let args = serde_json::json!({
+            "paths": ["a.rs"],
+            "mode": "edit"
+        });
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let err = tool_read(&tc(&args), &cache, &session, false)
+            .expect_err("mode: edit must still be rejected");
+        assert!(
+            err.contains("auto, full, signature, stripped"),
+            "error must name valid modes: {err}"
+        );
+        assert!(
+            err.contains("\"edit\" is not a mode"),
+            "error must redirect \"edit\" to the mode-only clause, not just call it unknown: {err}"
+        );
     }
 
     /// Batch reads must return the content of every submitted path — no file
@@ -706,6 +755,11 @@ mod tests {
                 "output must contain content of file {i}"
             );
         }
+
+        assert!(
+            !result.contains("> Note: paths accepts an array"),
+            "well-formed array paths must not carry the coercion nudge: {result}"
+        );
     }
 
     #[test]
@@ -1367,6 +1421,10 @@ mod tests {
         let err =
             tool_read(&tc(&args), &cache, &session, false).expect_err("unknown mode rejected");
         assert!(err.contains("stripped"), "error must list new mode: {err}");
+        assert!(
+            err.contains("edit mode"),
+            "error must explain tagged/edit reads happen automatically in edit mode: {err}"
+        );
     }
 
     /// Auto-signature on large code emits `view: "signature"` and the

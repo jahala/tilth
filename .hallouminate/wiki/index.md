@@ -17,6 +17,9 @@ under `.cheese/`.
 - [Local gate gotchas (macOS)](local-gate-gotchas.md) — why a local `cargo test` shows one failure CI does not (`batch_budget_represents_every_query`), and why CI's `cargo clippy -- -D warnings` is clean while `--all-targets` is not. Both are baseline; check before "fixing" either.
 - [MCP cwd / workspace-root binding](mcp-cwd-root-binding.md) — why tilth uses a required per-call `cwd` param (renamed from `root` in PR #113, hook removed in #144; not the MCP `roots` capability) to resolve paths to the right git-worktree checkout; the silent worktree gotcha; 8-harness client survey.
 
+
+- [`tilth_read` budget accounting and vacuous budget guards](read-budget-accounting.md) — `finalize_response` is the only budget gate and `record_savings` has two easily-conflated call sites; why a `<= budget` assertion is vacuous on Linux CI (50-token flat header reserve) while failing on macOS, why the obvious token-count differential is also wrong (`estimate_tokens` is subadditive), and the exact-equality assertion that works. Also the known macOS-only `batch_budget_represents_every_query` failure.
+
 ## How to use this index
 
 `index.md` is a table of contents, not a topic. Add new pages to the list

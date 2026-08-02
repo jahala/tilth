@@ -12,11 +12,64 @@ use crate::cache::OutlineCache;
 use crate::mcp::path_suffix::PathSuffix;
 use crate::session::Session;
 
+const PATHS_SHAPE_EXAMPLE: &str = "paths: [\"a.rs\", \"b.rs\"]";
+
+fn batching_note() -> String {
+    format!(
+        "\n\n> Note: paths accepts an array — batch related files in one call, e.g. {PATHS_SHAPE_EXAMPLE}."
+    )
+}
+
 pub(in crate::mcp) fn tool_read(
     args: &Value,
     cache: &OutlineCache,
     session: &Session,
     edit_mode: bool,
+) -> Result<String, String> {
+    // A bare-string `paths` coerces to a single-element array — the caller
+    // asked for one file, not the wrong shape — and the response teaches
+    // batching so the next call can request several files at once.
+    let coerced_str = args.get("paths").and_then(Value::as_str).map(String::from);
+    let note_tokens = if coerced_str.is_some() {
+        crate::types::estimate_tokens(batching_note().len() as u64)
+    } else {
+        0
+    };
+    let patched;
+    let dispatch_args = if let Some(s) = &coerced_str {
+        let mut clone = args.clone();
+        clone["paths"] = Value::Array(vec![Value::String(s.clone())]);
+        // The nudge appended below escapes tool_read_paths's own budget
+        // enforcement — shrink the budget passed down by the note's cost so
+        // a coerced read still respects the caller's declared cap.
+        let budget_val = args
+            .get("budget")
+            .and_then(Value::as_u64)
+            .unwrap_or(crate::budget::DEFAULT_BUDGET);
+        clone["budget"] = Value::from(budget_val.saturating_sub(note_tokens));
+        patched = clone;
+        &patched
+    } else {
+        args
+    };
+
+    let result = tool_read_paths(dispatch_args, cache, session, edit_mode, note_tokens);
+    if coerced_str.is_some() {
+        result.map(|mut body| {
+            body.push_str(&batching_note());
+            body
+        })
+    } else {
+        result
+    }
+}
+
+fn tool_read_paths(
+    args: &Value,
+    cache: &OutlineCache,
+    session: &Session,
+    edit_mode: bool,
+    note_tokens: u64,
 ) -> Result<String, String> {
     // Default to DEFAULT_BUDGET when the caller omits `budget`, matching
     // `apply_budget` used by the other tools — an uncapped `mode=full` or
@@ -48,7 +101,9 @@ pub(in crate::mcp) fn tool_read(
         .iter()
         .map(|p| {
             p.as_str()
-                .ok_or("paths must be an array of strings")
+                .ok_or_else(|| {
+                    format!("paths must be an array of strings, e.g. {PATHS_SHAPE_EXAMPLE}")
+                })
                 .map(String::from)
         })
         .collect::<Result<_, _>>()?;
@@ -57,7 +112,9 @@ pub(in crate::mcp) fn tool_read(
     let mode_str = args.get("mode").and_then(|v| v.as_str()).unwrap_or("auto");
     if !matches!(mode_str, "auto" | "full" | "signature" | "stripped") {
         return Err(format!(
-            "unknown read mode: {mode_str}. Use: auto, full, signature, stripped"
+            "unknown read mode: {mode_str}. Valid modes: auto, full, signature, stripped. \
+            \"edit\" is not a mode — mode only controls the view; tagged, editable reads happen \
+            automatically when the server runs in edit mode."
         ));
     }
     let force_full = mode_str == "full";
@@ -282,7 +339,7 @@ pub(in crate::mcp) fn tool_read(
         if let Some(file_byte_len) = savings_baseline {
             session.record_savings(
                 crate::types::estimate_tokens(file_byte_len),
-                crate::types::estimate_tokens(response.len() as u64),
+                crate::types::estimate_tokens(response.len() as u64) + note_tokens,
             );
         }
         return Ok(response);
@@ -346,7 +403,7 @@ pub(in crate::mcp) fn tool_read(
     if let Some(file_byte_len) = savings_baseline {
         session.record_savings(
             crate::types::estimate_tokens(file_byte_len),
-            crate::types::estimate_tokens(response.len() as u64),
+            crate::types::estimate_tokens(response.len() as u64) + note_tokens,
         );
     }
     Ok(response)
@@ -1153,5 +1210,179 @@ mod tests {
             "section reads must not record a full-file baseline"
         );
         assert_eq!(saved, 0, "section reads must not record savings");
+    }
+
+    /// A non-array, non-string `paths` (number, bool, object) is a type
+    /// error, not a missing parameter — the bare-string coercion only
+    /// applies to strings, so every other wrong shape must still be
+    /// reported as wrong-type, never misdiagnosed as absent.
+    #[test]
+    fn tool_read_paths_wrong_type_reports_type_error() {
+        let (session, cache) = services();
+        let args = serde_json::json!({ "paths": 42, "cwd": "/" });
+        let err = tool_read(&args, &cache, &session, false)
+            .expect_err("wrong-type paths must be rejected");
+        assert!(
+            err.contains("paths must be an array of file paths"),
+            "error must name the type mismatch: {err}"
+        );
+        assert!(
+            !err.contains("missing required parameter"),
+            "wrong-type paths must not be misreported as missing: {err}"
+        );
+    }
+
+    /// A coerced bare-string read appends a batching nudge after
+    /// `tool_read_paths` returns — the caller's declared `budget` must still
+    /// cap the combined body, not just the pre-nudge response. The absolute
+    /// `<= budget` check alone can never reliably catch a regression:
+    /// `truncate` flat-reserves 50 header tokens, so for a short tempdir path
+    /// there is more than the note's 25 tokens of slack under the cap and the
+    /// unfixed code passes too. It is kept as a cheap guard and paired with an
+    /// exact statement of the contract — a coerced read at `budget` must equal
+    /// the array-shaped read at `budget - note_tokens`, with the note appended.
+    ///
+    /// Equality is deliberate. Token-count comparisons between the two reads
+    /// are knife edges in both directions: the shrink reserves 25 tokens
+    /// (100 bytes) for a 99-byte note, so a 1-byte margin is all that separates
+    /// them and truncation's line-boundary rounding swamps it. Byte equality
+    /// has no margin to lose, and it fails pre-fix on every platform because
+    /// the unfixed code truncates against the full `budget`.
+    #[test]
+    fn tool_read_coerced_paths_respects_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.rs");
+        let mut src = String::new();
+        for i in 0..500 {
+            let _ = writeln!(src, "let v{i} = {i};");
+        }
+        std::fs::write(&path, &src).unwrap();
+        let budget = 200u64;
+
+        let (session, cache) = services();
+        let args = serde_json::json!({
+            "paths": path.to_str().unwrap(),
+            "mode": "full",
+            "budget": budget,
+            "cwd": dir.path().to_str().unwrap()
+        });
+        let out = tool_read(&args, &cache, &session, false).expect("coerced read must succeed");
+        let out_tokens = crate::types::estimate_tokens(out.len() as u64);
+
+        assert!(
+            out_tokens <= budget,
+            "coerced read + nudge must respect the caller's declared budget ({budget}): got {out_tokens} tokens",
+        );
+
+        // The note's cost must come out of the caller's budget, so the coerced
+        // read is exactly the array read budgeted `note_tokens` lower, plus the
+        // note. Unfixed, the body is truncated against the full `budget` and is
+        // strictly longer — this fails regardless of tempdir path length.
+        let note = batching_note();
+        let note_tokens = crate::types::estimate_tokens(note.len() as u64);
+        let (session_arr, cache_arr) = services();
+        let array_args = serde_json::json!({
+            "paths": [path.to_str().unwrap()],
+            "mode": "full",
+            "budget": budget - note_tokens,
+            "cwd": dir.path().to_str().unwrap()
+        });
+        let array_out = tool_read(&array_args, &cache_arr, &session_arr, false)
+            .expect("array read must succeed");
+
+        assert_eq!(
+            out,
+            format!("{array_out}{note}"),
+            "coerced read must be the array read at budget-minus-note plus the note",
+        );
+    }
+
+    /// A coerced bare-string auto read on a large file (outline path) must
+    /// book savings against what the caller actually receives (response +
+    /// batching note), not the pre-note body — else the note's tokens are
+    /// booked as savings never delivered (`.cheese/affinage/pr-149.md:51-55`).
+    #[test]
+    fn tool_read_coerced_paths_savings_excludes_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.rs");
+        // Build a file large enough to exceed TOKEN_THRESHOLD (6 000 tokens
+        // ≈ 24 KB) so the outline compresses well below the file size and
+        // genuine (non-saturated) savings are booked.
+        let mut src = String::from("// header\n");
+        for i in 0..200 {
+            let _ = writeln!(src, "fn func_{i}() {{");
+            for j in 0..20 {
+                let _ = writeln!(src, "    let v_{i}_{j}: u64 = {j} * {i} + 42;");
+            }
+            src.push_str("}\n");
+        }
+        std::fs::write(&path, &src).unwrap();
+        let file_size = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            file_size > 24_000,
+            "test file must be large enough to trigger outline: {file_size} bytes"
+        );
+
+        let (session, cache) = services();
+        let args = serde_json::json!({
+            "paths": path.to_str().unwrap(),
+            "cwd": dir.path().to_str().unwrap()
+        });
+
+        let out = tool_read(&args, &cache, &session, false).expect("coerced read must succeed");
+        let (baseline, saved) = session.savings();
+
+        let baseline_tokens = crate::types::estimate_tokens(file_size);
+        assert_eq!(baseline, baseline_tokens);
+
+        // What the caller actually received includes the batching note.
+        let note_len = batching_note().len() as u64;
+        let response_len = out.len() as u64 - note_len;
+        let expected_returned =
+            crate::types::estimate_tokens(response_len) + crate::types::estimate_tokens(note_len);
+        let expected_saved = baseline_tokens.saturating_sub(expected_returned);
+        assert_eq!(
+            saved, expected_saved,
+            "booked savings must account for the batching note actually delivered to the caller"
+        );
+    }
+
+    /// The general auto-read path (non-code file over TOKEN_THRESHOLD, e.g.
+    /// markdown/JSON/YAML) must also book savings against what the caller
+    /// actually receives (response + batching note) — this path
+    /// (read.rs:404) is a separate `record_savings` call site from the
+    /// signature/auto-promotion path above and was missed by the fix that
+    /// covered only code files.
+    #[test]
+    fn tool_read_coerced_paths_savings_excludes_note_markdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.md");
+        let mut src = String::from("# Top\n\n## Headline Marker\n\nBody preview line one.\n");
+        src.push_str(&"filler line repeated for size.\n".repeat(2_000));
+        std::fs::write(&path, &src).unwrap();
+        let file_size = std::fs::metadata(&path).unwrap().len();
+
+        let (session, cache) = services();
+        let args = serde_json::json!({
+            "paths": path.to_str().unwrap(),
+            "cwd": dir.path().to_str().unwrap()
+        });
+
+        let out = tool_read(&args, &cache, &session, false).expect("coerced read must succeed");
+        assert!(out.contains("[outline]"), "expected outline path: {out}");
+        let (baseline, saved) = session.savings();
+
+        let baseline_tokens = crate::types::estimate_tokens(file_size);
+        assert_eq!(baseline, baseline_tokens);
+
+        let note_len = batching_note().len() as u64;
+        let response_len = out.len() as u64 - note_len;
+        let expected_returned =
+            crate::types::estimate_tokens(response_len) + crate::types::estimate_tokens(note_len);
+        let expected_saved = baseline_tokens.saturating_sub(expected_returned);
+        assert_eq!(
+            saved, expected_saved,
+            "booked savings must account for the batching note actually delivered to the caller"
+        );
     }
 }
