@@ -24,13 +24,14 @@ if [[ ! -f $edit ]]; then
   exit 1
 fi
 
-# Concatenate the two source files verbatim. mcp-edit.md starts with a leading
-# blank-line pair to separate it visually from mcp-base.md in both the rendered
-# AGENTS.md and the runtime instructions string (where format!("{S}{E}") relies
-# on the same leading newlines).
+# Render both mode files, clearly labeled, so AGENTS.md documents the
+# mode-select served instructions (one complete file per mode — no
+# concatenation) rather than a single composed prompt.
 {
-  printf '<!-- generated from prompts/mcp-base.md + prompts/mcp-edit.md by scripts/regen-agents-md.sh — do not edit directly -->\n'
+  printf '<!-- generated from prompts/mcp-base.md + prompts/mcp-edit.md by scripts/regen-agents-md.sh — do not edit directly -->\n\n'
+  printf '## Base mode\n\n'
   cat "$base"
+  printf '\n\n## Edit mode\n\n'
   cat "$edit"
   printf '\n'
 } > "$out"

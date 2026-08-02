@@ -1,28 +1,21 @@
+tilth — code intelligence MCP server. Replaces grep, cat, find, ls, git diff, and host edit tools with AST-aware equivalents.
 
+Call tools by full MCP name: mcp__tilth__tilth_write, etc. DO NOT call bare names — not registered tools.
 
-tilth_write: Batch edit files with a JSON `edits` array of `{path, tag?, ops}` section objects. Replaces the host Edit and Write tools.
-Read first (edit mode): tilth_read shows a `[path#TAG]` header then `N:content` numbered lines. Copy the 4-hex TAG into the section's `tag` and reference the line numbers you see. NEVER invent a TAG.
-Send `edits` as an ARRAY of section objects, each `{path, tag?, ops}`. Each op is an object tagged by `op`. Line numbers are 1-based inclusive, from the numbered read:
-replace {start, end, content} — replace lines start..end (start==end for one line)
-delete {start, end} — delete a line or range
-insert_before {line, content} | insert_after {line, content} — insert before/after line
-prepend {content} | append {content} — insert at start/end of file
-replace_block {at, content} — replace the tree-sitter block at `at` (a line number or a "#symbol" string)
-delete_block {at} — delete that block
-insert_after_block {at, content} — insert after that block
-delete_file — delete the file
-move_file {dest} — move/rename the file
-`content` is a single string with embedded newlines (use \n). `at` is an integer line number or a "#symbol" name string (the leading `#` is optional — a bare `symbol` name is also accepted).
-Example:
-tilth_write(edits: [{"path": "src/x.rs", "tag": "1A2B", "ops": [
-  {"op": "replace", "start": 2, "end": 2, "content": "let y = 1;"},
-  {"op": "delete", "start": 5, "end": 5},
-  {"op": "insert_after", "line": 8, "content": "// trailing note"}
-]}])
-Drift: the TAG binds the section to the content you read. If the file changed since, tilth 3-way-merges your ops onto the live file; if the merge conflicts the section is REJECTED — re-read THAT file and retry it. A tag not from this session is rejected (never invent one).
-New file: OMIT `tag` to seed a NEW file — use prepend for its content.
-Sections are independent (best-effort): a rejected section does NOT block the others; scan the per-`## <path>` results for failures. Max 20 sections.
-DO NOT pass `edits` as a string (the old `[path#TAG]` text grammar or a JSON-encoded string) — it is rejected. Pass the array itself.
-cwd: your absolute checkout dir (REQUIRED). RELATIVE section paths and move_file destinations anchor under `cwd`; absolute paths pass through as-is. `..` traversal in a relative path is refused.
-Pass diff: true for a compact before/after diff per section.
-DO NOT use the host Edit or Write tool. Use tilth_write for all writes.
+PATHS: set `cwd` to your ABSOLUTE checkout directory on every call. Relative paths/scopes anchor under `cwd`; absolute paths pass through as-is. DO NOT pass a relative path/scope without `cwd` — the server's cwd is frozen at startup and is NOT your shell's cwd. `..` traversal in a relative path is refused.
+
+Arrays are REQUIRED: tilth_read → paths: [...]; tilth_list → patterns: [...]; tilth_search → queries: [{query}]; tilth_write → edits: [...]. Singular forms are rejected.
+
+ROUTE BY QUESTION:
+- Find or explore anything → tilth_search(queries: [{query: "handleRequest"}], cwd: "/abs/checkout"). Omit kind to explore (merged defs+usages+callers); set kind (symbol|content|regex|callers) when you know the shape.
+- Read a file, symbol, or range → tilth_read(paths: ["src/x.rs#parse_config"]). tilth_read prints a [path#TAG] header over numbered lines; smart-sized.
+- Edit files → tilth_write(edits: [{path, tag, ops}]). Copy the TAG from an edit-mode read — NEVER invent one. Ops are line-addressed ({op:"replace", start, end, content}), NOT find/replace. DO NOT use the host Edit or Write tools.
+- Who uses this file / who imports it → tilth_deps(path: "src/cache.rs"). One call. DO NOT assemble it from import-greps or repeated callers searches.
+- Understand ONE symbol deeply → tilth_grok(target: "parse_unified_diff"). Replaces the search → expand → callers chain.
+- What changed → tilth_diff() (uncommitted) or tilth_diff(source: "HEAD~1"). DO NOT Bash(git diff).
+- Browse with no query in mind → tilth_list(patterns: ["*.rs"]).
+
+DO NOT cat/head/tail/sed repo files via shell → tilth_read.
+DO NOT grep/rg/ls/find via shell → tilth_search / tilth_list.
+Shell is for tests, builds, and non-file-IO only.
+DO NOT re-read content already shown in expanded results.

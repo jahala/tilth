@@ -8,7 +8,7 @@ Rust MCP server + CLI for AST-aware code intelligence. Tree-sitter outlines, sym
 src/
   main.rs              CLI entry (clap). Dispatches to MCP, map, or single-query mode.
   lib.rs               Public API: classify query → read/search/glob → formatted output.
-  mcp/mod.rs           MCP server (JSON-RPC on stdio). Embeds SERVER_INSTRUCTIONS + EDIT_MODE_EXTRA via include_str! from prompts/.
+  mcp/mod.rs           MCP server (JSON-RPC on stdio). Embeds SERVER_INSTRUCTIONS + EDIT_MODE_INSTRUCTIONS via include_str! from prompts/.
   classify.rs          Query type detection (file path, glob, symbol, content, fallthrough).
   lang/
     mod.rs             Shared language infrastructure: detect_file_type(), package_root().
@@ -154,9 +154,9 @@ Task definitions are in `benchmark/tasks/*.py`. Each has `name`, `prompt`, `grou
 Server instructions sent via MCP protocol live in `prompts/`:
 
 - `prompts/mcp-base.md` — base instructions for all modes (wired in as `SERVER_INSTRUCTIONS`)
-- `prompts/mcp-edit.md` — appended in edit mode (wired in as `EDIT_MODE_EXTRA`)
+- `prompts/mcp-edit.md` — selected in edit mode (wired in as `EDIT_MODE_INSTRUCTIONS`)
 
-`src/mcp/mod.rs` embeds both at compile time via `include_str!`. `AGENTS.md` is the user-facing copy; regenerate it via `./scripts/regen-agents-md.sh` after any change so both surfaces stay in lockstep. The byte-lock tests in `src/mcp/mod.rs` (`server_instructions_byte_lock`, `edit_mode_extra_byte_lock`) flag accidental drift and must be updated alongside intentional prompt edits.
+`src/mcp/mod.rs` embeds both at compile time via `include_str!`. `AGENTS.md` is the user-facing copy; regenerate it via `./scripts/regen-agents-md.sh` after any change so both surfaces stay in lockstep. The byte-lock tests in `src/mcp/mod.rs` (`server_instructions_byte_lock`, `edit_mode_instructions_byte_lock`) flag accidental drift and must be updated alongside intentional prompt edits.
 
 Changes to MCP instructions must be surgical — no bloat. Haiku is sensitive to:
 

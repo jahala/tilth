@@ -52,10 +52,6 @@ struct Cli {
     #[arg(long)]
     edit: bool,
 
-    /// Disable project fingerprint in MCP init.
-    #[arg(long)]
-    no_overview: bool,
-
     /// Inline source for top N search matches (default 2 when flag bare).
     ///
     /// Applies to symbol / text / regex queries. Without the flag the
@@ -252,9 +248,6 @@ fn main() {
 
     // MCP mode: JSON-RPC server
     if cli.mcp {
-        if cli.no_overview {
-            std::env::set_var("TILTH_NO_OVERVIEW", "1");
-        }
         // Pass --scope to MCP if it's not the default "."
         let mcp_scope = if cli.scope.as_os_str() == "." {
             None

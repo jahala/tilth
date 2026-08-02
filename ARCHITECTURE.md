@@ -37,7 +37,8 @@ src/
 │                    queries, hot dirs, expanded-set dedup
 ├── cache.rs         OutlineCache: rendered outlines + parsed
 │                    tree_sitter::Tree, both keyed by (path, mtime)
-├── overview.rs      Project fingerprint emitted at MCP `initialize`
+├── overview.rs      Project fingerprint; CLI-only via `tilth overview`,
+│                    not injected at MCP `initialize`
 ├── map.rs           tilth --map: structural tree of the codebase
 ├── install.rs       Writes MCP server entries into ~20 host configs
 ├── edit.rs          Hash-anchored line edits + EditResult diff preview
@@ -159,14 +160,12 @@ anything else returns a JSON-RPC `method not found` error. The two
 methods worth describing in detail:
 
 - `initialize` — emits `protocolVersion`, capabilities, `serverInfo`,
-  and an `instructions` string. The instructions are the
-  `SERVER_INSTRUCTIONS` constant, loaded at compile time via
-  `include_str!("../../prompts/mcp-base.md")` and rewritten on `fd3de77`
-  as a pre-flight gate naming the exact Bash commands and host tools to
-  avoid, with concrete `<bad>→<good>` rewrites. When
-  `TILTH_NO_OVERVIEW` is unset, `overview::fingerprint(cwd)` is
-  prepended — a project summary built in <250ms (a stderr warning fires
-  if it overruns).
+  and an `instructions` string: the standalone base file
+  (`SERVER_INSTRUCTIONS`, `include_str!("../../prompts/mcp-base.md")`)
+  or the standalone edit-mode file (`EDIT_MODE_INSTRUCTIONS`,
+  `prompts/mcp-edit.md`) — never both, never concatenated with an
+  overview. `build_instructions(edit_mode)` selects the one complete
+  file for the mode and returns it trimmed.
 - `tools/list` — returns the tool schemas. `tools/call` is the workhorse
   and goes through `handle_tool_call`.
 
@@ -187,8 +186,8 @@ Rust since cancelling a thread mid-tree-sitter-parse is unsound. A
 process-wide `ABANDONED_THREADS` counter logs to stderr once
 accumulation hits 3.
 
-Edit mode (`--edit`) appends an `EDIT_MODE_EXTRA` instruction block
-describing `tilth_edit` and unlocks the `tilth_edit` dispatch arm.
+Edit mode (`--edit`) selects the standalone `EDIT_MODE_INSTRUCTIONS`
+file describing `tilth_write` and unlocks the `tilth_write` dispatch arm.
 
 ## Query pipeline
 
@@ -747,17 +746,16 @@ shapes; the in-process `dispatch_tool` and the per-tool functions
 (`tool_search`, `tool_read`, etc.) parse them by `serde_json::Value`
 lookups rather than typed structs.
 
-**Instructions injection.** The `SERVER_INSTRUCTIONS` constant is the
-strategic guidance every host gets at `initialize`. It lives in
-`prompts/mcp-base.md` and is wired in at compile time via
-`include_str!`. The text names exact bad commands
-(`Bash(grep/cat/find)`) and provides `<bad>→<good>` rewrites because
-agents kept reaching for those despite earlier "DO NOT use
-Grep/Read/Glob" rules. Edit mode appends an `EDIT_MODE_EXTRA` block
-from `prompts/mcp-edit.md` with the `tilth_edit` instructions.
-`overview::fingerprint(cwd)` is prepended unless `TILTH_NO_OVERVIEW`
-is set — a brief summary of language counts, manifests, hot files,
-and git context.
+**Instructions injection.** `build_instructions(edit_mode)` selects and
+returns exactly one standalone file per mode as the `instructions`
+string every host gets at `initialize` — never concatenated, and
+never prefixed with a project overview. Base mode serves
+`SERVER_INSTRUCTIONS` (`prompts/mcp-base.md`); edit mode serves
+`EDIT_MODE_INSTRUCTIONS` (`prompts/mcp-edit.md`) with the `tilth_write`
+instructions. Both files fit Claude Code's 2KB `instructions`-field
+truncation. The text names exact bad commands (`Bash(grep/cat/find)`)
+and provides `<bad>→<good>` rewrites because agents kept reaching for
+those despite earlier "DO NOT use Grep/Read/Glob" rules.
 
 `AGENTS.md` at the repo root is the user-facing copy of these
 instructions for hosts that read prompts from disk rather than via
@@ -796,8 +794,8 @@ user-facing.
   `package.json`, `go.mod`, `pyproject.toml`), reads `git` context
   (`branch`, `uncommitted`, `recent commits`), and emits a few
   hot-file lines. Wrapped in `catch_unwind` and a 250ms wall-clock
-  budget; warn-on-overrun via stderr. Output is the project summary
-  that the MCP `initialize` response prepends to `SERVER_INSTRUCTIONS`.
+  budget; warn-on-overrun via stderr. CLI-only via `tilth overview`;
+  the MCP `initialize` response no longer injects it.
 - **`map.rs`** — `tilth --map` generates a structural codebase tree:
   per-directory token estimates, top-level symbols per file, depth
   control. CLI-only — the MCP boundary doesn't expose it (no schema
