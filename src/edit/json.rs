@@ -164,12 +164,16 @@ fn lower_op(op: JsonOp) -> Result<Op, String> {
 fn lower_section(index: usize, raw: RawSection) -> Result<Section, String> {
     let tag = match raw.tag {
         None => None,
-        Some(t) => Some(parse_tag(&t).ok_or_else(|| {
-            format!(
-                "edits[{index}] (path {:?}): tag {t:?} is not a 4-hex-digit tag from an edit-mode read",
-                raw.path
-            )
-        })?),
+        Some(t) => {
+            let stripped = t.strip_prefix('#').unwrap_or(t.as_str());
+            Some(parse_tag(stripped).ok_or_else(|| {
+                format!(
+                    "edits[{index}] (path {:?}): tag {t:?} is not a 4-hex-digit tag from an \
+                     edit-mode read — run an edit-mode tilth_read of the path to mint a fresh tag",
+                    raw.path
+                )
+            })?)
+        }
     };
     let mut ops = Vec::with_capacity(raw.ops.len());
     for (j, ov) in raw.ops.into_iter().enumerate() {
@@ -178,8 +182,13 @@ fn lower_section(index: usize, raw: RawSection) -> Result<Section, String> {
             .and_then(Value::as_str)
             .unwrap_or("<missing>")
             .to_string();
-        let parsed: JsonOp = serde_json::from_value(ov)
-            .map_err(|e| format!("edits[{index}].ops[{j}] op \"{verb}\": {e}"))?;
+        let parsed: JsonOp = serde_json::from_value(ov).map_err(|e| {
+            format!(
+                "edits[{index}].ops[{j}] op \"{verb}\": {e}. Example op: \
+                 {{\"op\":\"replace\",\"start\":12,\"end\":14,\"content\":\"...\"}} — ops are \
+                 line-addressed using line numbers from the tagged read — not find/replace."
+            )
+        })?;
         ops.push(
             lower_op(parsed).map_err(|e| format!("edits[{index}].ops[{j}] op \"{verb}\": {e}"))?,
         );
@@ -465,6 +474,59 @@ mod tests {
         assert!(
             err.contains("\"path\": \"a.rs\""),
             "must show unwrapped form: {err}"
+        );
+    }
+
+    #[test]
+    fn op_deserialize_failure_teaches_example_and_line_addressed() {
+        let cases = [
+            json!([{ "path": "a.rs", "tag": "0000", "ops": [{ "op": "delete", "start": 1, "end": 1, "content": "oops" }] }]),
+            json!([{ "path": "a.rs", "tag": "0000", "ops": [{ "op": "seed" }] }]),
+            json!([{ "path": "a.rs", "tag": "0000", "ops": [{ "op": "replace", "start": 1, "end": 2 }] }]),
+        ];
+        for edits in cases {
+            let err = lower_edits(&edits).expect_err("bad op must fail");
+            assert!(
+                err.contains(r#"{"op":"replace","start":12,"end":14,"content":"..."}"#),
+                "must show the canonical example op: {err}"
+            );
+            assert!(
+                err.contains("line-addressed"),
+                "must teach line-addressing, not find/replace: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn leading_hash_tag_strips_and_passes() {
+        let edits = json!([{
+            "path": "a.rs", "tag": "#A0EA",
+            "ops": [{ "op": "delete", "start": 1, "end": 1 }]
+        }]);
+        let sections = lower_edits(&edits).expect("leading # must strip and parse");
+        assert_eq!(sections[0].tag, Some(0xA0EA));
+    }
+
+    #[test]
+    fn leading_hash_wrong_tag_still_fails() {
+        let edits = json!([{
+            "path": "a.rs", "tag": "#ZZZZ",
+            "ops": [{ "op": "delete", "start": 1, "end": 1 }]
+        }]);
+        let err = lower_edits(&edits).expect_err("stripped non-hex tag must still fail");
+        assert!(err.contains("ZZZZ") && err.contains("hex"), "got: {err}");
+    }
+
+    #[test]
+    fn bad_tag_error_hints_mint_a_tag() {
+        let edits = json!([{
+            "path": "a.rs", "tag": "auto",
+            "ops": [{ "op": "delete", "start": 1, "end": 1 }]
+        }]);
+        let err = lower_edits(&edits).expect_err("bad tag must fail");
+        assert!(
+            err.contains("tilth_read") && err.contains("mint"),
+            "must hint how to mint a fresh tag: {err}"
         );
     }
 }
