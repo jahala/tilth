@@ -97,10 +97,6 @@ enum Command {
         /// Enable edit mode (whole-file-tag output + tilth_write tool).
         #[arg(long)]
         edit: bool,
-
-        /// Skip installing the cwd-injection PreToolUse hook (claude-code only).
-        #[arg(long)]
-        no_hook: bool,
     },
     /// Show structural diff with function-level change summaries.
     Diff {
@@ -177,12 +173,8 @@ fn main() {
     // Subcommands
     if let Some(cmd) = cli.command {
         match cmd {
-            Command::Install {
-                ref host,
-                edit,
-                no_hook,
-            } => {
-                if let Err(e) = tilth::install::run(host, edit, no_hook) {
+            Command::Install { ref host, edit } => {
+                if let Err(e) = tilth::install::run(host, edit) {
                     eprintln!("install error: {e}");
                     process::exit(1);
                 }

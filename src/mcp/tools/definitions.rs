@@ -290,23 +290,10 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
     tools
 }
 
-/// The description for the shared `cwd` property, chosen by whether the Claude
-/// Code `PreToolUse` hook injects cwd automatically (`injected == true`) or the
-/// model is expected to set it explicitly (Codex and every other host).
-fn cwd_description(injected: bool) -> &'static str {
-    if injected {
-        "Your absolute checkout directory. Injected automatically by the Claude Code hook — do NOT set it."
-    } else {
-        "Your absolute checkout directory — always set this explicitly. Relative paths/scopes anchor under it; absolute paths pass through. The server cannot see your shell cwd."
-    }
-}
-
-/// The shared `cwd` schema property. The description flips on the
-/// `TILTH_MCP_CWD_HOOK_INJECTED` env var (`"1"` → hook-injected on Claude Code;
-/// anything else → set explicitly), which `tilth install` writes per host.
+/// The shared `cwd` schema property. The description text is model-facing
+/// and must always tell the model to set `cwd` explicitly.
 fn cwd_property() -> Value {
-    let injected = std::env::var("TILTH_MCP_CWD_HOOK_INJECTED").as_deref() == Ok("1");
-    serde_json::json!({ "type": "string", "description": cwd_description(injected) })
+    serde_json::json!({ "type": "string", "description": "Your absolute checkout directory — always set this explicitly. Relative paths/scopes anchor under it; absolute paths pass through. The server cannot see your shell cwd." })
 }
 
 #[cfg(test)]
@@ -602,22 +589,16 @@ mod tests {
         }
     }
 
-    /// The `cwd` description flips between the hook-injected and explicit
-    /// variants. Tested through the pure helper so no process-global env var
-    /// has to be mutated (which would race the parallel test runner).
     #[test]
-    fn cwd_description_flips_on_hook_injection() {
+    fn cwd_property_description_tells_model_to_set_explicitly() {
+        let property = cwd_property();
+        let description = property["description"]
+            .as_str()
+            .expect("cwd property description is a string");
         assert!(
-            cwd_description(true).contains("do NOT set"),
-            "hook-injected variant must tell the model not to set cwd: {}",
-            cwd_description(true)
+            description.contains("always set this explicitly"),
+            "cwd description must tell the model to set cwd: {description}"
         );
-        assert!(
-            cwd_description(false).contains("always set this explicitly"),
-            "explicit variant must tell the model to set cwd: {}",
-            cwd_description(false)
-        );
-        assert_ne!(cwd_description(true), cwd_description(false));
     }
 
     /// `tilth_list` relaxed `patterns` to optional: a bare `{cwd}` call must

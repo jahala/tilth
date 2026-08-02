@@ -53,49 +53,39 @@ const SUPPORTED_HOSTS: &[&str] = &[
     "pi",
 ];
 
-/// The tilth cwd-injection `PreToolUse` hook script, embedded from the
-/// standalone plugin so `tilth install claude-code` can write it directly
-/// instead of requiring a manual `plugin/claude/` install step.
-const INJECT_CWD_JS: &str = include_str!("../plugin/claude/hooks/inject-cwd.js");
-
-/// Matcher for the tilth `PreToolUse` hook entry — mirrors `plugin/claude/hooks/hooks.json`.
-const TILTH_HOOK_MATCHER: &str = "mcp__tilth__.*";
-
 /// The tilth server entry as JSON. Format depends on the host's [`ConfigFormat`] variant.
-fn tilth_server_entry(edit: bool, format: &ConfigFormat, hook_injected: &str) -> Value {
+fn tilth_server_entry(edit: bool, format: &ConfigFormat) -> Value {
     let (command, args) = tilth_command_and_args(edit);
-    let env = json!({ "TILTH_MCP_CWD_HOOK_INJECTED": hook_injected });
     match format {
         ConfigFormat::Json { .. } => json!({
             "command": command,
-            "args": args,
-            "env": env
+            "args": args
         }),
         ConfigFormat::JsonLocal { .. } => {
             let mut command_arr = vec![command];
             command_arr.extend(args);
             json!({
                 "type": "local",
-                "command": command_arr,
-                "environment": env
+                "command": command_arr
             })
         }
         ConfigFormat::Toml => unreachable!("tilth_server_entry called for TOML host"),
     }
 }
 
+/// Returns a migration warning when a pre-#144 Claude Code hook install is still
+/// on disk. tilth no longer ships the `PreToolUse` cwd-injection hook; leaving it
+/// wired means an omitted `cwd` gets silently filled with the session root instead
+/// of tilth's teaching refusal.
+fn stale_hook_warning(script_exists: bool) -> Option<&'static str> {
+    script_exists.then_some(
+        "tilth: found a stale Claude Code cwd-injection hook. Delete ~/.claude/tilth/inject-cwd.js and remove the mcp__tilth__.* PreToolUse entry from ~/.claude/settings.json — tilth no longer ships this hook, and leaving it wired means an omitted cwd is silently filled with the session root instead of tilth's teaching refusal.",
+    )
+}
+
 /// Write MCP config for the given host, preserving existing config.
-///
-/// For claude-code (unless `no_hook`), also writes the cwd-injection hook
-/// script to `~/.claude/tilth/inject-cwd.js` and upserts a `PreToolUse` entry
-/// into `~/.claude/settings.json` — a different file from `~/.claude.json`
-/// (the MCP server config written above).
-pub fn run(host: &str, edit: bool, no_hook: bool) -> Result<(), String> {
+pub fn run(host: &str, edit: bool) -> Result<(), String> {
     let host_info = resolve_host(host)?;
-    // Claude Code ships the cwd-injection hook (auto-installed below unless
-    // --no-hook), so its schema tells the model NOT to set cwd; every other
-    // host sets it explicitly.
-    let hook_injected = if host == "claude-code" { "1" } else { "0" };
 
     if let Some(parent) = host_info.path.parent() {
         fs::create_dir_all(parent)
@@ -104,9 +94,17 @@ pub fn run(host: &str, edit: bool, no_hook: bool) -> Result<(), String> {
 
     match host_info.format {
         ConfigFormat::Json { .. } | ConfigFormat::JsonLocal { .. } => {
-            write_json_config(&host_info, edit, hook_injected)?;
+            write_json_config(&host_info, edit)?;
         }
-        ConfigFormat::Toml => write_toml_config(&host_info, edit, hook_injected)?,
+        ConfigFormat::Toml => write_toml_config(&host_info, edit)?,
+    }
+
+    if host == "claude-code" {
+        if let Some(msg) =
+            stale_hook_warning(home_dir()?.join(".claude/tilth/inject-cwd.js").exists())
+        {
+            eprintln!("{msg}");
+        }
     }
 
     if edit {
@@ -115,19 +113,7 @@ pub fn run(host: &str, edit: bool, no_hook: bool) -> Result<(), String> {
         eprintln!("✓ tilth added to {}", host_info.path.display());
     }
 
-    if host == "claude-code" {
-        if no_hook {
-            eprintln!(
-                "  Hook not installed (--no-hook). Install manually from plugin/claude/, or via the Claude Code plugin marketplace."
-            );
-        } else {
-            let home = home_dir()?;
-            let (script_path, settings_path) = install_claude_code_hook(&home)?;
-            eprintln!("✓ cwd-injection hook installed");
-            eprintln!("  script:   {}", script_path.display());
-            eprintln!("  settings: {}", settings_path.display());
-        }
-    } else if let Some(note) = host_info.note {
+    if let Some(note) = host_info.note {
         eprintln!("  {note}");
     }
 
@@ -141,7 +127,7 @@ fn atomic_write(path: &std::path::Path, content: &str) -> Result<(), String> {
         .map_err(|e| format!("failed to write {}: {e}", path.display()))
 }
 
-fn write_json_config(host_info: &HostInfo, edit: bool, hook_injected: &str) -> Result<(), String> {
+fn write_json_config(host_info: &HostInfo, edit: bool) -> Result<(), String> {
     let servers_key = match host_info.format {
         ConfigFormat::Json { servers_key } | ConfigFormat::JsonLocal { servers_key } => servers_key,
         ConfigFormat::Toml => unreachable!("write_json_config called for TOML host"),
@@ -159,7 +145,7 @@ fn write_json_config(host_info: &HostInfo, edit: bool, hook_injected: &str) -> R
     upsert_json_server(
         &mut config,
         servers_key,
-        tilth_server_entry(edit, &host_info.format, hook_injected),
+        tilth_server_entry(edit, &host_info.format),
     )?;
 
     let out =
@@ -168,10 +154,10 @@ fn write_json_config(host_info: &HostInfo, edit: bool, hook_injected: &str) -> R
     Ok(())
 }
 
-/// Builds the `[mcp_servers.tilth]` TOML table for the given command/args/env.
+/// Builds the `[mcp_servers.tilth]` TOML table for the given command/args.
 /// Split from `upsert_toml_tilth_table` so a test can feed it arbitrary
 /// strings (e.g. containing `"`) without going through `tilth_command_and_args`.
-fn build_tilth_toml_table(command: &str, args: &[String], hook_injected: &str) -> toml_edit::Table {
+fn build_tilth_toml_table(command: &str, args: &[String]) -> toml_edit::Table {
     let mut table = toml_edit::Table::new();
     table["command"] = toml_edit::value(command);
 
@@ -180,11 +166,6 @@ fn build_tilth_toml_table(command: &str, args: &[String], hook_injected: &str) -
         args_arr.push(a.as_str());
     }
     table["args"] = toml_edit::value(args_arr);
-
-    let mut env = toml_edit::InlineTable::new();
-    env.insert("TILTH_MCP_CWD_HOOK_INJECTED", hook_injected.into());
-    table["env"] = toml_edit::value(env);
-
     table
 }
 
@@ -210,19 +191,15 @@ fn insert_tilth_table(root: &mut toml_edit::Table, table: toml_edit::Table) -> R
 /// Inserts/replaces the `[mcp_servers.tilth]` table in a parsed TOML document,
 /// preserving every other table, key, and comment via `toml_edit`'s
 /// format-preserving edit model.
-fn upsert_toml_tilth_table(
-    doc: &mut toml_edit::DocumentMut,
-    edit: bool,
-    hook_injected: &str,
-) -> Result<(), String> {
+fn upsert_toml_tilth_table(doc: &mut toml_edit::DocumentMut, edit: bool) -> Result<(), String> {
     let (command, args) = tilth_command_and_args(edit);
-    let table = build_tilth_toml_table(&command, &args, hook_injected);
+    let table = build_tilth_toml_table(&command, &args);
     insert_tilth_table(doc.as_table_mut(), table)
 }
 
 /// Writes a `[mcp_servers.tilth]` section into a TOML config file, preserving
 /// the rest of the document (formatting, comments, other tables) untouched.
-fn write_toml_config(host_info: &HostInfo, edit: bool, hook_injected: &str) -> Result<(), String> {
+fn write_toml_config(host_info: &HostInfo, edit: bool) -> Result<(), String> {
     let existing = if host_info.path.exists() {
         fs::read_to_string(&host_info.path)
             .map_err(|e| format!("failed to read {}: {e}", host_info.path.display()))?
@@ -234,7 +211,7 @@ fn write_toml_config(host_info: &HostInfo, edit: bool, hook_injected: &str) -> R
         .parse()
         .map_err(|e| format!("invalid TOML in {}: {e}", host_info.path.display()))?;
 
-    upsert_toml_tilth_table(&mut doc, edit, hook_injected)
+    upsert_toml_tilth_table(&mut doc, edit)
         .map_err(|e| format!("{}: {e}", host_info.path.display()))?;
 
     atomic_write(&host_info.path, &doc.to_string())?;
@@ -293,7 +270,7 @@ fn resolve_host(host: &str) -> Result<HostInfo, String> {
             format: ConfigFormat::Json {
                 servers_key: "mcpServers",
             },
-            note: None, // hook install / --no-hook messaging is handled inline in `run`
+            note: None,
         }),
 
         // Cursor global: ~/.cursor/mcp.json → mcpServers
@@ -518,80 +495,6 @@ fn upsert_json_server(config: &mut Value, servers_key: &str, entry: Value) -> Re
     Ok(())
 }
 
-/// Idempotently upsert the tilth cwd-injection `PreToolUse` hook entry into a
-/// claude-code `settings.json` [`Value`]. Replaces any existing entry whose
-/// matcher equals [`TILTH_HOOK_MATCHER`]; appends when none exists. Preserves
-/// every other `PreToolUse` entry, every other hook event, and every
-/// unrelated top-level settings key. Extracted for testability — used by
-/// `install_claude_code_hook` and unit tests.
-fn upsert_pretooluse_hook(settings: &mut Value, script_path: &str) -> Result<(), String> {
-    let entry = json!({
-        "matcher": TILTH_HOOK_MATCHER,
-        "hooks": [
-            { "type": "command", "command": format!("node \"{script_path}\"") }
-        ]
-    });
-
-    let root = settings
-        .as_object_mut()
-        .ok_or("settings root is not a JSON object")?;
-    let pre_tool_use = root
-        .entry("hooks")
-        .or_insert(json!({}))
-        .as_object_mut()
-        .ok_or("hooks is not a JSON object")?
-        .entry("PreToolUse")
-        .or_insert(json!([]));
-    let entries = pre_tool_use
-        .as_array_mut()
-        .ok_or("hooks.PreToolUse is not a JSON array")?;
-
-    match entries
-        .iter_mut()
-        .find(|e| e.get("matcher").and_then(Value::as_str) == Some(TILTH_HOOK_MATCHER))
-    {
-        Some(existing) => *existing = entry,
-        None => entries.push(entry),
-    }
-    Ok(())
-}
-
-/// Writes the cwd-injection hook script to `~/.claude/tilth/inject-cwd.js`
-/// and upserts its `PreToolUse` entry into `~/.claude/settings.json` — a
-/// different file from `~/.claude.json` (the MCP server config). Returns the
-/// (script path, settings path) written, for the success message in `run`.
-fn install_claude_code_hook(home: &std::path::Path) -> Result<(PathBuf, PathBuf), String> {
-    let script_dir = home.join(".claude/tilth");
-    fs::create_dir_all(&script_dir)
-        .map_err(|e| format!("failed to create {}: {e}", script_dir.display()))?;
-    let script_path = script_dir.join("inject-cwd.js");
-    atomic_write(&script_path, INJECT_CWD_JS)?;
-
-    let settings_path = home.join(".claude/settings.json");
-    let mut settings: Value = if settings_path.exists() {
-        let raw = fs::read_to_string(&settings_path)
-            .map_err(|e| format!("failed to read {}: {e}", settings_path.display()))?;
-        serde_json::from_str(&raw)
-            .map_err(|e| format!("invalid JSON in {}: {e}", settings_path.display()))?
-    } else {
-        json!({})
-    };
-
-    let script_str = script_path.to_str().ok_or_else(|| {
-        format!(
-            "hook script path is not valid UTF-8: {}",
-            script_path.display()
-        )
-    })?;
-    upsert_pretooluse_hook(&mut settings, script_str)?;
-
-    let out =
-        serde_json::to_string_pretty(&settings).expect("serde_json::Value is always serializable");
-    atomic_write(&settings_path, &out)?;
-
-    Ok((script_path, settings_path))
-}
-
 /// Returns the VS Code globalStorage path for a given extension and settings filename.
 fn vscode_global_storage_path(extension_id: &str, filename: &str) -> Result<PathBuf, String> {
     let base = vscode_global_storage_base()?;
@@ -649,7 +552,7 @@ mod tests {
     #[test]
     fn toml_section_appended_when_absent() {
         let mut doc: toml_edit::DocumentMut = "[other]\nk = 1\n".parse().unwrap();
-        upsert_toml_tilth_table(&mut doc, false, "0").unwrap();
+        upsert_toml_tilth_table(&mut doc, false).unwrap();
         let out = doc.to_string();
         assert!(out.contains("[other]"));
         assert!(out.contains("[mcp_servers.tilth]"));
@@ -660,7 +563,7 @@ mod tests {
     fn toml_preserves_comments_and_unrelated_section() {
         let existing = "# legacy note about [mcp_servers.tilth] kept for humans\n[other]\nk = 1\n";
         let mut doc: toml_edit::DocumentMut = existing.parse().unwrap();
-        upsert_toml_tilth_table(&mut doc, false, "0").unwrap();
+        upsert_toml_tilth_table(&mut doc, false).unwrap();
         let out = doc.to_string();
         assert!(
             out.contains("# legacy note about [mcp_servers.tilth] kept for humans"),
@@ -679,15 +582,11 @@ mod tests {
     fn toml_section_replaces_existing_tilth_table() {
         let existing = "[mcp_servers.tilth]\ncommand = \"old\"\nargs = []\n[other]\nk = 1\n";
         let mut doc: toml_edit::DocumentMut = existing.parse().unwrap();
-        upsert_toml_tilth_table(&mut doc, true, "1").unwrap();
+        upsert_toml_tilth_table(&mut doc, true).unwrap();
         let out = doc.to_string();
         assert!(!out.contains("\"old\""), "old command not removed: {out:?}");
         assert!(out.contains("[other]"));
         assert_eq!(doc["other"]["k"].as_integer(), Some(1));
-        assert_eq!(
-            doc["mcp_servers"]["tilth"]["env"]["TILTH_MCP_CWD_HOOK_INJECTED"].as_str(),
-            Some("1")
-        );
     }
 
     #[test]
@@ -697,7 +596,7 @@ mod tests {
         // the exact original string.
         let command = "C:\\Program Files\\has \"quotes\"\\tilth.exe";
         let args = vec!["--mcp".to_string(), "say \"hi\"".to_string()];
-        let table = build_tilth_toml_table(command, &args, "0");
+        let table = build_tilth_toml_table(command, &args);
 
         let mut doc = toml_edit::DocumentMut::new();
         insert_tilth_table(doc.as_table_mut(), table).unwrap();
@@ -735,7 +634,7 @@ mod tests {
             format: ConfigFormat::Toml,
             note: None,
         };
-        let err = write_toml_config(&host_info, false, "0").unwrap_err();
+        let err = write_toml_config(&host_info, false).unwrap_err();
         assert!(
             err.contains(&path.display().to_string()),
             "error must include config path, got: {err:?}"
@@ -806,6 +705,26 @@ mod tests {
         upsert_json_server(&mut config, "amp.mcpServers", entry).unwrap();
 
         assert_eq!(config["amp.mcpServers"]["tilth"]["args"], json!(["--mcp"]));
+    }
+
+    #[test]
+    fn amp_overwrite_drops_stale_env_key() {
+        let mut config = json!({
+            "amp.mcpServers": {
+                "tilth": {"command": "old", "args": ["--old"], "env": {"TILTH_MCP_CWD_HOOK_INJECTED": "1"}}
+            }
+        });
+        let entry = json!({"command": "tilth", "args": ["--mcp"]});
+        upsert_json_server(&mut config, "amp.mcpServers", entry).unwrap();
+
+        // Asserting the whole entry, not just `env`'s absence: indexing a missing
+        // key yields `Value::Null`, whose `.get("env")` is also `None`, so an
+        // absence-only check would pass even if the upsert dropped `tilth` entirely.
+        assert_eq!(
+            config["amp.mcpServers"]["tilth"],
+            json!({"command": "tilth", "args": ["--mcp"]}),
+            "upsert must replace the whole entry, dropping the stale env key: {config:?}"
+        );
     }
 
     #[test]
@@ -1163,7 +1082,7 @@ mod tests {
 
     #[test]
     fn opencode_entry_uses_local_shape() {
-        let entry = tilth_server_entry(false, &ConfigFormat::JsonLocal { servers_key: "mcp" }, "0");
+        let entry = tilth_server_entry(false, &ConfigFormat::JsonLocal { servers_key: "mcp" });
         assert_eq!(entry["type"], json!("local"));
         assert!(entry["command"].is_array());
         assert!(entry.get("args").is_none());
@@ -1171,7 +1090,7 @@ mod tests {
 
     #[test]
     fn opencode_entry_with_edit() {
-        let entry = tilth_server_entry(true, &ConfigFormat::JsonLocal { servers_key: "mcp" }, "0");
+        let entry = tilth_server_entry(true, &ConfigFormat::JsonLocal { servers_key: "mcp" });
         assert_eq!(entry["type"], json!("local"));
         let cmd = entry["command"].as_array().unwrap();
         assert!(cmd.iter().any(|v| v == "--edit"));
@@ -1185,7 +1104,6 @@ mod tests {
             &ConfigFormat::Json {
                 servers_key: "mcpServers",
             },
-            "0",
         );
         assert!(entry.get("type").is_none());
         assert!(entry["command"].is_string());
@@ -1195,7 +1113,7 @@ mod tests {
     #[test]
     fn opencode_upserts_under_mcp_key() {
         let mut config = json!({});
-        let entry = tilth_server_entry(false, &ConfigFormat::JsonLocal { servers_key: "mcp" }, "0");
+        let entry = tilth_server_entry(false, &ConfigFormat::JsonLocal { servers_key: "mcp" });
         upsert_json_server(&mut config, "mcp", entry).unwrap();
 
         assert!(config.get("mcp").is_some());
@@ -1204,125 +1122,22 @@ mod tests {
         assert!(config["mcp"]["tilth"]["command"].is_array());
     }
 
-    /// `tilth install` writes the cwd-hook env var into the server entry: "1"
-    /// for claude-code (the hook injects cwd), "0" for every other host.
+    /// The message is this function's entire product, and it names two operator-facing
+    /// paths plus the hook matcher. Pin the full text so drifting it — or drifting the
+    /// path `run` actually probes — fails here instead of telling an operator to delete
+    /// a file tilth never looked for.
     #[test]
-    fn server_entry_carries_hook_injected_env() {
-        let claude = tilth_server_entry(
-            false,
-            &ConfigFormat::Json {
-                servers_key: "mcpServers",
-            },
-            "1",
-        );
-        assert_eq!(claude["env"]["TILTH_MCP_CWD_HOOK_INJECTED"], json!("1"));
-
-        let other = tilth_server_entry(
-            false,
-            &ConfigFormat::Json {
-                servers_key: "mcpServers",
-            },
-            "0",
-        );
-        assert_eq!(other["env"]["TILTH_MCP_CWD_HOOK_INJECTED"], json!("0"));
-
-        let local = tilth_server_entry(true, &ConfigFormat::JsonLocal { servers_key: "mcp" }, "0");
+    fn stale_hook_warning_present_when_script_exists() {
         assert_eq!(
-            local["environment"]["TILTH_MCP_CWD_HOOK_INJECTED"],
-            json!("0")
+            stale_hook_warning(true),
+            Some(
+                "tilth: found a stale Claude Code cwd-injection hook. Delete ~/.claude/tilth/inject-cwd.js and remove the mcp__tilth__.* PreToolUse entry from ~/.claude/settings.json — tilth no longer ships this hook, and leaving it wired means an omitted cwd is silently filled with the session root instead of tilth's teaching refusal."
+            )
         );
     }
 
-    /// The TOML config path (codex — the host that most depends on the
-    /// explicit-cwd posture) emits the hook-injected env var as an inline
-    /// table that parses as valid TOML with the right value.
     #[test]
-    fn toml_section_carries_hook_injected_env() {
-        for hook_injected in ["0", "1"] {
-            let (command, args) = tilth_command_and_args(false);
-            let table = build_tilth_toml_table(&command, &args, hook_injected);
-            let mut doc = toml_edit::DocumentMut::new();
-            insert_tilth_table(doc.as_table_mut(), table).unwrap();
-            let parsed: toml::Table = doc
-                .to_string()
-                .parse()
-                .expect("generated [mcp_servers.tilth] section must be valid TOML");
-            assert_eq!(
-                parsed["mcp_servers"]["tilth"]["env"]["TILTH_MCP_CWD_HOOK_INJECTED"]
-                    .as_str()
-                    .expect("env var must be a TOML string"),
-                hook_injected,
-                "TOML env emission must carry the hook-injected flag"
-            );
-        }
-    }
-
-    /// Upserting the hook twice must yield exactly one `mcp__tilth__.*`
-    /// `PreToolUse` entry — `tilth install claude-code` run twice should not
-    /// duplicate the hook.
-    #[test]
-    fn pretooluse_hook_upsert_is_idempotent() {
-        let mut settings = json!({});
-        upsert_pretooluse_hook(&mut settings, "/home/x/.claude/tilth/inject-cwd.js").unwrap();
-        upsert_pretooluse_hook(&mut settings, "/home/x/.claude/tilth/inject-cwd.js").unwrap();
-
-        let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
-        let tilth_entries: Vec<_> = entries
-            .iter()
-            .filter(|e| e["matcher"] == json!(TILTH_HOOK_MATCHER))
-            .collect();
-        assert_eq!(
-            tilth_entries.len(),
-            1,
-            "expected exactly one tilth PreToolUse entry, got: {entries:?}"
-        );
-    }
-
-    /// An existing unrelated `PreToolUse` entry and an unrelated top-level
-    /// settings key must both survive the upsert.
-    #[test]
-    fn pretooluse_hook_upsert_preserves_unrelated_entries() {
-        let mut settings = json!({
-            "otherTopLevelSetting": true,
-            "hooks": {
-                "PreToolUse": [
-                    { "matcher": "Bash", "hooks": [{ "type": "command", "command": "echo hi" }] }
-                ],
-                "PostToolUse": [
-                    { "matcher": "Edit", "hooks": [{ "type": "command", "command": "echo bye" }] }
-                ]
-            }
-        });
-        upsert_pretooluse_hook(&mut settings, "/home/x/.claude/tilth/inject-cwd.js").unwrap();
-
-        assert_eq!(settings["otherTopLevelSetting"], json!(true));
-        let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
-        assert!(
-            entries.iter().any(|e| e["matcher"] == json!("Bash")),
-            "unrelated PreToolUse entry was dropped: {entries:?}"
-        );
-        assert_eq!(
-            settings["hooks"]["PostToolUse"][0]["matcher"],
-            json!("Edit"),
-            "unrelated hook event was dropped"
-        );
-    }
-
-    /// The upserted entry has the right matcher, command type, and a `node`
-    /// invocation of the written script path.
-    #[test]
-    fn pretooluse_hook_entry_shape() {
-        let mut settings = json!({});
-        upsert_pretooluse_hook(&mut settings, "/home/x/.claude/tilth/inject-cwd.js").unwrap();
-
-        let entry = &settings["hooks"]["PreToolUse"][0];
-        assert_eq!(entry["matcher"], json!(TILTH_HOOK_MATCHER));
-        let command = entry["hooks"][0]["command"].as_str().unwrap();
-        assert_eq!(entry["hooks"][0]["type"], json!("command"));
-        assert!(command.starts_with("node "), "command: {command}");
-        assert!(
-            command.contains("/home/x/.claude/tilth/inject-cwd.js"),
-            "command should contain the script path: {command}"
-        );
+    fn stale_hook_warning_absent_when_script_missing() {
+        assert_eq!(stale_hook_warning(false), None);
     }
 }

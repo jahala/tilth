@@ -70,48 +70,26 @@ impl Services {
 const SERVER_INSTRUCTIONS: &str = include_str!("../../prompts/mcp-base.md");
 const EDIT_MODE_EXTRA: &str = include_str!("../../prompts/mcp-edit.md");
 
-/// True when the Claude Code cwd-injection hook is active
-/// (`TILTH_MCP_CWD_HOOK_INJECTED=1`, written per-host by `tilth install`). The
-/// per-tool `cwd` schema description reads the same var in
-/// `mcp::tools::definitions::cwd_property`; both surfaces must agree, so the
-/// hook-aware prompt swap below keys off the identical check.
-fn cwd_hook_injected() -> bool {
-    std::env::var("TILTH_MCP_CWD_HOOK_INJECTED").as_deref() == Ok("1")
-}
-
-/// The cwd-guidance spans in prompts/mcp-base.md, and their hook-aware
-/// replacements. When the hook injects `cwd` the model must NOT set it, so the
-/// built `instructions` swap these two spans. They are exact substrings of
-/// `SERVER_INSTRUCTIONS` (guarded by `cwd_guidance_spans_present`, so a markdown
-/// edit that drifts them fails loudly instead of silently no-op'ing the swap).
-const CWD_PATHS_DEFAULT: &str = "PATHS: set `cwd` to your ABSOLUTE checkout directory on every call. Relative paths/scopes anchor under `cwd`; absolute paths pass through as-is. DO NOT pass a relative path/scope without `cwd` — the server's cwd is frozen at startup and is NOT your shell's cwd. `..` traversal in a relative path is refused.";
-const CWD_PATHS_HOOKED: &str = "PATHS: `cwd` is injected automatically by the Claude Code hook — do NOT set it. Relative paths/scopes anchor under the injected `cwd`; absolute paths pass through as-is. `..` traversal in a relative path is refused.";
-const CWD_REQ_DEFAULT: &str = "Every tool also REQUIRES `cwd` — your absolute checkout directory.";
-const CWD_REQ_HOOKED: &str =
-    "Every tool takes `cwd`, but the Claude Code hook injects it — do NOT set it.";
+/// The cwd-guidance spans in prompts/mcp-base.md. Exact substrings of
+/// `SERVER_INSTRUCTIONS`, guarded by `cwd_guidance_spans_present` so an edit
+/// that drops or reworks the explicit-cwd directive fails the test rather
+/// than silently changing the model-facing cwd contract.
+#[cfg(test)]
+const CWD_PATHS_SPAN: &str = "PATHS: set `cwd` to your ABSOLUTE checkout directory on every call. Relative paths/scopes anchor under `cwd`; absolute paths pass through as-is. DO NOT pass a relative path/scope without `cwd` — the server's cwd is frozen at startup and is NOT your shell's cwd. `..` traversal in a relative path is refused.";
+#[cfg(test)]
+const CWD_REQ_SPAN: &str = "Every tool also REQUIRES `cwd` — your absolute checkout directory.";
 
 /// Compose the MCP `instructions` field: optional overview, the base prompt,
 /// and (in edit mode) the edit-mode addendum, separated by single blank lines
-/// with no trailing whitespace. When `cwd_injected`, the cwd guidance is
-/// rewritten to tell the model the hook supplies `cwd` — matching the per-tool
-/// schema description so the two surfaces never contradict.
-fn build_instructions(edit_mode: bool, overview: &str, cwd_injected: bool) -> String {
-    let trimmed = SERVER_INSTRUCTIONS.trim_end();
-    let base: std::borrow::Cow<str> = if cwd_injected {
-        std::borrow::Cow::Owned(
-            trimmed
-                .replace(CWD_PATHS_DEFAULT, CWD_PATHS_HOOKED)
-                .replace(CWD_REQ_DEFAULT, CWD_REQ_HOOKED),
-        )
-    } else {
-        std::borrow::Cow::Borrowed(trimmed)
-    };
+/// with no trailing whitespace.
+fn build_instructions(edit_mode: bool, overview: &str) -> String {
+    let base = SERVER_INSTRUCTIONS.trim_end();
     let mut out = String::with_capacity(base.len() + EDIT_MODE_EXTRA.len() + overview.len() + 64);
     if !overview.is_empty() {
         out.push_str(overview);
         out.push_str("\n\n");
     }
-    out.push_str(&base);
+    out.push_str(base);
     if edit_mode {
         // EDIT_MODE_EXTRA owns the separator: it opens with "\n\n" (locked by
         // edit_mode_extra_byte_lock), so appending it directly yields exactly
@@ -147,15 +125,6 @@ fn current_dir_or_log() -> PathBuf {
     }
 }
 
-/// The startup warning emitted when the Claude Code cwd-injection hook is
-/// expected (`TILTH_MCP_CWD_HOOK_INJECTED=1`) so an operator without the hook
-/// installed has a grep-able stderr line. `None` for any other env value.
-fn hook_injection_warning(env_value: Option<&str>) -> Option<&'static str> {
-    (env_value == Some("1")).then_some(
-        "tilth: cwd hook injection expected (TILTH_MCP_CWD_HOOK_INJECTED=1) — ensure the plugin/claude hook is installed",
-    )
-}
-
 /// MCP server over stdio. When `edit_mode` is true, exposes `tilth_write` and
 /// switches `tilth_read` to whole-file-tag (`[path#TAG]` + numbered lines) output.
 ///
@@ -176,12 +145,6 @@ pub fn run(edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
         if let Some(root) = crate::lang::package_root(&cwd) {
             chdir_or_log(root);
         }
-    }
-
-    if let Some(msg) =
-        hook_injection_warning(std::env::var("TILTH_MCP_CWD_HOOK_INJECTED").ok().as_deref())
-    {
-        eprintln!("{msg}");
     }
     let services = Services::new(edit_mode);
     let stdin = io::stdin();
@@ -281,7 +244,7 @@ fn handle_request(req: &JsonRpcRequest, services: &Services) -> JsonRpcResponse 
                 let cwd = current_dir_or_log();
                 crate::overview::fingerprint(&cwd)
             };
-            let instructions = build_instructions(edit_mode, &overview, cwd_hook_injected());
+            let instructions = build_instructions(edit_mode, &overview);
             JsonRpcResponse {
                 jsonrpc: "2.0",
                 id: req.id.clone(),
@@ -468,17 +431,6 @@ fn write_error(w: &mut impl Write, id: Option<Value>, code: i32, msg: &str) -> i
 mod tests {
     use super::*;
     use std::fmt::Write as _;
-
-    #[test]
-    fn hook_injection_warning_fires_only_on_one() {
-        assert_eq!(
-            hook_injection_warning(Some("1")),
-            Some("tilth: cwd hook injection expected (TILTH_MCP_CWD_HOOK_INJECTED=1) — ensure the plugin/claude hook is installed")
-        );
-        assert_eq!(hook_injection_warning(Some("0")), None);
-        assert_eq!(hook_injection_warning(Some("true")), None);
-        assert_eq!(hook_injection_warning(None), None);
-    }
 
     /// Tool handlers now require an absolute `cwd`. Injects a default so the
     /// behavior tests below can focus on the handler under test: absolute paths
@@ -1636,7 +1588,7 @@ mod tests {
 
     #[test]
     fn build_instructions_base_has_expected_anchors() {
-        let s = build_instructions(false, "", false);
+        let s = build_instructions(false, "");
         // Adapted: pre-merge opening anchor was "tilth — AST-aware code
         // intelligence MCP server."; current prompts/mcp-base.md opens with
         // "tilth — code intelligence MCP server. Replaces grep, cat, find, ls".
@@ -1659,7 +1611,7 @@ mod tests {
 
     #[test]
     fn build_instructions_edit_appends_thin_pointer() {
-        let s = build_instructions(true, "", false);
+        let s = build_instructions(true, "");
         // Adapted: pre-merge asserted the marker "tilth_write is exposed";
         // current EDIT_MODE_EXTRA opens with "tilth_write: Batch write".
         assert!(
@@ -1685,7 +1637,7 @@ mod tests {
     #[test]
     fn build_instructions_no_trailing_whitespace() {
         for &edit in &[false, true] {
-            let s = build_instructions(edit, "", false);
+            let s = build_instructions(edit, "");
             assert!(
                 !s.ends_with('\n') && !s.ends_with(' '),
                 "wire output must not end with whitespace (edit={edit})"
@@ -1701,7 +1653,7 @@ mod tests {
         // byte-identical invariant the revival claimed. The piece-wise locks
         // (edit_mode_extra_byte_lock, SERVER_INSTRUCTIONS checks) do not guard
         // the *composed* output, so lock it here.
-        let edit = build_instructions(true, "", false);
+        let edit = build_instructions(true, "");
         assert!(
             edit.contains(
                 "DO NOT re-read files already shown in expanded search results.\n\ntilth_write: Batch edit files"
@@ -1713,7 +1665,7 @@ mod tests {
             "edit-mode composition must not contain a triple newline (double blank line)"
         );
         assert_eq!(
-            build_instructions(false, "", false).len(),
+            build_instructions(false, "").len(),
             5708,
             "non-edit composed instructions byte count drifted"
         );
@@ -1726,49 +1678,24 @@ mod tests {
 
     #[test]
     fn build_instructions_overview_prepends_with_blank_line() {
-        let s = build_instructions(false, "OVERVIEW", false);
+        let s = build_instructions(false, "OVERVIEW");
         assert!(
             s.starts_with("OVERVIEW\n\ntilth — "),
             "overview should be followed by blank line then base"
         );
     }
 
-    /// The hook-aware swap targets exact substrings of the base prompt. If a
-    /// markdown edit drifts either span, `.replace` would silently no-op and the
-    /// prompt would keep telling the model to set `cwd` under the hook — the
-    /// exact contradiction this feature removes. Guard both spans here.
+    /// Guard the cwd-guidance spans against markdown drift.
     #[test]
     fn cwd_guidance_spans_present() {
         assert!(
-            SERVER_INSTRUCTIONS.contains(CWD_PATHS_DEFAULT),
-            "PATHS cwd span drifted from prompts/mcp-base.md — hook swap would no-op"
+            SERVER_INSTRUCTIONS.contains(CWD_PATHS_SPAN),
+            "PATHS cwd span drifted from prompts/mcp-base.md"
         );
         assert!(
-            SERVER_INSTRUCTIONS.contains(CWD_REQ_DEFAULT),
-            "REQUIRES cwd span drifted from prompts/mcp-base.md — hook swap would no-op"
+            SERVER_INSTRUCTIONS.contains(CWD_REQ_SPAN),
+            "REQUIRES cwd span drifted from prompts/mcp-base.md"
         );
-    }
-
-    #[test]
-    fn build_instructions_flips_cwd_guidance_under_hook() {
-        let default = build_instructions(false, "", false);
-        let hooked = build_instructions(false, "", true);
-
-        // Default keeps the explicit-cwd directive; hooked drops it.
-        assert!(default.contains(CWD_PATHS_DEFAULT));
-        assert!(default.contains(CWD_REQ_DEFAULT));
-        assert!(!default.contains("injected automatically by the Claude Code hook"));
-
-        // Hooked tells the model NOT to set cwd, matching the schema description.
-        assert!(!hooked.contains(CWD_PATHS_DEFAULT));
-        assert!(!hooked.contains(CWD_REQ_DEFAULT));
-        assert!(hooked
-            .contains("`cwd` is injected automatically by the Claude Code hook — do NOT set it"));
-        assert!(hooked.contains("the Claude Code hook injects it — do NOT set it"));
-        // The "do NOT set it" phrasing mirrors the per-tool cwd schema
-        // description (mcp::tools::definitions::cwd_description), keeping the two
-        // model-facing surfaces consistent.
-        assert!(hooked.contains("do NOT set it"));
     }
 
     /// Tightened tree-shape assertion: the rendered tree carries the box-
