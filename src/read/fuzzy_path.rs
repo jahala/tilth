@@ -63,20 +63,28 @@ pub fn resolve_fuzzy_path(scope: &Path, query: &str, _gate: GateProfile) -> Fuzz
         );
     }
 
-    let mut scored = score_candidates(query, &candidates);
-    if scored.is_empty() {
-        return FuzzyResolution::None;
+    let suggestions = rank_path_suggestions(query, &candidates);
+    if suggestions.is_empty() {
+        FuzzyResolution::None
+    } else {
+        FuzzyResolution::Suggestions(suggestions)
     }
-    // Highest score first; stable tie order keeps equal-score candidates as the
-    // walker yielded them (sorted by path in `collect_candidates`).
-    scored.sort_by_key(|&(score, _)| std::cmp::Reverse(score));
+}
 
-    let suggestions = scored
+/// Rank `candidates` (scope-relative path strings) against `query` and return
+/// the top [`SUGGESTION_K`] by nucleo path-aware fuzzy score, as owned
+/// strings. Shared ranking core for the fuzzy-path fallback above and
+/// `diff::not_found_error`'s "did you mean" suggestions.
+pub(crate) fn rank_path_suggestions(query: &str, candidates: &[String]) -> Vec<String> {
+    let mut scored = score_candidates(query, candidates);
+    // Highest score first; stable tie order keeps equal-score candidates as
+    // the caller yielded them.
+    scored.sort_by_key(|&(score, _)| std::cmp::Reverse(score));
+    scored
         .into_iter()
         .take(SUGGESTION_K)
         .map(|(_, p)| p.to_string_lossy().into_owned())
-        .collect();
-    FuzzyResolution::Suggestions(suggestions)
+        .collect()
 }
 
 /// Search-miss suggestions for the MCP `tilth_search` default path, which

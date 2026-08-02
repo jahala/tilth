@@ -194,7 +194,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     },
                     "scope": {
                         "type": "string",
-                        "description": "Restrict diff output to a specific file or directory path."
+                        "description": "Restrict diff output to a file (suffix-matched, e.g. 'a.rs'). In overview mode only, also accepts a repo-root-relative directory prefix (e.g. 'src/fanout'); log mode takes a file scope only."
                     },
                     "a": {
                         "type": "string",

@@ -4,6 +4,7 @@ pub mod overlay;
 pub mod parse;
 
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -223,10 +224,185 @@ fn run_git_diff(source: &DiffSource) -> Result<String, String> {
         .output()
         .map_err(|e| format!("failed to run git diff: {e}"))?;
 
-    // git diff --no-index exits 1 when there are differences; that is normal.
-    // For all other variants, a non-zero exit is unexpected but we still return
-    // whatever stdout was produced so the caller can decide.
+    // git diff exits 0 (no diff) or 1 (diff found) on success; --no-index uses
+    // the same convention. Anything else (typically 128/129) is a fatal error,
+    // for every source — not just refs.
+    if !matches!(output.status.code(), Some(0 | 1)) {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let msg = match source {
+            DiffSource::GitRef(r) => {
+                append_default_branch_hint(format!("git diff failed for '{r}': {stderr}"), &stderr)
+            }
+            DiffSource::GitUncommitted => format!("git diff against HEAD failed: {stderr}"),
+            DiffSource::GitStaged => format!("git diff --staged failed: {stderr}"),
+            DiffSource::Files(fa, fb) => format!(
+                "git diff --no-index failed for '{}' vs '{}': {stderr}",
+                fa.display(),
+                fb.display()
+            ),
+            DiffSource::Patch(_) | DiffSource::Log(_) => unreachable!(),
+        };
+        return Err(msg);
+    }
+
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn parse_origin_head_ref(s: &str) -> Option<String> {
+    s.strip_prefix("refs/remotes/origin/")
+        .filter(|n| !n.is_empty())
+        .map(str::to_string)
+}
+
+/// Detect the repo's default branch: prefer `origin/HEAD`'s symbolic-ref
+/// target, falling back to a local `main`/`master` branch if there is no
+/// configured remote. Returns `None` rather than guessing at an arbitrary
+/// branch.
+fn default_branch_hint() -> Option<String> {
+    if let Ok(output) = Command::new("git")
+        .args(["symbolic-ref", "refs/remotes/origin/HEAD"])
+        .output()
+    {
+        if output.status.success() {
+            let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if let Some(name) = parse_origin_head_ref(&s) {
+                return Some(name);
+            }
+        }
+    }
+
+    let output = Command::new("git")
+        .args(["branch", "--format=%(refname:short)"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|b| *b == "main" || *b == "master")
+        .map(str::to_string)
+}
+
+/// Append a "this repo's default branch is ..." hint to an error message when
+/// `stderr` indicates an unresolvable revision and the default branch can be
+/// detected; otherwise return `msg` unchanged.
+fn append_default_branch_hint(mut msg: String, stderr: &str) -> String {
+    if !(stderr.contains("unknown revision") || stderr.contains("ambiguous argument")) {
+        return msg;
+    }
+    if let Some(branch) = default_branch_hint() {
+        let _ = write!(
+            msg,
+            "; this repo's default branch is '{branch}' — try '{branch}..HEAD'"
+        );
+    }
+    msg
+}
+
+/// Normalize an absolute scope under the repo root to repo-relative, strip a
+/// leading `./`, and trim a trailing slash. A scope equal to the repo root
+/// normalizes to the empty string. Non-absolute scopes, and scopes outside
+/// the repo root, are returned trimmed but otherwise unchanged.
+fn normalize_scope(scope: &str) -> String {
+    let trimmed = scope.trim_end_matches('/');
+    let trimmed = trimmed.strip_prefix("./").unwrap_or(trimmed);
+    let path = Path::new(trimmed);
+    if path.is_absolute() {
+        if let Some(root) = repo_root() {
+            if let Ok(rel) = path.strip_prefix(&root) {
+                return rel.to_string_lossy().into_owned();
+            }
+        }
+    }
+    trimmed.to_string()
+}
+
+/// The repo root via `git rev-parse --show-toplevel`, run against the current
+/// process cwd.
+fn repo_root() -> Option<PathBuf> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(s))
+    }
+}
+
+/// True when `path` sits under `scope` at a component boundary — scope
+/// `src/fanout` matches `src/fanout/a.rs` but not `src/fanout_extra/a.rs`.
+/// `scope` must be non-empty; an empty scope is the caller's signal to fall
+/// through to the unscoped full overview, not to filter here.
+fn path_has_scope_prefix(path: &Path, scope: &str) -> bool {
+    path.starts_with(Path::new(scope))
+}
+
+/// Find the overlay whose path exactly matches or ends with `query`.
+fn find_overlay_by_path<'a>(overlays: &'a [FileOverlay], query: &str) -> Option<&'a FileOverlay> {
+    overlays.iter().find(|o| {
+        let p = o.path.to_string_lossy();
+        p == query || p.ends_with(query)
+    })
+}
+
+/// Build a "not found" error for `missing`, appending up to 3 similar overlay
+/// paths as a suggest-only "did you mean" clause when any score.
+fn not_found_error(missing: &str, overlays: &[FileOverlay]) -> String {
+    let candidates: Vec<String> = overlays
+        .iter()
+        .map(|o| o.path.to_string_lossy().into_owned())
+        .collect();
+    let suggestions = crate::read::fuzzy_path::rank_path_suggestions(missing, &candidates);
+    if suggestions.is_empty() {
+        format!("file '{missing}' not found in diff")
+    } else {
+        format!(
+            "file '{missing}' not found in diff; did you mean: {}",
+            suggestions.join(", ")
+        )
+    }
+}
+
+/// Extract the backtick-quoted symbol name from a `signature_warnings`/
+/// `compute_blast` warning string (`` warning: `name` ... `` / `` blast: `name` ... ``).
+fn warning_symbol_name(warning: &str) -> Option<&str> {
+    let rest = warning.split_once('`')?.1;
+    rest.split_once('`').map(|(name, _)| name)
+}
+
+/// True when `scope`'s first `:` is the `file:function` separator rather
+/// than a Windows drive-letter colon (`C:/repo/src`, index 1).
+fn is_file_function_scope(scope: &str) -> bool {
+    let rest = if scope.as_bytes().get(1) == Some(&b':') {
+        &scope[2..]
+    } else {
+        scope
+    };
+    rest.contains(':')
+}
+
+/// Build `file_meta` parallel to `overlays`: `(path, is_generated, is_binary)`.
+fn build_file_meta<'a>(
+    overlays: &'a [FileOverlay],
+    file_diffs: &[FileDiff],
+) -> Vec<(&'a Path, bool, bool)> {
+    overlays
+        .iter()
+        .map(|o| {
+            let fd = file_diffs.iter().find(|fd| fd.path == o.path);
+            let (is_generated, is_binary) =
+                fd.map_or((false, false), |f| (f.is_generated, f.is_binary));
+            (o.path.as_path(), is_generated, is_binary)
+        })
+        .collect()
 }
 
 /// Full diff orchestrator — parse → overlay → format pipeline.
@@ -283,45 +459,52 @@ pub fn diff(
         warnings.append(&mut blast_warnings);
     }
 
-    // 7. Build file_meta parallel to overlays.
-    let file_meta: Vec<(&Path, bool, bool)> = overlays
-        .iter()
-        .map(|o| {
-            // Find the original FileDiff for this overlay to get is_generated/is_binary.
-            let fd = file_diffs.iter().find(|fd| fd.path == o.path);
-            let (is_generated, is_binary) =
-                fd.map_or((false, false), |f| (f.is_generated, f.is_binary));
-            (o.path.as_path(), is_generated, is_binary)
-        })
-        .collect();
-
-    // 8. Format based on scope.
+    // 7. Format based on scope.
     let label = source_label(source);
     let mut output = match scope {
-        None => format::format_overview(&overlays, &file_meta, &warnings, &label, budget),
-        Some(s) if s.contains(':') => {
-            // file:function scope
-            let (file_part, fn_name) = s.split_once(':').unwrap();
-            match overlays.iter().find(|o| {
-                let p = o.path.to_string_lossy();
-                p == file_part || p.ends_with(file_part)
-            }) {
-                Some(o) => format::format_function_detail(o, fn_name),
-                None => return Err(format!("file '{file_part}' not found in diff")),
-            }
+        None => {
+            let file_meta = build_file_meta(&overlays, &file_diffs);
+            format::format_overview(&overlays, &file_meta, &warnings, &label, budget)
         }
-        Some(file) => {
-            match overlays.iter().find(|o| {
-                let p = o.path.to_string_lossy();
-                p == file || p.ends_with(file)
-            }) {
-                Some(o) => format::format_file_detail(o, budget),
-                None => return Err(format!("file '{file}' not found in diff")),
+        Some(raw_scope) => {
+            let scope_norm = normalize_scope(raw_scope);
+            if scope_norm.is_empty() {
+                let file_meta = build_file_meta(&overlays, &file_diffs);
+                format::format_overview(&overlays, &file_meta, &warnings, &label, budget)
+            } else if is_file_function_scope(&scope_norm) {
+                // file:function scope
+                let (file_part, fn_name) = scope_norm.split_once(':').unwrap();
+                match find_overlay_by_path(&overlays, file_part) {
+                    Some(o) => format::format_function_detail(o, fn_name),
+                    None => return Err(not_found_error(file_part, &overlays)),
+                }
+            } else if let Some(o) = find_overlay_by_path(&overlays, &scope_norm) {
+                format::format_file_detail(o, budget)
+            } else {
+                if !overlays
+                    .iter()
+                    .any(|o| path_has_scope_prefix(&o.path, &scope_norm))
+                {
+                    return Err(not_found_error(raw_scope, &overlays));
+                }
+                overlays.retain(|o| path_has_scope_prefix(&o.path, &scope_norm));
+                let retained_names: HashSet<&str> = overlays
+                    .iter()
+                    .flat_map(|o| o.symbol_changes.iter())
+                    .filter(|c| matches!(c.change, ChangeType::SignatureChanged))
+                    .map(|c| c.name.as_str())
+                    .collect();
+                warnings
+                    .retain(|w| warning_symbol_name(w).is_none_or(|n| retained_names.contains(n)));
+                let file_meta = build_file_meta(&overlays, &file_diffs);
+                let overview =
+                    format::format_overview(&overlays, &file_meta, &warnings, &label, budget);
+                format!("Scope filter: files under '{scope_norm}/'\n\n{overview}")
             }
         }
     };
 
-    // 9. Conflict detection for uncommitted diffs.
+    // 8. Conflict detection for uncommitted diffs.
     if matches!(source, DiffSource::GitUncommitted) {
         let mut all_conflicts = Vec::new();
         for overlay in &overlays {
@@ -447,19 +630,27 @@ fn compute_blast(overlays: &[FileOverlay]) -> Vec<String> {
     }
 }
 
+/// Git's well-known empty-tree object hash — the "old" side of a root
+/// commit's diff, which has no parent to diff against.
+const EMPTY_TREE_SHA1: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
 /// Log mode pipeline: run per-commit diffs and format as commit summaries.
 fn diff_log(range: &str, scope: Option<&str>, budget: Option<u64>) -> Result<String, String> {
     reject_leading_dash(range)?;
+    let scope_norm = scope.map(normalize_scope);
 
-    // Get commit list.
+    // Get commit list, including parent hashes to detect root commits.
     let output = Command::new("git")
-        .args(["log", "--format=%H %at %s%x00%an", range])
+        .args(["log", "--format=%H %at %P%x01%s%x00%an", range])
         .output()
         .map_err(|e| format!("failed to run git log: {e}"))?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("git log failed: {stderr}"));
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(append_default_branch_hint(
+            format!("git log failed: {stderr}"),
+            &stderr,
+        ));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -471,20 +662,28 @@ fn diff_log(range: &str, scope: Option<&str>, budget: Option<u64>) -> Result<Str
             continue;
         }
 
-        // Format: "<hash> <timestamp> <subject>\0<author>"
+        // Format: "<hash> <timestamp> <parents>\x01<subject>\0<author>"
         let Some((rest, author)) = line.split_once('\0') else {
             continue;
         };
+        let Some((meta, message)) = rest.split_once('\x01') else {
+            continue;
+        };
 
-        let mut parts = rest.splitn(3, ' ');
+        let mut parts = meta.splitn(3, ' ');
         let Some(hash) = parts.next() else {
             continue;
         };
         let timestamp: i64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-        let message = parts.next().unwrap_or("").to_string();
+        let has_parent = !parts.next().unwrap_or("").trim().is_empty();
 
-        // Run diff for this commit.
-        let ref_str = format!("{hash}^..{hash}");
+        // Run diff for this commit. A root commit has no parent to diff
+        // against, so diff it against the empty tree instead.
+        let ref_str = if has_parent {
+            format!("{hash}^..{hash}")
+        } else {
+            format!("{EMPTY_TREE_SHA1}..{hash}")
+        };
         let commit_source = DiffSource::GitRef(ref_str);
         let raw = run_git_diff(&commit_source)?;
         let file_diffs = parse::parse_unified_diff(&raw);
@@ -498,14 +697,14 @@ fn diff_log(range: &str, scope: Option<&str>, budget: Option<u64>) -> Result<Str
         summaries.push(CommitSummary {
             hash: hash.to_string(),
             timestamp,
-            message,
+            message: message.to_string(),
             author: author.to_string(),
             overlays,
         });
     }
 
     // Filter by scope if set.
-    if let Some(file_scope) = scope {
+    if let Some(file_scope) = scope_norm.as_deref() {
         for summary in &mut summaries {
             summary.overlays.retain(|o| {
                 let p = o.path.to_string_lossy();
@@ -1143,6 +1342,654 @@ diff --git a/src/main.rs b/src/main.rs
         assert!(
             result.unwrap_err().contains("arg-injection guard"),
             "expected arg-injection guard message"
+        );
+    }
+
+    // 21. test_dir_prefix_scope_filters_overview
+    #[test]
+    fn test_dir_prefix_scope_filters_overview() {
+        let dir = setup_test_repo();
+        let fanout_dir = dir.path().join("src/fanout");
+        fs::create_dir_all(&fanout_dir).unwrap();
+        let a_rs = fanout_dir.join("a.rs");
+        fs::write(&a_rs, "fn a() {\n    1\n}\n").unwrap();
+        let other_rs = dir.path().join("src/other.rs");
+        fs::write(&other_rs, "fn b() {\n    2\n}\n").unwrap();
+        git(dir.path(), &["add", "-A"]);
+        git(dir.path(), &["commit", "-m", "add fanout+other"]);
+
+        fs::write(&a_rs, "fn a() {\n    99\n}\n").unwrap();
+        fs::write(&other_rs, "fn b() {\n    99\n}\n").unwrap();
+
+        let result = run_diff_in(
+            dir.path(),
+            &DiffSource::GitUncommitted,
+            Some("src/fanout"),
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            result.contains("fanout/a.rs"),
+            "expected fanout file in filtered overview:\n{result}"
+        );
+        assert!(
+            !result.contains("other.rs"),
+            "expected other.rs excluded from filtered overview:\n{result}"
+        );
+        assert!(
+            result.contains("Scope filter"),
+            "expected scope filter header:\n{result}"
+        );
+    }
+
+    // 22. test_dir_prefix_boundary_no_match
+    #[test]
+    fn test_dir_prefix_boundary_no_match() {
+        let dir = setup_test_repo();
+        let fanout_dir = dir.path().join("src/fanout");
+        fs::create_dir_all(&fanout_dir).unwrap();
+        let a_rs = fanout_dir.join("a.rs");
+        fs::write(&a_rs, "fn a() {\n    1\n}\n").unwrap();
+        git(dir.path(), &["add", "-A"]);
+        git(dir.path(), &["commit", "-m", "add fanout"]);
+
+        fs::write(&a_rs, "fn a() {\n    99\n}\n").unwrap();
+
+        let result = run_diff_in(
+            dir.path(),
+            &DiffSource::GitUncommitted,
+            Some("src/fan"),
+            None,
+            false,
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "expected 'src/fan' to NOT component-boundary-match 'src/fanout/a.rs'"
+        );
+        assert!(
+            result.unwrap_err().contains("not found"),
+            "expected not-found error for non-matching prefix"
+        );
+    }
+
+    // 23. test_scope_not_found_suggests_similar
+    #[test]
+    fn test_scope_not_found_suggests_similar() {
+        let dir = setup_test_repo();
+        let main_rs = dir.path().join("src/main.rs");
+        let content = fs::read_to_string(&main_rs).unwrap();
+        fs::write(
+            &main_rs,
+            content.replace("println!(\"hello\")", "println!(\"hi\")"),
+        )
+        .unwrap();
+
+        let result = run_diff_in(
+            dir.path(),
+            &DiffSource::GitUncommitted,
+            Some("src/man.rs"),
+            None,
+            false,
+            None,
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("did you mean"),
+            "expected did-you-mean suggestion in:\n{err}"
+        );
+        assert!(
+            err.contains("main.rs"),
+            "expected main.rs suggested in:\n{err}"
+        );
+    }
+
+    // 24. test_scope_not_found_no_suggestion_for_garbage
+    #[test]
+    fn test_scope_not_found_no_suggestion_for_garbage() {
+        let dir = setup_test_repo();
+        let main_rs = dir.path().join("src/main.rs");
+        let content = fs::read_to_string(&main_rs).unwrap();
+        fs::write(
+            &main_rs,
+            content.replace("println!(\"hello\")", "println!(\"hi\")"),
+        )
+        .unwrap();
+
+        let result = run_diff_in(
+            dir.path(),
+            &DiffSource::GitUncommitted,
+            Some("zzqqxx/nonexistent_totally_unrelated.xyz"),
+            None,
+            false,
+            None,
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            !err.contains("did you mean"),
+            "expected no suggestion for unrelated garbage path:\n{err}"
+        );
+    }
+
+    // 25. test_bad_ref_teaches_default_branch
+    #[test]
+    fn test_bad_ref_teaches_default_branch() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let p = dir.path();
+        git(p, &["init", "-b", "trunk"]);
+        git(p, &["config", "user.email", "test@test.com"]);
+        git(p, &["config", "user.name", "Test"]);
+        git(p, &["commit", "--allow-empty", "-m", "initial"]);
+        git(p, &["branch", "main"]);
+
+        let result = run_diff_in(
+            p,
+            &DiffSource::GitRef("nonexistent-ref..HEAD".to_string()),
+            None,
+            None,
+            false,
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "expected error for unresolvable ref 'nonexistent-ref'"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("default branch is 'main'"),
+            "expected default-branch teaching hint in:\n{err}"
+        );
+        assert!(
+            err.contains("main..HEAD"),
+            "expected suggested range in:\n{err}"
+        );
+    }
+
+    // 26. test_log_bad_ref_teaches_default_branch
+    #[test]
+    fn test_log_bad_ref_teaches_default_branch() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let p = dir.path();
+        git(p, &["init", "-b", "trunk"]);
+        git(p, &["config", "user.email", "test@test.com"]);
+        git(p, &["config", "user.name", "Test"]);
+        git(p, &["commit", "--allow-empty", "-m", "initial"]);
+        git(p, &["branch", "main"]);
+
+        let result = run_diff_in(
+            p,
+            &DiffSource::Log("nonexistent-ref..HEAD".to_string()),
+            None,
+            None,
+            false,
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "expected error for unresolvable log range 'nonexistent-ref'"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("default branch is 'main'"),
+            "expected default-branch teaching hint in:\n{err}"
+        );
+    }
+
+    // 27. test_no_default_branch_hint_without_main_or_master
+    #[test]
+    fn test_no_default_branch_hint_without_main_or_master() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let p = dir.path();
+        git(p, &["init", "-b", "trunk"]);
+        git(p, &["config", "user.email", "test@test.com"]);
+        git(p, &["config", "user.name", "Test"]);
+        git(p, &["commit", "--allow-empty", "-m", "initial"]);
+
+        let result = run_diff_in(
+            p,
+            &DiffSource::GitRef("nonexistent-ref..HEAD".to_string()),
+            None,
+            None,
+            false,
+            None,
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            !err.contains("default branch"),
+            "expected no default-branch hint without a local main/master:\n{err}"
+        );
+    }
+
+    // 28. test_uncommitted_diff_errors_outside_repo
+    #[test]
+    fn test_uncommitted_diff_errors_outside_repo() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let result = run_diff_in(
+            dir.path(),
+            &DiffSource::GitUncommitted,
+            None,
+            None,
+            false,
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "expected an error diffing outside a git repo, got: {result:?}"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.to_lowercase().contains("git diff"),
+            "expected the error to name the failing git command:\n{err}"
+        );
+    }
+
+    // 29. test_log_mode_root_commit
+    #[test]
+    fn test_log_mode_root_commit() {
+        let dir = setup_test_repo();
+        let main_rs = dir.path().join("src/main.rs");
+
+        let content = fs::read_to_string(&main_rs).unwrap();
+        fs::write(
+            &main_rs,
+            content.replace("println!(\"hello\")", "println!(\"root test\")"),
+        )
+        .unwrap();
+        git(dir.path(), &["add", "-A"]);
+        git(dir.path(), &["commit", "-m", "second commit"]);
+
+        let result = run_diff_in(
+            dir.path(),
+            &DiffSource::Log("HEAD".to_string()),
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            result.contains("initial"),
+            "expected the root commit's message in log output:\n{result}"
+        );
+        assert!(
+            result.contains("main.rs"),
+            "expected the root commit's added file in log output:\n{result}"
+        );
+    }
+
+    // 30. test_append_default_branch_hint_gated_by_stderr
+    #[test]
+    fn test_append_default_branch_hint_gated_by_stderr() {
+        let _lock = CWD_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let p = dir.path();
+        git(p, &["init", "-b", "main"]);
+        git(p, &["config", "user.email", "test@test.com"]);
+        git(p, &["config", "user.name", "Test"]);
+        git(p, &["commit", "--allow-empty", "-m", "initial"]);
+
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(p).unwrap();
+
+        let with_hint = append_default_branch_hint(
+            "git diff failed".to_string(),
+            "fatal: ambiguous argument 'x..HEAD': unknown revision or path not in the working tree.",
+        );
+        let without_hint = append_default_branch_hint(
+            "git diff failed".to_string(),
+            "fatal: unrelated failure, nothing to do with revisions",
+        );
+
+        std::env::set_current_dir(&prev).unwrap();
+
+        assert!(
+            with_hint.contains("default branch is 'main'"),
+            "expected hint for unresolvable-ref stderr:\n{with_hint}"
+        );
+        assert!(
+            !without_hint.contains("default branch"),
+            "expected no hint for unrelated stderr:\n{without_hint}"
+        );
+    }
+
+    // 31. test_parse_origin_head_ref
+    #[test]
+    fn test_parse_origin_head_ref() {
+        assert_eq!(
+            parse_origin_head_ref("refs/remotes/origin/release/stable"),
+            Some("release/stable".to_string())
+        );
+        assert_eq!(
+            parse_origin_head_ref("refs/remotes/origin/main"),
+            Some("main".to_string())
+        );
+    }
+
+    // 32. test_scope_prefix_no_match_on_shared_dir_name_stem
+    #[test]
+    fn test_scope_prefix_no_match_on_shared_dir_name_stem() {
+        let dir = setup_test_repo();
+        let fanout_extra_dir = dir.path().join("src/fanout_extra");
+        fs::create_dir_all(&fanout_extra_dir).unwrap();
+        let a_rs = fanout_extra_dir.join("a.rs");
+        fs::write(&a_rs, "fn a() {\n    1\n}\n").unwrap();
+        git(dir.path(), &["add", "-A"]);
+        git(dir.path(), &["commit", "-m", "add fanout_extra"]);
+
+        fs::write(&a_rs, "fn a() {\n    99\n}\n").unwrap();
+
+        let result = run_diff_in(
+            dir.path(),
+            &DiffSource::GitUncommitted,
+            Some("src/fanout"),
+            None,
+            false,
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "expected 'src/fanout' to NOT match 'src/fanout_extra/a.rs' (non-boundary prefix)"
+        );
+        assert!(result.unwrap_err().contains("not found"));
+    }
+
+    // 33. test_dot_slash_prefixed_scope_matches_directory
+    #[test]
+    fn test_dot_slash_prefixed_scope_matches_directory() {
+        let dir = setup_test_repo();
+        let fanout_dir = dir.path().join("src/fanout");
+        fs::create_dir_all(&fanout_dir).unwrap();
+        let a_rs = fanout_dir.join("a.rs");
+        fs::write(&a_rs, "fn a() {\n    1\n}\n").unwrap();
+        git(dir.path(), &["add", "-A"]);
+        git(dir.path(), &["commit", "-m", "add fanout"]);
+
+        fs::write(&a_rs, "fn a() {\n    99\n}\n").unwrap();
+
+        let result = run_diff_in(
+            dir.path(),
+            &DiffSource::GitUncommitted,
+            Some("./src/fanout"),
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            result.contains("fanout/a.rs"),
+            "expected './'-prefixed scope to match directory:\n{result}"
+        );
+        assert!(result.contains("Scope filter"));
+    }
+
+    // 34. test_repo_root_scope_falls_through_to_full_overview
+    #[test]
+    fn test_repo_root_scope_falls_through_to_full_overview() {
+        let dir = setup_test_repo();
+        let main_rs = dir.path().join("src/main.rs");
+        let content = fs::read_to_string(&main_rs).unwrap();
+        fs::write(
+            &main_rs,
+            content.replace("println!(\"hello\")", "println!(\"hi\")"),
+        )
+        .unwrap();
+
+        let root = git(dir.path(), &["rev-parse", "--show-toplevel"])
+            .trim()
+            .to_string();
+
+        let result = run_diff_in(
+            dir.path(),
+            &DiffSource::GitUncommitted,
+            Some(&root),
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            !result.contains("Scope filter"),
+            "expected repo-root scope to fall through to unscoped overview:\n{result}"
+        );
+        assert!(result.contains("main.rs"));
+    }
+
+    // 35. test_absolute_file_scope_normalizes_to_repo_relative
+    #[test]
+    fn test_absolute_file_scope_normalizes_to_repo_relative() {
+        let dir = setup_test_repo();
+        let main_rs = dir.path().join("src/main.rs");
+        let content = fs::read_to_string(&main_rs).unwrap();
+        fs::write(
+            &main_rs,
+            content.replace("println!(\"hello\")", "println!(\"hi\")"),
+        )
+        .unwrap();
+
+        let root = git(dir.path(), &["rev-parse", "--show-toplevel"])
+            .trim()
+            .to_string();
+        let abs_scope = format!("{root}/src/main.rs");
+
+        let relative_result = run_diff_in(
+            dir.path(),
+            &DiffSource::GitUncommitted,
+            Some("src/main.rs"),
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        let absolute_result = run_diff_in(
+            dir.path(),
+            &DiffSource::GitUncommitted,
+            Some(&abs_scope),
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        // Symbol order isn't deterministic across two `diff()` calls in one
+        // process (`matching.rs`'s `match_symbols` HashMap iteration), so
+        // sort both sides before comparing.
+        let mut abs_lines: Vec<&str> = absolute_result.lines().collect();
+        let mut rel_lines: Vec<&str> = relative_result.lines().collect();
+        abs_lines.sort_unstable();
+        rel_lines.sort_unstable();
+        assert_eq!(
+            abs_lines, rel_lines,
+            "absolute file scope should resolve to the same file detail as its repo-relative spelling:\nabs:\n{absolute_result}\nrel:\n{relative_result}"
+        );
+    }
+
+    // 36. test_scoped_overview_filters_warnings_to_retained_files
+    #[test]
+    fn test_scoped_overview_filters_warnings_to_retained_files() {
+        let dir = setup_test_repo();
+        let fanout_dir = dir.path().join("src/fanout");
+        let other_dir = dir.path().join("src/other");
+        fs::create_dir_all(&fanout_dir).unwrap();
+        fs::create_dir_all(&other_dir).unwrap();
+
+        let a_rs = fanout_dir.join("a.rs");
+        let b_rs = other_dir.join("b.rs");
+        let c_rs = other_dir.join("c.rs");
+        let d_rs = other_dir.join("d.rs");
+        fs::write(&a_rs, "fn shared(x: i32) {\n    x\n}\n").unwrap();
+        fs::write(&b_rs, "fn shared(x: i32) {\n    x\n}\n").unwrap();
+        fs::write(&c_rs, "fn lonely(x: i32) {\n    x\n}\n").unwrap();
+        fs::write(&d_rs, "fn lonely(x: i32) {\n    x\n}\n").unwrap();
+        git(dir.path(), &["add", "-A"]);
+        git(dir.path(), &["commit", "-m", "add fanout+other"]);
+
+        fs::write(&a_rs, "fn shared(x: i32, y: i32) {\n    x\n}\n").unwrap();
+        fs::write(&b_rs, "fn shared(x: i32, y: i32) {\n    x\n}\n").unwrap();
+        fs::write(&c_rs, "fn lonely(x: i32, y: i32) {\n    x\n}\n").unwrap();
+        fs::write(&d_rs, "fn lonely(x: i32, y: i32) {\n    x\n}\n").unwrap();
+
+        let result = run_diff_in(
+            dir.path(),
+            &DiffSource::GitUncommitted,
+            Some("src/fanout"),
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            result.contains("`shared`"),
+            "expected warning for `shared` (retained file in scope) in:\n{result}"
+        );
+        assert!(
+            !result.contains("`lonely`"),
+            "expected no warning for `lonely` (entirely out of scope) in:\n{result}"
+        );
+    }
+
+    // 37. test_is_file_function_scope_ignores_windows_drive_colon
+    #[test]
+    fn test_is_file_function_scope_ignores_windows_drive_colon() {
+        assert!(
+            !is_file_function_scope("C:/repo/src"),
+            "drive-letter colon at index 1 must not be treated as file:function separator"
+        );
+        assert!(
+            !is_file_function_scope("C:\\repo\\src"),
+            "drive-letter colon (backslash form) must not be treated as file:function separator"
+        );
+        assert!(
+            is_file_function_scope("src/main.rs:hello"),
+            "a real file:function scope must still be detected"
+        );
+        assert!(
+            is_file_function_scope("C:/other/x.rs:hello"),
+            "a colon after the drive-letter prefix must still be detected as file:function"
+        );
+    }
+
+    // 38. test_normalize_scope_trims_trailing_slash
+    #[test]
+    fn test_normalize_scope_trims_trailing_slash() {
+        assert_eq!(normalize_scope("src/fanout/"), "src/fanout");
+    }
+
+    // 39. test_normalize_scope_strips_leading_dot_slash
+    #[test]
+    fn test_normalize_scope_strips_leading_dot_slash() {
+        assert_eq!(normalize_scope("./src/fanout"), "src/fanout");
+    }
+
+    // 40. test_normalize_scope_absolute_to_repo_relative_and_root_is_empty
+    #[test]
+    fn test_normalize_scope_absolute_to_repo_relative_and_root_is_empty() {
+        let _lock = CWD_LOCK.lock().unwrap();
+        let dir = setup_test_repo();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        let root = repo_root().unwrap();
+        let abs_subdir = root.join("src/fanout").to_string_lossy().into_owned();
+        let subdir_result = normalize_scope(&abs_subdir);
+        let root_result = normalize_scope(&root.to_string_lossy());
+        std::env::set_current_dir(&prev).unwrap();
+        assert_eq!(subdir_result, "src/fanout");
+        assert_eq!(root_result, "");
+    }
+
+    // 41. test_scope_not_found_suggestions_are_ordered_by_score
+    #[test]
+    fn test_scope_not_found_suggestions_are_ordered_by_score() {
+        let dir = setup_test_repo();
+        fs::create_dir_all(dir.path().join("src/domain")).unwrap();
+        let manager_rs = dir.path().join("src/manager.rs");
+        let domain_man_rs = dir.path().join("src/domain/man.rs");
+        let unrelated = dir.path().join("totally_unrelated_zzqq.xyz");
+        fs::write(&manager_rs, "fn m() {\n    1\n}\n").unwrap();
+        fs::write(&domain_man_rs, "fn m() {\n    1\n}\n").unwrap();
+        fs::write(&unrelated, "noise").unwrap();
+        git(dir.path(), &["add", "-A"]);
+        git(dir.path(), &["commit", "-m", "add candidates"]);
+
+        let main_rs = dir.path().join("src/main.rs");
+        let content = fs::read_to_string(&main_rs).unwrap();
+        fs::write(
+            &main_rs,
+            content.replace("println!(\"hello\")", "println!(\"hi\")"),
+        )
+        .unwrap();
+        fs::write(&manager_rs, "fn m() {\n    2\n}\n").unwrap();
+        fs::write(&domain_man_rs, "fn m() {\n    2\n}\n").unwrap();
+        fs::write(&unrelated, "noise changed").unwrap();
+
+        let result = run_diff_in(
+            dir.path(),
+            &DiffSource::GitUncommitted,
+            Some("src/man.rs"),
+            None,
+            false,
+            None,
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let man_pos = err
+            .find("src/main.rs")
+            .expect("expected src/main.rs suggested");
+        let mgr_pos = err
+            .find("src/manager.rs")
+            .expect("expected src/manager.rs suggested");
+        let domain_pos = err
+            .find("src/domain/man.rs")
+            .expect("expected src/domain/man.rs suggested");
+        assert!(
+            domain_pos < mgr_pos && mgr_pos < man_pos,
+            "expected ranked order src/domain/man.rs < src/manager.rs < src/main.rs in:\n{err}"
+        );
+    }
+
+    // 42. test_log_mode_absolute_file_scope_normalizes_to_repo_relative
+    #[test]
+    fn test_log_mode_absolute_file_scope_normalizes_to_repo_relative() {
+        let dir = setup_test_repo();
+        let main_rs = dir.path().join("src/main.rs");
+        let content = fs::read_to_string(&main_rs).unwrap();
+        fs::write(
+            &main_rs,
+            content.replace("println!(\"hello\")", "println!(\"log test\")"),
+        )
+        .unwrap();
+        git(dir.path(), &["add", "-A"]);
+        git(dir.path(), &["commit", "-m", "second commit"]);
+
+        let root = git(dir.path(), &["rev-parse", "--show-toplevel"])
+            .trim()
+            .to_string();
+        let abs_scope = format!("{root}/src/main.rs");
+
+        let relative_result = run_diff_in(
+            dir.path(),
+            &DiffSource::Log("HEAD~1..HEAD".to_string()),
+            Some("src/main.rs"),
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        let absolute_result = run_diff_in(
+            dir.path(),
+            &DiffSource::Log("HEAD~1..HEAD".to_string()),
+            Some(&abs_scope),
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            absolute_result, relative_result,
+            "absolute file scope should resolve to the same commit history as its repo-relative spelling:\nabs:\n{absolute_result}\nrel:\n{relative_result}"
         );
     }
 }
