@@ -3,6 +3,8 @@ import sys
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from pricing import compute_cost_breakdown
+
 
 @dataclass
 class ToolCall:
@@ -21,6 +23,8 @@ class Turn:
     output_tokens: int
     cache_creation_tokens: int
     cache_read_tokens: int
+    cache_creation_5m_tokens: int = 0
+    cache_creation_1h_tokens: int = 0
     tool_calls: list[ToolCall] = field(default_factory=list)
 
     @property
@@ -51,6 +55,16 @@ class RunResult:
     correctness_reason: str = ""
 
 
+def _cache_creation_ttl_tokens(usage: dict) -> tuple[int, int]:
+    cache_creation = usage.get("cache_creation")
+    if not isinstance(cache_creation, dict):
+        return 0, 0
+    return (
+        cache_creation.get("ephemeral_5m_input_tokens", 0),
+        cache_creation.get("ephemeral_1h_input_tokens", 0),
+    )
+
+
 def parse_stream_json(raw_output: str) -> RunResult:
     """Parse newline-delimited JSON output from claude -p --output-format stream-json --verbose."""
     lines = [line.strip() for line in raw_output.strip().split("\n") if line.strip()]
@@ -58,9 +72,9 @@ def parse_stream_json(raw_output: str) -> RunResult:
 
     session_id = ""
     turns: list[Turn] = []
+    turns_by_message_id: dict[str, Turn] = {}
     result_text_parts: list[str] = []
     final_summary = {}
-    turn_index = 0
 
     for event in events:
         event_type = event.get("type")
@@ -71,35 +85,52 @@ def parse_stream_json(raw_output: str) -> RunResult:
         elif event_type == "assistant":
             message = event.get("message", {})
             usage = message.get("usage", {})
-            content_blocks = message.get("content", [])
-
-            tool_calls: list[ToolCall] = []
-            text_blocks: list[str] = []
-
-            for block in content_blocks:
-                if block.get("type") == "tool_use":
-                    tool_calls.append(ToolCall(
-                        name=block.get("name", ""),
-                        input=block.get("input", {}),
-                        tool_use_id=block.get("id", ""),
-                        turn_index=turn_index,
-                    ))
-                elif block.get("type") == "text":
-                    text_blocks.append(block.get("text", ""))
-
-            turn = Turn(
-                index=turn_index,
-                input_tokens=usage.get("input_tokens", 0),
-                output_tokens=usage.get("output_tokens", 0),
-                cache_creation_tokens=usage.get("cache_creation_input_tokens", 0),
-                cache_read_tokens=usage.get("cache_read_input_tokens", 0),
-                tool_calls=tool_calls,
+            message_id = message.get("id")
+            turn = (
+                turns_by_message_id.get(message_id)
+                if isinstance(message_id, str) and message_id
+                else None
             )
-            turns.append(turn)
-            turn_index += 1
 
-            if text_blocks:
-                result_text_parts.append("\n".join(text_blocks))
+            if turn is None:
+                turn = Turn(
+                    index=len(turns),
+                    input_tokens=0,
+                    output_tokens=0,
+                    cache_creation_tokens=0,
+                    cache_read_tokens=0,
+                )
+                turns.append(turn)
+                if isinstance(message_id, str) and message_id:
+                    turns_by_message_id[message_id] = turn
+
+            if usage:
+                (
+                    turn.cache_creation_5m_tokens,
+                    turn.cache_creation_1h_tokens,
+                ) = _cache_creation_ttl_tokens(usage)
+                turn.input_tokens = usage.get("input_tokens", 0)
+                turn.output_tokens = usage.get("output_tokens", 0)
+                turn.cache_creation_tokens = usage.get(
+                    "cache_creation_input_tokens",
+                    0,
+                )
+                turn.cache_read_tokens = usage.get("cache_read_input_tokens", 0)
+
+            for block in message.get("content", []):
+                if block.get("type") == "tool_use":
+                    tool_use_id = block.get("id", "")
+                    if not any(
+                        call.tool_use_id == tool_use_id for call in turn.tool_calls
+                    ):
+                        turn.tool_calls.append(ToolCall(
+                            name=block.get("name", ""),
+                            input=block.get("input", {}),
+                            tool_use_id=tool_use_id,
+                            turn_index=turn.index,
+                        ))
+                elif block.get("type") == "text":
+                    result_text_parts.append(block.get("text", ""))
 
         elif event_type == "result":
             final_summary = event
@@ -113,8 +144,14 @@ def parse_stream_json(raw_output: str) -> RunResult:
         duration_api_ms=final_summary.get("duration_api_ms", 0),
         total_input_tokens=final_summary.get("usage", {}).get("input_tokens", 0),
         total_output_tokens=final_summary.get("usage", {}).get("output_tokens", 0),
-        total_cache_creation_tokens=final_summary.get("usage", {}).get("cache_creation_input_tokens", 0),
-        total_cache_read_tokens=final_summary.get("usage", {}).get("cache_read_input_tokens", 0),
+        total_cache_creation_tokens=final_summary.get("usage", {}).get(
+            "cache_creation_input_tokens",
+            0,
+        ),
+        total_cache_read_tokens=final_summary.get("usage", {}).get(
+            "cache_read_input_tokens",
+            0,
+        ),
         result_text="\n".join(result_text_parts),
     )
 
@@ -123,13 +160,6 @@ def parse_codex_json(raw_output: str, model_id: str) -> RunResult:
     """Parse newline-delimited JSON output from codex exec --json."""
     lines = [line.strip() for line in raw_output.strip().split("\n") if line.strip()]
     events = [json.loads(line) for line in lines]
-
-    # Pricing per 1M tokens (approximate)
-    pricing = {
-        "gpt-5-codex": {"input": 2.00, "cached": 0.50, "output": 8.00},
-        "o3": {"input": 2.00, "cached": 0.50, "output": 8.00},
-    }
-    rates = pricing.get(model_id, pricing["gpt-5-codex"])
 
     session_id = ""
     result_text_parts: list[str] = []
@@ -169,9 +199,20 @@ def parse_codex_json(raw_output: str, model_id: str) -> RunResult:
         items = turn_items[turn_idx]
         usage = turn_usages[turn_idx] if turn_idx < len(turn_usages) else {}
 
-        input_tokens = usage.get("input_tokens", 0)
-        cached_input_tokens = usage.get("cached_input_tokens", 0)
-        output_tokens = usage.get("output_tokens", 0)
+        reported_input_tokens = usage.get("input_tokens") or 0
+        cached_input_tokens = usage.get("cached_input_tokens") or 0
+        cache_write_input_tokens = (
+            usage.get("cache_write_input_tokens")
+            or usage.get("cache_write_tokens")
+            or 0
+        )
+        input_tokens = max(
+            reported_input_tokens
+            - cached_input_tokens
+            - cache_write_input_tokens,
+            0,
+        )
+        output_tokens = usage.get("output_tokens") or 0
 
         # Build tool calls from items
         tool_calls: list[ToolCall] = []
@@ -216,22 +257,32 @@ def parse_codex_json(raw_output: str, model_id: str) -> RunResult:
             index=turn_idx,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
-            cache_creation_tokens=0,  # codex doesn't report this
+            cache_creation_tokens=cache_write_input_tokens,
             cache_read_tokens=cached_input_tokens,
             tool_calls=tool_calls,
         )
         turns.append(turn)
 
-    # Compute totals
-    total_input = sum(u.get("input_tokens", 0) for u in turn_usages)
-    total_cached = sum(u.get("cached_input_tokens", 0) for u in turn_usages)
-    total_output = sum(u.get("output_tokens", 0) for u in turn_usages)
+    # The API reports cached and cache-write tokens as subsets of input_tokens.
+    total_input = sum(turn.input_tokens for turn in turns)
+    total_cache_creation = sum(turn.cache_creation_tokens for turn in turns)
+    total_cached = sum(turn.cache_read_tokens for turn in turns)
+    total_output = sum(turn.output_tokens for turn in turns)
 
-    # Calculate cost
-    cost_usd = (
-        (total_input * rates["input"] / 1_000_000) +
-        (total_cached * rates["cached"] / 1_000_000) +
-        (total_output * rates["output"] / 1_000_000)
+    per_turn_usage = [
+        {
+            "input_tokens": turn.input_tokens,
+            "cache_creation_tokens": turn.cache_creation_tokens,
+            "cache_read_tokens": turn.cache_read_tokens,
+            "output_tokens": turn.output_tokens,
+        }
+        for turn in turns
+    ]
+    cost_usd = sum(
+        compute_cost_breakdown({
+            "model": model_id,
+            "per_turn_token_usage": per_turn_usage,
+        }).values()
     )
 
     return RunResult(
@@ -243,7 +294,7 @@ def parse_codex_json(raw_output: str, model_id: str) -> RunResult:
         duration_api_ms=0,
         total_input_tokens=total_input,
         total_output_tokens=total_output,
-        total_cache_creation_tokens=0,
+        total_cache_creation_tokens=total_cache_creation,
         total_cache_read_tokens=total_cached,
         result_text="\n".join(result_text_parts),
     )

@@ -77,6 +77,41 @@ def test_stream_json_result_text_single_turn_unchanged():
     assert result.result_text == "The answer is 42."
 
 
+def test_stream_json_preserves_cache_creation_ttl_breakdown():
+    event = _assistant_event("The answer is 42.")
+    event["message"]["usage"].update({
+        "cache_creation_input_tokens": 6_300,
+        "cache_creation": {
+            "ephemeral_5m_input_tokens": 300,
+            "ephemeral_1h_input_tokens": 6_000,
+        },
+    })
+    raw_output = "\n".join(json.dumps(e) for e in [event, _result_event()])
+
+    result = parse_stream_json(raw_output)
+
+    assert result.turns[0].cache_creation_tokens == 6_300
+    assert result.turns[0].cache_creation_5m_tokens == 300
+    assert result.turns[0].cache_creation_1h_tokens == 6_000
+
+
+def test_stream_json_counts_each_message_usage_once():
+    thinking = _assistant_event("")
+    thinking["message"].update({
+        "id": "msg_1",
+        "content": [{"type": "thinking", "thinking": "working"}],
+    })
+    text = _assistant_event("The answer is 42.")
+    text["message"]["id"] = "msg_1"
+    raw_output = "\n".join(json.dumps(e) for e in [thinking, text, _result_event()])
+
+    result = parse_stream_json(raw_output)
+
+    assert len(result.turns) == 1
+    assert result.turns[0].input_tokens == 10
+    assert result.turns[0].output_tokens == 10
+
+
 # --- codex exec --json ------------------------------------------------------
 
 
@@ -117,6 +152,61 @@ def test_codex_result_text_single_turn_unchanged():
     result = parse_codex_json(raw_output, "gpt-5-codex")
 
     assert result.result_text == "The answer is 42."
+
+
+def test_codex_usage_partitions_cached_and_cache_write_tokens():
+    events = [
+        {"type": "thread.started", "thread_id": "t1"},
+        {"type": "turn.started"},
+        {
+            "type": "turn.completed",
+            "usage": {
+                "input_tokens": 10,
+                "cached_input_tokens": 4,
+                "cache_write_input_tokens": 3,
+                "output_tokens": 2,
+            },
+        },
+    ]
+
+    result = parse_codex_json("\n".join(json.dumps(e) for e in events), "gpt-5.6-sol")
+
+    assert result.turns[0].input_tokens == 3
+    assert result.turns[0].cache_creation_tokens == 3
+    assert result.turns[0].cache_read_tokens == 4
+    assert result.turns[0].context_tokens == 10
+    assert result.total_input_tokens == 3
+    assert result.total_cache_creation_tokens == 3
+
+    assert result.total_cost_usd == 0.00009575
+
+
+def test_codex_gpt_5_6_cost_uses_short_and_long_context_rates_per_turn():
+    events = [
+        {"type": "thread.started", "thread_id": "t1"},
+        {"type": "turn.started"},
+        {
+            "type": "turn.completed",
+            "usage": {
+                "input_tokens": 200_000,
+                "cached_input_tokens": 100_000,
+                "output_tokens": 100_000,
+            },
+        },
+        {"type": "turn.started"},
+        {
+            "type": "turn.completed",
+            "usage": {
+                "input_tokens": 300_000,
+                "cached_input_tokens": 200_000,
+                "output_tokens": 100_000,
+            },
+        },
+    ]
+
+    result = parse_codex_json("\n".join(json.dumps(e) for e in events), "gpt-5.6-sol")
+
+    assert result.total_cost_usd == 9.25
 
 
 # --- opencode run --format json ---------------------------------------------

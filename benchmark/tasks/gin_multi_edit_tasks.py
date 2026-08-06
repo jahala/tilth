@@ -12,6 +12,7 @@ class GinMultiContextTask(Task):
     The prompt deliberately does not name the methods or bug shapes — the agent
     localizes all three from the failing tests.
     """
+    capability = "fix"
 
     @property
     def name(self) -> str:

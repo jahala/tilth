@@ -2,6 +2,7 @@ from tasks.base import Task, GroundTruth
 
 
 class ExpressJsonSendTask(Task):
+    capability = "trace"
     @property
     def name(self) -> str:
         return "express_json_send"
@@ -21,11 +22,12 @@ class ExpressJsonSendTask(Task):
     @property
     def ground_truth(self) -> GroundTruth:
         return GroundTruth(
-            required_strings=["res.json", "json replacer", "json spaces", "res.send", "Content-Type"],
+            required_strings=["response.js", "json", "send"],
         )
 
 
 class ExpressRenderChainTask(Task):
+    capability = "trace"
     @property
     def name(self) -> str:
         return "express_render_chain"
@@ -45,15 +47,15 @@ class ExpressRenderChainTask(Task):
     @property
     def ground_truth(self) -> GroundTruth:
         return GroundTruth(
-            required_strings=["res.render", "app.render", "View", "lookup"],
+            required_strings=["application.js", "app.render", "tryRender"],
         )
-
     @property
     def task_type(self) -> str:
         return "navigate"
 
 
 class ExpressAppInitTask(Task):
+    capability = "trace"
     @property
     def name(self) -> str:
         return "express_app_init"
@@ -82,6 +84,7 @@ class ExpressAppInitTask(Task):
 
 
 class ExpressResSendTask(Task):
+    capability = "locate"
     @property
     def name(self) -> str:
         return "express_res_send"
@@ -100,11 +103,11 @@ class ExpressResSendTask(Task):
     @property
     def ground_truth(self) -> GroundTruth:
         return GroundTruth(
-            required_strings=["res.send", "response", "Content-Length"],
+            required_strings=["response.js", "res.send", "Content-Length"],
         )
 
-
 class ExpressAppRenderTask(Task):
+    capability = "trace"
     @property
     def name(self) -> str:
         return "express_app_render"

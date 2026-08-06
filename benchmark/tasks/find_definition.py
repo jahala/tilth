@@ -2,6 +2,7 @@ from .base import Task, GroundTruth
 
 
 class FindDefinitionTask(Task):
+    capability = "locate"
     @property
     def name(self) -> str:
         return "find_definition"

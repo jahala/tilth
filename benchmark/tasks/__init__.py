@@ -8,7 +8,6 @@ from .ripgrep_tasks import (
     RipgrepFlagDefinitionTask,
     RipgrepSearchDispatchTask,
     RipgrepWalkerParallelTask,
-    RipgrepLineIterDefinitionTask,
     RipgrepLineIterUsageTask,
 )
 from .ripgrep_edit_tasks import (
@@ -20,8 +19,6 @@ from .fastapi_tasks import (
     FastAPIDependencyResolutionTask,
     FastAPIRequestValidationTask,
     FastAPIDependsInternalsTask,
-    FastAPIDependsFunctionTask,
-    FastAPIDependsProcessingTask,
 )
 from .fastapi_edit_tasks import (
     FastAPIEditDepCacheTask,
@@ -67,6 +64,17 @@ from .grok_tasks import (
     GrokDependsTask,
     GrokContextNextTask,
 )
+from .corpus_tasks import (
+    ControlArithmeticTask,
+    ControlChangelogReadTask,
+    ControlPackageManifestTask,
+    FastAPIDependencyTargetTask,
+    GinDependencyTargetTask,
+    GrokRipgrepMatcherTask,
+    JavaLocateImplementorTask,
+    TypeScriptExpressMiddlewareLocateTask,
+    TypeScriptGenericTraceTask,
+)
 
 TASKS = {
     # Synthetic repo tasks
@@ -75,12 +83,21 @@ TASKS = {
     "edit_task": EditTask(),
     "codebase_navigation": CodebaseNavigationTask(),
     "markdown_section": MarkdownSectionTask(),
+    # Corpus additions
+    "ts_express_middleware_locate": TypeScriptExpressMiddlewareLocateTask(),
+    "ts_generic_trace": TypeScriptGenericTraceTask(),
+    "java_locate_implementor": JavaLocateImplementorTask(),
+    "fapi_deps_target": FastAPIDependencyTargetTask(),
+    "gin_deps_target": GinDependencyTargetTask(),
+    "grok_rg_matcher": GrokRipgrepMatcherTask(),
+    "control_pkg_manifest": ControlPackageManifestTask(),
+    "control_changelog_read": ControlChangelogReadTask(),
+    "control_arith_util": ControlArithmeticTask(),
     # ripgrep (Rust)
     "rg_trait_implementors": RipgrepTraitImplementorsTask(),
     "rg_flag_definition": RipgrepFlagDefinitionTask(),
     "rg_search_dispatch": RipgrepSearchDispatchTask(),
     "rg_walker_parallel": RipgrepWalkerParallelTask(),
-    "rg_lineiter_definition": RipgrepLineIterDefinitionTask(),
     "rg_lineiter_usage": RipgrepLineIterUsageTask(),
     "rg_edit_line_count": RipgrepEditLineCountTask(),
     "rg_edit_line_locate": RipgrepEditLineLocateTask(),
@@ -90,8 +107,6 @@ TASKS = {
     "fastapi_dependency_resolution": FastAPIDependencyResolutionTask(),
     "fastapi_request_validation": FastAPIRequestValidationTask(),
     "fastapi_depends_internals": FastAPIDependsInternalsTask(),
-    "fastapi_depends_function": FastAPIDependsFunctionTask(),
-    "fastapi_depends_processing": FastAPIDependsProcessingTask(),
     "fastapi_edit_dep_cache": FastAPIEditDepCacheTask(),
     "fastapi_edit_response_filter": FastAPIEditResponseFilterTask(),
     "fastapi_edit_scope_cache": FastAPIEditScopeCacheTask(),

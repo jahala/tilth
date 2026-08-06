@@ -3,6 +3,7 @@ from tasks.base import Task, GroundTruth, Mutation
 
 class ExpressEditJsonContentTypeTask(Task):
     """String literal change: res.json sets text/plain instead of application/json."""
+    capability = "fix"
 
     @property
     def name(self) -> str:
@@ -49,6 +50,7 @@ class ExpressEditJsonContentTypeTask(Task):
 
 class ExpressEditCookiePrefixTask(Task):
     """String literal change: JSON cookie prefix 'j:' becomes 'x:'."""
+    capability = "fix"
 
     @property
     def name(self) -> str:
@@ -96,6 +98,7 @@ class ExpressEditCookiePrefixTask(Task):
 
 class ExpressEditSendHtmlTypeTask(Task):
     """String literal change: res.send defaults to json instead of html for strings."""
+    capability = "fix"
 
     @property
     def name(self) -> str:

@@ -12,8 +12,12 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+from collections.abc import Mapping
+from contextlib import contextmanager
+from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -34,7 +38,7 @@ from config import (
     TILTH_MCP_CODEX_ARGS,
     TILTH_BIN,
     OPENCODE_CONFIGS,
-    OPENCODE_BARE_XDG,
+    OPENCODE_CONFIG_HOME,
 )
 from parse import parse_stream_json, parse_codex_json, parse_opencode_json, tool_call_counts, extract_stream_error
 from tasks import TASKS
@@ -59,6 +63,59 @@ def get_repo_path(repo_name: str) -> Path:
     if repo_name == "synthetic":
         return SYNTHETIC_REPO
     return REPOS[repo_name].path
+
+
+_RUNTIME_ENV_KEYS = frozenset(
+    {
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "TMPDIR",
+        "TERM",
+        "LANG",
+        "LANGUAGE",
+        "XDG_DATA_HOME",
+    }
+)
+_PROVIDER_AUTH_PREFIXES = ("ANTHROPIC_", "OPENAI_", "OPENROUTER_")
+_PROVIDER_AUTH_KEYS = frozenset({"CODEX_API_KEY"})
+
+
+def build_runner_env(
+    runner: str,
+    *,
+    opencode_config: Optional[str] = None,
+    bare: bool = False,
+    ambient: Optional[Mapping[str, str]] = None,
+) -> dict[str, str]:
+    """Build a minimal environment for one runner subprocess."""
+    source = os.environ if ambient is None else ambient
+    env = {
+        key: value
+        for key, value in source.items()
+        if key in _RUNTIME_ENV_KEYS
+        or key in _PROVIDER_AUTH_KEYS
+        or key.startswith(_PROVIDER_AUTH_PREFIXES)
+        or key.startswith("LC_")
+    }
+
+    tilth_dir = os.path.dirname(TILTH_BIN)
+    if tilth_dir:
+        env["PATH"] = tilth_dir + os.pathsep + env.get("PATH", "")
+
+    if runner == "opencode" and opencode_config is not None:
+        OPENCODE_CONFIG_HOME.mkdir(parents=True, exist_ok=True)
+        env["OPENCODE_CONFIG"] = opencode_config
+        env["XDG_CONFIG_HOME"] = str(OPENCODE_CONFIG_HOME)
+        if bare:
+            env["OPENCODE_DISABLE_DEFAULT_PLUGINS"] = "1"
+            env["OPENCODE_DISABLE_PROJECT_CONFIG"] = "1"
+            env["OPENCODE_DISABLE_CLAUDE_CODE"] = "1"
+            env["OPENCODE_DISABLE_EXTERNAL_SKILLS"] = "1"
+
+    return env
 
 
 def _compact_tool_sequence(result):
@@ -92,6 +149,23 @@ def _compact_tool_sequence(result):
     return seq
 
 
+@contextmanager
+def _agent_repo(repo_path: Path, hide_git: bool):
+    """Yield an agent workspace without repository metadata when requested."""
+    if not hide_git:
+        yield repo_path
+        return
+
+    with tempfile.TemporaryDirectory(prefix="tilth-benchmark-") as temp_dir:
+        workspace = Path(temp_dir) / repo_path.name
+        shutil.copytree(
+            repo_path,
+            workspace,
+            ignore=shutil.ignore_patterns(".git", ".git_hidden"),
+        )
+        yield workspace
+
+
 def run_single(
     task_name: str,
     mode_name: str,
@@ -101,21 +175,36 @@ def run_single(
     stream_log_path: Optional[Path] = None,
     bare: bool = False,
 ) -> dict:
-    """
-    Run a single benchmark iteration.
-
-    Args:
-        task_name: Name of task to run
-        mode_name: Mode (baseline or tilth)
-        model_name: Model (haiku, sonnet, opus)
-        repetition: Repetition number
-        verbose: Whether to print detailed output
-
-    Returns:
-        Dictionary with benchmark results
-    """
+    """Run one benchmark cell in the task's configured agent workspace."""
     task = TASKS[task_name]
-    repo_path = get_repo_path(task.repo)
+    with _agent_repo(
+        get_repo_path(task.repo),
+        getattr(task, "hide_git", False),
+    ) as repo_path:
+        return _run_single_in_repo(
+            task_name,
+            mode_name,
+            model_name,
+            repetition,
+            repo_path,
+            verbose=verbose,
+            stream_log_path=stream_log_path,
+            bare=bare,
+        )
+
+
+def _run_single_in_repo(
+    task_name: str,
+    mode_name: str,
+    model_name: str,
+    repetition: int,
+    repo_path: Path,
+    verbose: bool = False,
+    stream_log_path: Optional[Path] = None,
+    bare: bool = False,
+) -> dict:
+    """Execute and grade one benchmark cell."""
+    task = TASKS[task_name]
     mode = MODES[mode_name]
     model_id = MODELS[model_name]
     runner = RUNNERS[model_name]
@@ -197,33 +286,13 @@ def run_single(
     if verbose:
         print(f"    Running: {' '.join(cmd)}")
 
-    # Run subprocess (unset CLAUDECODE to allow nested claude -p)
-    env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
-    # Prepend the TILTH_BIN directory to PATH so every runner can spawn the
-    # tilth MCP server. The claude and opencode fixtures use a bare
-    # "command": "tilth"; only codex interpolates the resolved {TILTH_BIN}.
-    # An off-PATH absolute TILTH_BIN therefore breaks those two lanes unless
-    # we extend PATH here, in the shared env-building path before any runner
-    # branch.
-    _tilth_dir = os.path.dirname(TILTH_BIN)
-    if _tilth_dir:
-        env["PATH"] = _tilth_dir + os.pathsep + env.get("PATH", "")
-    if opencode_config is not None:
-        env["OPENCODE_CONFIG"] = opencode_config
-        if bare:
-            # --bare parity with the claude runner. opencode has no
-            # --strict-mcp-config: OPENCODE_CONFIG MERGES onto the user's global
-            # ~/.config/opencode/opencode.json, so without isolation the global
-            # MCP servers (tilth included!) and skills leak into the baseline.
-            # Redirect XDG_CONFIG_HOME to a hermetic dir (drops global config +
-            # its MCP/skills/agents) and disable the remaining global instruction
-            # sources. Auth lives in XDG_DATA_HOME and is untouched.
-            OPENCODE_BARE_XDG.mkdir(parents=True, exist_ok=True)
-            env["XDG_CONFIG_HOME"] = str(OPENCODE_BARE_XDG)
-            env["OPENCODE_DISABLE_DEFAULT_PLUGINS"] = "1"
-            env["OPENCODE_DISABLE_PROJECT_CONFIG"] = "1"
-            env["OPENCODE_DISABLE_CLAUDE_CODE"] = "1"
-            env["OPENCODE_DISABLE_EXTERNAL_SKILLS"] = "1"
+    # Build a fresh allowlist for every runner subprocess. Runner-specific
+    # config is added only by the lane that consumes it.
+    env = build_runner_env(
+        runner,
+        opencode_config=opencode_config,
+        bare=bare,
+    )
     start_time = time.time()
 
     if runner == "claude" and stream_log_path is not None:
@@ -236,6 +305,7 @@ def run_single(
             cwd=str(repo_path),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
             text=True,
             bufsize=1,  # line-buffered
             env=env,
@@ -284,6 +354,7 @@ def run_single(
         result = subprocess.run(
             cmd,
             cwd=str(repo_path),
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=600,
@@ -329,16 +400,21 @@ def run_single(
     # Build tool call breakdown
     tool_breakdown = tool_call_counts(run_result)
 
-    # Collect per-turn context tokens (input + cache = actual context processed)
+    # Collect per-turn context and output token counts.
     per_turn_context = [turn.context_tokens for turn in run_result.turns]
+    per_turn_output = [turn.output_tokens for turn in run_result.turns]
     total_context = sum(per_turn_context)
+    task_source = asdict(task.source)
 
     # Return JSON-serializable dict
     return {
         "task": task_name,
         "repo": task.repo,
         "mode": mode_name,
-        "model": model_name,
+        "model": model_id,
+        "model_alias": model_name,
+        "capability": task.capability,
+        "source": task_source,
         "repetition": repetition,
         "tilth_version": _tilth_version() if "tilth" in mode_name else None,
         "num_turns": run_result.num_turns,
@@ -350,8 +426,26 @@ def run_single(
         "output_tokens": run_result.total_output_tokens,
         "input_tokens": run_result.total_input_tokens,
         "cache_creation_tokens": run_result.total_cache_creation_tokens,
+        "cache_creation_5m_tokens": sum(
+            turn.cache_creation_5m_tokens for turn in run_result.turns
+        ),
+        "cache_creation_1h_tokens": sum(
+            turn.cache_creation_1h_tokens for turn in run_result.turns
+        ),
         "cache_read_tokens": run_result.total_cache_read_tokens,
         "per_turn_context_tokens": per_turn_context,
+        "per_turn_output_tokens": per_turn_output,
+        "per_turn_token_usage": [
+            {
+                "input_tokens": turn.input_tokens,
+                "cache_creation_tokens": turn.cache_creation_tokens,
+                "cache_creation_5m_tokens": turn.cache_creation_5m_tokens,
+                "cache_creation_1h_tokens": turn.cache_creation_1h_tokens,
+                "cache_read_tokens": turn.cache_read_tokens,
+                "output_tokens": turn.output_tokens,
+            }
+            for turn in run_result.turns
+        ],
         "correct": correct,
         "correctness_reason": reason,
         "result_text": run_result.result_text[:5000],
@@ -579,6 +673,17 @@ Examples:
                             f"{current_run:02d}_{task_name}_{mode_name}"
                             f"_{model_name}_rep{rep}"
                         )
+                        record_metadata = {
+                            "task": task_name,
+                            "mode": mode_name,
+                            "model": MODELS[model_name],
+                            "model_alias": model_name,
+                            "capability": task.capability,
+                            "source": asdict(task.source),
+                            "repetition": rep,
+                            "per_turn_output_tokens": [],
+                        }
+
                         try:
                             result = run_single(
                                 task_name,
@@ -611,10 +716,7 @@ Examples:
                         except subprocess.TimeoutExpired:
                             print(f"  ✗ TIMEOUT (>600s)")
                             error_result = {
-                                "task": task_name,
-                                "mode": mode_name,
-                                "model": model_name,
-                                "repetition": rep,
+                                **record_metadata,
                                 "error": "timeout",
                                 "correct": False,
                                 "correctness_reason": "Subprocess timed out",
@@ -628,10 +730,7 @@ Examples:
                                 import traceback
                                 traceback.print_exc()
                             error_result = {
-                                "task": task_name,
-                                "mode": mode_name,
-                                "model": model_name,
-                                "repetition": rep,
+                                **record_metadata,
                                 "error": str(e),
                                 "correct": False,
                                 "correctness_reason": f"Exception: {e}",

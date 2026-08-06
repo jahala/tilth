@@ -6,6 +6,7 @@ from tasks.base import Task, GroundTruth, Mutation
 
 class FastAPIDiffWhichCommitTask(Task):
     """3 commits, only middle one is the bug. Agent must navigate history."""
+    capability = "debug"
 
     @property
     def name(self) -> str:

@@ -3,6 +3,7 @@ from tasks.base import Task, GroundTruth, Mutation
 
 class RipgrepDiffMisdirectedErrorTask(Task):
     """Test error points at glue.rs but bug is in lines.rs. Diff reveals the real source."""
+    capability = "debug"
 
     @property
     def name(self) -> str:

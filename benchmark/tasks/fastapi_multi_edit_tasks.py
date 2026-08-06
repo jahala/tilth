@@ -3,6 +3,7 @@ from tasks.base import Task, GroundTruth, Mutation
 
 class FastAPIMultiResponseTask(Task):
     """Three regressions in serialize_response() in fastapi/routing.py."""
+    capability = "fix"
 
     @property
     def name(self) -> str:

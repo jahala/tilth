@@ -2,6 +2,7 @@ from tasks.base import Task, GroundTruth
 
 
 class RipgrepTraitImplementorsTask(Task):
+    capability = "trace"
     @property
     def name(self) -> str:
         return "rg_trait_implementors"
@@ -31,6 +32,7 @@ class RipgrepTraitImplementorsTask(Task):
 
 
 class RipgrepFlagDefinitionTask(Task):
+    capability = "locate"
     @property
     def name(self) -> str:
         return "rg_flag_definition"
@@ -54,6 +56,7 @@ class RipgrepFlagDefinitionTask(Task):
 
 
 class RipgrepSearchDispatchTask(Task):
+    capability = "trace"
     @property
     def name(self) -> str:
         return "rg_search_dispatch"
@@ -83,6 +86,7 @@ class RipgrepSearchDispatchTask(Task):
 
 
 class RipgrepWalkerParallelTask(Task):
+    capability = "trace"
     @property
     def name(self) -> str:
         return "rg_walker_parallel"
@@ -109,30 +113,9 @@ class RipgrepWalkerParallelTask(Task):
         return "navigate"
 
 
-class RipgrepLineIterDefinitionTask(Task):
-    @property
-    def name(self) -> str:
-        return "rg_lineiter_definition"
-
-    @property
-    def repo(self) -> str:
-        return "ripgrep"
-
-    @property
-    def prompt(self) -> str:
-        return (
-            "Find the LineIter struct definition in the ripgrep codebase. "
-            "Show the struct and its fields, and explain what it's used for."
-        )
-
-    @property
-    def ground_truth(self) -> GroundTruth:
-        return GroundTruth(
-            required_strings=["LineIter", "bytes"],
-        )
-
-
 class RipgrepLineIterUsageTask(Task):
+    capability = "trace"
+
     @property
     def name(self) -> str:
         return "rg_lineiter_usage"
@@ -151,9 +134,7 @@ class RipgrepLineIterUsageTask(Task):
 
     @property
     def ground_truth(self) -> GroundTruth:
-        return GroundTruth(
-            required_strings=["LineIter", "lines.rs", "new"],
-        )
+        return GroundTruth(required_strings=["LineIter", "lines.rs", "new"])
 
     @property
     def task_type(self) -> str:

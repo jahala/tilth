@@ -3,6 +3,7 @@ from tasks.base import Task, GroundTruth, Mutation
 
 class GinDiffComprehensionTask(Task):
     """Understand a committed change without running tests. Pure diff comprehension."""
+    capability = "debug"
 
     @property
     def name(self) -> str:
@@ -25,6 +26,11 @@ class GinDiffComprehensionTask(Task):
                 mutated='RemoteIPHeaders:        []string{"X-Real-IP", "X-Forwarded-For"},',
             )
         ]
+
+    @property
+    def test_command(self) -> list[str]:
+        return ["go", "test", "-run", "^TestContextClientIP$", "-v"]
+
 
     @property
     def prompt(self) -> str:

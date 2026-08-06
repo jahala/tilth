@@ -3,6 +3,7 @@ from tasks.base import Task, GroundTruth, Mutation
 
 class FastAPIEditDepCacheTask(Task):
     """Logical operator swap in dependency resolution: and → or breaks caching."""
+    capability = "fix"
 
     @property
     def name(self) -> str:
@@ -50,6 +51,7 @@ class FastAPIEditDepCacheTask(Task):
 
 class FastAPIEditResponseFilterTask(Task):
     """Condition negation in response serialization: skips filtering when it should apply."""
+    capability = "fix"
 
     @property
     def name(self) -> str:
@@ -98,6 +100,7 @@ class FastAPIEditResponseFilterTask(Task):
 
 class FastAPIEditScopeCacheTask(Task):
     """Condition negation in security scope cache key: scoped/unscoped deps share keys."""
+    capability = "fix"
 
     @property
     def name(self) -> str:

@@ -8,6 +8,7 @@ with context efficiency metrics and comparisons.
 
 import argparse
 import json
+import math
 import sys
 from collections import defaultdict
 from datetime import datetime
@@ -17,26 +18,10 @@ from statistics import median, mean, stdev
 sys.path.insert(0, str(Path(__file__).parent))
 
 import stats
-from paired import pair_ab
-
-
-# Anthropic Claude pricing (per million tokens)
-PRICING = {
-    "cache_creation": 3.75,  # $3.75 per MTok
-    "cache_read": 0.30,      # $0.30 per MTok
-    "output": 15.00,         # $15.00 per MTok
-    "input": 3.00,           # $3.00 per MTok
-}
-
-
-def compute_cost_breakdown(run: dict) -> dict[str, float]:
-    """Compute cost breakdown by token category."""
-    return {
-        "cache_creation_cost": run.get("cache_creation_tokens", 0) * PRICING["cache_creation"] / 1_000_000,
-        "cache_read_cost": run.get("cache_read_tokens", 0) * PRICING["cache_read"] / 1_000_000,
-        "output_cost": run.get("output_tokens", 0) * PRICING["output"] / 1_000_000,
-        "input_cost": run.get("input_tokens", 0) * PRICING["input"] / 1_000_000,
-    }
+from flags import detect_flags
+from paired import pair_ab, paired_cpc_delta as paired_cpc_delta_impl
+from pricing import PRICING_DATA, compute_cost_breakdown, pricing_staleness_warning
+from tasks import TASKS
 
 
 def format_cost_breakdown(costs: dict[str, float], indent: str = "  ") -> str:
@@ -163,15 +148,14 @@ def format_metric_value(key: str, value: float) -> str:
 def correctness_pct(runs: list[dict]) -> float:
     if not runs:
         return 0.0
-    return (sum(1 for r in runs if r["correct"]) / len(runs)) * 100
+    return (sum(1 for r in runs if r.get("correct", False)) / len(runs)) * 100
 
 
 def correctness_with_ci(runs: list[dict]) -> tuple[float, float, float]:
-    """Accuracy with a Wilson 95% CI, all in 0-100. Matches correctness_pct's
-    convention (error records are excluded upstream)."""
+    """Accuracy with a Wilson 95% CI, all in 0-100."""
     if not runs:
         return (0.0, 0.0, 0.0)
-    successes = sum(1 for r in runs if r["correct"])
+    successes = sum(1 for r in runs if r.get("correct", False))
     lo, hi = stats.wilson_interval(successes, len(runs))
     return (successes / len(runs) * 100, lo * 100, hi * 100)
 
@@ -223,6 +207,157 @@ def merge_tool_calls(runs: list[dict]) -> dict[str, float]:
 
     return result
 
+CAPABILITIES = ("locate", "trace", "fix", "debug", "control")
+
+
+def capability_for_record(record: dict) -> str:
+    """Resolve recorded capability, falling back to the current task registry."""
+    capability = record.get("capability")
+    if capability in CAPABILITIES:
+        return capability
+    task = TASKS.get(record.get("task"))
+    registry_capability = getattr(task, "capability", "") if task else ""
+    return registry_capability if registry_capability in CAPABILITIES else "unknown"
+
+
+def _fraction_text(value: float | None) -> str:
+    if value is None:
+        return "n/a (baseline 0-correct)"
+    if math.isinf(value):
+        return "∞"
+    return f"{value * 100:+.0f}%"
+
+
+def paired_cpc_delta(
+    results: list[dict],
+    experiment_mode: str,
+    baseline_mode: str = "baseline",
+) -> tuple[float | None, float | None, float | None]:
+    """Expose the headline CPC delta as a fraction and paired 95% CI."""
+    return paired_cpc_delta_impl(results, experiment_mode, baseline_mode)
+
+
+def _headline_section(results: list[dict], modes: list[str]) -> list[str]:
+    baseline = [run for run in results if run.get("mode") == "baseline"]
+    baseline_cpc = cost_per_correct(baseline)[0]
+    lines = [
+        "## Headline",
+        "",
+        "Cost-per-correct delta versus baseline, with a fixed-seed 10,000-resample "
+        "paired percentile 95% CI over per-task percentage deltas.",
+        "",
+        "| Experiment | Baseline CPC | Experiment CPC | Delta | Paired 95% CI |",
+        "|---|---:|---:|---:|---:|",
+    ]
+    experiments = [mode for mode in modes if mode != "baseline"]
+    if not experiments:
+        lines.append("| — | — | — | — | — |")
+        lines.append("")
+        return lines
+    for mode in experiments:
+        experiment = [run for run in results if run.get("mode") == mode]
+        delta, lo, hi = paired_cpc_delta(results, mode)
+        if delta is None:
+            lines.append(
+                f"| {mode_label(mode)} | n/a | {_fmt_usd(cost_per_correct(experiment)[0])} | "
+                "n/a (baseline 0-correct) | n/a (baseline 0-correct) |"
+            )
+            continue
+        lines.append(
+            f"| {mode_label(mode)} | {_fmt_usd(baseline_cpc)} | "
+            f"{_fmt_usd(cost_per_correct(experiment)[0])} | {_fraction_text(delta)} | "
+            f"[{_fraction_text(lo)}, {_fraction_text(hi)}] |"
+        )
+    lines.append("")
+    return lines
+
+
+def _capability_section(results: list[dict], modes: list[str]) -> list[str]:
+    capabilities = [capability for capability in CAPABILITIES if any(
+        capability_for_record(run) == capability for run in results
+    )]
+    if not capabilities:
+        return []
+    lines = [
+        "## Capability breakdown",
+        "",
+        "| Capability | Mode | Correctness | Cost/correct |",
+        "|---|---|---:|---:|",
+    ]
+    for capability in capabilities:
+        for mode in modes:
+            runs = [
+                run for run in results
+                if run.get("mode") == mode and capability_for_record(run) == capability
+            ]
+            if not runs:
+                continue
+            lines.append(
+                f"| {capability} | {mode_label(mode)} | {correctness_pct(runs):.0f}% | "
+                f"{_fmt_usd(cost_per_correct(runs)[0])} |"
+            )
+    lines.append("")
+    return lines
+
+
+def _control_section(results: list[dict], modes: list[str]) -> list[str]:
+    lines = [
+        "## Control-task delta",
+        "",
+        "Control tasks should show little tool advantage; deltas are relative to baseline.",
+        "",
+    ]
+    control = [run for run in results if capability_for_record(run) == "control"]
+    baseline = [run for run in control if run.get("mode") == "baseline"]
+    if not control or not baseline:
+        lines.extend(["No paired control-task baseline data.", ""])
+        return lines
+    baseline_accuracy = correctness_pct(baseline)
+    for mode in modes:
+        if mode == "baseline":
+            continue
+        experiment = [run for run in control if run.get("mode") == mode]
+        if not experiment:
+            continue
+        delta, _lo, _hi = paired_cpc_delta(control, mode)
+        lines.append(
+            f"- **{mode_label(mode)} vs baseline:** correctness "
+            f"{correctness_pct(experiment) - baseline_accuracy:+.0f}pp; "
+            f"cost/correct {_fraction_text(delta)}"
+        )
+    lines.append("")
+    return lines
+
+
+def _flags_section(results: list[dict]) -> list[str]:
+    flags = detect_flags(results)
+    lines = ["## Evidence flags", ""]
+    if not flags:
+        lines.append("No evidence flags detected.")
+        lines.append("")
+        return lines
+    counts: dict[str, int] = defaultdict(int)
+    for flag in flags:
+        for mode in flag["modes"]:
+            counts[mode] += 1
+    counts_text = ", ".join(
+        f"{mode_label(mode)}={count}" for mode, count in sorted(counts.items())
+    )
+    lines.extend([f"Flag counts by mode: {counts_text}", ""])
+    lines.extend([
+        "| Flag | Task | Model | Rep | Evidence | Mitigation |",
+        "|---|---|---|---:|---|---|",
+    ])
+    for flag in flags:
+        evidence = str(flag["evidence"]).replace("|", "\\|")
+        mitigation = str(flag["mitigation"]).replace("|", "\\|")
+        lines.append(
+            f"| {flag['flag']} | {flag['task']} | {flag['model']} | "
+            f"{flag['repetition']} | {evidence} | {mitigation} |"
+        )
+    lines.append("")
+    return lines
+
 
 def generate_report(results: list[dict]) -> str:
     """Generate markdown report from results."""
@@ -234,31 +369,39 @@ def generate_report(results: list[dict]) -> str:
     error_count = len(results) - len(valid_results)
 
     if not valid_results:
-        return f"# Error\n\nAll {len(results)} runs failed.\n"
+        lines = [f"# Error\n\nAll {len(results)} runs failed.", ""]
+        lines.extend(_flags_section(results))
+        return "\n".join(lines) + "\n"
 
     # Extract metadata
-    models = sorted(set(r["model"] for r in valid_results))
-    tasks = sorted(set(r["task"] for r in valid_results))
-    modes = ordered_modes(set(r["mode"] for r in valid_results))
+    models = sorted(set(r.get("model") or r.get("model_alias") or "unknown" for r in valid_results))
+    tasks = sorted(set(r.get("task", "unknown") for r in valid_results))
+    modes = ordered_modes(set(r.get("mode", "unknown") for r in valid_results))
     repos = sorted(set(r.get("repo", "synthetic") for r in valid_results))
-    max_rep = max(r["repetition"] for r in valid_results)
+    max_rep = max(int(r.get("repetition", 0)) for r in valid_results)
     num_reps = max_rep + 1
 
-    # Build header
+    run_summary = f"**Runs:** {len(valid_results)} valid"
+    if error_count > 0:
+        run_summary += f" ({error_count} errors)"
+
     lines = [
         "# tilth Benchmark Results",
         "",
         f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         "",
-        f"**Runs:** {len(valid_results)} valid",
-    ]
-
-    if error_count > 0:
-        lines.append(f" ({error_count} errors)")
-
-    lines.extend([
-        f" | **Models:** {', '.join(models)} | **Repos:** {', '.join(repos)} | **Reps:** {num_reps}",
+        f"{run_summary} | **Models:** {', '.join(models)} | "
+        f"**Repos:** {', '.join(repos)} | **Reps:** {num_reps}",
         "",
+    ]
+    warning = pricing_staleness_warning(PRICING_DATA["as_of"])
+    if warning:
+        lines.extend([warning, ""])
+    lines.extend(_headline_section(valid_results, modes))
+    lines.extend(_capability_section(valid_results, modes))
+    lines.extend(_control_section(valid_results, modes))
+    lines.extend(_flags_section(results))
+    lines.extend([
         "## Context Efficiency",
         "",
         "The primary metric. Context tokens (input + cached) represent the actual context processed each turn. This compounds because each turn re-sends conversation history.",
@@ -312,7 +455,7 @@ def generate_report(results: list[dict]) -> str:
 
         for label, key in metrics:
             medians = {
-                mode: compute_stats([r[key] for r in runs])["median"]
+                mode: compute_stats([r.get(key, 0) for r in runs])["median"]
                 for mode, runs in runs_by_mode.items()
             }
             row = [f"{label} (median)"]
@@ -443,7 +586,7 @@ def generate_report(results: list[dict]) -> str:
             for mode in present_modes_all:
                 by_task = group_by(runs_by_mode_all[mode], "task")
                 task_medians = [
-                    compute_stats([r[key] for r in runs])["median"]
+                    compute_stats([r.get(key, 0) for r in runs])["median"]
                     for runs in by_task.values()
                 ]
                 if task_medians:
@@ -618,12 +761,10 @@ Examples:
 
     args = parser.parse_args()
 
-    # Validate input file
     if not args.results_file.exists():
         print(f"ERROR: File not found: {args.results_file}", file=sys.stderr)
         sys.exit(1)
 
-    # Load and analyze
     try:
         results = load_results(args.results_file)
     except Exception as e:

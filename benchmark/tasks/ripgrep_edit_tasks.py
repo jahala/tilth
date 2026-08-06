@@ -3,6 +3,7 @@ from tasks.base import Task, GroundTruth, Mutation
 
 class RipgrepEditLineCountTask(Task):
     """Off-by-one in line count: adds 1 to every newline count."""
+    capability = "fix"
 
     @property
     def name(self) -> str:
@@ -48,6 +49,7 @@ class RipgrepEditLineCountTask(Task):
 
 class RipgrepEditLineLocateTask(Task):
     """Off-by-one in line locate: returns newline position instead of line start."""
+    capability = "fix"
 
     @property
     def name(self) -> str:
@@ -94,6 +96,7 @@ class RipgrepEditLineLocateTask(Task):
 
 class RipgrepEditPrecedingLinesTask(Task):
     """Boundary value change in preceding_by_pos: count == 0 becomes count == 1."""
+    capability = "fix"
 
     @property
     def name(self) -> str:

@@ -81,7 +81,7 @@ def check_pairing() -> None:
                  "repetition": 2, "error": "timeout", "correct": False})
 
     pairs = pair_ab(runs)
-    tuples = pairs[("t1", "sonnet")]
+    tuples = pairs[("t1", "claude-sonnet-4-6")]
     assert len(tuples) == 3, "all 3 reps pair, including the errored one"
     # discordances: tilth correct on all 3; baseline correct only rep0.
     # rep1: baseline wrong, tilth right -> c. rep2 (error): baseline wrong, tilth right -> c.

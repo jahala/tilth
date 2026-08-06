@@ -1511,6 +1511,94 @@ class QueryBuilder:
 def get_other_files_content() -> Dict[str, str]:
     """Generate content for remaining files."""
     return {
+        "src/typescript/express_middleware.ts": '''export type Request = { headers: Record<string, string> };
+export type Response = { statusCode: number };
+export type Next = () => void;
+export type RequestHandler = (request: Request, response: Response, next: Next) => void;
+
+export function createAuthMiddleware(requiredRole: string): RequestHandler {
+    return (_request, response, next) => {
+        response.statusCode = requiredRole ? 200 : 403;
+        next();
+    };
+}
+
+export function registerAuth(
+    app: { use(handler: RequestHandler): void },
+    requiredRole: string,
+): void {
+    app.use(createAuthMiddleware(requiredRole));
+}
+''',
+
+        "src/typescript/generic_trace.ts": '''export type UserRecord = { id: string; name: string };
+
+export class GenericRepository<T extends { id: string }> {
+    constructor(private readonly records: T[]) {}
+
+    findById(id: string): T | undefined {
+        return this.records.find((record) => record.id === id);
+    }
+}
+
+export function loadUser(
+    repository: GenericRepository<UserRecord>,
+    id: string,
+): UserRecord | undefined {
+    return repository.findById(id);
+}
+''',
+
+        "src/java/Implementor.java": '''interface Notifier {
+    void notify(String message);
+}
+
+final class EmailNotifier implements Notifier {
+    @Override
+    public void notify(String message) {
+        System.out.println("email:" + message);
+    }
+}
+
+final class WebhookNotifier implements Notifier {
+    @Override
+    public void notify(String message) {
+        System.out.println("webhook:" + message);
+    }
+}
+
+public final class Implementor {
+    public static Notifier defaultNotifier() {
+        return new EmailNotifier();
+    }
+}
+''',
+
+        "CHANGELOG.md": '''# Changelog
+
+## 1.0.0
+
+### Added
+
+- Added request validation helpers.
+
+### Fixed
+
+- Fixed database connection pool annotations.
+''',
+
+        "src/utils/arithmetic.py": '''"""Small arithmetic helper used by a tool-neutral reasoning task."""
+
+
+def multiply(left: int, right: int) -> int:
+    return left * right
+
+
+def combine(left: int, right: int) -> int:
+    """The documented example combine(6, 7) evaluates to 42."""
+    return multiply(left, right)
+''',
+
         "src/auth/__init__.py": '"""Authentication module."""\n',
 
         "src/database/__init__.py": '"""Database module."""\n',

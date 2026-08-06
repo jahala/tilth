@@ -2,6 +2,7 @@ from .base import Task, GroundTruth
 
 
 class EditTask(Task):
+    capability = "fix"
     @property
     def name(self) -> str:
         return "edit_task"

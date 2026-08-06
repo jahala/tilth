@@ -2,6 +2,7 @@ from .base import Task, GroundTruth
 
 
 class MarkdownSectionTask(Task):
+    capability = "control"
     @property
     def name(self) -> str:
         return "markdown_section"

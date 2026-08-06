@@ -21,6 +21,7 @@ class GrokGinNewTask(Task):
     grok uniquely supplies. `New` has a 30-line body, 3 internal callees
     (`allocateContext`, `With`, `debugPrintWARNINGNew`), and 144 cross-file
     callers — all sections of grok's output are exercised."""
+    capability = "trace"
 
     @property
     def name(self) -> str:
@@ -65,6 +66,7 @@ class GrokGinNewTask(Task):
 
 class GrokDependsTask(Task):
     """Function with cross-file usages: FastAPI Depends + its processors."""
+    capability = "trace"
 
     @property
     def name(self) -> str:
@@ -96,6 +98,7 @@ class GrokDependsTask(Task):
 
 class GrokContextNextTask(Task):
     """Method on a struct: Gin's Context.Next + peer methods on Context."""
+    capability = "trace"
 
     @property
     def name(self) -> str:
@@ -117,9 +120,13 @@ class GrokContextNextTask(Task):
     @property
     def ground_truth(self) -> GroundTruth:
         return GroundTruth(
-            required_strings=["Next", "index", "handlers", "Abort"],
+            required_strings=[
+                "context.go",
+                "Context.Next",
+                "HandlersChain",
+                "Context.Abort",
+            ],
         )
-
     @property
     def task_type(self) -> str:
         return "navigate"

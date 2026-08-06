@@ -1,9 +1,12 @@
+import os
+import shlex
+import subprocess
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-import subprocess
+from functools import cached_property
 from pathlib import Path
 
-from fixtures.reset import restore_git
+from config import REPOS
 
 
 @dataclass
@@ -25,6 +28,17 @@ class GroundTruth:
     # For forward-edit tasks only (no mutations):
     file_path: str = ""
     expected_diff_contains: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class TaskSource:
+    origin: str = "original"
+    license: str = "MIT"
+    commit_or_tag: str = "fixture-pin"
+    transformation: str = "none"
+
+
+DEFAULT_TASK_SOURCE = TaskSource()
 
 
 def required_matches(required: str, text_lower: str) -> bool:
@@ -64,6 +78,21 @@ class Task(ABC):
         return "synthetic"
 
     @property
+    def capability(self) -> str:
+        return ""
+
+    @cached_property
+    def source(self) -> TaskSource:
+        if self.repo == "synthetic":
+            return DEFAULT_TASK_SOURCE
+        repo = REPOS[self.repo]
+        return TaskSource(
+            origin=repo.url,
+            license=repo.license,
+            commit_or_tag=repo.commit_sha,
+        )
+
+    @property
     def mutations(self) -> list[Mutation]:
         """Mutations to apply before the agent runs. Empty for non-mutation tasks."""
         return []
@@ -75,19 +104,11 @@ class Task(ABC):
 
     @property
     def hide_git(self) -> bool:
-        """If True, apply mutations WITHOUT committing and move `.git` aside for
-        the agent run, so git history/diff/blame cannot be used to localize the
-        bug. The bug must be found by reading and navigating the code. Reset
-        restores `.git` (see fixtures/reset.py). Default: False (committed bug)."""
-        return False
+        """Hide repository history for fix tasks unless the task opts out."""
+        return self.capability == "fix" and bool(self.mutations)
 
     def apply_mutations(self, repo_path: str) -> None:
-        """Apply all mutations to the repo and commit them.
-
-        Committing makes the benchmark realistic — real bugs are committed code.
-        The agent can discover them via git log/diff, and after fixing, git diff
-        shows a real diff (no 'matches HEAD' confusion).
-        """
+        """Apply configured mutations to the task workspace."""
         for m in self.mutations:
             fp = Path(repo_path) / m.file_path
             content = fp.read_text()
@@ -99,14 +120,7 @@ class Task(ABC):
             content = content.replace(m.original, m.mutated, 1)
             fp.write_text(content)
 
-        # No-git tasks: leave the edit uncommitted and move `.git` aside so the
-        # agent cannot use git log/show/diff/blame as an oracle. ensure_repo_clean
-        # restores `.git` before the next reset.
         if self.hide_git:
-            git_dir = Path(repo_path) / ".git"
-            hidden = Path(repo_path) / ".git_hidden"
-            if git_dir.exists():
-                git_dir.rename(hidden)
             return
 
         mutated_files = [m.file_path for m in self.mutations]
@@ -116,7 +130,6 @@ class Task(ABC):
             "GIT_COMMITTER_NAME": "dev",
             "GIT_COMMITTER_EMAIL": "dev@test.com",
         }
-        import os
         env = {**os.environ, **git_env}
         subprocess.run(
             ["git", "add"] + mutated_files,
@@ -131,21 +144,16 @@ class Task(ABC):
         """Validate result against ground truth."""
         gt = self.ground_truth
 
-        # Restore .git if a hide_git task moved it aside, so the test command (and the
-        # git-diff correctness path below) see a real repo rather than the agent-run
-        # state. Reset restores it later too; doing it here avoids a latent bug for
-        # any hide_git task whose test_command shells out to git.
-        restore_git(Path(repo_path))
 
         # Mutation tasks with a test command: run the test. That's the source of truth.
-        if self.mutations and self.test_command:
+        if self.task_type == "edit" and self.mutations and self.test_command:
             result = subprocess.run(
                 self.test_command,
                 cwd=repo_path, capture_output=True, text=True,
                 timeout=300,
             )
             if result.returncode != 0:
-                return False, f"Test failed: {self.test_command[-1]}"
+                return False, f"Test failed: {shlex.join(self.test_command)}"
             return True, "Test passed"
 
         # Forward-edit tasks: check git diff for expected patterns.

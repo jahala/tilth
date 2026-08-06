@@ -3,6 +3,7 @@ from tasks.base import Task, GroundTruth, Mutation
 
 class ExpressDiffMultiMutationTask(Task):
     """Multi-mutation in one commit: 2 bugs + 1 harmless rename. Agent must diff to scope."""
+    capability = "debug"
 
     @property
     def name(self) -> str:

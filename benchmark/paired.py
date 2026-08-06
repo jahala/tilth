@@ -12,16 +12,36 @@ cost delta.
 
 import argparse
 import json
+import math
 import sys
 from collections import defaultdict
 from pathlib import Path
-
 sys.path.insert(0, str(Path(__file__).parent))
 
 import stats
 
+
 BASELINE_MODE = "baseline"
 TILTH_MODE = "tilth"
+
+
+MODEL_ALIASES = {
+    "haiku": "claude-haiku-4-5-20251001",
+    "sonnet": "claude-sonnet-4-6",
+    "opus": "claude-opus-4-6",
+    "gpt5": "gpt-5-codex",
+    "gpt-5.1-codex": "gpt-5-codex",
+    "gpt-5-codex": "gpt-5-codex",
+    "gpt5mini": "gpt-5-mini",
+    "openrouter/openai/gpt-5-mini": "gpt-5-mini",
+    "openai/gpt-5.1-codex": "gpt-5-codex",
+    "openai/o3": "o3",
+}
+
+
+def _model_key(run: dict) -> object:
+    model = run.get("model") or run.get("model_alias")
+    return MODEL_ALIASES.get(model, model)
 
 
 def load_runs(path: Path) -> list[dict]:
@@ -53,7 +73,7 @@ def pair_ab(runs: list[dict]) -> dict[tuple[str, str], list[tuple]]:
     by_key: dict[tuple, dict] = {}
     for run in runs:
         task = run.get("task")
-        model = run.get("model")
+        model = _model_key(run)
         mode = run.get("mode")
         rep = run.get("repetition")
         if None in (task, model, mode, rep) or mode not in (BASELINE_MODE, TILTH_MODE):
@@ -75,6 +95,123 @@ def pair_ab(runs: list[dict]) -> dict[tuple[str, str], list[tuple]]:
             _cost(tilth),
         ))
     return dict(pairs)
+
+
+def _cpc(runs: list[dict]) -> float:
+    """Return total reported cost per correct result, or infinity."""
+    costed = [run for run in runs if _cost(run) is not None]
+    correct = sum(1 for run in costed if run.get("correct", False))
+    if not costed or correct == 0:
+        return float("inf")
+    return sum(_cost(run) or 0.0 for run in costed) / correct
+
+
+def _matched_runs_by_task(
+    runs: list[dict],
+    experiment_mode: str,
+    baseline_mode: str,
+) -> dict[object, dict[str, list[dict]]]:
+    by_key: dict[tuple[object, object, object], dict[str, dict]] = defaultdict(dict)
+    for run in runs:
+        mode = run.get("mode")
+        task = run.get("task")
+        model = _model_key(run)
+        repetition = run.get("repetition")
+        if (
+            mode not in {baseline_mode, experiment_mode}
+            or task is None
+            or model is None
+            or repetition is None
+        ):
+            continue
+        by_key[(task, model, repetition)][mode] = run
+
+    by_task: dict[object, dict[str, list[dict]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    for (task, _model, _repetition), modes in by_key.items():
+        baseline = modes.get(baseline_mode)
+        experiment = modes.get(experiment_mode)
+        if baseline is None or experiment is None:
+            continue
+        by_task[task][baseline_mode].append(baseline)
+        by_task[task][experiment_mode].append(experiment)
+    return by_task
+
+
+def _task_cpc_percentage_deltas(
+    by_task: dict[object, dict[str, list[dict]]],
+    experiment_mode: str,
+    baseline_mode: str,
+) -> list[float]:
+    deltas: list[float] = []
+    for task in sorted(by_task, key=str):
+        baseline_cpc = _cpc(by_task[task][baseline_mode])
+        experiment_cpc = _cpc(by_task[task][experiment_mode])
+        if (
+            baseline_cpc == 0
+            or not math.isfinite(baseline_cpc)
+            or not math.isfinite(experiment_cpc)
+        ):
+            continue
+        deltas.append((experiment_cpc - baseline_cpc) / baseline_cpc)
+    return deltas
+
+
+def paired_cpc_percentage_deltas(
+    runs: list[dict],
+    experiment_mode: str,
+    baseline_mode: str = BASELINE_MODE,
+) -> list[float]:
+    """Return finite per-task CPC deltas from matched mode repetitions."""
+    by_task = _matched_runs_by_task(runs, experiment_mode, baseline_mode)
+    return _task_cpc_percentage_deltas(
+        by_task,
+        experiment_mode,
+        baseline_mode,
+    )
+
+
+def paired_cpc_delta(
+    runs: list[dict],
+    experiment_mode: str,
+    baseline_mode: str = BASELINE_MODE,
+) -> tuple[float | None, float | None, float | None]:
+    """Return aggregate CPC delta and a fixed-seed paired percentile CI.
+
+    Values are fractions (``0.25`` means +25%).  A missing or zero-correct
+    baseline returns ``(None, None, None)`` so callers never divide infinity.
+    """
+    by_task = _matched_runs_by_task(runs, experiment_mode, baseline_mode)
+    baseline_runs = [
+        run
+        for modes in by_task.values()
+        for run in modes[baseline_mode]
+    ]
+    experiment_runs = [
+        run
+        for modes in by_task.values()
+        for run in modes[experiment_mode]
+    ]
+    baseline_cpc = _cpc(baseline_runs)
+    if not baseline_runs or not math.isfinite(baseline_cpc):
+        return (None, None, None)
+    if baseline_cpc == 0:
+        return (float("inf"), float("inf"), float("inf"))
+    experiment_cpc = _cpc(experiment_runs)
+    aggregate_delta = (experiment_cpc - baseline_cpc) / baseline_cpc
+    if not math.isfinite(experiment_cpc):
+        return (aggregate_delta, float("inf"), float("inf"))
+
+    deltas = _task_cpc_percentage_deltas(
+        by_task,
+        experiment_mode,
+        baseline_mode,
+    )
+    if not deltas:
+        return (aggregate_delta, aggregate_delta, aggregate_delta)
+    lo, hi = stats.paired_bootstrap_ci(deltas, n_resamples=10_000, seed=0)
+    return (aggregate_delta, lo, hi)
 
 
 def paired_report(pairs: dict[tuple[str, str], list[tuple]]) -> None:
@@ -135,7 +272,7 @@ def paired_report(pairs: dict[tuple[str, str], list[tuple]]) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Paired A/B analysis of benchmark results")
     parser.add_argument("results_file", type=Path, help="Path to JSONL results file from run.py")
-    parser.add_argument("--model", help="Restrict to a single model short-name")
+    parser.add_argument("--model", help="Restrict to a model alias or configured model ID")
     args = parser.parse_args()
 
     if not args.results_file.exists():
@@ -144,7 +281,8 @@ def main() -> None:
 
     runs = load_runs(args.results_file)
     if args.model:
-        runs = [r for r in runs if r.get("model") == args.model]
+        target_model = MODEL_ALIASES.get(args.model, args.model)
+        runs = [r for r in runs if _model_key(r) == target_model]
 
     paired_report(pair_ab(runs))
 

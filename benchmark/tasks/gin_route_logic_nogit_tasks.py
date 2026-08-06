@@ -17,6 +17,7 @@ class GinRouteCatchAllNoGitTask(GinRouteCatchAllLogicTask):
     than from actually reading the router/tree code. ``ensure_repo_clean``
     restores ``.git`` before the next reset.
     """
+    capability = "fix"
 
     @property
     def name(self) -> str:

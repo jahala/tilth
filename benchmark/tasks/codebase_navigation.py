@@ -2,6 +2,7 @@ from .base import Task, GroundTruth
 
 
 class CodebaseNavigationTask(Task):
+    capability = "locate"
     @property
     def name(self) -> str:
         return "codebase_navigation"

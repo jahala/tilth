@@ -2,6 +2,7 @@ from tasks.base import Task, GroundTruth
 
 
 class GinRadixTreeTask(Task):
+    capability = "trace"
     @property
     def name(self) -> str:
         return "gin_radix_tree"
@@ -21,11 +22,20 @@ class GinRadixTreeTask(Task):
     @property
     def ground_truth(self) -> GroundTruth:
         return GroundTruth(
-            required_strings=["type node struct", "catchAll", "getValue", "wildChild"],
+            required_strings=[
+                "tree.go",
+                "type node struct",
+                "static",
+                "root",
+                "param",
+                "catchAll",
+                "getValue",
+            ],
         )
 
 
 class GinClientIPTask(Task):
+    capability = "locate"
     @property
     def name(self) -> str:
         return "gin_client_ip"
@@ -46,15 +56,15 @@ class GinClientIPTask(Task):
     def ground_truth(self) -> GroundTruth:
         return GroundTruth(
             required_strings=[
-                "func (c *Context) ClientIP",
+                "ForwardedByClientIP",
                 "RemoteIPHeaders",
-                "X-Forwarded-For",
-                "isTrustedProxy",
+                "TrustedPlatform",
             ],
         )
 
 
 class GinMiddlewareChainTask(Task):
+    capability = "trace"
     @property
     def name(self) -> str:
         return "gin_middleware_chain"
@@ -75,15 +85,20 @@ class GinMiddlewareChainTask(Task):
     @property
     def ground_truth(self) -> GroundTruth:
         return GroundTruth(
-            required_strings=["ServeHTTP", "HandlersChain", "Next", "pool", "index"],
+            required_strings=[
+                "gin.go",
+                "Engine.ServeHTTP",
+                "HandlersChain",
+                "Context.Next",
+            ],
         )
-
     @property
     def task_type(self) -> str:
         return "navigate"
 
 
 class GinContextNextTask(Task):
+    capability = "locate"
     @property
     def name(self) -> str:
         return "gin_context_next"
@@ -103,12 +118,14 @@ class GinContextNextTask(Task):
     def ground_truth(self) -> GroundTruth:
         return GroundTruth(
             required_strings=[
-                "Next", "index", "handlers",
+                "context.go",
+                "Context.Next",
+                "HandlersChain",
             ],
         )
 
-
 class GinServeHTTPFlowTask(Task):
+    capability = "trace"
     @property
     def name(self) -> str:
         return "gin_servehttp_flow"

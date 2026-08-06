@@ -16,6 +16,7 @@ class GinRenderContractCascadeTask(Task):
     across the package and reconcile them — exactly the cross-file callers /
     dependency reasoning that hard SWE-bench / CrossCodeEval instances target.
     """
+    capability = "fix"
 
     @property
     def name(self) -> str:

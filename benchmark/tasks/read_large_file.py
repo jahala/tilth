@@ -2,6 +2,7 @@ from .base import Task, GroundTruth
 
 
 class ReadLargeFileTask(Task):
+    capability = "locate"
     @property
     def name(self) -> str:
         return "read_large_file"

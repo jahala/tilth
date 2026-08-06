@@ -3,6 +3,7 @@ from tasks.base import Task, GroundTruth, Mutation
 
 class GinEditMiddlewareChainTask(Task):
     """Increment change in Next(): skips every other handler in the chain."""
+    capability = "fix"
 
     @property
     def name(self) -> str:
@@ -48,6 +49,7 @@ class GinEditMiddlewareChainTask(Task):
 
 class GinEditAbortCheckTask(Task):
     """Comparison change in IsAborted(): >= becomes >, breaks abort detection."""
+    capability = "fix"
 
     @property
     def name(self) -> str:
@@ -92,6 +94,7 @@ class GinEditAbortCheckTask(Task):
 
 class GinEditContextResetTask(Task):
     """Initial value change in reset(): index starts at 0 instead of -1."""
+    capability = "fix"
 
     @property
     def name(self) -> str:

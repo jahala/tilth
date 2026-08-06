@@ -1,0 +1,84 @@
+{
+  "as_of": "2026-08-04",
+  "sources": {
+    "anthropic": "https://platform.claude.com/docs/en/about-claude/pricing",
+    "openai": "https://developers.openai.com/api/docs/pricing"
+  },
+  "models": {
+    "claude-haiku-4-5-20251001": {
+      "input": 1.0,
+      "cache_creation": 2.0,
+      "cache_creation_5m": 1.25,
+      "cache_creation_1h": 2.0,
+      "cache_read": 0.1,
+      "output": 5.0
+    },
+    "claude-sonnet-4-6": {
+      "input": 3.0,
+      "cache_creation": 6.0,
+      "cache_creation_5m": 3.75,
+      "cache_creation_1h": 6.0,
+      "cache_read": 0.3,
+      "output": 15.0
+    },
+    "claude-opus-4-6": {
+      "input": 5.0,
+      "cache_creation": 10.0,
+      "cache_creation_5m": 6.25,
+      "cache_creation_1h": 10.0,
+      "cache_read": 0.5,
+      "output": 25.0
+    },
+    "claude-opus-5": {
+      "input": 5.0,
+      "cache_creation": 10.0,
+      "cache_creation_5m": 6.25,
+      "cache_creation_1h": 10.0,
+      "cache_read": 0.5,
+      "output": 25.0
+    },
+    "gpt-5-codex": {
+      "input": 1.25,
+      "cache_creation": 1.25,
+      "cache_read": 0.125,
+      "output": 10.0
+    },
+    "gpt-5.6-sol": {
+      "input": 5.0,
+      "cache_creation": 6.25,
+      "cache_read": 0.5,
+      "output": 30.0,
+      "long_context_threshold": 272000,
+      "long_context": {
+        "input": 10.0,
+        "cache_creation": 12.5,
+        "cache_read": 1.0,
+        "output": 45.0
+      }
+    },
+    "o3": {
+      "input": 2.0,
+      "cache_creation": 2.0,
+      "cache_read": 0.5,
+      "output": 8.0
+    },
+    "gpt-5-mini": {
+      "input": 0.25,
+      "cache_creation": 0.25,
+      "cache_read": 0.025,
+      "output": 2.0
+    }
+  },
+  "aliases": {
+    "haiku": "claude-haiku-4-5-20251001",
+    "sonnet": "claude-sonnet-4-6",
+    "opus": "claude-opus-5",
+    "gpt5": "gpt-5.6-sol",
+    "gpt-5.6": "gpt-5.6-sol",
+    "gpt-5.1-codex": "gpt-5-codex",
+    "gpt5mini": "gpt-5-mini",
+    "openrouter/openai/gpt-5-mini": "gpt-5-mini",
+    "openai/gpt-5.1-codex": "gpt-5-codex",
+    "openai/o3": "o3"
+  }
+}

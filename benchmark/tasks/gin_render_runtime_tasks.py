@@ -16,6 +16,7 @@ class GinRenderRuntimeCascadeTask(Task):
     included as a guard: it must stay green, so a fix that breaks the shared
     ``writeContentType`` helper to satisfy the others is rejected.
     """
+    capability = "fix"
 
     @property
     def name(self) -> str:

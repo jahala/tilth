@@ -30,6 +30,7 @@ class GinRouteCatchAllLogicTask(Task):
     fix that mangles the shared param-key extraction to satisfy the catch-all is
     rejected by the same tests.
     """
+    capability = "fix"
 
     @property
     def name(self) -> str:
@@ -42,6 +43,9 @@ class GinRouteCatchAllLogicTask(Task):
     @property
     def task_type(self) -> str:
         return "edit"
+    @property
+    def hide_git(self) -> bool:
+        return False
 
     @property
     def mutations(self) -> list[Mutation]:

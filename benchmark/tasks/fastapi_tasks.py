@@ -2,6 +2,7 @@ from tasks.base import Task, GroundTruth
 
 
 class FastAPIDependencyResolutionTask(Task):
+    capability = "trace"
     @property
     def name(self) -> str:
         return "fastapi_dependency_resolution"
@@ -22,7 +23,7 @@ class FastAPIDependencyResolutionTask(Task):
     @property
     def ground_truth(self) -> GroundTruth:
         return GroundTruth(
-            required_strings=["get_dependant", "solve_dependencies", "Dependant", "analyze_param"],
+            required_strings=["param_functions.py", "Depends", "dependency"],
         )
 
     @property
@@ -31,6 +32,7 @@ class FastAPIDependencyResolutionTask(Task):
 
 
 class FastAPIRequestValidationTask(Task):
+    capability = "trace"
     @property
     def name(self) -> str:
         return "fastapi_request_validation"
@@ -60,6 +62,7 @@ class FastAPIRequestValidationTask(Task):
 
 
 class FastAPIDependsInternalsTask(Task):
+    capability = "locate"
     @property
     def name(self) -> str:
         return "fastapi_depends_internals"
@@ -81,58 +84,3 @@ class FastAPIDependsInternalsTask(Task):
         return GroundTruth(
             required_strings=["def Depends", "use_cache", "params.Depends"],
         )
-
-
-class FastAPIDependsFunctionTask(Task):
-    @property
-    def name(self) -> str:
-        return "fastapi_depends_function"
-
-    @property
-    def repo(self) -> str:
-        return "fastapi"
-
-    @property
-    def prompt(self) -> str:
-        return (
-            "Find the Depends function in FastAPI. Show its complete signature "
-            "and docstring."
-        )
-
-    @property
-    def ground_truth(self) -> GroundTruth:
-        return GroundTruth(
-            required_strings=["def Depends", "use_cache"],
-        )
-
-
-class FastAPIDependsProcessingTask(Task):
-    @property
-    def name(self) -> str:
-        return "fastapi_depends_processing"
-
-    @property
-    def repo(self) -> str:
-        return "fastapi"
-
-    @property
-    def prompt(self) -> str:
-        return (
-            "Find the Depends function in fastapi/param_functions.py and show "
-            "its implementation. Then find how FastAPI processes dependencies "
-            "— look for the function that walks the dependency tree and resolves "
-            "each Depends() call at request time."
-        )
-
-    @property
-    def ground_truth(self) -> GroundTruth:
-        return GroundTruth(
-            required_strings=[
-                "def Depends", "solve_dependencies",
-                "Dependant", "get_dependant",
-            ],
-        )
-
-    @property
-    def task_type(self) -> str:
-        return "navigate"
