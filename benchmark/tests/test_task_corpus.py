@@ -4,7 +4,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from config import REPOS
-from fixtures.setup import get_other_files_content
+from fixtures.setup import TEMPLATE_PATH
 from tasks import TASKS
 from tasks.base import TaskSource
 
@@ -199,9 +199,15 @@ def test_history_oracle_tasks_keep_git_visible() -> None:
         name: False for name in oracle_tasks
     }
 
-def test_setup_generates_exact_corpus_fixture_mappings_deterministically() -> None:
-    first = get_other_files_content()
-    second = get_other_files_content()
+
+def test_template_has_exact_corpus_fixture_mappings() -> None:
+    fixtures = {
+        path.relative_to(TEMPLATE_PATH).as_posix(): path.read_text(encoding="utf-8")
+        for path in TEMPLATE_PATH.rglob("*")
+        if path.is_file()
+        and "__pycache__" not in path.parts
+        and path.suffix not in {".pyc", ".pyo"}
+    }
     expected_markers = {
         "src/typescript/express_middleware.ts": (
             "createAuthMiddleware",
@@ -227,11 +233,10 @@ def test_setup_generates_exact_corpus_fixture_mappings_deterministically() -> No
         "control/multistep.txt",
     }
 
-    assert first == second
-    assert set(expected_markers) <= first.keys()
-    assert obsolete.isdisjoint(first)
+    assert set(expected_markers) <= fixtures.keys()
+    assert obsolete.isdisjoint(fixtures)
     for path, markers in expected_markers.items():
-        assert all(marker in first[path] for marker in markers)
-    assert "Added" in first["CHANGELOG.md"]
-    assert "requires-python" in first["pyproject.toml"]
-    assert "42" in first["src/utils/arithmetic.py"]
+        assert all(marker in fixtures[path] for marker in markers)
+    assert "Added" in fixtures["CHANGELOG.md"]
+    assert "requires-python" in fixtures["pyproject.toml"]
+    assert "42" in fixtures["src/utils/arithmetic.py"]
