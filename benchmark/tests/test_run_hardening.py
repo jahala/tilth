@@ -274,7 +274,13 @@ def test_run_single_uses_allowlisted_env_and_preserves_runner_flags(
 
     monkeypatch.setattr(run.subprocess, "run", fake_subprocess_run)
 
-    result = run.run_single("runner_test_task", "runner_test_mode", alias, 0)
+    result = run.run_single(
+        "runner_test_task",
+        "runner_test_mode",
+        alias,
+        0,
+        bare=True,
+    )
 
     env = captured["env"]
     assert isinstance(env, dict)
@@ -293,6 +299,8 @@ def test_run_single_uses_allowlisted_env_and_preserves_runner_flags(
         assert "--output-format" in cmd and "stream-json" in cmd
         assert "--strict-mcp-config" in cmd
         assert ["--mcp-config", "/controlled/tilth_mcp.json"] == cmd[-4:-2]
+        assert "--safe-mode" in cmd
+        assert "--bare" not in cmd
     elif runner == "codex":
         assert cmd[:3] == ["codex", "exec", "--json"]
         assert "--full-auto" in cmd and "--ephemeral" in cmd
@@ -302,6 +310,7 @@ def test_run_single_uses_allowlisted_env_and_preserves_runner_flags(
         assert cmd[:4] == ["opencode", "run", "--format", "json"]
         assert "--dir" in cmd and "--model" in cmd
         assert "--dangerously-skip-permissions" in cmd
+        assert "--pure" in cmd
 
     assert result["model"] == model_id
     assert result["model_alias"] == alias

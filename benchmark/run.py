@@ -340,12 +340,11 @@ def _run_single_in_repo(
             "--system-prompt", SYSTEM_PROMPT + f"\nYour current working directory is: {repo_path}",
         ]
 
-        # --bare strips slash commands, hooks, plugins, agents, and skills.
-        # Opt in for a maximally stripped harness (e.g. measuring tilth in
-        # isolation). It does not touch the built-in tool set, so the --tools
-        # allowlist below governs Grep/Glob identically with or without --bare.
+        # --safe-mode strips customizations while retaining OAuth/keychain auth.
+        # --bare would isolate more aggressively, but deliberately refuses those
+        # credentials and only supports ANTHROPIC_API_KEY or apiKeyHelper.
         if bare:
-            cmd += ["--bare"]
+            cmd += ["--safe-mode"]
 
         tools_list = list(mode.tools)
 
@@ -603,8 +602,8 @@ Examples:
         action="store_true",
         help="Strip the harness to built-in tools + the per-mode MCP config; "
              "pinned experiments enable this automatically. "
-             "claude: passes --bare (drops slash commands, hooks, plugins, "
-             "agents, skills). "
+             "claude: passes --safe-mode (drops customizations while retaining "
+             "OAuth/keychain auth). "
              "opencode: redirects XDG_CONFIG_HOME + sets OPENCODE_DISABLE_*. "
              "codex: always resets mcp_servers through CLI overrides.",
     )
