@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Regenerate the human-facing AGENTS.md by concatenating the complete
-# read-only and edit-mode prompt sources.
+# Regenerate the human-facing AGENTS.md from the complete read-only and
+# edit-mode prompt sources, labeled by mode.
 #
 # AGENTS.md is a generated artifact — edit the source files in prompts/, not
 # AGENTS.md. The MCP server embeds both files via include_str! and selects one
@@ -22,8 +22,12 @@ done
 # Human-facing reference only. The MCP server selects one source file:
 # mcp-base.md in read-only mode, mcp-edit.md in edit mode.
 {
-  printf '<!-- generated from prompts/mcp-base.md + prompts/mcp-edit.md by scripts/regen-agents-md.sh — do not edit directly -->\n'
-  printf '%s\n\n%s\n' "$(cat "$base")" "$(cat "$edit")"
+  printf '<!-- generated from prompts/mcp-base.md + prompts/mcp-edit.md by scripts/regen-agents-md.sh — do not edit directly -->\n\n'
+  printf '## Base mode\n\n'
+  cat "$base"
+  printf '\n\n## Edit mode\n\n'
+  cat "$edit"
+  printf '\n'
 } > "$out"
 
 echo "wrote $out ($(wc -c < "$out" | tr -d ' ') bytes)"

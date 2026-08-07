@@ -497,6 +497,10 @@ mod tests {
             path_pos < 800,
             "root path discipline must stay in the cacheable prefix (was byte {path_pos})"
         );
+        assert!(
+            !instructions.contains("mcp__"),
+            "instructions must use protocol tool names, not client-specific prefixes"
+        );
     }
 
     #[test]
@@ -535,8 +539,17 @@ mod tests {
 
     #[test]
     fn static_prompt_bytes_are_locked() {
-        assert_eq!(MCP_BASE_INSTRUCTIONS.len(), 1_784);
-        assert_eq!(MCP_EDIT_INSTRUCTIONS.len(), 1_955);
+        assert_eq!(MCP_BASE_INSTRUCTIONS.len(), 1_642);
+        assert_eq!(MCP_EDIT_INSTRUCTIONS.len(), 1_838);
+    }
+
+    #[test]
+    fn agents_md_matches_prompt_sources() {
+        const AGENTS_MD: &str = include_str!("../../AGENTS.md");
+        let expected = format!(
+            "<!-- generated from prompts/mcp-base.md + prompts/mcp-edit.md by scripts/regen-agents-md.sh — do not edit directly -->\n\n## Base mode\n\n{MCP_BASE_INSTRUCTIONS}\n\n## Edit mode\n\n{MCP_EDIT_INSTRUCTIONS}\n"
+        );
+        assert_eq!(AGENTS_MD, expected);
     }
 
     #[test]

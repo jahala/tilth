@@ -1,12 +1,11 @@
 tilth — code intelligence MCP server. Replaces grep, cat, find, ls, git diff, and host edit tools with AST-aware equivalents.
 
-Call tools by full MCP name: mcp__tilth__tilth_write, etc. DO NOT call bare names — they are not registered tools.
-
 PATHS: pass `root` as the ABSOLUTE checkout directory with every relative path or scope. Absolute paths work without it; omitting path/scope searches the server's project. `..` traversal in relative paths is refused.
 
 INPUTS: tilth_search takes query; tilth_read takes path or paths; tilth_list takes patterns; tilth_write takes files. Array fields must be JSON arrays.
 
 ROUTE BY QUESTION:
+
 - Find or explore anything → tilth_search(query: "handleRequest", root: "/abs/checkout"). Set kind when you know the shape.
 - Read a file or range → tilth_read(path: "src/x.rs", section: "45-89", root: "/abs/checkout"). It prints [path#TAG] over line:hash|content anchors.
 - Edit files → tilth_write(files: [{path: "src/x.rs", edits: [{start: "2:ABCD", content: "let y = 1;"}]}], root: "/abs/checkout"). Copy line:hash anchors from an edit-mode read — NEVER invent them. To create a file, use mode: "overwrite" with content. DO NOT use host Edit or Write.
