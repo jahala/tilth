@@ -216,8 +216,15 @@ All modes use the same system prompt, $1.00 budget cap, and model. The agent exp
 # Clone repos at pinned commits (~100MB total)
 python benchmark/fixtures/setup_repos.py
 
-# Build upstream and fork from the exact experiment SHAs into separate roots
-python benchmark/build_variants.py benchmark/experiments/upstream-fork.json
+# Resolve mutable branch names to immutable SHAs, then build both tilth arms.
+# The candidate is named "fork" in result data even when both repos are jahala/tilth.
+python benchmark/prepare_experiment.py \
+  --reference-repository https://github.com/jahala/tilth \
+  --reference-ref main \
+  --variant-repository https://github.com/jahala/tilth \
+  --variant-ref <candidate-branch> \
+  --output /tmp/tilth-benchmark/experiment.json
+python benchmark/build_variants.py /tmp/tilth-benchmark/experiment.json
 
 # Install the analysis stats deps used by analyze.py / paired.py / stats.py
 pip install -r benchmark/requirements.txt
@@ -229,14 +236,20 @@ pip install -r benchmark/requirements.txt
 # Primary three-way experiment: no tilth, pinned upstream, pinned fork.
 # Arm order is randomized inside each task/model/repetition block.
 python benchmark/run.py \
-  --experiment benchmark/experiments/upstream-fork.json \
+  --experiment /tmp/tilth-benchmark/experiment.json \
   --tasks all --repos ripgrep,fastapi,gin,express \
   --models sonnet --reps 3
 
 # Multiple model lanes use the same pinned variants and arm-order seed
 python benchmark/run.py \
-  --experiment benchmark/experiments/upstream-fork.json \
+  --experiment /tmp/tilth-benchmark/experiment.json \
   --tasks all --models sonnet,opus --reps 3
+
+# Routine-safe bounded run: 2 tasks × 1 model × 1 repetition × 3 arms
+python benchmark/run.py \
+  --experiment /tmp/tilth-benchmark/experiment.json \
+  --tasks find_definition,markdown_section \
+  --models haiku --reps 1 --max-cells 6
 
 # Legacy local A/B remains available for development checks
 python benchmark/run.py \
@@ -250,6 +263,14 @@ python benchmark/run.py --tasks all --models haiku --reps 1 --modes tilth_forced
 **Analyze:**
 
 ```bash
+# Reject error rows, missing/extra schedule blocks, incomplete matched blocks,
+# and variant metadata drift before analysis. run.py records cell failures but
+# intentionally completes the schedule.
+python benchmark/check_experiment.py \
+  benchmark/results/benchmark_<timestamp>_<model>.jsonl \
+  /tmp/tilth-benchmark/experiment.json \
+  --tasks <task-a,task-b> --models <model-a,model-b> --reps <repetitions>
+
 # Summarize a run: descriptive Wilson CIs and cost metrics, plus task-clustered
 # paired accuracy bootstrap CIs. The primary comparison is fork vs upstream;
 # fork vs no_tilth and upstream vs no_tilth are guardrails.
@@ -263,7 +284,7 @@ python benchmark/paired.py benchmark/results/benchmark_<timestamp>_<model>.jsonl
 python benchmark/regrade.py benchmark/results/benchmark_<timestamp>_<model>.jsonl
 ```
 
-Results are written to `benchmark/results/benchmark_<timestamp>_<model>.jsonl`. Each line records the task/model/repetition cell, randomized arm order, manifest seed, variant repository and git SHA, absolute binary path and SHA-256, tilth/rustc versions, cost, tokens, correctness, and tool sequence. Every cell runs in a fresh disposable copy or Git worktree.
+Results are written to `benchmark/results/benchmark_<timestamp>_<model>.jsonl`. Each line records the task/model/repetition cell, randomized arm order, manifest seed, requested variant Git ref and resolved SHA, repository, absolute binary path and SHA-256, tilth/rustc versions, cost, tokens, correctness, and tool sequence. Every cell runs in a fresh disposable copy or Git worktree.
 
 ### Task definitions
 

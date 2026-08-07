@@ -221,6 +221,7 @@ def test_run_single_uses_allowlisted_env_and_preserves_runner_flags(
             description="test mode",
             binary_path="/opt/tilth/bin/tilth",
             repository="https://github.com/example/tilth",
+            git_ref="feature/candidate",
             git_sha="a" * 40,
             binary_sha256="b" * 64,
             tilth_version="9.9.9",
@@ -337,6 +338,7 @@ def test_run_single_uses_allowlisted_env_and_preserves_runner_flags(
     assert result["variant"] == {
         "label": "runner_test_mode",
         "repository": "https://github.com/example/tilth",
+        "git_ref": "feature/candidate",
         "git_sha": "a" * 40,
         "binary_path": "/opt/tilth/bin/tilth",
         "binary_sha256": "b" * 64,
@@ -413,6 +415,22 @@ def test_claude_streaming_run_does_not_inherit_stdin(
     assert (tmp_path / "stream.jsonl").read_text() == '{"type":"result"}\n'
     assert result["task"] == "runner_stream_task"
     assert result["model"] == "configured-claude-model"
+
+
+def test_cell_ceiling_rejects_an_expanded_experiment() -> None:
+    planned = run.planned_cell_count(
+        task_count=2,
+        mode_count=3,
+        model_count=1,
+        repetitions=2,
+    )
+
+    assert planned == 12
+    with pytest.raises(
+        ValueError,
+        match=r"planned 12 benchmark cells exceeds --max-cells 11",
+    ):
+        run.enforce_cell_ceiling(planned, maximum=11)
 
 
 def test_experiment_scheduler_randomizes_matched_blocks_and_records_order(
@@ -506,6 +524,8 @@ def test_experiment_scheduler_randomizes_matched_blocks_and_records_order(
             "runner_test_task",
             "--reps",
             "2",
+            "--max-cells",
+            "6",
         ],
     )
 

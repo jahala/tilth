@@ -37,6 +37,7 @@ benchmark/results/*.jsonl
 benchmark/results/*.md
 benchmark/results/*.log
 benchmark/results/streams/
+benchmark/results/configs/
 !benchmark/results/.gitkeep
 
 # Local env (API keys, secrets)

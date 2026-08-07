@@ -15,7 +15,7 @@ from config import ModeConfig
 _SHA_RE = re.compile(r"[0-9a-f]{40}")
 _NAME_RE = re.compile(r"[a-z][a-z0-9_-]*")
 _EXPERIMENT_KEYS = {"arm_order_seed", "variants"}
-_VARIANT_KEYS = {"name", "repository", "git_sha"}
+_VARIANT_KEYS = {"name", "repository", "git_ref", "git_sha"}
 _TOOLS = ["Read", "Edit", "Grep", "Glob", "Bash"]
 
 
@@ -23,6 +23,7 @@ _TOOLS = ["Read", "Edit", "Grep", "Glob", "Bash"]
 class Variant:
     name: str
     repository: str | None
+    git_ref: str | None
     git_sha: str | None
     binary_path: Path | None
 
@@ -83,22 +84,29 @@ def load_experiment(
         names.add(name)
 
         repository = entry.get("repository")
+        git_ref = entry.get("git_ref")
         git_sha = entry.get("git_sha")
         if name == "no_tilth":
-            if repository is not None or git_sha is not None:
-                raise ValueError("no_tilth must not specify repository or git_sha")
+            if any(value is not None for value in (repository, git_ref, git_sha)):
+                raise ValueError(
+                    "no_tilth must not specify repository, git_ref, or git_sha"
+                )
             binary_path = None
         else:
             if not isinstance(repository, str) or not repository.startswith(
                 ("https://", "ssh://", "git@")
             ):
                 raise ValueError(f"variant {name} repository must be a git URL")
+            if git_ref is not None and (
+                not isinstance(git_ref, str) or not git_ref.strip()
+            ):
+                raise ValueError(f"variant {name} git_ref must be a non-empty string")
             if not isinstance(git_sha, str) or not _SHA_RE.fullmatch(git_sha):
                 raise ValueError(
                     f"variant {name} git_sha must be a lowercase 40-character SHA"
                 )
             binary_path = (root / f"{name}-{git_sha}" / "bin" / "tilth").resolve()
-        variants.append(Variant(name, repository, git_sha, binary_path))
+        variants.append(Variant(name, repository, git_ref, git_sha, binary_path))
 
     if names != {"no_tilth", "upstream", "fork"}:
         raise ValueError("variants must be exactly: no_tilth, upstream, fork")
@@ -156,6 +164,7 @@ def experiment_modes(experiment: Experiment, config_dir: Path) -> dict[str, Mode
             opencode_config_path=str(opencode_path.resolve()),
             binary_path=str(variant.binary_path) if variant.binary_path else None,
             repository=variant.repository,
+            git_ref=variant.git_ref,
             git_sha=variant.git_sha,
             description=(
                 "Built-in tools without tilth"

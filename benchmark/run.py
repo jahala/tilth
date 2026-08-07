@@ -80,6 +80,7 @@ def _variant_metadata(
     return {
         "label": mode.name,
         "repository": mode.repository,
+        "git_ref": mode.git_ref,
         "git_sha": mode.git_sha,
         "binary_path": mode.binary_path,
         "binary_sha256": mode.binary_sha256,
@@ -548,6 +549,25 @@ def parse_comma_list(value: str, valid_options: dict, name: str) -> list[str]:
         )
     return items
 
+def planned_cell_count(
+    *,
+    task_count: int,
+    mode_count: int,
+    model_count: int,
+    repetitions: int,
+) -> int:
+    """Return the number of model calls in a benchmark schedule."""
+    return task_count * mode_count * model_count * repetitions
+
+
+def enforce_cell_ceiling(planned: int, *, maximum: int | None) -> None:
+    """Reject a benchmark schedule that exceeds its explicit cell ceiling."""
+    if maximum is not None and planned > maximum:
+        raise ValueError(
+            f"planned {planned} benchmark cells exceeds --max-cells {maximum}"
+        )
+
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -570,6 +590,11 @@ Examples:
         type=int,
         default=DEFAULT_REPS,
         help=f"Number of repetitions (default: {DEFAULT_REPS})",
+    )
+    parser.add_argument(
+        "--max-cells",
+        type=int,
+        help="Abort before model calls when the expanded schedule exceeds this count",
     )
     parser.add_argument(
         "--tasks",
@@ -611,6 +636,8 @@ Examples:
     args = parser.parse_args()
     if args.reps < 1:
         parser.error("--reps must be at least 1")
+    if args.max_cells is not None and args.max_cells < 1:
+        parser.error("--max-cells must be at least 1")
 
     RESULTS_DIR.mkdir(exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -672,6 +699,17 @@ Examples:
         if not tasks_list:
             parser.error(f"No tasks found for repos: {args.repos}")
 
+    total_runs = planned_cell_count(
+        task_count=len(tasks_list),
+        mode_count=len(modes),
+        model_count=len(models),
+        repetitions=args.reps,
+    )
+    try:
+        enforce_cell_ceiling(total_runs, maximum=args.max_cells)
+    except ValueError as error:
+        parser.error(str(error))
+
     # Validate and restore the synthetic source once. Every cell runs from a
     # disposable copy, so the scheduler never mutates this source again.
     if "synthetic" in {TASKS[name].repo for name in tasks_list}:
@@ -721,8 +759,6 @@ Examples:
     print("=" * 70)
     print()
 
-    # Calculate total runs
-    total_runs = len(tasks_list) * len(modes) * len(models) * args.reps
     current_run = 0
 
     # Run matched task/model/repetition blocks. Experiment arms are shuffled

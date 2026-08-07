@@ -1,0 +1,43 @@
+{
+  "skill_name": "tilth-benchmark",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Prepare a routine-ready Haiku smoke benchmark comparing jahala/tilth main with the jahala/tilth merge-edit-impl branch. Show the exact plan and commands, but do not make model calls.",
+      "expected_output": "A no-execution runbook that resolves both same-repository branches to immutable SHAs, retains the candidate as the fork arm, requires explicit tasks and a cell ceiling, preflights Claude authentication, and validates JSONL before analysis.",
+      "files": [],
+      "expectations": [
+        "Uses benchmark/prepare_experiment.py with reference-ref main and variant-ref merge-edit-impl",
+        "Explains that the candidate remains the fork arm even though both refs use jahala/tilth",
+        "Does not run benchmark/run.py or make paid model calls",
+        "Requires explicit task names and computes task_count times one model times repetitions times three arms",
+        "Includes claude auth status and benchmark/check_experiment.py before benchmark/analyze.py"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "Plan a routine benchmark of paulnsorensen/tilth branch feature/edit against jahala/tilth main for tasks find_definition and markdown_section, model sonnet, two repetitions, with a ceiling of 12 cells. Do not execute it.",
+      "expected_output": "A bounded cross-repository plan that calculates exactly 12 cells, pins both refs, builds the resolved revisions, runs only the two named tasks and Sonnet lane, and treats any preflight or result validation failure as fatal.",
+      "files": [],
+      "expectations": [
+        "Passes distinct reference and candidate repositories to benchmark/prepare_experiment.py",
+        "Calculates 2 tasks times 1 model times 2 repetitions times 3 arms as 12 cells",
+        "Uses only find_definition and markdown_section rather than tasks all",
+        "Stops when authentication or the configured ceiling check fails",
+        "Validates the result JSONL against the generated manifest before analysis"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "Analyze the existing benchmark result benchmark/results/example.jsonl against /tmp/tilth-benchmark/experiment.json. Do not rebuild variants and do not rerun the benchmark.",
+      "expected_output": "An analysis-only procedure that first validates the existing JSONL against its manifest, runs analysis only if validation succeeds, and avoids ref resolution, builds, fixture setup, and paid model calls.",
+      "files": [],
+      "expectations": [
+        "Runs benchmark/check_experiment.py before benchmark/analyze.py",
+        "Does not invoke benchmark/prepare_experiment.py or benchmark/build_variants.py",
+        "Does not invoke benchmark/run.py",
+        "Reports validation failure instead of analyzing partial data"
+      ]
+    }
+  ]
+}

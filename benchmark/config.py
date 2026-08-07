@@ -56,6 +56,7 @@ class ModeConfig:
     opencode_config_path: Optional[str] = None
     binary_path: Optional[str] = None
     repository: Optional[str] = None
+    git_ref: Optional[str] = None
     git_sha: Optional[str] = None
     binary_sha256: Optional[str] = None
     tilth_version: Optional[str] = None
