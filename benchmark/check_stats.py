@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Standalone checks for the benchmark stats layer — no pytest.
 
-Exercises stats.py, the paired-A/B pairing logic, the grader alternation, and
+Exercises stats.py, task-clustered paired analysis, grader alternation, and
 the offline re-grade recovery path on hand-checked inputs. Run after installing
 the deps:
 
@@ -17,9 +17,9 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-import stats
 import regrade
-from paired import pair_ab
+import stats
+from paired import pair_ab, paired_accuracy_delta
 from tasks.base import GroundTruth, required_matches
 
 
@@ -52,12 +52,6 @@ def check_stats() -> None:
     plo, phi = stats.paired_bootstrap_ci([0.1, -0.2, 0.3, 0.05, -0.1, 0.4, 0.0, 0.2])
     assert plo < (0.75 / 8) < phi, (plo, phi)
 
-    # McNemar exact.
-    p, direction = stats.mcnemar_exact(1, 9)
-    assert p < 0.05 and direction == "tilth", (p, direction)
-    assert stats.mcnemar_exact(9, 1)[1] == "baseline"
-    assert stats.mcnemar_exact(0, 0) == (1.0, "tie")
-    assert approx(stats.mcnemar_exact(5, 5)[0], 1.0)
 
     # MDE: positive, capped at 1.0, larger N -> smaller MDE, n<=0 -> 1.0.
     assert stats.min_detectable_effect(0, 0.5) == 1.0
@@ -91,6 +85,29 @@ def check_pairing() -> None:
     # errored rep drops from cost deltas (base cost None) -> only 2 cost deltas.
     cost_deltas = [tk - bk for (_r, _bc, _tc, bk, tk) in tuples if bk is not None and tk is not None]
     assert len(cost_deltas) == 2, cost_deltas
+
+    # Repetitions are averaged within task before inference. Ten wins on one
+    # task and one loss on another therefore have a zero task-weighted delta.
+    uneven = []
+    for rep in range(10):
+        uneven.extend([
+            {"task": "many", "model": "m", "mode": "upstream",
+             "repetition": rep, "correct": False},
+            {"task": "many", "model": "m", "mode": "fork",
+             "repetition": rep, "correct": True},
+        ])
+    uneven.extend([
+        {"task": "one", "model": "m", "mode": "upstream",
+         "repetition": 0, "correct": True},
+        {"task": "one", "model": "m", "mode": "fork",
+         "repetition": 0, "correct": False},
+    ])
+    delta, _lo, _hi, n_tasks = paired_accuracy_delta(
+        uneven,
+        "fork",
+        "upstream",
+    )
+    assert delta == 0.0 and n_tasks == 2, (delta, n_tasks)
     print("  pairing .......... OK")
 
 
@@ -195,7 +212,7 @@ def check_power_readout() -> None:
                         "repetition": 0, "correct": tc, "total_cost_usd": 0.05})
         return out
 
-    # Significant: baseline 2/10, tilth 10/10 -> b=0, c=8, McNemar p<0.05.
+    # Significant: task-clustered bootstrap CI excludes zero.
     sig = runs_for([(True, True), (True, True)] + [(False, True)] * 8)
     text = "\n".join(analyze._power_readout(sig))
     assert "SIGNIFICANT" in text, text
@@ -209,7 +226,7 @@ def check_power_readout() -> None:
     only_base = [{"task": "t", "model": "m", "mode": "baseline",
                   "repetition": 0, "correct": True, "total_cost_usd": 0.1}]
     text3 = "\n".join(analyze._power_readout(only_base))
-    assert "unavailable" in text3, text3
+    assert "No paired variant comparisons" in text3, text3
     print("  power readout .... OK")
 
 

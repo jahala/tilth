@@ -13,15 +13,16 @@ the observed effect. Concretely, run:
 python benchmark/analyze.py benchmark/results/<latest>.jsonl
 ```
 
-and read the **Power readout** line (emitted by `analyze.py._power_readout`). The
-gate is OPEN when that line says:
+and read the **Power readout by model** line (emitted by
+`analyze.py._power_readout`). The gate is OPEN when that line says:
 
-> N INSUFFICIENT for observed effect — grow TASK pool (Phase 4 trigger)
+> N INSUFFICIENT for observed effect — grow TASK pool
 
-i.e. the McNemar test is not significant (p ≥ 0.05) AND the observed accuracy
-gap is below the minimum detectable effect (MDE) at the current task count N.
-If instead the line says **effect SIGNIFICANT**, the A/B already resolves at
-current N — do not spend effort growing the pool.
+i.e. the task-clustered paired bootstrap interval includes zero and the
+observed task-weighted accuracy gap is below the minimum detectable effect
+(MDE) at the current task count N. If instead the line says **effect
+SIGNIFICANT**, the paired 95% interval excludes zero — do not spend effort
+growing the pool.
 
 Why tasks, not reps: the task is the sampling unit. Reps (held at 3) only shrink
 within-task variance; they do not raise N. MDE falls as `1/sqrt(N_tasks)`, so
@@ -46,8 +47,8 @@ power is bought by adding TASKS.
 - Reserve **frontier** (`claude -p` / `codex exec`) for a small **confirmatory
   subset** once the cheap lane shows a candidate effect, to confirm the result
   holds at frontier quality without paying frontier cost for the whole pool.
-- Re-run `analyze.py` after each batch; stop growing when the power readout flips
-  to **effect SIGNIFICANT** (MDE@N drops below the observed gap and p < 0.05).
+- Re-run `analyze.py` after each batch; stop growing when the task-clustered
+  paired interval excludes zero and the readout flips to **effect SIGNIFICANT**.
 
 ### 3. (Optional) adopt ContextBench metrics
 
@@ -79,4 +80,5 @@ want to run on ContextBench's own harness rather than borrow its task pool.
 - Research: `.cheese/research/benchmark-model-and-robustness/benchmark-model-and-robustness.md`
   (Q2 — methodology robustness).
 - Power readout source: `benchmark/analyze.py` → `_power_readout`,
-  `benchmark/stats.py` → `min_detectable_effect`, `mcnemar_exact`.
+  `benchmark/paired.py` → `paired_accuracy_delta`, and
+  `benchmark/stats.py` → `paired_bootstrap_ci`, `min_detectable_effect`.

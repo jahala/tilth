@@ -1,0 +1,18 @@
+{
+  "arm_order_seed": 163162,
+  "variants": [
+    {
+      "name": "no_tilth"
+    },
+    {
+      "name": "upstream",
+      "repository": "https://github.com/jahala/tilth",
+      "git_sha": "ad9eb2cdb90a4333c4eec337ff7499e1867d248f"
+    },
+    {
+      "name": "fork",
+      "repository": "https://github.com/paulnsorensen/tilth",
+      "git_sha": "4bb885e76d4ade1babf51ee820c7588114df9ea9"
+    }
+  ]
+}

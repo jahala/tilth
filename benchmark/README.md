@@ -205,10 +205,9 @@ All modes use the same system prompt, $1.00 budget cap, and model. The agent exp
 
 **Prerequisites:**
 
-- Python 3.9+
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI (`claude`) installed and authenticated
-- tilth installed (`cargo install tilth` or `npx tilth`)
-- Git (for cloning benchmark repos)
+- Python 3.12+
+- At least one supported agent CLI (`claude`, `codex`, or `opencode`) installed and authenticated
+- Rust/Cargo and Git (for building exact tilth revisions and cloning benchmark repos)
 - Analysis stats deps: `pip install -r benchmark/requirements.txt` (scipy + numpy)
 
 **Setup:**
@@ -217,45 +216,54 @@ All modes use the same system prompt, $1.00 budget cap, and model. The agent exp
 # Clone repos at pinned commits (~100MB total)
 python benchmark/fixtures/setup_repos.py
 
-# Install the analysis stats deps (scipy, numpy) used by analyze.py / paired.py / stats.py
+# Build upstream and fork from the exact experiment SHAs into separate roots
+python benchmark/build_variants.py benchmark/experiments/upstream-fork.json
+
+# Install the analysis stats deps used by analyze.py / paired.py / stats.py
 pip install -r benchmark/requirements.txt
 ```
 
 **Run:**
 
 ```bash
-# All tasks, baseline + tilth, 3 reps, Sonnet
-python benchmark/run.py --tasks all --repos ripgrep,fastapi,gin,express --models sonnet --reps 3
+# Primary three-way experiment: no tilth, pinned upstream, pinned fork.
+# Arm order is randomized inside each task/model/repetition block.
+python benchmark/run.py \
+  --experiment benchmark/experiments/upstream-fork.json \
+  --tasks all --repos ripgrep,fastapi,gin,express \
+  --models sonnet --reps 3
 
-# Specific tasks
-python benchmark/run.py --tasks fastapi_depends_processing,gin_middleware_chain --models sonnet --reps 3
+# Multiple model lanes use the same pinned variants and arm-order seed
+python benchmark/run.py \
+  --experiment benchmark/experiments/upstream-fork.json \
+  --tasks all --models sonnet,opus --reps 3
 
-# Opus on all tasks
-python benchmark/run.py --tasks all --repos ripgrep,fastapi,gin,express --models opus --reps 3
+# Legacy local A/B remains available for development checks
+python benchmark/run.py \
+  --tasks fastapi_depends_processing,gin_middleware_chain \
+  --models sonnet --reps 1 --modes baseline,tilth
 
-# Haiku forced mode (built-in search tools removed)
-python benchmark/run.py --tasks all --repos ripgrep,fastapi,gin,express --models haiku --reps 1 --modes tilth_forced
-
-# Single mode only (skip baseline comparison)
-python benchmark/run.py --tasks all --repos ripgrep,fastapi,gin,express --models sonnet --reps 1 --modes tilth
+# Diagnostic only: remove built-in search tools and force the local tilth MCP
+python benchmark/run.py --tasks all --models haiku --reps 1 --modes tilth_forced
 ```
 
 **Analyze:**
 
 ```bash
-# Summarize a run: per-task tables PLUS a Statistical Analysis section
-# (Wilson CIs, cost-per-correct, per-repo clustering, synthetic-vs-real split,
-# and a paired-A/B power readout that flags when N is too small)
+# Summarize a run: descriptive Wilson CIs and cost metrics, plus task-clustered
+# paired accuracy bootstrap CIs. The primary comparison is fork vs upstream;
+# fork vs no_tilth and upstream vs no_tilth are guardrails.
 python benchmark/analyze.py benchmark/results/benchmark_<timestamp>_<model>.jsonl
 
-# Paired A/B significance: exact McNemar + paired cost-delta bootstrap CI
-python benchmark/paired.py benchmark/results/benchmark_<timestamp>_<model>.jsonl
+# Focus one task-clustered pairwise comparison
+python benchmark/paired.py benchmark/results/benchmark_<timestamp>_<model>.jsonl \
+  --experiment-mode fork --baseline-mode upstream
 
 # Offline re-grade under grader alternation (recovers historical false negatives)
 python benchmark/regrade.py benchmark/results/benchmark_<timestamp>_<model>.jsonl
 ```
 
-Results are written to `benchmark/results/benchmark_<timestamp>_<model>.jsonl`. Each line is a JSON object with task name, mode, cost, token counts, correctness, and tool sequence.
+Results are written to `benchmark/results/benchmark_<timestamp>_<model>.jsonl`. Each line records the task/model/repetition cell, randomized arm order, manifest seed, variant repository and git SHA, absolute binary path and SHA-256, tilth/rustc versions, cost, tokens, correctness, and tool sequence. Every cell runs in a fresh disposable copy or Git worktree.
 
 ### Task definitions
 

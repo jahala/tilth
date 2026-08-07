@@ -90,25 +90,6 @@ def ratio_bootstrap_ci(numerators: list[float], denominators: list[float],
     return (float(res.confidence_interval.low), float(res.confidence_interval.high))
 
 
-def mcnemar_exact(b: int, c: int) -> tuple[float, str]:
-    """Exact (binomial) McNemar test on discordant pairs.
-
-    b = pairs where baseline is correct and tilth wrong; c = pairs where tilth
-    is correct and baseline wrong. Returns (two_sided_p, direction): direction
-    is "tilth" when tilth wins more discordances, "baseline" when baseline does,
-    "tie" when b == c. No discordant pairs (b + c == 0) returns (1.0, "tie").
-    """
-    n = b + c
-    if n == 0:
-        return (1.0, "tie")
-    p = float(binomtest(b, n, 0.5).pvalue)
-    if c > b:
-        direction = "tilth"
-    elif b > c:
-        direction = "baseline"
-    else:
-        direction = "tie"
-    return (p, direction)
 
 
 def min_detectable_effect(n: int, baseline_rate: float, power: float = 0.80,
@@ -124,11 +105,10 @@ def min_detectable_effect(n: int, baseline_rate: float, power: float = 0.80,
     is capped at 1.0. The normal approximation degrades when `baseline_rate` is
     near 0 or 1 (variance collapses) — read those readouts with that caveat.
 
-    This is a SINGLE-proportion bound, but the power readout consumes it to gate a
-    PAIRED baseline-vs-tilth comparison, whose true MDE is larger (a two-proportion
-    bound is ~1.41x this). Treat it as an optimistic lower bound: an observed paired
-    delta below even this MDE is definitely under-powered (the Phase 4 trigger holds
-    in that direction); a delta above it does not guarantee adequate paired power.
+    This is a SINGLE-proportion bound, but the power readout consumes it only
+    as an optimistic planning guide for a PAIRED variant comparison, whose true
+    MDE is larger. The task-clustered paired bootstrap interval remains the
+    inferential decision rule.
     """
     if n <= 0:
         return 1.0

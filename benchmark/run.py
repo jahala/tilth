@@ -26,36 +26,66 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).parent))
 
 from config import (
+    DEFAULT_MAX_BUDGET_USD,
+    DEFAULT_REPS,
     MODELS,
     MODES,
-    REPOS,
-    RUNNERS,
-    SYSTEM_PROMPT,
-    DEFAULT_MAX_BUDGET_USD,
-    SYNTHETIC_REPO,
-    RESULTS_DIR,
-    DEFAULT_REPS,
-    TILTH_MCP_CODEX_ARGS,
-    TILTH_BIN,
-    OPENCODE_CONFIGS,
     OPENCODE_CONFIG_HOME,
+    OPENCODE_CONFIGS,
+    REPOS,
+    RESULTS_DIR,
+    RUNNERS,
+    SYNTHETIC_REPO,
+    SYSTEM_PROMPT,
+    TILTH_BIN,
+    ModeConfig,
 )
-from parse import parse_stream_json, parse_codex_json, parse_opencode_json, tool_call_counts, extract_stream_error
+from fixtures.reset import ensure_repo_clean, reset_repo
+from parse import (
+    extract_stream_error,
+    parse_codex_json,
+    parse_opencode_json,
+    parse_stream_json,
+    tool_call_counts,
+)
 from tasks import TASKS
-from fixtures.reset import reset_repo, ensure_repo_clean
+from variants import (
+    experiment_modes,
+    hydrate_mode_metadata,
+    load_experiment,
+    randomized_arm_order,
+    rustc_version,
+)
 
 
-def _tilth_version() -> Optional[str]:
-    """Get installed tilth version via `tilth --version`."""
+def _tilth_version(binary_path: Optional[str] = None) -> Optional[str]:
+    """Get a tilth binary's reported version."""
     try:
         result = subprocess.run(
-            [TILTH_BIN, "--version"],
-            capture_output=True, text=True, timeout=5,
+            [binary_path or TILTH_BIN, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
-        # Output: "tilth 0.2.1"
         return result.stdout.strip().removeprefix("tilth ") if result.returncode == 0 else None
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return None
+
+
+def _variant_metadata(
+    mode: ModeConfig,
+    *,
+    reported_version: Optional[str] = None,
+) -> dict:
+    return {
+        "label": mode.name,
+        "repository": mode.repository,
+        "git_sha": mode.git_sha,
+        "binary_path": mode.binary_path,
+        "binary_sha256": mode.binary_sha256,
+        "tilth_version": reported_version or mode.tilth_version,
+        "rustc_version": mode.rustc_version,
+    }
 
 
 def get_repo_path(repo_name: str) -> Path:
@@ -83,12 +113,16 @@ _PROVIDER_AUTH_PREFIXES = ("ANTHROPIC_", "OPENAI_", "OPENROUTER_")
 _PROVIDER_AUTH_KEYS = frozenset({"CODEX_API_KEY"})
 
 
+_DEFAULT_TILTH_BIN = object()
+
+
 def build_runner_env(
     runner: str,
     *,
     opencode_config: Optional[str] = None,
     bare: bool = False,
     ambient: Optional[Mapping[str, str]] = None,
+    tilth_bin: object = _DEFAULT_TILTH_BIN,
 ) -> dict[str, str]:
     """Build a minimal environment for one runner subprocess."""
     source = os.environ if ambient is None else ambient
@@ -101,9 +135,11 @@ def build_runner_env(
         or key.startswith("LC_")
     }
 
-    tilth_dir = os.path.dirname(TILTH_BIN)
-    if tilth_dir:
-        env["PATH"] = tilth_dir + os.pathsep + env.get("PATH", "")
+    selected_tilth_bin = TILTH_BIN if tilth_bin is _DEFAULT_TILTH_BIN else tilth_bin
+    if isinstance(selected_tilth_bin, str):
+        tilth_dir = os.path.dirname(selected_tilth_bin)
+        if tilth_dir:
+            env["PATH"] = tilth_dir + os.pathsep + env.get("PATH", "")
 
     if runner == "opencode" and opencode_config is not None:
         OPENCODE_CONFIG_HOME.mkdir(parents=True, exist_ok=True)
@@ -151,17 +187,50 @@ def _compact_tool_sequence(result):
 
 @contextmanager
 def _agent_repo(repo_path: Path, hide_git: bool):
-    """Yield an agent workspace without repository metadata when requested."""
-    if not hide_git:
-        yield repo_path
-        return
-
+    """Yield a disposable workspace for one benchmark cell."""
     with tempfile.TemporaryDirectory(prefix="tilth-benchmark-") as temp_dir:
         workspace = Path(temp_dir) / repo_path.name
+        if not hide_git and (repo_path / ".git").exists():
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo_path),
+                    "worktree",
+                    "add",
+                    "--detach",
+                    str(workspace),
+                    "HEAD",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            try:
+                yield workspace
+            finally:
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(repo_path),
+                        "worktree",
+                        "remove",
+                        "--force",
+                        str(workspace),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+            return
+
         shutil.copytree(
             repo_path,
             workspace,
-            ignore=shutil.ignore_patterns(".git", ".git_hidden"),
+            ignore=shutil.ignore_patterns(".git", ".git_hidden")
+            if hide_git
+            else shutil.ignore_patterns(".git_hidden"),
         )
         yield workspace
 
@@ -181,6 +250,9 @@ def run_single(
         get_repo_path(task.repo),
         getattr(task, "hide_git", False),
     ) as repo_path:
+        mutations = getattr(task, "mutations", ())
+        if mutations:
+            task.apply_mutations(str(repo_path))
         return _run_single_in_repo(
             task_name,
             mode_name,
@@ -218,18 +290,23 @@ def _run_single_in_repo(
             "--full-auto",
             "--ephemeral",
             "-m", model_id,
+            "-c", "mcp_servers={}",
         ]
 
         # Add MCP config for tilth modes
         if mode.mcp_config_path:
-            cmd += TILTH_MCP_CODEX_ARGS
+            tilth_bin = mode.binary_path or TILTH_BIN
+            cmd += [
+                "-c", f'mcp_servers.tilth.command="{tilth_bin}"',
+                "-c", 'mcp_servers.tilth.args=["--mcp", "--edit"]',
+            ]
 
         # Codex has no --system-prompt, prepend to prompt
         full_prompt = f"{SYSTEM_PROMPT}\n\n{task.prompt}"
         cmd += ["--", full_prompt]
 
     elif runner == "opencode":
-        opencode_config = OPENCODE_CONFIGS.get(mode_name)
+        opencode_config = mode.opencode_config_path or OPENCODE_CONFIGS.get(mode_name)
         if opencode_config is None:
             raise RuntimeError(
                 f"opencode runner has no config for mode '{mode_name}'. "
@@ -292,6 +369,7 @@ def _run_single_in_repo(
         runner,
         opencode_config=opencode_config,
         bare=bare,
+        tilth_bin=mode.binary_path,
     )
     start_time = time.time()
 
@@ -405,6 +483,9 @@ def _run_single_in_repo(
     per_turn_output = [turn.output_tokens for turn in run_result.turns]
     total_context = sum(per_turn_context)
     task_source = asdict(task.source)
+    reported_version = mode.tilth_version or (
+        _tilth_version(mode.binary_path) if mode.binary_path else None
+    )
 
     # Return JSON-serializable dict
     return {
@@ -416,7 +497,8 @@ def _run_single_in_repo(
         "capability": task.capability,
         "source": task_source,
         "repetition": repetition,
-        "tilth_version": _tilth_version() if "tilth" in mode_name else None,
+        "tilth_version": reported_version,
+        "variant": _variant_metadata(mode, reported_version=reported_version),
         "num_turns": run_result.num_turns,
         "num_tool_calls": sum(tool_breakdown.values()),
         "tool_calls": tool_breakdown,
@@ -474,9 +556,8 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python run.py --models sonnet --reps 5 --tasks all --modes all
+  python run.py --experiment benchmark/experiments/upstream-fork.json --models sonnet --reps 5
   python run.py --models haiku --reps 1 --tasks find_definition --modes baseline,tilth
-  python run.py --models sonnet,opus --reps 3 --tasks find_definition,edit_task --modes tilth
         """,
     )
 
@@ -496,10 +577,15 @@ Examples:
         default="all",
         help="Comma-separated task names or 'all' (default: all)",
     )
-    parser.add_argument(
+    arm_group = parser.add_mutually_exclusive_group()
+    arm_group.add_argument(
         "--modes",
-        default="all",
-        help="Comma-separated mode names or 'all' (default: all)",
+        help="Legacy local A/B: comma-separated mode names or 'all'",
+    )
+    arm_group.add_argument(
+        "--experiment",
+        type=Path,
+        help="Pinned variant experiment manifest",
     )
     parser.add_argument(
         "--repos",
@@ -515,24 +601,41 @@ Examples:
     parser.add_argument(
         "--bare",
         action="store_true",
-        help="Strip the harness to built-in tools + the per-mode MCP config. "
+        help="Strip the harness to built-in tools + the per-mode MCP config; "
+             "pinned experiments enable this automatically. "
              "claude: passes --bare (drops slash commands, hooks, plugins, "
              "agents, skills). "
-             "opencode: redirects XDG_CONFIG_HOME + sets OPENCODE_DISABLE_* so "
-             "the user's global opencode config (MCP servers, skills) can't "
-             "leak into the baseline. Ignored for codex.",
+             "opencode: redirects XDG_CONFIG_HOME + sets OPENCODE_DISABLE_*. "
+             "codex: always resets mcp_servers through CLI overrides.",
     )
 
     args = parser.parse_args()
+    if args.reps < 1:
+        parser.error("--reps must be at least 1")
 
-    # Parse and validate inputs
+    RESULTS_DIR.mkdir(exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    experiment = None
     try:
         models = parse_comma_list(args.models, MODELS, "models")
         tasks_list = parse_comma_list(args.tasks, TASKS, "tasks")
-        modes = parse_comma_list(args.modes, MODES, "modes")
-    except ValueError as e:
-        parser.error(str(e))
-        return
+        if args.experiment:
+            experiment = load_experiment(args.experiment)
+            configured_modes = experiment_modes(
+                experiment,
+                RESULTS_DIR / "configs" / timestamp,
+            )
+            compiler = rustc_version()
+            configured_modes = {
+                name: hydrate_mode_metadata(mode, compiler)
+                for name, mode in configured_modes.items()
+            }
+            MODES.update(configured_modes)
+            modes = [variant.name for variant in experiment.variants]
+        else:
+            modes = parse_comma_list(args.modes or "all", MODES, "modes")
+    except ValueError as error:
+        parser.error(str(error))
 
     # Verify every MCP server referenced by selected modes can actually spawn.
     # Catches stale absolute paths in mcp config files (e.g. /Users/<other-user>/...).
@@ -570,14 +673,15 @@ Examples:
         if not tasks_list:
             parser.error(f"No tasks found for repos: {args.repos}")
 
-    # Validate synthetic repo exists (only if synthetic tasks are selected)
-    if "synthetic" in set(TASKS[t].repo for t in tasks_list):
+    # Validate and restore the synthetic source once. Every cell runs from a
+    # disposable copy, so the scheduler never mutates this source again.
+    if "synthetic" in {TASKS[name].repo for name in tasks_list}:
         if not SYNTHETIC_REPO.exists():
-            print("ERROR: Synthetic repo not found.")
-            print(f"Expected at: {SYNTHETIC_REPO}")
-            print("Run setup.py to create the test repository:")
-            print("  python benchmark/fixtures/setup.py")
-            sys.exit(1)
+            parser.error(
+                f"Synthetic repo not found at {SYNTHETIC_REPO}; "
+                "run python benchmark/fixtures/setup.py"
+            )
+        reset_repo()
 
     # Validate real-world repos exist (for selected tasks)
     selected_repos = set(TASKS[t].repo for t in tasks_list) - {"synthetic"}
@@ -597,12 +701,8 @@ Examples:
         if args.verbose:
             print(f"Cleaned repo: {repo_name}")
 
-    # Create results directory
-    RESULTS_DIR.mkdir(exist_ok=True)
 
-    # Create timestamped output file (include model name to avoid collisions
-    # when multiple benchmark processes run in parallel)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Include the model in the filename when one process owns one model.
     model_suffix = f"_{models[0]}" if len(models) == 1 else ""
     output_file = RESULTS_DIR / f"benchmark_{timestamp}{model_suffix}.jsonl"
     stream_log_dir = RESULTS_DIR / "streams" / timestamp
@@ -626,53 +726,45 @@ Examples:
     total_runs = len(tasks_list) * len(modes) * len(models) * args.reps
     current_run = 0
 
-    # Track previous state for reset logic
-    prev_task = None
-    prev_mode = None
-
-    # Main benchmark loop
-    with open(output_file, "w") as f:
+    # Run matched task/model/repetition blocks. Experiment arms are shuffled
+    # within each block from the manifest seed, never scheduled in long arm runs.
+    with open(output_file, "w") as output:
         for task_name in tasks_list:
             task = TASKS[task_name]
-
-            for mode_name in modes:
-                for model_name in models:
-                    for rep in range(args.reps):
+            for model_name in models:
+                for rep in range(args.reps):
+                    arm_order = (
+                        randomized_arm_order(
+                            modes,
+                            seed=experiment.arm_order_seed,
+                            task=task_name,
+                            model=model_name,
+                            repetition=rep,
+                        )
+                        if experiment
+                        else list(modes)
+                    )
+                    for arm_index, mode_name in enumerate(arm_order):
                         current_run += 1
                         run_id = f"{task_name}/{mode_name}/{model_name}/rep{rep}"
-
-                        # Reset repo and apply mutations for tasks that have them
-                        if task.mutations:
-                            repo_path = get_repo_path(task.repo)
-                            if task.repo == "synthetic":
-                                if rep > 0 or mode_name != prev_mode or task_name != prev_task:
-                                    if args.verbose:
-                                        print(f"  Resetting synthetic repo...")
-                                    reset_repo()
-                            else:
-                                # Real repos: always clean + re-mutate before each run
-                                if args.verbose:
-                                    print(f"  Resetting {task.repo}...")
-                                ensure_repo_clean(repo_path, REPOS[task.repo].commit_sha)
-                            # Apply mutations (if any) after clean state
-                            if task.mutations:
-                                if args.verbose:
-                                    print(f"  Applying {len(task.mutations)} mutation(s)...")
-                                task.apply_mutations(str(repo_path))
-                        elif task.repo == "synthetic" and mode_name != prev_mode:
-                            reset_repo()
-
-                        prev_task = task_name
-                        prev_mode = mode_name
-
-                        # Print progress
                         print(f"[{current_run}/{total_runs}] {run_id}")
 
-                        # Run benchmark
                         cell_slug = (
                             f"{current_run:02d}_{task_name}_{mode_name}"
                             f"_{model_name}_rep{rep}"
                         )
+                        mode = MODES[mode_name]
+                        variant_metadata = _variant_metadata(mode)
+                        experiment_metadata = {
+                            "experiment_manifest": (
+                                str(experiment.path) if experiment else None
+                            ),
+                            "arm_order_seed": (
+                                experiment.arm_order_seed if experiment else None
+                            ),
+                            "arm_order": arm_order,
+                            "arm_order_index": arm_index,
+                        }
                         record_metadata = {
                             "task": task_name,
                             "mode": mode_name,
@@ -682,6 +774,8 @@ Examples:
                             "source": asdict(task.source),
                             "repetition": rep,
                             "per_turn_output_tokens": [],
+                            "variant": variant_metadata,
+                            **experiment_metadata,
                         }
 
                         try:
@@ -692,14 +786,12 @@ Examples:
                                 rep,
                                 verbose=args.verbose,
                                 stream_log_path=stream_log_dir / f"{cell_slug}.jsonl",
-                                bare=args.bare,
+                                bare=args.bare or experiment is not None,
                             )
+                            result.update(experiment_metadata)
+                            output.write(json.dumps(result) + "\n")
+                            output.flush()
 
-                            # Write JSONL record
-                            f.write(json.dumps(result) + "\n")
-                            f.flush()
-
-                            # Print status line
                             status = "✓" if result["correct"] else "✗"
                             print(
                                 f"  {status} "
@@ -709,34 +801,33 @@ Examples:
                                 f"${result['total_cost_usd']:.4f} "
                                 f"{result['duration_ms']:,}ms"
                             )
-
                             if not result["correct"]:
                                 print(f"  → {result['correctness_reason']}")
 
                         except subprocess.TimeoutExpired:
-                            print(f"  ✗ TIMEOUT (>600s)")
+                            print("  ✗ TIMEOUT (>600s)")
                             error_result = {
                                 **record_metadata,
                                 "error": "timeout",
                                 "correct": False,
                                 "correctness_reason": "Subprocess timed out",
                             }
-                            f.write(json.dumps(error_result) + "\n")
-                            f.flush()
+                            output.write(json.dumps(error_result) + "\n")
+                            output.flush()
 
-                        except Exception as e:
-                            print(f"  ✗ ERROR: {e}")
+                        except Exception as error:
+                            print(f"  ✗ ERROR: {error}")
                             if args.verbose:
                                 import traceback
                                 traceback.print_exc()
                             error_result = {
                                 **record_metadata,
-                                "error": str(e),
+                                "error": str(error),
                                 "correct": False,
-                                "correctness_reason": f"Exception: {e}",
+                                "correctness_reason": f"Exception: {error}",
                             }
-                            f.write(json.dumps(error_result) + "\n")
-                            f.flush()
+                            output.write(json.dumps(error_result) + "\n")
+                            output.flush()
 
     # Clean real-world repos after run (remove junk files written by Claude sessions)
     for repo_name in selected_repos:

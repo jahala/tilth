@@ -52,8 +52,8 @@ def test_headline_delta_has_direction_and_deterministic_paired_ci():
     assert "## Evidence flags" in report
     assert "## Statistical Analysis" in report
     assert "Accuracy with 95% Wilson CIs" in report
-    assert "McNemar p=" in report
-    assert "MDE@N" in report
+    assert "Task-clustered paired accuracy" in report
+    assert "McNemar" not in report
     assert "## Control-task delta" in report
 
 def test_report_header_keeps_error_count_with_run_metadata():
@@ -207,3 +207,64 @@ def test_paired_cpc_delta_bootstraps_task_deltas_with_fixed_seed(monkeypatch):
     }
     assert result[0] == pytest.approx(-1 / 6)
     assert result[1:] == (-0.25, 0.75)
+
+
+def test_paired_accuracy_delta_weights_tasks_not_repetitions(monkeypatch):
+    records = []
+    for repetition in range(10):
+        records.extend([
+            _run(
+                task="many-reps",
+                mode="upstream",
+                cost=1.0,
+                correct=False,
+                repetition=repetition,
+            ),
+            _run(
+                task="many-reps",
+                mode="fork",
+                cost=1.0,
+                correct=True,
+                repetition=repetition,
+            ),
+        ])
+    records.extend([
+        _run(task="one-rep", mode="upstream", cost=1.0, correct=True),
+        _run(task="one-rep", mode="fork", cost=1.0, correct=False),
+    ])
+    observed: dict[str, object] = {}
+
+    def fake_bootstrap(deltas, *, n_resamples, seed):
+        observed["deltas"] = list(deltas)
+        observed["n_resamples"] = n_resamples
+        observed["seed"] = seed
+        return (-0.75, 0.75)
+
+    monkeypatch.setattr(paired.stats, "paired_bootstrap_ci", fake_bootstrap)
+
+    result = paired.paired_accuracy_delta(records, "fork", "upstream")
+
+    assert observed == {
+        "deltas": [1.0, -1.0],
+        "n_resamples": 10_000,
+        "seed": 0,
+    }
+    assert result == (0.0, -0.75, 0.75, 2)
+
+
+def test_three_way_report_prioritizes_fork_upstream_and_guardrails():
+    records = [
+        _run(task=task, mode=mode, cost=1.0, correct=correct)
+        for task, outcomes in {
+            "one": {"no_tilth": False, "upstream": True, "fork": True},
+            "two": {"no_tilth": True, "upstream": False, "fork": True},
+        }.items()
+        for mode, correct in outcomes.items()
+    ]
+
+    report = analyze.generate_report(records)
+
+    assert "fork vs upstream" in report
+    assert "fork vs no_tilth" in report
+    assert "upstream vs no_tilth" in report
+    assert "task is the sampling unit" in report

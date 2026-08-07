@@ -1,9 +1,11 @@
 """Focused tests for runner isolation and result metadata."""
 
-from dataclasses import dataclass
 import io
+import json
 import os
+import subprocess
 import sys
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pytest
@@ -14,7 +16,6 @@ import run
 from config import ModeConfig
 from parse import RunResult, Turn
 from tasks.base import TaskSource
-
 
 _RUNTIME_KEYS = {
     "PATH",
@@ -109,6 +110,16 @@ def test_build_runner_env_allowlists_ambient_environment(
         assert "XDG_CONFIG_HOME" not in env
 
 
+def test_no_tilth_arm_does_not_prepend_a_tilth_binary_to_path() -> None:
+    env = run.build_runner_env(
+        "claude",
+        ambient={"PATH": "/usr/bin"},
+        tilth_bin=None,
+    )
+
+    assert env["PATH"] == "/usr/bin"
+
+
 def test_agent_repo_export_excludes_repository_metadata(tmp_path: Path) -> None:
     source = tmp_path / "source"
     source.mkdir()
@@ -126,6 +137,43 @@ def test_agent_repo_export_excludes_repository_metadata(tmp_path: Path) -> None:
 
     assert tracked.read_text() == "mutated"
 
+
+def test_agent_repo_is_fresh_even_when_git_remains_visible(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    tracked = source / "tracked.py"
+    tracked.write_text("clean")
+
+    with run._agent_repo(source, hide_git=False) as workspace:
+        assert workspace != source
+        (workspace / "tracked.py").write_text("agent edit")
+
+    assert tracked.read_text() == "clean"
+
+
+
+def test_agent_repo_uses_disposable_git_worktree(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    tracked = source / "tracked.py"
+    tracked.write_text("clean")
+    subprocess.run(["git", "init", "-q", str(source)], check=True)
+    subprocess.run(
+        ["git", "-C", str(source), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(source), "config", "user.name", "Benchmark Test"],
+        check=True,
+    )
+    subprocess.run(["git", "-C", str(source), "add", "tracked.py"], check=True)
+    subprocess.run(["git", "-C", str(source), "commit", "-qm", "fixture"], check=True)
+
+    with run._agent_repo(source, hide_git=False) as workspace:
+        assert (workspace / ".git").is_file()
+        (workspace / "tracked.py").write_text("agent edit")
+
+    assert tracked.read_text() == "clean"
 
 @dataclass
 class _RunnerTask:
@@ -171,6 +219,12 @@ def test_run_single_uses_allowlisted_env_and_preserves_runner_flags(
             tools=["Read", "Edit"],
             mcp_config_path="/controlled/tilth_mcp.json",
             description="test mode",
+            binary_path="/opt/tilth/bin/tilth",
+            repository="https://github.com/example/tilth",
+            git_sha="a" * 40,
+            binary_sha256="b" * 64,
+            tilth_version="9.9.9",
+            rustc_version="rustc 1.99.0",
         ),
     )
     monkeypatch.setitem(run.OPENCODE_CONFIGS, "runner_test_mode", "/controlled/opencode.json")
@@ -242,6 +296,7 @@ def test_run_single_uses_allowlisted_env_and_preserves_runner_flags(
     elif runner == "codex":
         assert cmd[:3] == ["codex", "exec", "--json"]
         assert "--full-auto" in cmd and "--ephemeral" in cmd
+        assert "mcp_servers={}" in cmd
         assert "-c" in cmd and any("mcp_servers.tilth.command" in arg for arg in cmd)
     else:
         assert cmd[:4] == ["opencode", "run", "--format", "json"]
@@ -270,6 +325,15 @@ def test_run_single_uses_allowlisted_env_and_preserves_runner_flags(
             "output_tokens": 17,
         }
     ]
+    assert result["variant"] == {
+        "label": "runner_test_mode",
+        "repository": "https://github.com/example/tilth",
+        "git_sha": "a" * 40,
+        "binary_path": "/opt/tilth/bin/tilth",
+        "binary_sha256": "b" * 64,
+        "tilth_version": "9.9.9",
+        "rustc_version": "rustc 1.99.0",
+    }
 
 
 
@@ -340,3 +404,122 @@ def test_claude_streaming_run_does_not_inherit_stdin(
     assert (tmp_path / "stream.jsonl").read_text() == '{"type":"result"}\n'
     assert result["task"] == "runner_stream_task"
     assert result["model"] == "configured-claude-model"
+
+
+def test_experiment_scheduler_randomizes_matched_blocks_and_records_order(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "synthetic"
+    source.mkdir()
+    results_dir = tmp_path / "results"
+    manifest_path = tmp_path / "experiment.json"
+    manifest_path.write_text(json.dumps({
+        "arm_order_seed": 42,
+        "variants": [
+            {"name": "no_tilth"},
+            {
+                "name": "upstream",
+                "repository": "https://github.com/jahala/tilth",
+                "git_sha": "a" * 40,
+            },
+            {
+                "name": "fork",
+                "repository": "https://github.com/example/tilth",
+                "git_sha": "b" * 40,
+            },
+        ],
+    }))
+    task = _RunnerTask()
+    monkeypatch.setitem(run.TASKS, "runner_test_task", task)
+    monkeypatch.setitem(run.MODELS, "runner-model", "configured-model")
+    monkeypatch.setitem(run.RUNNERS, "runner-model", "claude")
+    monkeypatch.setattr(run, "SYNTHETIC_REPO", source)
+    monkeypatch.setattr(run, "RESULTS_DIR", results_dir)
+    monkeypatch.setattr(run, "reset_repo", lambda: None)
+    monkeypatch.setattr(run, "rustc_version", lambda: "rustc test")
+    monkeypatch.setattr(
+        run,
+        "hydrate_mode_metadata",
+        lambda mode, compiler: replace(
+            mode,
+            binary_sha256="c" * 64 if mode.binary_path else None,
+            tilth_version="test" if mode.binary_path else None,
+            rustc_version=compiler,
+        ),
+    )
+    monkeypatch.setenv("TILTH_BENCH_VARIANT_ROOT", str(tmp_path / "variants"))
+    for name, sha in (("upstream", "a" * 40), ("fork", "b" * 40)):
+        binary = tmp_path / "variants" / f"{name}-{sha}" / "bin" / "tilth"
+        binary.parent.mkdir(parents=True)
+        binary.write_text("#!/bin/sh\nprintf 'tilth test\\n'\n")
+        binary.chmod(0o755)
+    calls: list[tuple[str, int, bool]] = []
+
+    def fake_run_single(task_name, mode_name, model_name, repetition, **kwargs):
+        calls.append((mode_name, repetition, kwargs["bare"]))
+        mode = run.MODES[mode_name]
+        return {
+            "task": task_name,
+            "mode": mode_name,
+            "model": run.MODELS[model_name],
+            "model_alias": model_name,
+            "repetition": repetition,
+            "correct": True,
+            "correctness_reason": "expected",
+            "num_turns": 1,
+            "context_tokens": 1,
+            "output_tokens": 1,
+            "total_cost_usd": 0.0,
+            "duration_ms": 1,
+            "variant": {
+                "label": mode.name,
+                "repository": mode.repository,
+                "git_sha": mode.git_sha,
+                "binary_path": mode.binary_path,
+                "binary_sha256": mode.binary_sha256,
+                "tilth_version": mode.tilth_version,
+                "rustc_version": mode.rustc_version,
+            },
+        }
+
+    monkeypatch.setattr(run, "run_single", fake_run_single)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run.py",
+            "--experiment",
+            str(manifest_path),
+            "--models",
+            "runner-model",
+            "--tasks",
+            "runner_test_task",
+            "--reps",
+            "2",
+        ],
+    )
+
+    run.main()
+
+    for repetition in range(2):
+        expected = run.randomized_arm_order(
+            ["no_tilth", "upstream", "fork"],
+            seed=42,
+            task="runner_test_task",
+            model="runner-model",
+            repetition=repetition,
+        )
+        assert [
+            mode
+            for mode, rep, _bare in calls
+            if rep == repetition
+        ] == expected
+    assert all(bare for _mode, _rep, bare in calls)
+
+    result_path = next(results_dir.glob("benchmark_*.jsonl"))
+    records = [json.loads(line) for line in result_path.read_text().splitlines()]
+    for record in records:
+        assert record["experiment_manifest"] == str(manifest_path.resolve())
+        assert record["arm_order_seed"] == 42
+        assert record["arm_order"][record["arm_order_index"]] == record["mode"]

@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
-"""Paired A/B analysis of benchmark results.
+"""Task-clustered paired analysis of benchmark variants.
 
-The benchmark runs baseline (grep/cat/find) and tilth (MCP tools) on the SAME
-tasks, so the two arms are paired: each (task, model, repetition) yields one
-baseline run and one tilth run. This module joins them on that key, runs an
-exact McNemar test on the correctness discordances, and bootstraps the paired
-cost delta.
-
-    python benchmark/paired.py <results.jsonl> [--model MODEL]
+Runs join on ``(task, model, repetition)``, but inference treats the task as
+the sampling unit: repetitions are averaged within each task before the
+fixed-seed paired bootstrap.
 """
 
 import argparse
@@ -16,10 +12,10 @@ import math
 import sys
 from collections import defaultdict
 from pathlib import Path
+
 sys.path.insert(0, str(Path(__file__).parent))
 
 import stats
-
 
 BASELINE_MODE = "baseline"
 TILTH_MODE = "tilth"
@@ -61,40 +57,43 @@ def _cost(run: dict):
     return float(cost) if isinstance(cost, (int, float)) else None
 
 
-def pair_ab(runs: list[dict]) -> dict[tuple[str, str], list[tuple]]:
-    """Join baseline vs tilth runs on (task, model, repetition).
-
-    Returns {(task, model): [(rep, base_correct, tilth_correct, base_cost,
-    tilth_cost)]}. Error records count as incorrect with cost None, so they pair
-    cleanly for McNemar but drop out of the cost-delta CI (a crashed run has no
-    measurable cost). A pair is emitted only when BOTH arms have a run for that
-    (task, model, rep).
-    """
+def pair_modes(
+    runs: list[dict],
+    experiment_mode: str,
+    baseline_mode: str,
+) -> dict[tuple[str, str], list[tuple]]:
+    """Join two modes on ``(task, model, repetition)``."""
     by_key: dict[tuple, dict] = {}
+    selected = {baseline_mode, experiment_mode}
     for run in runs:
         task = run.get("task")
         model = _model_key(run)
         mode = run.get("mode")
         rep = run.get("repetition")
-        if None in (task, model, mode, rep) or mode not in (BASELINE_MODE, TILTH_MODE):
+        if None in (task, model, mode, rep) or mode not in selected:
             continue
         by_key[(task, model, mode, rep)] = run
 
-    triples = {(task, model, rep) for (task, model, _mode, rep) in by_key}
+    triples = {(task, model, rep) for task, model, _mode, rep in by_key}
     pairs: dict[tuple[str, str], list[tuple]] = defaultdict(list)
     for task, model, rep in sorted(triples):
-        base = by_key.get((task, model, BASELINE_MODE, rep))
-        tilth = by_key.get((task, model, TILTH_MODE, rep))
-        if base is None or tilth is None:
+        baseline = by_key.get((task, model, baseline_mode, rep))
+        experiment = by_key.get((task, model, experiment_mode, rep))
+        if baseline is None or experiment is None:
             continue
         pairs[(task, model)].append((
             rep,
-            bool(base.get("correct", False)),
-            bool(tilth.get("correct", False)),
-            _cost(base),
-            _cost(tilth),
+            bool(baseline.get("correct", False)),
+            bool(experiment.get("correct", False)),
+            _cost(baseline),
+            _cost(experiment),
         ))
     return dict(pairs)
+
+
+def pair_ab(runs: list[dict]) -> dict[tuple[str, str], list[tuple]]:
+    """Backward-compatible baseline/tilth pairing."""
+    return pair_modes(runs, TILTH_MODE, BASELINE_MODE)
 
 
 def _cpc(runs: list[dict]) -> float:
@@ -137,6 +136,27 @@ def _matched_runs_by_task(
         by_task[task][baseline_mode].append(baseline)
         by_task[task][experiment_mode].append(experiment)
     return by_task
+
+
+def paired_accuracy_delta(
+    runs: list[dict],
+    experiment_mode: str,
+    baseline_mode: str = BASELINE_MODE,
+) -> tuple[float | None, float | None, float | None, int]:
+    """Return a task-weighted accuracy delta and paired bootstrap interval."""
+    by_task = _matched_runs_by_task(runs, experiment_mode, baseline_mode)
+    deltas = []
+    for task in sorted(by_task, key=str):
+        baseline = by_task[task][baseline_mode]
+        experiment = by_task[task][experiment_mode]
+        baseline_rate = sum(bool(run.get("correct", False)) for run in baseline) / len(baseline)
+        experiment_rate = sum(bool(run.get("correct", False)) for run in experiment) / len(experiment)
+        deltas.append(experiment_rate - baseline_rate)
+    if not deltas:
+        return (None, None, None, 0)
+    point = sum(deltas) / len(deltas)
+    lo, hi = stats.paired_bootstrap_ci(deltas, n_resamples=10_000, seed=0)
+    return (point, lo, hi, len(deltas))
 
 
 def _task_cpc_percentage_deltas(
@@ -214,77 +234,73 @@ def paired_cpc_delta(
     return (aggregate_delta, lo, hi)
 
 
-def paired_report(pairs: dict[tuple[str, str], list[tuple]]) -> None:
-    """Print, per model: discordant b/c, exact McNemar p, accuracy delta, and a
-    paired cost-delta bootstrap CI."""
+def paired_report(
+    runs: list[dict],
+    experiment_mode: str,
+    baseline_mode: str,
+) -> None:
+    """Print task-clustered paired accuracy and CPC differences by model."""
     print("=" * 72)
-    print("PAIRED A/B  (baseline vs tilth, joined on task+model+repetition)")
+    print(
+        f"PAIRED VARIANTS ({experiment_mode} vs {baseline_mode}; "
+        "task is the sampling unit)"
+    )
     print("=" * 72)
 
-    if not pairs:
-        print("\nNo paired runs found (need both baseline and tilth on the same task/rep).")
-        return
-
-    print("McNemar uses the per-rep join, so p can be anti-conservative under rep correlation;")
-    print("the accuracy delta and MDE elsewhere treat the task as the sampling unit.")
-    by_model: dict[str, list[tuple]] = defaultdict(list)
-    for (_task, model), tuples in pairs.items():
-        by_model[model].extend(tuples)
-
-    for model in sorted(by_model):
-        tuples = by_model[model]
-        n = len(tuples)
-        base_correct = sum(1 for (_r, bc, _tc, _bk, _tk) in tuples if bc)
-        tilth_correct = sum(1 for (_r, _bc, tc, _bk, _tk) in tuples if tc)
-        b = sum(1 for (_r, bc, tc, _bk, _tk) in tuples if bc and not tc)
-        c = sum(1 for (_r, bc, tc, _bk, _tk) in tuples if tc and not bc)
-        p_value, direction = stats.mcnemar_exact(b, c)
-        base_acc = base_correct / n * 100
-        tilth_acc = tilth_correct / n * 100
-
-        cost_deltas = [
-            tk - bk
-            for (_r, _bc, _tc, bk, tk) in tuples
-            if bk is not None and tk is not None
-        ]
-        dropped = n - len(cost_deltas)
-
+    models = sorted({_model_key(run) for run in runs if _model_key(run) is not None})
+    found = False
+    for model in models:
+        model_runs = [run for run in runs if _model_key(run) == model]
+        delta, lo, hi, n_tasks = paired_accuracy_delta(
+            model_runs,
+            experiment_mode,
+            baseline_mode,
+        )
+        if delta is None:
+            continue
+        found = True
+        significance = "excludes 0" if lo > 0 or hi < 0 else "includes 0"
+        cpc_delta, cpc_lo, cpc_hi = paired_cpc_delta(
+            model_runs,
+            experiment_mode,
+            baseline_mode,
+        )
         print(f"\n## model: {model}")
-        print(f"  paired reps:        {n}")
-        print(f"  accuracy:           baseline {base_acc:.0f}%  ->  tilth {tilth_acc:.0f}%  (Δ {tilth_acc - base_acc:+.0f}pp)")
-        print(f"  discordant pairs:   b={b} (baseline-only correct)  c={c} (tilth-only correct)")
-        verdict = "significant" if p_value < 0.05 else "not significant"
-        favors = "" if direction == "tie" else f", favors {direction}"
-        print(f"  McNemar exact p:    {p_value:.4f}  ({verdict} at α=0.05{favors})")
-
-        if cost_deltas:
-            mean_delta = sum(cost_deltas) / len(cost_deltas)
-            lo, hi = stats.paired_bootstrap_ci(cost_deltas)
-            excludes_zero = lo > 0 or hi < 0
-            sig = "significant" if excludes_zero else "includes 0"
-            print(f"  cost Δ/rep (tilth-baseline): ${mean_delta:+.4f}  95% CI [${lo:+.4f}, ${hi:+.4f}] ({sig})")
+        print(f"  paired tasks:       {n_tasks}")
+        print(
+            f"  accuracy Δ:         {delta * 100:+.1f}pp  "
+            f"95% task bootstrap CI [{lo * 100:+.1f}, {hi * 100:+.1f}] "
+            f"({significance})"
+        )
+        if cpc_delta is None:
+            print("  cost/correct Δ:     n/a")
         else:
-            print("  cost Δ/rep: n/a (no rep had cost on both arms)")
-        if dropped:
-            print(f"  note: {dropped} rep(s) excluded from cost CI (error/missing cost; still counted in McNemar)")
+            print(
+                f"  cost/correct Δ:     {cpc_delta * 100:+.1f}%  "
+                f"95% task bootstrap CI [{cpc_lo * 100:+.1f}, {cpc_hi * 100:+.1f}]"
+            )
+    if not found:
+        print(
+            f"\nNo paired runs found for {experiment_mode} vs {baseline_mode} "
+            "on the same task/model/repetition."
+        )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Paired A/B analysis of benchmark results")
-    parser.add_argument("results_file", type=Path, help="Path to JSONL results file from run.py")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("results_file", type=Path, help="JSONL results from run.py")
     parser.add_argument("--model", help="Restrict to a model alias or configured model ID")
+    parser.add_argument("--experiment-mode", default=TILTH_MODE)
+    parser.add_argument("--baseline-mode", default=BASELINE_MODE)
     args = parser.parse_args()
 
     if not args.results_file.exists():
-        print(f"ERROR: File not found: {args.results_file}", file=sys.stderr)
-        sys.exit(1)
-
+        parser.error(f"file not found: {args.results_file}")
     runs = load_runs(args.results_file)
     if args.model:
         target_model = MODEL_ALIASES.get(args.model, args.model)
-        runs = [r for r in runs if _model_key(r) == target_model]
-
-    paired_report(pair_ab(runs))
+        runs = [run for run in runs if _model_key(run) == target_model]
+    paired_report(runs, args.experiment_mode, args.baseline_mode)
 
 
 if __name__ == "__main__":

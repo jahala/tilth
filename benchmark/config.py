@@ -43,20 +43,23 @@ RUNNERS = {
     "gpt5mini": "opencode",
 }
 
-# MCP config arguments for codex (tilth server)
-TILTH_MCP_CODEX_ARGS = [
-    "-c", f'mcp_servers.tilth.command="{TILTH_BIN}"',
-    "-c", 'mcp_servers.tilth.args=["--mcp", "--edit"]',
-]
 
 
 @dataclass
 class ModeConfig:
-    """Configuration for a benchmark mode (baseline vs tilth)."""
+    """Configuration for one benchmark arm."""
+
     name: str
     tools: list[str]
     mcp_config_path: Optional[str]
     description: str
+    opencode_config_path: Optional[str] = None
+    binary_path: Optional[str] = None
+    repository: Optional[str] = None
+    git_sha: Optional[str] = None
+    binary_sha256: Optional[str] = None
+    tilth_version: Optional[str] = None
+    rustc_version: Optional[str] = None
 
 
 REPO_ROOT = Path(__file__).parent.parent
@@ -133,18 +136,22 @@ MODES = {
         name="baseline",
         tools=["Read", "Edit", "Grep", "Glob", "Bash"],
         mcp_config_path=None,
+        opencode_config_path=str(FIXTURES_DIR / "opencode_baseline.json"),
         description="Claude Code built-in tools",
     ),
     "tilth": ModeConfig(
         name="tilth",
         tools=["Read", "Edit", "Grep", "Glob", "Bash"],
         mcp_config_path=str(TILTH_MCP_CONFIG),
+        opencode_config_path=str(FIXTURES_DIR / "opencode_tilth.json"),
+        binary_path=TILTH_BIN,
         description="Built-in tools + tilth MCP (hybrid)",
     ),
     "tilth_forced": ModeConfig(
         name="tilth_forced",
         tools=[],
         mcp_config_path=str(TILTH_MCP_CONFIG),
+        binary_path=TILTH_BIN,
         description="tilth MCP only (no built-in tools)",
     ),
 }

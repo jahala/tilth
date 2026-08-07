@@ -13,13 +13,17 @@ import sys
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from statistics import median, mean, stdev
+from statistics import mean, median, stdev
 
 sys.path.insert(0, str(Path(__file__).parent))
 
 import stats
 from flags import detect_flags
-from paired import pair_ab, paired_cpc_delta as paired_cpc_delta_impl
+from paired import (
+    pair_modes,
+    paired_accuracy_delta,
+    paired_cpc_delta as paired_cpc_delta_impl,
+)
 from pricing import PRICING_DATA, compute_cost_breakdown, pricing_staleness_warning
 from tasks import TASKS
 
@@ -120,8 +124,11 @@ def format_delta(baseline_val: float, tilth_val: float) -> str:
     return f"{sign}{pct_change:.0f}%"
 
 
-MODE_ORDER = ["baseline", "tilth", "tilth_forced"]
+MODE_ORDER = ["no_tilth", "upstream", "fork", "baseline", "tilth", "tilth_forced"]
 MODE_LABELS = {
+    "no_tilth": "no_tilth",
+    "upstream": "upstream",
+    "fork": "fork",
     "baseline": "baseline",
     "tilth": "tilth-added",
     "tilth_forced": "tilth-only",
@@ -137,6 +144,31 @@ def ordered_modes(mode_names: set[str]) -> list[str]:
 
 def mode_label(mode_name: str) -> str:
     return MODE_LABELS.get(mode_name, mode_name)
+
+
+def reference_mode(modes: list[str]) -> str | None:
+    """Return the descriptive comparison arm for a report."""
+    for candidate in ("no_tilth", "baseline"):
+        if candidate in modes:
+            return candidate
+    return modes[0] if modes else None
+
+
+def comparison_pairs(modes: list[str]) -> list[tuple[str, str]]:
+    """Return primary and guardrail comparisons in report order."""
+    present = set(modes)
+    three_way = [
+        ("fork", "upstream"),
+        ("fork", "no_tilth"),
+        ("upstream", "no_tilth"),
+    ]
+    selected = [pair for pair in three_way if set(pair) <= present]
+    if selected:
+        return selected
+    reference = reference_mode(modes)
+    if reference is None:
+        return []
+    return [(mode, reference) for mode in modes if mode != reference]
 
 
 def format_metric_value(key: str, value: float) -> str:
@@ -238,25 +270,28 @@ def paired_cpc_delta(
 
 
 def _headline_section(results: list[dict], modes: list[str]) -> list[str]:
-    baseline = [run for run in results if run.get("mode") == "baseline"]
-    baseline_cpc = cost_per_correct(baseline)[0]
+    reference = reference_mode(modes)
+    reference_runs = [
+        run for run in results if run.get("mode") == reference
+    ]
+    reference_cpc = cost_per_correct(reference_runs)[0]
     lines = [
         "## Headline",
         "",
-        "Cost-per-correct delta versus baseline, with a fixed-seed 10,000-resample "
-        "paired percentile 95% CI over per-task percentage deltas.",
+        f"Cost-per-correct delta versus {reference or 'the reference arm'}, with a "
+        "fixed-seed 10,000-resample paired percentile 95% CI over per-task "
+        "percentage deltas.",
         "",
-        "| Experiment | Baseline CPC | Experiment CPC | Delta | Paired 95% CI |",
+        "| Experiment | Reference CPC | Experiment CPC | Delta | Paired 95% CI |",
         "|---|---:|---:|---:|---:|",
     ]
-    experiments = [mode for mode in modes if mode != "baseline"]
-    if not experiments:
-        lines.append("| — | — | — | — | — |")
-        lines.append("")
+    experiments = [mode for mode in modes if mode != reference]
+    if reference is None or not experiments:
+        lines.extend(["| — | — | — | — | — |", ""])
         return lines
     for mode in experiments:
         experiment = [run for run in results if run.get("mode") == mode]
-        delta, lo, hi = paired_cpc_delta(results, mode)
+        delta, lo, hi = paired_cpc_delta(results, mode, reference)
         if delta is None:
             lines.append(
                 f"| {mode_label(mode)} | n/a | {_fmt_usd(cost_per_correct(experiment)[0])} | "
@@ -264,7 +299,7 @@ def _headline_section(results: list[dict], modes: list[str]) -> list[str]:
             )
             continue
         lines.append(
-            f"| {mode_label(mode)} | {_fmt_usd(baseline_cpc)} | "
+            f"| {mode_label(mode)} | {_fmt_usd(reference_cpc)} | "
             f"{_fmt_usd(cost_per_correct(experiment)[0])} | {_fraction_text(delta)} | "
             f"[{_fraction_text(lo)}, {_fraction_text(hi)}] |"
         )
@@ -301,28 +336,31 @@ def _capability_section(results: list[dict], modes: list[str]) -> list[str]:
 
 
 def _control_section(results: list[dict], modes: list[str]) -> list[str]:
+    reference = reference_mode(modes)
     lines = [
         "## Control-task delta",
         "",
-        "Control tasks should show little tool advantage; deltas are relative to baseline.",
+        f"Control tasks should show little tool advantage; deltas are relative to {reference}.",
         "",
     ]
     control = [run for run in results if capability_for_record(run) == "control"]
-    baseline = [run for run in control if run.get("mode") == "baseline"]
-    if not control or not baseline:
-        lines.extend(["No paired control-task baseline data.", ""])
+    reference_runs = [
+        run for run in control if run.get("mode") == reference
+    ]
+    if not control or not reference_runs:
+        lines.extend(["No paired control-task reference data.", ""])
         return lines
-    baseline_accuracy = correctness_pct(baseline)
+    reference_accuracy = correctness_pct(reference_runs)
     for mode in modes:
-        if mode == "baseline":
+        if mode == reference:
             continue
         experiment = [run for run in control if run.get("mode") == mode]
         if not experiment:
             continue
-        delta, _lo, _hi = paired_cpc_delta(control, mode)
+        delta, _lo, _hi = paired_cpc_delta(control, mode, reference)
         lines.append(
-            f"- **{mode_label(mode)} vs baseline:** correctness "
-            f"{correctness_pct(experiment) - baseline_accuracy:+.0f}pp; "
+            f"- **{mode_label(mode)} vs {reference}:** correctness "
+            f"{correctness_pct(experiment) - reference_accuracy:+.0f}pp; "
             f"cost/correct {_fraction_text(delta)}"
         )
     lines.append("")
@@ -431,7 +469,7 @@ def generate_report(results: list[dict]) -> str:
         mode_groups = group_by(task_results, "mode")
         present_modes = [mode for mode in modes if (mode,) in mode_groups]
         runs_by_mode = {mode: mode_groups[(mode,)] for mode in present_modes}
-        has_baseline = "baseline" in runs_by_mode
+        reference = reference_mode(present_modes)
 
         if not present_modes:
             lines.append("_No valid mode results._")
@@ -447,7 +485,7 @@ def generate_report(results: list[dict]) -> str:
             ("Duration ms", "duration_ms"),
         ]
 
-        delta_modes = [mode for mode in present_modes if mode != "baseline"] if has_baseline else []
+        delta_modes = [mode for mode in present_modes if mode != reference]
         headers = ["Metric"] + [mode_label(mode) for mode in present_modes]
         headers += [f"{mode_label(mode)} Δ" for mode in delta_modes]
         lines.append("| " + " | ".join(headers) + " |")
@@ -460,17 +498,17 @@ def generate_report(results: list[dict]) -> str:
             }
             row = [f"{label} (median)"]
             row.extend(format_metric_value(key, medians[mode]) for mode in present_modes)
-            if has_baseline:
-                baseline_value = medians["baseline"]
-                row.extend(format_delta(baseline_value, medians[mode]) for mode in delta_modes)
+            if reference is not None:
+                reference_value = medians[reference]
+                row.extend(format_delta(reference_value, medians[mode]) for mode in delta_modes)
             lines.append("| " + " | ".join(row) + " |")
 
         correctness = {mode: correctness_pct(runs) for mode, runs in runs_by_mode.items()}
         row = ["Correctness"]
         row.extend(f"{correctness[mode]:.0f}%" for mode in present_modes)
-        if has_baseline:
-            baseline_correctness = correctness["baseline"]
-            row.extend(f"{correctness[mode] - baseline_correctness:+.0f}pp" for mode in delta_modes)
+        if reference is not None:
+            reference_correctness = correctness[reference]
+            row.extend(f"{correctness[mode] - reference_correctness:+.0f}pp" for mode in delta_modes)
         lines.append("| " + " | ".join(row) + " |")
         lines.append("")
 
@@ -496,21 +534,21 @@ def generate_report(results: list[dict]) -> str:
             lines.append(f"  {label}: {turns} turns, ${total:.2f}, {correct_str}")
             lines.append(format_cost_breakdown(median_costs[mode]))
 
-        if has_baseline and delta_modes:
-            baseline_run = median_cost_runs["baseline"]
-            baseline_costs = median_costs["baseline"]
-            baseline_total = baseline_run.get("total_cost_usd", 0.0)
-            baseline_turns = baseline_run.get("num_turns", 0)
+        if reference is not None and delta_modes:
+            reference_run = median_cost_runs[reference]
+            reference_costs = median_costs[reference]
+            reference_total = reference_run.get("total_cost_usd", 0.0)
+            reference_turns = reference_run.get("num_turns", 0)
             for mode in delta_modes:
                 run = median_cost_runs[mode]
-                total_delta = run.get("total_cost_usd", 0.0) - baseline_total
-                turns_delta = run.get("num_turns", 0) - baseline_turns
+                total_delta = run.get("total_cost_usd", 0.0) - reference_total
+                turns_delta = run.get("num_turns", 0) - reference_turns
                 lines.append(
-                    f"  {mode_label(mode)} vs baseline: "
+                    f"  {mode_label(mode)} vs {reference}: "
                     f"{'+' if turns_delta >= 0 else ''}{turns_delta} turns, "
                     f"{'+' if total_delta >= 0 else ''}${total_delta:.2f}"
                 )
-                lines.append(format_cost_delta(baseline_costs, median_costs[mode]))
+                lines.append(format_cost_delta(reference_costs, median_costs[mode]))
         lines.append("")
 
         # Per-turn sparklines
@@ -567,8 +605,8 @@ def generate_report(results: list[dict]) -> str:
         lines.append("Averaged across all tasks (median of medians):")
         lines.append("")
 
-        has_baseline = "baseline" in runs_by_mode_all and bool(runs_by_mode_all["baseline"])
-        delta_modes = [mode for mode in present_modes_all if mode != "baseline"] if has_baseline else []
+        reference = reference_mode(present_modes_all)
+        delta_modes = [mode for mode in present_modes_all if mode != reference]
         headers = ["Metric"] + [mode_label(mode) for mode in present_modes_all]
         headers += [f"{mode_label(mode)} Δ" for mode in delta_modes]
         lines.append("| " + " | ".join(headers) + " |")
@@ -600,10 +638,10 @@ def generate_report(results: list[dict]) -> str:
                 format_metric_value(key, medians_by_mode.get(mode, 0))
                 for mode in present_modes_all
             )
-            if has_baseline and "baseline" in medians_by_mode:
-                baseline_value = medians_by_mode["baseline"]
+            if reference is not None and reference in medians_by_mode:
+                reference_value = medians_by_mode[reference]
                 row.extend(
-                    format_delta(baseline_value, medians_by_mode[mode])
+                    format_delta(reference_value, medians_by_mode[mode])
                     if mode in medians_by_mode else "—"
                     for mode in delta_modes
                 )
@@ -682,57 +720,93 @@ def statistical_analysis_section(valid_results: list[dict], all_results: list[di
 
 
 def _power_readout(all_results: list[dict]) -> list[str]:
-    """Per-model paired-A/B power line: MDE at current N tasks + significance.
-
-    Uses ALL records (errored reps count as incorrect, per the pairing contract).
-    Insufficient power for the observed effect is the explicit Phase 4 trigger.
-    """
+    """Report task-clustered paired accuracy and task-level power by model."""
+    modes = ordered_modes({
+        run.get("mode")
+        for run in all_results
+        if isinstance(run.get("mode"), str)
+    })
+    comparisons = comparison_pairs(modes)
     lines = [
-        "**Power readout (paired A/B, baseline vs tilth):**",
-        "_Errored reps count as incorrect here, so the baseline % may differ from the pooled accuracy above._",
-        "_McNemar uses the per-rep (task, model, repetition) join, so p can be anti-conservative under rep correlation; MDE and N are at the task level. MDE is an optimistic single-proportion bound — the true paired MDE is larger._",
+        "**Task-clustered paired accuracy differences:**",
+        "_The task is the sampling unit. Repetitions and models are averaged "
+        "within task before a fixed-seed 10,000-resample paired bootstrap._",
+        "_Errored cells count as incorrect. A comparison is significant at "
+        "α=0.05 when its 95% interval excludes zero._",
         "",
+        "| Comparison | Accuracy Δ | Task-paired 95% CI | N tasks |",
+        "|---|---:|---:|---:|",
     ]
-    pairs = pair_ab(all_results)
-    if not pairs:
-        lines.append("_No paired baseline/tilth runs; power readout unavailable._")
-        return lines
-    by_model = defaultdict(lambda: defaultdict(list))
-    for (task, model), tuples in pairs.items():
-        by_model[model][task].extend(tuples)
-    for model in sorted(by_model):
-        by_task = by_model[model]
-        n_tasks = len(by_task)
-        all_tuples = [t for tuples in by_task.values() for t in tuples]
-        # base_rate/delta are TASK-weighted to match the task-level MDE: average
-        # correctness within each task first, then across tasks, so tasks with
-        # more paired reps don't dominate when rep counts are uneven.
-        base_per_task = [
-            sum(1 for (_r, bc, _tc, _bk, _tk) in tuples if bc) / len(tuples)
-            for tuples in by_task.values()
-        ]
-        tilth_per_task = [
-            sum(1 for (_r, _bc, tc, _bk, _tk) in tuples if tc) / len(tuples)
-            for tuples in by_task.values()
-        ]
-        base_rate = sum(base_per_task) / n_tasks
-        delta = sum(tilth_per_task) / n_tasks - base_rate
-        # McNemar stays at the per-rep level (disclosed in the readout header).
-        b = sum(1 for (_r, bc, tc, _bk, _tk) in all_tuples if bc and not tc)
-        c = sum(1 for (_r, bc, tc, _bk, _tk) in all_tuples if tc and not bc)
-        mde = stats.min_detectable_effect(n_tasks, base_rate)
-        p_value, _direction = stats.mcnemar_exact(b, c)
-        if p_value < 0.05:
-            verdict = "effect SIGNIFICANT — N sufficient to detect it"
-        elif abs(delta) < mde:
-            verdict = "N INSUFFICIENT for observed effect — grow TASK pool (Phase 4 trigger)"
-        else:
-            verdict = "not significant though observed ≥ MDE — more data advised"
-        lines.append(
-            f"- **{model}**: N={n_tasks} tasks, baseline {base_rate * 100:.0f}%, "
-            f"observed Δ {delta * 100:+.0f}pp, MDE@N≈{mde * 100:.0f}pp, "
-            f"McNemar p={p_value:.3f} → {verdict}"
+    observed = False
+    for experiment_mode, baseline_mode in comparisons:
+        delta, lo, hi, n_tasks = paired_accuracy_delta(
+            all_results,
+            experiment_mode,
+            baseline_mode,
         )
+        if delta is None:
+            continue
+        observed = True
+        lines.append(
+            f"| {experiment_mode} vs {baseline_mode} | {delta * 100:+.1f}pp | "
+            f"[{lo * 100:+.1f}, {hi * 100:+.1f}] | {n_tasks} |"
+        )
+    if not observed:
+        lines.append("| — | — | — | — |")
+    lines.extend([
+        "",
+        "**Power readout by model:**",
+        "_MDE@N is an optimistic single-proportion bound; the paired bootstrap "
+        "interval is the inferential decision rule._",
+        "",
+    ])
+
+    for experiment_mode, baseline_mode in comparisons:
+        pairs = pair_modes(all_results, experiment_mode, baseline_mode)
+        by_model: dict[str, dict[str, list[tuple]]] = defaultdict(
+            lambda: defaultdict(list)
+        )
+        for (task, model), tuples in pairs.items():
+            by_model[model][task].extend(tuples)
+        for model in sorted(by_model):
+            by_task = by_model[model]
+            deltas = []
+            baseline_rates = []
+            for tuples in by_task.values():
+                baseline_rate = (
+                    sum(1 for (_rep, correct, _other, _a, _b) in tuples if correct)
+                    / len(tuples)
+                )
+                experiment_rate = (
+                    sum(1 for (_rep, _other, correct, _a, _b) in tuples if correct)
+                    / len(tuples)
+                )
+                baseline_rates.append(baseline_rate)
+                deltas.append(experiment_rate - baseline_rate)
+            n_tasks = len(deltas)
+            baseline_rate = sum(baseline_rates) / n_tasks
+            delta = sum(deltas) / n_tasks
+            lo, hi = stats.paired_bootstrap_ci(
+                deltas,
+                n_resamples=10_000,
+                seed=0,
+            )
+            mde = stats.min_detectable_effect(n_tasks, baseline_rate)
+            if lo > 0 or hi < 0:
+                verdict = "effect SIGNIFICANT"
+            elif abs(delta) < mde:
+                verdict = "N INSUFFICIENT for observed effect — grow TASK pool"
+            else:
+                verdict = "CI includes zero — more data advised"
+            lines.append(
+                f"- **{experiment_mode} vs {baseline_mode}; {model}**: "
+                f"N={n_tasks} tasks, reference {baseline_rate * 100:.0f}%, "
+                f"observed Δ {delta * 100:+.0f}pp, "
+                f"95% CI [{lo * 100:+.0f}, {hi * 100:+.0f}], "
+                f"MDE@N≈{mde * 100:.0f}pp → {verdict}"
+            )
+    if not comparisons:
+        lines.append("_No paired variant comparisons available._")
     lines.append("")
     return lines
 
