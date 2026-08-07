@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use streaming_iterator::StreamingIterator;
@@ -16,36 +16,8 @@ const MAX_MATCHES: usize = 10;
 const IMPACT_FANOUT_THRESHOLD: usize = 10;
 /// Max 2nd-hop results to display.
 const IMPACT_MAX_RESULTS: usize = 15;
-/// Stop the batch caller walk once we have this many raw matches. Generous headroom for dedup + ranking.
-pub(crate) const BATCH_EARLY_QUIT: usize = 50;
-
 /// Match-count cap when `--full` is set. Mirrors the symbol/content search caps.
 const FULL_MAX_MATCHES: usize = 100;
-/// Walker early-quit threshold when `--full` is set.
-const FULL_BATCH_EARLY_QUIT: usize = FULL_MAX_MATCHES * 3;
-
-/// Scale a single-target batch-walk budget for a multi-target search.
-///
-/// `find_callers_batch`'s `early_quit_threshold` is a walk-wide raw-match
-/// count shared by every target in the `HashSet` passed to it — the walker
-/// has no concept of "budget per target," it just stops once the total
-/// match count crosses the threshold (see `found_count` in
-/// `find_callers_batch`). A single target's budget (`BATCH_EARLY_QUIT` /
-/// `FULL_BATCH_EARLY_QUIT`) sized for one symbol therefore starves later
-/// targets in a multi-target search once an earlier, hit-rich target
-/// consumes it. Scaling linearly by target count gives each target
-/// approximately its own full budget's worth of headroom; `n_targets` is
-/// already bounded to 5 by the dispatch layer (`tool_search`'s
-/// `2..=5 => ...` arm), so the scaled result stays bounded too.
-///
-/// Note: the early-quit mechanism itself is a coarse walk-wide heuristic
-/// that is a candidate for removal/replacement in a future change — this
-/// scaling is a minimal parity fix so multi-target does not regress vs. N
-/// separate single-target calls, not a long-term investment in the
-/// mechanism's design.
-fn scaled_batch_quit(base_quit: usize, n_targets: usize) -> usize {
-    base_quit.saturating_mul(n_targets.max(1))
-}
 
 /// A single caller match — a call site of a target symbol.
 #[derive(Debug)]
@@ -111,23 +83,15 @@ pub(crate) fn find_callers_batch(
     scope: &Path,
     bloom: &crate::index::bloom::BloomFilterCache,
     glob: Option<&str>,
-    early_quit_threshold: usize,
 ) -> Result<Vec<(String, CallerMatch)>, TilthError> {
     let matches: Mutex<Vec<(String, CallerMatch)>> = Mutex::new(Vec::new());
-    let found_count = AtomicUsize::new(0);
 
     let walker = super::walker(scope, glob)?;
 
     walker.run(|| {
         let matches = &matches;
-        let found_count = &found_count;
 
         Box::new(move |entry| {
-            // Early termination: enough callers found
-            if found_count.load(Ordering::Relaxed) >= early_quit_threshold {
-                return ignore::WalkState::Quit;
-            }
-
             let Ok(entry) = entry else {
                 return ignore::WalkState::Continue;
             };
@@ -171,7 +135,6 @@ pub(crate) fn find_callers_batch(
                 find_callers_treesitter_batch(path, targets, &ts_lang, &content, lang);
 
             if !file_callers.is_empty() {
-                found_count.fetch_add(file_callers.len(), Ordering::Relaxed);
                 let mut all = matches
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -308,13 +271,9 @@ pub fn search_callers_expanded(
     glob: Option<&str>,
     full: bool,
 ) -> Result<String, TilthError> {
-    let (max_matches, batch_quit) = if full {
-        (FULL_MAX_MATCHES, FULL_BATCH_EARLY_QUIT)
-    } else {
-        (MAX_MATCHES, BATCH_EARLY_QUIT)
-    };
+    let max_matches = if full { FULL_MAX_MATCHES } else { MAX_MATCHES };
     let single: HashSet<String> = std::iter::once(target.to_string()).collect();
-    let raw = find_callers_batch(&single, scope, bloom, glob, batch_quit)?;
+    let raw = find_callers_batch(&single, scope, bloom, glob)?;
     let callers: Vec<CallerMatch> = raw.into_iter().map(|(_, m)| m).collect();
 
     if callers.is_empty() {
@@ -346,7 +305,6 @@ pub fn search_callers_expanded(
         scope,
         bloom,
         glob,
-        batch_quit,
     );
 
     let tokens = crate::types::estimate_tokens(output.len() as u64);
@@ -441,12 +399,11 @@ fn write_second_hop_impact(
     scope: &Path,
     bloom: &crate::index::bloom::BloomFilterCache,
     glob: Option<&str>,
-    batch_quit: usize,
 ) {
     if all_caller_names.is_empty() || all_caller_names.len() > IMPACT_FANOUT_THRESHOLD {
         return;
     }
-    let Ok(hop2) = find_callers_batch(all_caller_names, scope, bloom, glob, batch_quit) else {
+    let Ok(hop2) = find_callers_batch(all_caller_names, scope, bloom, glob) else {
         return;
     };
 
@@ -520,9 +477,8 @@ fn write_second_hop_impact(
 /// `write_second_hop_impact` helpers the single-target path uses, so a
 /// bucket here is byte-identical to what a lone `search_callers_expanded`
 /// call for that target would produce (PR #138 review: HIGH — 2nd-hop parity;
-/// MED — header shape parity). The batch walk's early-quit budget is scaled
-/// by target count so a hit-rich earlier target cannot starve a later,
-/// rarer one (PR #138 review: MED — budget scaling).
+/// MED — header shape parity). The batch walk completes before ranking so
+/// every target sees the same deterministic match set.
 pub fn search_callers_multi_expanded(
     targets: &[&str],
     scope: &Path,
@@ -532,11 +488,7 @@ pub fn search_callers_multi_expanded(
     glob: Option<&str>,
     full: bool,
 ) -> Result<String, TilthError> {
-    let (max_matches, base_batch_quit) = if full {
-        (FULL_MAX_MATCHES, FULL_BATCH_EARLY_QUIT)
-    } else {
-        (MAX_MATCHES, BATCH_EARLY_QUIT)
-    };
+    let max_matches = if full { FULL_MAX_MATCHES } else { MAX_MATCHES };
 
     // Dedupe targets, preserving first-seen order: a repeated target (e.g.
     // query "foo,foo") must not render an empty no-callers section on its
@@ -549,14 +501,8 @@ pub fn search_callers_multi_expanded(
         .filter(|t| seen.insert(*t))
         .collect();
 
-    // Scale the walk-wide early-quit budget by (deduped) target count so
-    // each target gets roughly its own single-target budget's headroom —
-    // see `scaled_batch_quit` for why an unscaled shared budget starves
-    // later targets.
-    let batch_quit = scaled_batch_quit(base_batch_quit, ordered.len());
-
     let target_set: HashSet<String> = ordered.iter().map(ToString::to_string).collect();
-    let raw = find_callers_batch(&target_set, scope, bloom, glob, batch_quit)?;
+    let raw = find_callers_batch(&target_set, scope, bloom, glob)?;
 
     // Bucket matches by which target they call. Preserve the caller-supplied
     // target order so output is deterministic.
@@ -592,15 +538,7 @@ pub fn search_callers_multi_expanded(
         callers.truncate(max_matches);
 
         write_caller_bucket(&mut output, target, scope, total, &callers, expand);
-        write_second_hop_impact(
-            &mut output,
-            &all_caller_names,
-            &callers,
-            scope,
-            bloom,
-            glob,
-            batch_quit,
-        );
+        write_second_hop_impact(&mut output, &all_caller_names, &callers, scope, bloom, glob);
         output.push('\n');
     }
 
@@ -681,38 +619,6 @@ fn rank_callers(callers: &mut [CallerMatch], scope: &Path, context: Option<&Path
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// MED finding from PR review: the batch walk's early-quit budget is a
-    /// walk-wide raw-match count shared by every target passed to
-    /// `find_callers_batch` — a single target's budget therefore starves
-    /// later targets in a multi-target search. `scaled_batch_quit` is the
-    /// pure scaling function `search_callers_multi_expanded` uses to size
-    /// the walk's budget by target count instead of reusing the unscaled
-    /// single-target constant. This asserts the scaling directly (rather
-    /// than only via an integration test against the parallel walker, whose
-    /// starvation is real but not reliably reproducible in a small,
-    /// deterministic unit test — see
-    /// `callers_multi_target_later_target_not_starved_by_hit_rich_earlier_target`
-    /// in `src/mcp/tools/search.rs` for that scenario-level guard).
-    #[test]
-    fn scaled_batch_quit_multiplies_by_target_count() {
-        assert_eq!(scaled_batch_quit(BATCH_EARLY_QUIT, 1), BATCH_EARLY_QUIT);
-        assert_eq!(
-            scaled_batch_quit(BATCH_EARLY_QUIT, 2),
-            BATCH_EARLY_QUIT * 2,
-            "2 targets must not share a single target's budget"
-        );
-        assert_eq!(scaled_batch_quit(BATCH_EARLY_QUIT, 5), BATCH_EARLY_QUIT * 5);
-    }
-
-    /// `n_targets = 0` cannot happen through the dispatch layer (`tool_search`
-    /// rejects an empty query before reaching `search_callers_multi_expanded`),
-    /// but the scaling function must stay total rather than dividing by zero
-    /// or returning a zero budget that would make every walk quit instantly.
-    #[test]
-    fn scaled_batch_quit_treats_zero_targets_as_one() {
-        assert_eq!(scaled_batch_quit(BATCH_EARLY_QUIT, 0), BATCH_EARLY_QUIT);
-    }
 
     #[test]
     fn no_callers_message_for_unseen_symbol_says_typo_or_scope() {

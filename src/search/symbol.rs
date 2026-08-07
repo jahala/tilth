@@ -21,18 +21,10 @@ use grep_searcher::sinks::UTF8;
 use grep_searcher::Searcher;
 
 const MAX_MATCHES: usize = 10;
-/// Stop walking once we have this many raw definition matches.
-const EARLY_QUIT_THRESHOLD_DEFINITIONS: usize = 50;
-/// Stop walking once we have this many raw usage matches.
-const EARLY_QUIT_THRESHOLD_USAGES: usize = MAX_MATCHES * 3;
 
 /// Match-count cap when `--full` is set. Generous but bounded so a `tilth
 /// foo --full` on a huge repo can't blow up output.
 const FULL_MAX_MATCHES: usize = 100;
-/// Walker early-quit threshold when `--full` is set. Proportional to
-/// `FULL_MAX_MATCHES` the same way the default thresholds are.
-const FULL_EARLY_QUIT_USAGES: usize = FULL_MAX_MATCHES * 3;
-const FULL_EARLY_QUIT_DEFINITIONS: usize = FULL_MAX_MATCHES * 3;
 
 /// Display-side stratum: 0 = code def, 1 = doc-heading def, 2 = usage. Used
 /// as a stable sort key after `rank::sort` so the `MAX_MATCHES` cap can't drop
@@ -59,19 +51,7 @@ pub fn search(
     glob: Option<&str>,
     full: bool,
 ) -> Result<SearchResult, TilthError> {
-    let (max_matches, def_threshold, usage_threshold) = if full {
-        (
-            FULL_MAX_MATCHES,
-            FULL_EARLY_QUIT_DEFINITIONS,
-            FULL_EARLY_QUIT_USAGES,
-        )
-    } else {
-        (
-            MAX_MATCHES,
-            EARLY_QUIT_THRESHOLD_DEFINITIONS,
-            EARLY_QUIT_THRESHOLD_USAGES,
-        )
-    };
+    let max_matches = if full { FULL_MAX_MATCHES } else { MAX_MATCHES };
 
     // Compile regex once, share across both arms
     let word_pattern = format!(r"\b{}\b", regex_syntax::escape(query));
@@ -81,15 +61,15 @@ pub fn search(
     })?;
 
     let (defs, usages) = rayon::join(
-        || find_definitions(query, scope, glob, def_threshold),
-        || find_usages(query, &matcher, scope, glob, usage_threshold),
+        || find_definitions(query, scope, glob),
+        || find_usages(query, &matcher, scope, glob),
     );
 
     let defs = defs?;
     let usages = usages?;
 
     // Deduplicate: remove usage matches that overlap with definition matches.
-    // Linear scan — max ~30 defs from EARLY_QUIT_THRESHOLD, no allocation needed.
+    // Linear scan over the (complete) def set — small in practice.
     let mut merged: Vec<Match> = defs;
     let def_count = merged.len();
 
@@ -151,12 +131,13 @@ pub fn search(
 ///
 /// Single-read design: reads each file once, checks for symbol via
 /// `memchr::memmem` (SIMD), then reuses the buffer for tree-sitter parsing.
-/// Early termination: quits the parallel walker once enough defs are found.
+/// The walk always completes — quitting on a racy shared counter made the
+/// discovered SET thread-timing dependent (identical calls returned different
+/// match sets); display caps are applied deterministically after ranking.
 fn find_definitions(
     query: &str,
     scope: &Path,
     glob: Option<&str>,
-    early_quit_threshold: usize,
 ) -> Result<Vec<Match>, TilthError> {
     let matches: Mutex<Vec<Match>> = Mutex::new(Vec::new());
     // Relaxed is correct: walker.run() joins all threads before we read the final value.
@@ -171,11 +152,6 @@ fn find_definitions(
         let found_count = &found_count;
 
         Box::new(move |entry| {
-            // Early termination: enough definitions found
-            if found_count.load(Ordering::Relaxed) >= early_quit_threshold {
-                return ignore::WalkState::Quit;
-            }
-
             let Ok(entry) = entry else {
                 return ignore::WalkState::Continue;
             };
@@ -510,7 +486,6 @@ fn find_usages(
     matcher: &RegexMatcher,
     scope: &Path,
     glob: Option<&str>,
-    early_quit_threshold: usize,
 ) -> Result<Vec<Match>, TilthError> {
     let matches: Mutex<Vec<Match>> = Mutex::new(Vec::new());
     // Relaxed: same reasoning as find_definitions — approximate early-quit, joined before read
@@ -524,10 +499,6 @@ fn find_usages(
 
         Box::new(move |entry| {
             // Early termination: enough usages found
-            if found_count.load(Ordering::Relaxed) >= early_quit_threshold {
-                return ignore::WalkState::Quit;
-            }
-
             let Ok(entry) = entry else {
                 return ignore::WalkState::Continue;
             };

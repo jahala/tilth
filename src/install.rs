@@ -74,7 +74,7 @@ fn tilth_server_entry(edit: bool, format: &ConfigFormat) -> Value {
 }
 
 /// Write MCP config for the given host, preserving existing config.
-pub fn run(host: &str, edit: bool) -> Result<(), String> {
+pub fn run(host: &str, edit: bool, with_scout: bool) -> Result<(), String> {
     let host_info = resolve_host(host)?;
 
     if let Some(parent) = host_info.path.parent() {
@@ -94,6 +94,17 @@ pub fn run(host: &str, edit: bool) -> Result<(), String> {
     } else {
         eprintln!("✓ tilth added to {}", host_info.path.display());
     }
+    if with_scout && host == "claude-code" {
+        // Claude Code reads hooks from settings.json, NOT the MCP config file.
+        let hook_path = home_dir()?.join(".claude").join("settings.json");
+        write_claude_code_scout_hook(&hook_path)?;
+        eprintln!(
+            "✓ tilth scout hook (UserPromptSubmit) added to {}",
+            hook_path.display()
+        );
+    } else if with_scout {
+        eprintln!("  note: --with-scout only writes a hook for claude-code; the tilth_scout MCP tool is installed for all hosts.");
+    }
     if let Some(note) = host_info.note {
         eprintln!("  {note}");
     }
@@ -105,6 +116,84 @@ pub fn run(host: &str, edit: bool) -> Result<(), String> {
 fn atomic_write(path: &std::path::Path, content: &str) -> Result<(), String> {
     crate::util::atomic_write_bytes(path, content.as_bytes())
         .map_err(|e| format!("failed to write {}: {e}", path.display()))
+}
+
+/// Merge the `tilth scout --hook` entry into the Claude Code config's
+/// `hooks.UserPromptSubmit` array without clobbering existing hook entries.
+///
+/// The hook entry shape Claude Code expects:
+/// ```json
+/// {
+///   "hooks": {
+///     "UserPromptSubmit": [
+///       { "matcher": "", "hooks": [{ "type": "command", "command": "tilth scout --hook" }] }
+///     ]
+///   }
+/// }
+/// ```
+fn write_claude_code_scout_hook(path: &std::path::Path) -> Result<(), String> {
+    let mut config: Value = if path.exists() {
+        let raw = fs::read_to_string(path)
+            .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+        serde_json::from_str(&raw)
+            .map_err(|e| format!("invalid JSON in {}: {e}", path.display()))?
+    } else {
+        json!({})
+    };
+
+    let root = config
+        .as_object_mut()
+        .ok_or("config root is not a JSON object")?;
+
+    // Ensure hooks.UserPromptSubmit is an array, then merge.
+    let hooks_obj = root
+        .entry("hooks")
+        .or_insert(json!({}))
+        .as_object_mut()
+        .ok_or("hooks is not a JSON object")?;
+
+    let ups = hooks_obj.entry("UserPromptSubmit").or_insert(json!([]));
+
+    let arr = ups
+        .as_array_mut()
+        .ok_or("hooks.UserPromptSubmit is not a JSON array")?;
+
+    // Absolute path — a bare `tilth` resolves via PATH at hook time and can run
+    // a different (older) binary than the one that installed the server. The
+    // dedup check matches any existing scout hook entry (bare or absolute).
+    let scout_command = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.canonicalize().ok())
+        .map_or_else(
+            || "tilth scout --hook".to_string(),
+            |p| format!("{} scout --hook", p.display()),
+        );
+    let already_present = arr.iter().any(|entry| {
+        entry
+            .get("hooks")
+            .and_then(|h| h.as_array())
+            .is_some_and(|inner| {
+                inner.iter().any(|h| {
+                    h.get("command")
+                        .and_then(|c| c.as_str())
+                        .is_some_and(|c| c.ends_with("scout --hook"))
+                })
+            })
+    });
+
+    if !already_present {
+        arr.push(json!({
+            "matcher": "",
+            // Explicit timeout: model load + on-demand pool embedding can exceed
+            // Claude Code's 60 s default under load (measured in the cost A/Bs).
+            "hooks": [{ "type": "command", "command": scout_command, "timeout": 120 }]
+        }));
+    }
+
+    let out =
+        serde_json::to_string_pretty(&config).expect("serde_json::Value is always serializable");
+    fs::write(path, &out).map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+    Ok(())
 }
 
 fn write_json_config(host_info: &HostInfo, edit: bool) -> Result<(), String> {
@@ -1153,5 +1242,74 @@ mod tests {
         assert!(config.get("mcpServers").is_none());
         assert_eq!(config["mcp"]["tilth"]["type"], json!("local"));
         assert!(config["mcp"]["tilth"]["command"].is_array());
+    }
+
+    #[test]
+    fn scout_hook_written_into_empty_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("claude.json");
+        write_claude_code_scout_hook(&path).expect("should write hook");
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let config: Value = serde_json::from_str(&raw).unwrap();
+        let ups = &config["hooks"]["UserPromptSubmit"];
+        assert!(ups.is_array(), "UserPromptSubmit must be an array");
+        let arr = ups.as_array().unwrap();
+        assert!(!arr.is_empty(), "array must have one entry");
+        assert_eq!(arr[0]["matcher"], json!(""));
+        let inner = arr[0]["hooks"].as_array().unwrap();
+        let cmd = inner[0]["command"].as_str().unwrap();
+        assert!(
+            cmd.ends_with("scout --hook"),
+            "command must invoke the scout hook: {cmd}"
+        );
+        assert!(
+            std::path::Path::new(cmd.trim_end_matches(" scout --hook")).is_absolute(),
+            "hook command must use an absolute binary path: {cmd}"
+        );
+        assert_eq!(inner[0]["type"], json!("command"));
+        assert_eq!(inner[0]["timeout"], json!(120));
+    }
+
+    #[test]
+    fn scout_hook_merges_without_clobbering_existing_hooks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("claude.json");
+        // Pre-populate with an existing hook.
+        let existing = json!({
+            "hooks": {
+                "UserPromptSubmit": [
+                    { "matcher": "foo", "hooks": [{ "type": "command", "command": "echo hi" }] }
+                ]
+            }
+        });
+        std::fs::write(&path, serde_json::to_string(&existing).unwrap()).unwrap();
+
+        write_claude_code_scout_hook(&path).expect("should merge hook");
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let config: Value = serde_json::from_str(&raw).unwrap();
+        let arr = config["hooks"]["UserPromptSubmit"].as_array().unwrap();
+        assert_eq!(arr.len(), 2, "should have both hooks");
+        // Existing entry preserved.
+        assert_eq!(arr[0]["matcher"], json!("foo"));
+        // New entry appended.
+        let cmd = arr[1]["hooks"][0]["command"].as_str().unwrap();
+        assert!(
+            cmd.ends_with("scout --hook"),
+            "new entry must be the scout hook: {cmd}"
+        );
+    }
+
+    #[test]
+    fn scout_hook_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("claude.json");
+        write_claude_code_scout_hook(&path).unwrap();
+        write_claude_code_scout_hook(&path).unwrap(); // second call — must not duplicate
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let config: Value = serde_json::from_str(&raw).unwrap();
+        let arr = config["hooks"]["UserPromptSubmit"].as_array().unwrap();
+        assert_eq!(arr.len(), 1, "idempotent: entry must not be duplicated");
     }
 }

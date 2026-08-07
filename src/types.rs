@@ -218,6 +218,30 @@ pub(crate) fn is_test_file(path: &std::path::Path) -> bool {
     s.contains(".test.") || s.contains(".spec.") || s.contains("__tests__/")
 }
 
+/// Runtime kill-switch: a feature is disabled when the named env var is set
+/// (to anything). The bisect toggles for A/B arms — same pattern as
+/// `TILTH_NO_FOOTER`.
+pub(crate) fn feature_disabled(env_name: &str) -> bool {
+    std::env::var_os(env_name).is_some()
+}
+
+#[cfg(test)]
+mod feature_disabled_tests {
+    /// Uses a probe var no other test reads — env mutation stays race-free.
+    #[test]
+    fn feature_disabled_follows_the_env_var() {
+        const PROBE: &str = "TILTH_NO_TESTPROBE_XK9";
+        assert!(
+            !super::feature_disabled(PROBE),
+            "unset probe var must mean enabled"
+        );
+        std::env::set_var(PROBE, "1");
+        assert!(super::feature_disabled(PROBE));
+        std::env::remove_var(PROBE);
+        assert!(!super::feature_disabled(PROBE));
+    }
+}
+
 /// Tokens ≈ bytes / 4. Ceiling division, no float.
 #[must_use]
 pub fn estimate_tokens(byte_len: u64) -> u64 {

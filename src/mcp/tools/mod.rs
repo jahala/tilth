@@ -1,10 +1,11 @@
 mod definitions;
 mod deps;
 mod diff;
-mod files;
 mod grok;
+mod list;
 mod read;
 mod savings;
+mod scout;
 mod search;
 mod session;
 mod write;
@@ -12,10 +13,11 @@ mod write;
 pub(super) use definitions::tool_definitions;
 pub(super) use deps::tool_deps;
 pub(super) use diff::tool_diff;
-pub(super) use files::tool_files;
 pub(super) use grok::tool_grok;
+pub(super) use list::tool_list;
 pub(super) use read::tool_read;
 pub(super) use savings::tool_savings;
+pub(super) use scout::tool_scout;
 pub(super) use search::tool_search;
 pub(super) use session::tool_session;
 pub(super) use write::tool_write;
@@ -165,7 +167,7 @@ mod tests {
         // passes a relative scope/path without an absolute root. An omitted
         // `scope` must keep today's default behavior (server launch cwd, exactly
         // as on main) — refusing here would break the default flow of every
-        // session (e.g. a bare tilth_search/tilth_files call with no scope).
+        // session (e.g. a bare tilth_search/tilth_list call with no scope).
         let args = serde_json::json!({});
         let (scope, warning) = resolve_scope(&args, None).unwrap();
         assert_eq!(scope, PathBuf::from("."));

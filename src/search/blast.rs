@@ -82,14 +82,7 @@ pub(crate) fn blast_radius(
 
     let symbol_names: HashSet<String> = touched.iter().map(|t| t.name.clone()).collect();
 
-    let callers = find_callers_batch(
-        &symbol_names,
-        scope,
-        bloom,
-        None,
-        crate::search::callers::BATCH_EARLY_QUIT,
-    )
-    .ok()?;
+    let callers = find_callers_batch(&symbol_names, scope, bloom, None).ok()?;
 
     let canonical = path.canonicalize().ok()?;
     let callers: Vec<(String, CallerMatch)> = callers
@@ -120,6 +113,13 @@ fn format_blast_radius(
         } else {
             entry.0.push(m);
         }
+    }
+
+    // Callers arrive in parallel-walk order — sort for deterministic output
+    // (identical edits must produce byte-identical blast radii).
+    for (prod, test) in by_symbol.values_mut() {
+        prod.sort_by(|a, b| (&a.path, a.line).cmp(&(&b.path, b.line)));
+        test.sort_by(|a, b| (&a.path, a.line).cmp(&(&b.path, b.line)));
     }
 
     // Emit per-symbol prod callers in touched order (preserves definition order).

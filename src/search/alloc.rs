@@ -66,6 +66,26 @@ pub(crate) fn fit_to_budget(
     blocks: &[(i64, usize, usize)],
     budget_tokens: u64,
 ) -> String {
+    fit_to_budget_impl(
+        body,
+        blocks,
+        budget_tokens,
+        crate::types::feature_disabled("TILTH_NO_RDALLOC"),
+    )
+}
+
+/// Inner with the kill-switch as a parameter (testable without env races).
+/// Disabled = pre-allocator behaviour: return the body untouched and let the
+/// downstream positional `budget::apply` do any cutting.
+fn fit_to_budget_impl(
+    body: &str,
+    blocks: &[(i64, usize, usize)],
+    budget_tokens: u64,
+    disabled: bool,
+) -> String {
+    if disabled {
+        return body.to_string();
+    }
     // Invariant the slicing below relies on: blocks are ascending, non-overlapping,
     // within `body`, and on char boundaries. They come from `String::len()`
     // snapshots taken during assembly; assert it in debug so a future regression in
@@ -250,5 +270,15 @@ mod tests {
             !out.contains("omitted"),
             "no misleading omitted note when nothing was value-dropped: {out}"
         );
+    }
+
+    #[test]
+    fn fit_to_budget_disabled_passes_body_through_even_over_budget() {
+        // The TILTH_NO_RDALLOC bisect arm: value allocation off → body unchanged
+        // regardless of budget pressure (the old positional cut happens later).
+        let body = "## a\nAAAA\n## b\nBBBB\n".repeat(50);
+        let blocks = [(1i64, 0usize, 9usize)];
+        let out = fit_to_budget_impl(&body, &blocks, 5, true);
+        assert_eq!(out, body, "disabled allocator must not touch the body");
     }
 }
