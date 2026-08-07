@@ -16,7 +16,11 @@ pub(in crate::mcp) fn tool_scout(
         .get("prompt")
         .and_then(|v| v.as_str())
         .ok_or("missing required parameter: prompt")?;
-    let (scope, scope_warning) = resolve_scope(args);
+    let root = args
+        .get("root")
+        .and_then(Value::as_str)
+        .map(std::path::Path::new);
+    let (scope, scope_warning) = resolve_scope(args, root)?;
     // Default to "rerank" so the full validated pipeline fires when models are
     // present; degrades automatically to deterministic context when absent.
     let job = args.get("job").and_then(|v| v.as_str()).unwrap_or("rerank");
@@ -25,18 +29,19 @@ pub(in crate::mcp) fn tool_scout(
     let result = crate::run_scout(prompt, &scope, job, true).map_err(|e| e.to_string())?;
     // Volatile bytes poison prompt-prefix caching — identical calls must return
     // identical results, so timing stays off the MCP surface (the CLI keeps it).
-    let result = match serde_json::from_str::<Value>(&result) {
-        Ok(mut v) => {
-            if let Some(o) = v.as_object_mut() {
-                o.remove("elapsed_ms");
-            }
-            serde_json::to_string_pretty(&v).unwrap_or(result)
-        }
-        Err(_) => result,
-    };
-    let mut output = scope_warning.unwrap_or_default();
-    output.push_str(&result);
-    Ok(output)
+    let mut result: Value =
+        serde_json::from_str(&result).map_err(|e| format!("scout returned invalid JSON: {e}"))?;
+    let object = result
+        .as_object_mut()
+        .ok_or_else(|| "scout returned non-object JSON".to_string())?;
+    object.remove("elapsed_ms");
+    if let Some(warning) = scope_warning {
+        object.insert(
+            "scope_warning".to_string(),
+            Value::String(warning.trim().to_string()),
+        );
+    }
+    serde_json::to_string_pretty(&result).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -79,7 +84,8 @@ mod tests {
         let session = crate::session::Session::new();
         let args = serde_json::json!({
             "prompt": "parse a unified diff",
-            "scope": tmp.path().to_str().unwrap(),
+            "scope": "src",
+            "root": tmp.path().to_str().unwrap(),
             "job": "context",
         });
         // Should succeed — output is JSON.
@@ -94,6 +100,31 @@ mod tests {
         assert!(
             v.get("gate_fired").is_some(),
             "JSON must have gate_fired field: {out}"
+        );
+    }
+
+    #[test]
+    fn tool_scout_keeps_scope_warning_inside_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "a.rs", "fn foo() {}\n");
+        let bloom = Arc::new(BloomFilterCache::new());
+        let session = crate::session::Session::new();
+        let args = serde_json::json!({
+            "prompt": "foo function",
+            "scope": "missing",
+            "root": tmp.path().to_str().unwrap(),
+            "job": "context",
+        });
+
+        let out = tool_scout(&args, &bloom, &session).expect("fallback should succeed");
+        let value: Value = serde_json::from_str(&out).expect("fallback must remain JSON");
+        assert_eq!(
+            value["scope_warning"],
+            "scope \"missing\" is not a valid directory, searching the root/checkout directory instead."
+        );
+        assert!(
+            value.get("candidates").is_some(),
+            "must have candidates: {out}"
         );
     }
 

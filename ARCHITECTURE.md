@@ -37,7 +37,7 @@ src/
 │                    queries, hot dirs, expanded-set dedup
 ├── cache.rs         OutlineCache: rendered outlines + parsed
 │                    tree_sitter::Tree, both keyed by (path, mtime)
-├── overview.rs      Project fingerprint emitted at MCP `initialize`
+├── overview.rs      CLI-only project fingerprint for `tilth overview`
 ├── map.rs           tilth --map: structural tree of the codebase
 ├── install.rs       Writes MCP server entries into ~20 host configs
 ├── edit.rs          Hash-anchored line edits + EditResult diff preview
@@ -60,7 +60,7 @@ src/
 │   ├── callees.rs       Resolve function calls inside a definition
 │   ├── deps.rs          Blast-radius analysis (`tilth_deps`)
 │   ├── grok.rs          One-call symbol bundle (`tilth_grok`)
-│   ├── glob.rs          Glob query → file list (`tilth_files`)
+│   ├── glob.rs          Glob query → file list (`tilth_list` via MCP)
 │   ├── blast.rs         Symbol-level blast radius
 │   ├── bloom_walk.rs    Shared walker preamble (size gating, mtime,
 │   │                    bloom filter) factored out of callers/callees
@@ -126,8 +126,8 @@ free-form path:
 - `tilth install <host>` — delegates to `install::run`.
 - `tilth diff [<source>]` — bypasses `lib.rs` entirely and goes
   through `diff::resolve_source` + `diff::diff`.
-- `tilth overview` — prints the project fingerprint that the MCP
-  `initialize` response would inject.
+- `tilth overview` — prints a project fingerprint for CLI inspection;
+  MCP initialization uses only the static mode-specific prompt.
 
 The default (no-subcommand) mode dispatches into `lib::run` (or
 `run_full`, `run_expanded`, `run_callers`, `run_deps`,
@@ -160,20 +160,18 @@ anything else returns a JSON-RPC `method not found` error. The two
 methods worth describing in detail:
 
 - `initialize` — emits `protocolVersion`, capabilities, `serverInfo`,
-  and an `instructions` string. The instructions are the
-  `SERVER_INSTRUCTIONS` constant, loaded at compile time via
-  `include_str!("../../prompts/mcp-base.md")` and rewritten on `fd3de77`
-  as a pre-flight gate naming the exact Bash commands and host tools to
-  avoid, with concrete `<bad>→<good>` rewrites. When
-  `TILTH_NO_OVERVIEW` is unset, `overview::fingerprint(cwd)` is
-  prepended — a project summary built in <250ms (a stderr warning fires
-  if it overruns).
+  and an `instructions` string. `build_instructions(edit_mode)` selects
+  either `MCP_BASE_INSTRUCTIONS` or `MCP_EDIT_INSTRUCTIONS`, each loaded
+  at compile time from `prompts/` via `include_str!` and capped at 2 KiB.
+  No project fingerprint is injected, which keeps the prompt stable for
+  prefix caching.
 - `tools/list` — returns the tool schemas. `tools/call` is the workhorse
   and goes through `handle_tool_call`.
 
 Tool dispatch is routed by name through `dispatch_tool` to
-`tool_read` / `tool_search` / `tool_files` / `tool_deps` / `tool_diff` /
-`tool_session` / `tool_edit` (the last only in edit mode).
+`tool_read` / `tool_search` / `tool_list` / `tool_deps` / `tool_grok` /
+`tool_diff` / `tool_scout` / `tool_session` / `tool_savings` /
+`tool_write` (the last only in edit mode).
 `tilth_map` is no longer reachable through MCP — its schema is omitted
 from `tools/list` and the dispatch stub has been removed. The CLI
 still has `tilth --map`; the MCP boundary was retired after benchmark
@@ -188,8 +186,8 @@ Rust since cancelling a thread mid-tree-sitter-parse is unsound. A
 process-wide `ABANDONED_THREADS` counter logs to stderr once
 accumulation hits 3.
 
-Edit mode (`--edit`) appends an `EDIT_MODE_EXTRA` instruction block
-describing `tilth_write` and unlocks the `tilth_write` dispatch arm.
+Edit mode (`--edit`) selects the complete `MCP_EDIT_INSTRUCTIONS`
+payload and unlocks the `tilth_write` dispatch arm.
 
 ## Query pipeline
 
@@ -678,7 +676,7 @@ and emits a structural change list per commit.
 
 Hash-anchored line edits. The `Edit` struct carries a start line
 and hash (`<line>:<hash>`), an end line and hash (equal to the start
-for single-line edits — the MCP `tool_edit` parser fills these in
+for single-line edits — the MCP `tilth_write` handler fills these in
 when the JSON payload omits `end`), and a content string (empty =
 delete). `apply_edits` reads the file, hashes each line, validates
 that the supplied anchors match, and rewrites the file with the
@@ -693,13 +691,12 @@ compact `-`/`+` rendering of every edit site, `context` is the
 hashlined window around each rewrite. The formatter (`format_diffs`,
 also in `edit.rs`) produces the diff string itself.
 
-The callee-callers warning lives one layer up. `mcp::tool_edit`, on a
-successful `Applied` result, calls `search::blast::blast_radius` with
-the same `Edit` list and appends its output. The check is
-unconditional in MCP (every successful edit gets the warning); the
-`diff: true` argument controls whether the per-edit `-`/`+` block is
-shown alongside the hashlined context, *not* whether the blast
-radius runs.
+The callee-callers warning is emitted by `edit::render_applied` after a
+successful hash-anchored edit. It calls `search::blast::blast_radius`
+with the same `Edit` list and appends its output. The check runs for
+every successful hash-mode edit; the `diff: true` argument controls
+whether the per-edit `-`/`+` block is shown alongside the hashlined
+context, *not* whether the blast radius runs.
 
 ## MCP server (`src/mcp.rs`)
 
@@ -730,25 +727,18 @@ shapes; the in-process `dispatch_tool` and the per-tool functions
 (`tool_search`, `tool_read`, etc.) parse them by `serde_json::Value`
 lookups rather than typed structs.
 
-**Instructions injection.** The `SERVER_INSTRUCTIONS` constant is the
-strategic guidance every host gets at `initialize`. It lives in
-`prompts/mcp-base.md` and is wired in at compile time via
-`include_str!`. The text names exact bad commands
-(`Bash(grep/cat/find)`) and provides `<bad>→<good>` rewrites because
-agents kept reaching for those despite earlier "DO NOT use
-Grep/Read/Glob" rules. Edit mode appends an `EDIT_MODE_EXTRA` block
-from `prompts/mcp-edit.md` with the `tilth_write` instructions.
-`overview::fingerprint(cwd)` is prepended unless `TILTH_NO_OVERVIEW`
-is set — a brief summary of language counts, manifests, hot files,
-and git context.
+**Instructions injection.** `MCP_BASE_INSTRUCTIONS` and
+`MCP_EDIT_INSTRUCTIONS` are complete mode-specific payloads loaded from
+`prompts/` via `include_str!`. `build_instructions(edit_mode)` selects
+one; it never concatenates the files or injects a project overview.
+Each payload stays at or below 2 KiB, with tool routing and root
+discipline placed early for weaker models and stable prefix caching.
 
-`AGENTS.md` at the repo root is the user-facing copy of these
-instructions for hosts that read prompts from disk rather than via
-the MCP `instructions` field. It is regenerated from the same
-`prompts/*.md` files via `scripts/regen-agents-md.sh`, so editing the
-markdown and re-running the script keeps both surfaces in lockstep.
-Byte-equality tests in `src/mcp/mod.rs` lock the runtime strings to
-their refactor baseline and flag accidental drift.
+`AGENTS.md` is the human-facing concatenation for hosts that read
+instructions from disk rather than via the MCP `instructions` field. It
+is regenerated from `prompts/*.md` by `scripts/regen-agents-md.sh`, but
+is not used at runtime. Budget, byte-lock, prefix, and formatting tests
+in `src/mcp/mod.rs` flag accidental prompt drift.
 
 ## Cross-cutting modules
 
@@ -779,8 +769,8 @@ user-facing.
   `package.json`, `go.mod`, `pyproject.toml`), reads `git` context
   (`branch`, `uncommitted`, `recent commits`), and emits a few
   hot-file lines. Wrapped in `catch_unwind` and a 250ms wall-clock
-  budget; warn-on-overrun via stderr. Output is the project summary
-  that the MCP `initialize` response prepends to `SERVER_INSTRUCTIONS`.
+  budget with warn-on-overrun via stderr. It powers the CLI
+  `tilth overview` command; MCP initialization does not invoke it.
 - **`map.rs`** — `tilth --map` generates a structural codebase tree:
   per-directory token estimates, top-level symbols per file, depth
   control. CLI-only — the MCP boundary doesn't expose it (no schema

@@ -19,7 +19,6 @@ const IMPACT_MAX_RESULTS: usize = 15;
 /// Match-count cap when `--full` is set. Mirrors the symbol/content search caps.
 const FULL_MAX_MATCHES: usize = 100;
 
-
 /// A single caller match — a call site of a target symbol.
 #[derive(Debug)]
 pub struct CallerMatch {
@@ -502,7 +501,6 @@ pub fn search_callers_multi_expanded(
         .filter(|t| seen.insert(*t))
         .collect();
 
-
     let target_set: HashSet<String> = ordered.iter().map(ToString::to_string).collect();
     let raw = find_callers_batch(&target_set, scope, bloom, glob)?;
 
@@ -540,14 +538,7 @@ pub fn search_callers_multi_expanded(
         callers.truncate(max_matches);
 
         write_caller_bucket(&mut output, target, scope, total, &callers, expand);
-        write_second_hop_impact(
-            &mut output,
-            &all_caller_names,
-            &callers,
-            scope,
-            bloom,
-            glob,
-        );
+        write_second_hop_impact(&mut output, &all_caller_names, &callers, scope, bloom, glob);
         output.push('\n');
     }
 
@@ -628,7 +619,6 @@ fn rank_callers(callers: &mut [CallerMatch], scope: &Path, context: Option<&Path
 #[cfg(test)]
 mod tests {
     use super::*;
-
 
     #[test]
     fn no_callers_message_for_unseen_symbol_says_typo_or_scope() {

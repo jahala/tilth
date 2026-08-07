@@ -2,26 +2,15 @@ use serde_json::Value;
 
 pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
     let read_desc = if edit_mode {
-        "Read a file with smart outlining. Replaces cat/head/tail and the host Read tool — \
-         use this for all file reading. Output uses hashline format (line:hash|content) — \
-         the line:hash anchors are required by tilth_write. Small files return full hashlined content. \
-         Large files return a structural outline (no hashlines); use `section` to get hashlined \
-         content for the lines you want to edit. Use `sections` to grab several disjoint slices \
-         from the same file in one call. Use `full` to force complete content. \
-         Use `paths` to read multiple files in one call."
+        "AST-aware file reading with outlines, ranges, batching, and edit-mode hashes. Example: tilth_read({\"path\":\"src/cache.rs\",\"section\":\"45-89\",\"root\":\"/abs/checkout\"}). Copy line:hash anchors into tilth_write; use paths for file batches and sections for disjoint slices."
     } else {
-        "Read a file with smart outlining. Replaces cat/head/tail and the host Read tool — \
-         use this for all file reading. Small files return full content. Large files return \
-         a structural outline (functions, classes, imports) so you see the shape without \
-         consuming your context window. Use `section` to read a specific line range or heading. \
-         Use `sections` to grab several disjoint slices from the same file in one call. \
-         Use `full` to force complete content. Use `paths` to read multiple files in one call."
+        "AST-aware file reading with outlines, ranges, and batching. Example: tilth_read({\"path\":\"src/cache.rs\",\"section\":\"45-89\",\"root\":\"/abs/checkout\"}). Use paths for file batches and sections for disjoint slices."
     };
     let mut tools = vec![
         serde_json::json!({
             "name": "tilth_search",
             "annotations": { "readOnlyHint": true },
-            "description": "Search for symbols, text, or regex patterns in code. Replaces grep/rg and the host Grep tool — use this for all code search. Symbol search returns definitions first (via tree-sitter AST), then usages, with full source code inlined for top matches. Content search finds literal text. Regex search supports full regex patterns. For cross-file tracing, pass comma-separated symbol names (max 5).",
+            "description": "Unified code search across symbols, text, regex, and callers. Start here for exploration. Example: tilth_search({\"query\":\"handleRequest\",\"kind\":\"symbol\",\"root\":\"/abs/checkout\"}). Comma-separate up to 5 related queries. Relative scopes require root.",
             "inputSchema": {
                 "type": "object",
                 "required": ["query"],
@@ -114,7 +103,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         serde_json::json!({
             "name": "tilth_list",
             "annotations": { "readOnlyHint": true },
-            "description": "List files matching glob patterns as a directory tree. Replaces find/ls/tree and the host Glob tool — use this to see project structure with per-directory token-size rollups. Pass `patterns` to combine several globs into one tree.",
+            "description": "List files when you have no symbol or text query. Example: tilth_list({\"patterns\":[\"*.rs\"],\"scope\":\"src\",\"root\":\"/abs/checkout\"}). Prefer tilth_search for discovery.",
             "inputSchema": {
                 "type": "object",
                 "required": ["patterns"],
@@ -148,7 +137,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         serde_json::json!({
             "name": "tilth_deps",
             "annotations": { "readOnlyHint": true },
-            "description": "Blast-radius check before breaking changes. Shows what a file imports (local + external) and what other files call its exports, with symbol-level detail. Use ONLY when your planned edit changes a function signature, removes/renames an export, or modifies behavior that callers rely on. Do NOT use for reading files, adding new code, or internal-only changes — use tilth_read instead.",
+            "description": "File dependency blast radius: imports and imported_by in one call. Example: tilth_deps({\"path\":\"src/cache.rs\",\"root\":\"/abs/checkout\"}). Relative paths require root.",
             "inputSchema": {
                 "type": "object",
                 "required": ["path"],
@@ -175,7 +164,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         serde_json::json!({
             "name": "tilth_grok",
             "annotations": { "readOnlyHint": true },
-            "description": "Get everything structural about a symbol in one call — definition, body, signature, doc, callees, callers, siblings, tests. Use ONLY for 'understand this symbol' questions. Do NOT use for concept search (use tilth_search) or reading file contents (use tilth_read).",
+            "description": "Deep dive on one symbol: definition, callers, callees, siblings, and ranked context. Example: tilth_grok({\"target\":\"parse_unified_diff\",\"root\":\"/abs/checkout\"}). Replaces search → expand → callers.",
             "inputSchema": {
                 "type": "object",
                 "required": ["target"],
@@ -203,7 +192,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         serde_json::json!({
             "name": "tilth_diff",
             "annotations": { "readOnlyHint": true },
-            "description": "Structural diff showing function-level changes. Replaces git diff. Call with no args for uncommitted changes overview.",
+            "description": "Structured git diff. Example: tilth_diff({}) for uncommitted changes or tilth_diff({\"source\":\"HEAD~1\"}) for one commit. Prefer this over shell git diff/log --patch.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -255,7 +244,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         serde_json::json!({
             "name": "tilth_savings",
             "annotations": { "readOnlyHint": true },
-            "description": "Report tokens tilth saved this session vs naive grep/cat (conservative lower bound). Call ONLY when the user explicitly asks how much tilth saved — never proactively.",
+            "description": "Report conservative token savings for this session. Call only when the user explicitly asks.",
             "inputSchema": {
                 "type": "object",
                 "properties": {}
@@ -263,7 +252,8 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "tilth_scout",
-            "description": "Assemble candidate files for a natural-language prompt and rank them. Returns JSON with: candidates (ranked pool), gate_fired (bool), agreement (bool), skeleton (terse structural summary of the top match when gate fires), n_pool, elapsed_ms, model_used. Job 'rerank' (default) applies rrf(CE, embed) ranking on symbol texts and emits a grok skeleton when CE-top1 == embed-top1; degrades automatically to deterministic 'context' when models are absent.",
+            "annotations": { "readOnlyHint": true },
+            "description": "Research a subsystem from a natural-language prompt. Example: tilth_scout({\"prompt\":\"where is response compression applied?\",\"scope\":\"src\",\"root\":\"/abs/checkout\"}). Use for candidate ranking; use tilth_grok for one known symbol.",
             "inputSchema": {
                 "type": "object",
                 "required": ["prompt"],
@@ -281,6 +271,10 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "enum": ["context", "rerank"],
                         "default": "rerank",
                         "description": "Job to run: rerank (default — rrf fusion ranking + skeleton when gate fires) or context (deterministic candidate assembly only)."
+                    },
+                    "root": {
+                        "type": "string",
+                        "description": "Absolute project root; anchors a relative scope"
                     }
                 }
             }
@@ -291,7 +285,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         tools.push(serde_json::json!({
             "name": "tilth_write",
             "annotations": { "readOnlyHint": false },
-            "description": "Batch write one or more files in one call. Replaces the host Edit and Write tools — DO NOT use those. Three per-file modes: `hash` (default — replace lines at hash anchors from tilth_read), `overwrite` (whole file; create-only by default — pass `overwrite: true` to replace an existing file), `append` (append `content`, creates if absent). overwrite/append responses echo the file's hashlines so you can chain anchored edits in the next call without re-reading. ALWAYS group writes to multiple files into a single tilth_write call — never call tilth_write twice in a row. Each file is processed independently (best-effort): a failure on one file does not block the others; results are reported per file. Partial success returns isError: false — scan the per-file `## <path>` sections for failures rather than trusting the top-level status. A parse error on one edit invalidates ALL edits for that file (none applied); retry the whole file after fixing the malformed entry. Each file path may appear at most once per call. Max 20 files per call. Example overwrite (new file): `tilth_write(files: [{path: \"src/new.rs\", mode: \"overwrite\", content: \"fn main(){}\\n\"}])`.",
+            "description": "Hash-anchored multi-file edits. Example: tilth_write({\"files\":[{\"path\":\"src/x.rs\",\"edits\":[{\"start\":\"2:ABCD\",\"content\":\"let y = 1;\"}]}],\"root\":\"/abs/checkout\"}). Copy anchors from edit-mode tilth_read; never invent them. For creation, use mode:\"overwrite\" with content. Partial failures are per-file.",
             "inputSchema": {
                 "type": "object",
                 "required": ["files"],
@@ -443,6 +437,24 @@ mod tests {
             assert!(
                 names.contains(&"tilth_list"),
                 "tilth_list must remain advertised"
+            );
+        }
+    }
+
+    #[test]
+    fn all_tool_descriptions_fit_budget() {
+        let defs = tool_definitions(true);
+        assert_eq!(defs.len(), 9);
+        for tool in &defs {
+            let name = tool.get("name").and_then(Value::as_str).unwrap_or("?");
+            let desc = tool
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            assert!(
+                desc.len() <= 2_048,
+                "{name} description is {} bytes (limit 2048)",
+                desc.len()
             );
         }
     }

@@ -62,12 +62,17 @@ impl Services {
 }
 
 // Sent to the LLM via the MCP `instructions` field during initialization.
-// The strings live in prompts/mcp-base.md and prompts/mcp-edit.md so they can
-// be versioned and rendered as Markdown. AGENTS.md is regenerated from the
-// same files via scripts/regen-agents-md.sh, keeping the human-facing copy in
-// lockstep with what MCP hosts receive in the `instructions` field.
-const SERVER_INSTRUCTIONS: &str = include_str!("../../prompts/mcp-base.md");
-const EDIT_MODE_EXTRA: &str = include_str!("../../prompts/mcp-edit.md");
+const MCP_BASE_INSTRUCTIONS: &str = include_str!("../../prompts/mcp-base.md");
+const MCP_EDIT_INSTRUCTIONS: &str = include_str!("../../prompts/mcp-edit.md");
+
+fn build_instructions(edit_mode: bool) -> String {
+    if edit_mode {
+        MCP_EDIT_INSTRUCTIONS
+    } else {
+        MCP_BASE_INSTRUCTIONS
+    }
+    .to_string()
+}
 
 /// MCP server over stdio. When `edit_mode` is true, exposes `tilth_write` and
 /// switches `tilth_read` to hashline output format. Read-only deployments
@@ -229,23 +234,7 @@ fn handle_request(req: &JsonRpcRequest, services: &Services) -> JsonRpcResponse 
     let edit_mode = services.edit_mode();
     match req.method.as_str() {
         "initialize" => {
-            let overview = if std::env::var("TILTH_NO_OVERVIEW").is_ok() {
-                String::new()
-            } else {
-                let cwd = std::env::current_dir().unwrap_or_default();
-                crate::overview::fingerprint(&cwd)
-            };
-            let instructions = if edit_mode {
-                if overview.is_empty() {
-                    format!("{SERVER_INSTRUCTIONS}{EDIT_MODE_EXTRA}")
-                } else {
-                    format!("{overview}\n\n{SERVER_INSTRUCTIONS}{EDIT_MODE_EXTRA}")
-                }
-            } else if overview.is_empty() {
-                SERVER_INSTRUCTIONS.to_string()
-            } else {
-                format!("{overview}\n\n{SERVER_INSTRUCTIONS}")
-            };
+            let instructions = build_instructions(edit_mode);
             JsonRpcResponse {
                 jsonrpc: "2.0",
                 id: req.id.clone(),
@@ -492,79 +481,71 @@ mod tests {
         assert_eq!(root_canon, expected_canon);
     }
 
-    // -- prompt extraction byte locks ------------------------------------------
-    //
-    // These tests pin the MCP `instructions` strings to their pre-refactor byte
-    // shapes so the prompts/*.md extraction is provably a no-op. They flag
-    // future drift loudly: any prompt edit must update both the markdown source
-    // and the assertions below.
+    const CACHE_SAFE_PREFIX: &str =
+        "tilth — code intelligence MCP server. Replaces grep, cat, find, ls";
+    const PATH_DISCIPLINE_SPAN: &str = "PATHS: pass `root` as the ABSOLUTE checkout directory with every relative path or scope. Absolute paths work without it; omitting path/scope searches the server's project. `..` traversal in relative paths is refused.";
 
-    #[test]
-    fn server_instructions_byte_lock() {
-        assert_eq!(
-            SERVER_INSTRUCTIONS.len(),
-            1667,
-            "SERVER_INSTRUCTIONS byte count drifted from baseline"
-        );
-        assert!(SERVER_INSTRUCTIONS
-            .starts_with("tilth — code intelligence MCP server. Replaces grep, cat, find, ls"));
-        assert!(SERVER_INSTRUCTIONS
-            .ends_with("DO NOT re-read files already shown in expanded search results."));
+    fn assert_cache_safe_prefix_and_paths(instructions: &str) {
         assert!(
-            !SERVER_INSTRUCTIONS.contains("\n\n\n"),
-            "SERVER_INSTRUCTIONS must not introduce triple newlines (likely a trailing-newline drift in prompts/mcp-base.md)"
+            instructions.starts_with(CACHE_SAFE_PREFIX),
+            "static routing prefix must come first for prompt caching"
         );
+        let path_pos = instructions
+            .find(PATH_DISCIPLINE_SPAN)
+            .expect("root path discipline must be present verbatim");
         assert!(
-            SERVER_INSTRUCTIONS.contains(
-                "DO NOT pass a relative path or scope without also setting root (absolute)"
-            ),
-            "require-root path discipline must lead the file-I/O guidance"
-        );
-        // De-dup (R1) moved per-tool usage into the schemas. Lock that the
-        // native-vs-tilth steering for weaker models stays verbatim, and that the
-        // per-tool parameter manuals are gone from the always-on instructions field.
-        assert!(SERVER_INSTRUCTIONS.contains("DO NOT use Grep, Read, or Glob."));
-        // The k-validated steering (first config to beat native baseline):
-        // grok-steering + batching must stay in the always-on instructions.
-        assert!(SERVER_INSTRUCTIONS.contains("tilth_grok(symbol) returns def + callers + callees"));
-        assert!(SERVER_INSTRUCTIONS
-            .contains(r#"Pass them together: tilth_search("parse,decode,apply")"#));
-        assert!(SERVER_INSTRUCTIONS
-            .contains("To check what changed, use tilth_diff instead of Bash(git diff/git log)."));
-        assert!(SERVER_INSTRUCTIONS.contains("DO NOT use Bash(git diff) or Bash(git log --patch)."));
-        assert!(
-            !SERVER_INSTRUCTIONS.contains("expand (default 2)"),
-            "per-tool parameter manuals belong in the tool schemas, not the instructions field"
+            path_pos < 800,
+            "root path discipline must stay in the cacheable prefix (was byte {path_pos})"
         );
     }
 
     #[test]
-    fn edit_mode_extra_byte_lock() {
-        assert_eq!(
-            EDIT_MODE_EXTRA.len(),
-            314,
-            "EDIT_MODE_EXTRA byte count drifted from refactor baseline"
-        );
+    fn base_instructions_are_minimal_and_have_no_overview() {
+        let instructions = build_instructions(false);
+        assert_eq!(instructions, MCP_BASE_INSTRUCTIONS);
+        assert_cache_safe_prefix_and_paths(&instructions);
         assert!(
-            EDIT_MODE_EXTRA.starts_with("\n\ntilth_write replaces the host Edit and Write tools."),
-            "EDIT_MODE_EXTRA must keep its leading blank-line separator so format!(\"{{S}}{{E}}\") emits one blank line between sections"
+            !instructions.contains("## Project")
+                && !instructions.contains("Language breakdown")
+                && !instructions.contains("Git status"),
+            "initialize instructions must not contain a project fingerprint"
         );
-        assert!(EDIT_MODE_EXTRA
-            .ends_with("DO NOT use the host Edit or Write tool. Use tilth_write for all writes."));
+        assert!(instructions.contains("tilth_scout"));
         assert!(
-            !EDIT_MODE_EXTRA.contains("\n\n\n"),
-            "EDIT_MODE_EXTRA must not introduce triple newlines"
+            instructions.len() <= 2_048,
+            "base MCP instructions are {} bytes (limit 2048)",
+            instructions.len()
         );
     }
 
     #[test]
-    fn instructions_compose_with_single_blank_line_between_sections() {
-        // Pre-refactor: format!("{S}{E}") relied on EDIT_MODE_EXTRA's leading
-        // "\n\n" to produce one blank line between the base and edit sections.
-        // This asserts the composition still has that shape.
-        let combined = format!("{SERVER_INSTRUCTIONS}{EDIT_MODE_EXTRA}");
-        assert!(combined.contains(
-            "DO NOT re-read files already shown in expanded search results.\n\ntilth_write replaces"
-        ));
+    fn edit_instructions_are_minimal_and_select_edit_protocol() {
+        let instructions = build_instructions(true);
+        assert_eq!(instructions, MCP_EDIT_INSTRUCTIONS);
+        assert_cache_safe_prefix_and_paths(&instructions);
+        assert!(instructions.contains("tilth_write(files:"));
+        assert!(instructions.contains("DO NOT use host Edit or Write."));
+        assert!(instructions.contains("tilth_scout"));
+        assert!(
+            instructions.len() <= 2_048,
+            "edit MCP instructions are {} bytes (limit 2048)",
+            instructions.len()
+        );
+    }
+
+    #[test]
+    fn static_prompt_bytes_are_locked() {
+        assert_eq!(MCP_BASE_INSTRUCTIONS.len(), 1_784);
+        assert_eq!(MCP_EDIT_INSTRUCTIONS.len(), 1_955);
+    }
+
+    #[test]
+    fn prompt_sources_have_no_triple_newlines() {
+        for instructions in [MCP_BASE_INSTRUCTIONS, MCP_EDIT_INSTRUCTIONS] {
+            assert!(
+                !instructions.contains("\n\n\n"),
+                "prompt source must not contain triple newlines"
+            );
+        }
     }
 }

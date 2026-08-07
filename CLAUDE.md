@@ -9,20 +9,21 @@ src/
   main.rs              CLI entry (clap). Dispatches to MCP, map, or single-query mode.
   lib.rs               Public API: classify query → read/search/glob → formatted output.
   mcp/
-    mod.rs             MCP server (JSON-RPC on stdio). Embeds SERVER_INSTRUCTIONS + EDIT_MODE_EXTRA via include_str! from prompts/.
+    mod.rs             MCP server (JSON-RPC on stdio). Selects a complete mode-specific prompt via include_str! from prompts/.
     write.rs           tilth_write overwrite/append primitives — create-only guard, O_NOFOLLOW symlink refusal, atomic parent-dir creation.
     tools/
       mod.rs           Tool dispatch hub — path/scope resolution under the absolute-path discipline (anchor_path, resolve_scope), budget application.
-      definitions.rs   JSON schema definitions for every MCP tool (tilth_search/read/files/deps/grok/diff/savings/write).
+      definitions.rs   JSON schema definitions for every MCP tool (tilth_search/read/list/deps/grok/diff/savings/scout/write).
       search.rs        tool_search — symbol/content/regex/callers dispatch, multi-symbol support, scope-warning integration.
       read.rs          tool_read — smart file reads, batch/section/sections slicing, savings tracking.
       write.rs         tool_write — batch writes in hash/overwrite/append modes; hash mode delegates to edit::apply_batch.
       deps.rs          tool_deps — file-level dependency analysis (imports + dependents), bloom-filtered.
       diff.rs          tool_diff — structural diff dispatch (uncommitted/staged/ref/file-pair/patch/log).
-      files.rs         tool_files — glob file listing, pattern/patterns batch, scope resolution.
+      list.rs          tool_list — glob file listing, patterns batch, scope resolution, and directory-tree rendering.
       grok.rs          tool_grok — one-call symbol bundle, default vs full caps.
       savings.rs       tool_savings — session token-savings summary vs a naive-read baseline.
       session.rs       tool_session — summary/reset actions for grok dedup + savings state.
+      scout.rs         tool_scout — natural-language subsystem discovery with deterministic context and optional model reranking.
   classify.rs          Query type detection (file path, glob, symbol, content, fallthrough).
   lang/
     mod.rs             Shared language infrastructure: detect_file_type(), package_root().
@@ -75,7 +76,7 @@ src/
   format.rs            Output formatting helpers.
   budget.rs            Token budget enforcement.
   map.rs               Codebase map generation (CLI only, disabled as MCP tool).
-  overview.rs          Project fingerprint for MCP initialization (manifest, languages, modules, deps, git). Instant orientation without a tool call.
+  overview.rs          CLI-only project fingerprint (manifest, languages, modules, deps, git) for `tilth overview`.
   timeout.rs           Per-request wall-clock timeout for sync tool calls — worker thread + bounded channel, tracks abandoned threads on expiry.
   util.rs              atomic_write_bytes() — shared by edit.rs and install.rs.
   types.rs             Shared types (QueryType, Lang, OutlineEntry, etc.).
@@ -155,10 +156,10 @@ Task definitions are in `benchmark/tasks/*.py`. Each has `name`, `prompt`, `grou
 
 Server instructions sent via MCP protocol live in `prompts/`:
 
-- `prompts/mcp-base.md` — base instructions for all modes (wired in as `SERVER_INSTRUCTIONS`)
-- `prompts/mcp-edit.md` — appended in edit mode (wired in as `EDIT_MODE_EXTRA`)
+- `prompts/mcp-base.md` — complete read-only mode instructions
+- `prompts/mcp-edit.md` — complete edit-mode instructions
 
-`src/mcp/mod.rs` embeds both at compile time via `include_str!`. `AGENTS.md` is the user-facing copy; regenerate it via `./scripts/regen-agents-md.sh` after any change so both surfaces stay in lockstep. The byte-lock tests in `src/mcp/mod.rs` (`server_instructions_byte_lock`, `edit_mode_extra_byte_lock`) flag accidental drift and must be updated alongside intentional prompt edits.
+`src/mcp/mod.rs` embeds both at compile time via `include_str!` and selects one per mode. `AGENTS.md` is only the human-facing concatenated copy; regenerate it via `./scripts/regen-agents-md.sh` after modifying either prompt. Prompt budget and byte-lock tests in `src/mcp/mod.rs` keep each initialization payload at or below 2 KiB and flag accidental drift.
 
 Changes to MCP instructions must be surgical — no bloat. Haiku is sensitive to:
 

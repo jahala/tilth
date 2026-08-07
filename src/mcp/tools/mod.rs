@@ -167,7 +167,7 @@ mod tests {
         // passes a relative scope/path without an absolute root. An omitted
         // `scope` must keep today's default behavior (server launch cwd, exactly
         // as on main) — refusing here would break the default flow of every
-        // session (e.g. a bare tilth_search/tilth_files call with no scope).
+        // session (e.g. a bare tilth_search/tilth_list call with no scope).
         let args = serde_json::json!({});
         let (scope, warning) = resolve_scope(&args, None).unwrap();
         assert_eq!(scope, PathBuf::from("."));
