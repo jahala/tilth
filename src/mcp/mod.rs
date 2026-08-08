@@ -278,6 +278,18 @@ fn handle_request(req: &JsonRpcRequest, services: &Services) -> JsonRpcResponse 
     }
 }
 
+fn append_batch_nudge(body: String, tip: Option<String>) -> String {
+    let Some(tip) = tip else {
+        return body;
+    };
+    // Exactly one blank line between the body and the tip, whatever trailing
+    // newlines the body carries.
+    let mut out = body.trim_end_matches('\n').to_string();
+    out.push_str("\n\n");
+    out.push_str(&tip);
+    out
+}
+
 /// Execute a tool by name with the given arguments. Returns formatted output or error string.
 /// No classifier involved — the caller specifies the tool explicitly.
 fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String, String> {
@@ -299,7 +311,7 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
             }
         }
     }
-    match tool {
+    let result = match tool {
         "tilth_read" => tool_read(args, services.cache(), services.session(), edit_mode),
         "tilth_search" => tool_search(
             args,
@@ -314,7 +326,11 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
         "tilth_diff" => tool_diff(args),
         "tilth_write" if edit_mode => tool_write(args, services.session(), services.bloom()),
         _ => Err(format!("unknown tool: {tool}")),
-    }
+    };
+    // Observe every dispatch — an errored call still advances/resets the
+    // streak — but only successful responses can carry the tip.
+    let tip = services.session().batch_nudge(tool, args, result.is_ok());
+    result.map(|body| append_batch_nudge(body, tip))
 }
 
 // ---------------------------------------------------------------------------
@@ -428,6 +444,81 @@ mod tests {
             a["cwd"] = serde_json::json!("/");
         }
         a
+    }
+
+    /// The nudge must ride the REAL dispatch path: two consecutive
+    /// single-item reads through `dispatch_tool` end with the tip after
+    /// exactly one blank line, whatever trailing newlines the body carries.
+    /// Guards against the append being dropped from `dispatch_tool` (the
+    /// other nudge tests exercise `Session` directly and would stay green).
+    #[test]
+    fn dispatch_tool_appends_batch_nudge_after_one_blank_line() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(dir.path().join("b.rs"), "fn b() {}\n").unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        let services = Services::new(false);
+
+        let first = dispatch_tool(
+            "tilth_read",
+            &serde_json::json!({ "paths": ["a.rs"], "cwd": cwd }),
+            &services,
+        )
+        .unwrap();
+        assert!(
+            !first.contains("TIP:"),
+            "first call must not nudge: {first}"
+        );
+
+        let second = dispatch_tool(
+            "tilth_read",
+            &serde_json::json!({ "paths": ["b.rs"], "cwd": cwd }),
+            &services,
+        )
+        .unwrap();
+        let tip = "TIP: batch into one call — paths: [\"a.rs\", \"b.rs\"].";
+        assert!(
+            second.ends_with(&format!("\n\n{tip}")),
+            "tip must follow exactly one blank line: {second:?}"
+        );
+        assert!(
+            !second.ends_with(&format!("\n\n\n{tip}")),
+            "double blank line before tip: {second:?}"
+        );
+    }
+
+    /// An errored dispatch of a different tool must break the streak — the
+    /// old `result.map` shortcut skipped observation entirely and let the
+    /// tip claim a consecutive pair that never happened.
+    #[test]
+    fn errored_dispatch_of_different_tool_resets_batch_nudge_streak() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(dir.path().join("b.rs"), "fn b() {}\n").unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        let services = Services::new(false);
+
+        for path in ["a.rs", "b.rs"] {
+            if path == "b.rs" {
+                // Errored non-batchable call between the two reads.
+                dispatch_tool(
+                    "tilth_grok",
+                    &serde_json::json!({ "target": "x" }),
+                    &services,
+                )
+                .expect_err("grok without cwd must error");
+            }
+            let body = dispatch_tool(
+                "tilth_read",
+                &serde_json::json!({ "paths": [path], "cwd": cwd }),
+                &services,
+            )
+            .unwrap();
+            assert!(
+                !body.contains("TIP:"),
+                "streak must reset across the errored call: {body}"
+            );
+        }
     }
 
     /// Integration seam: the real JSON-RPC dispatch path (`dispatch_tool`) must
