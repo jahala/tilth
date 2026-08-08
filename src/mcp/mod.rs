@@ -76,7 +76,7 @@ const EDIT_MODE_INSTRUCTIONS: &str = include_str!("../../prompts/mcp-edit.md");
 /// that drops or reworks the explicit-cwd directive fails the test rather than
 /// silently changing the model-facing cwd contract.
 #[cfg(test)]
-const CWD_PATHS_SPAN: &str = "PATHS: set `cwd` to your ABSOLUTE checkout directory on every call. Relative paths/scopes anchor under `cwd`; absolute paths pass through as-is. DO NOT pass a relative path/scope without `cwd` — the server's cwd is frozen at startup and is NOT your shell's cwd. `..` traversal in a relative path is refused.";
+const CWD_PATHS_SPAN: &str = "DO NOT omit `cwd`: set it to the absolute checkout directory on every call. Relative paths/scopes anchor there; absolute paths pass through. The server cannot see your shell cwd; `..` in relative paths is refused.";
 
 /// Select and return the complete MCP `instructions` string for the given
 /// mode: the standalone base file, or the standalone edit-mode file — never
@@ -626,24 +626,27 @@ mod tests {
     fn server_instructions_byte_lock() {
         assert_eq!(
             SERVER_INSTRUCTIONS.len(),
-            2041,
+            1420,
             "SERVER_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(SERVER_INSTRUCTIONS
             .starts_with("tilth — code intelligence MCP server. Replaces grep, cat, find, ls"));
-        assert!(SERVER_INSTRUCTIONS
-            .ends_with("DO NOT re-read content already shown in expanded results."));
+        assert!(SERVER_INSTRUCTIONS.ends_with("DO NOT re-read expanded search content."));
         assert!(
             !SERVER_INSTRUCTIONS.contains("\n\n\n"),
             "SERVER_INSTRUCTIONS must not introduce triple newlines (likely a trailing-newline drift in prompts/mcp-base.md)"
         );
         assert!(
-            SERVER_INSTRUCTIONS.contains("DO NOT pass a relative path/scope without `cwd`"),
+            SERVER_INSTRUCTIONS.contains("DO NOT omit `cwd`"),
             "require-cwd path discipline must remain in SERVER_INSTRUCTIONS"
         );
         assert!(
-            SERVER_INSTRUCTIONS.contains("tilth_grok(target: \"parse_unified_diff\", cwd:"),
+            SERVER_INSTRUCTIONS.contains("tilth_grok(target: \"parse_diff\", cwd:"),
             "tilth_grok routing must remain in SERVER_INSTRUCTIONS"
+        );
+        assert!(
+            SERVER_INSTRUCTIONS.contains("set `kind` (symbol|content|regex|callers)"),
+            "search kind grammar must remain in SERVER_INSTRUCTIONS"
         );
         assert!(
             SERVER_INSTRUCTIONS.contains("mcp__tilth__tilth_search")
@@ -656,22 +659,27 @@ mod tests {
     fn edit_mode_instructions_byte_lock() {
         assert_eq!(
             EDIT_MODE_INSTRUCTIONS.len(),
-            2041,
+            1777,
             "EDIT_MODE_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(EDIT_MODE_INSTRUCTIONS.starts_with(
             "tilth — code intelligence MCP server. Replaces grep, cat, find, ls, git diff, and host edit tools"
         ));
-        assert!(EDIT_MODE_INSTRUCTIONS
-            .ends_with("DO NOT re-read content already shown in expanded results."));
+        assert!(EDIT_MODE_INSTRUCTIONS.ends_with("DO NOT re-read expanded search content."));
         assert!(
             !EDIT_MODE_INSTRUCTIONS.contains("\n\n\n"),
             "EDIT_MODE_INSTRUCTIONS must not introduce triple newlines"
         );
-        assert!(EDIT_MODE_INSTRUCTIONS.contains("tilth_write(edits: [{path, tag, ops}])"));
+        assert!(EDIT_MODE_INSTRUCTIONS.contains(
+            "edits: [{path: \"src/a.rs\", tag: \"1A2B\", ops: [...]}, {path: \"src/b.rs\""
+        ));
         assert!(
-            EDIT_MODE_INSTRUCTIONS.contains("Ops are line-addressed"),
+            EDIT_MODE_INSTRUCTIONS.contains("Line ops use copied integer"),
             "op grammar pointer must remain in EDIT_MODE_INSTRUCTIONS"
+        );
+        assert!(
+            EDIT_MODE_INSTRUCTIONS.contains("must escape tabs/newlines"),
+            "control-char escape rule must remain in EDIT_MODE_INSTRUCTIONS"
         );
     }
 
@@ -1781,12 +1789,12 @@ mod tests {
                 );
             }
             assert!(
-                s.contains("DO NOT cat/head/tail/sed repo files via shell"),
+                s.contains("DO NOT use shell for repo files or history"),
                 "missing shell DO NOT line (edit={edit})"
             );
             assert!(
-                s.contains("DO NOT grep/rg/ls/find via shell"),
-                "missing shell DO NOT line (edit={edit})"
+                s.contains("cat/head/tail/sed/grep/rg/ls/find/git diff/git log"),
+                "shell DO NOT line must enumerate the replaced commands (edit={edit})"
             );
         }
     }

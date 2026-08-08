@@ -7,7 +7,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         serde_json::json!({
             "name": "tilth_search",
             "annotations": { "readOnlyHint": true },
-            "description": "Search code — finds definitions, usages, and text. Replaces grep/rg and the host Grep tool for all code search. Use to explore or locate any symbol/text/regex; do NOT use to read a known file or symbol (use tilth_read) or to check a file's dependents (use tilth_deps). Example: tilth_search(queries: [{query: \"handleRequest\"}], cwd: \"/abs/checkout\").",
+            "description": "Search definitions, usages, text, regex, or callers. DO NOT use for a known file/symbol (tilth_read) or file dependencies (tilth_deps). Batch example: tilth_search(queries: [{query: \"foo\"}, {query: \"bar\", kind: \"symbol\"}], cwd: \"/abs/repo\").",
             "inputSchema": {
                 "type": "object",
                 "required": ["queries", "cwd"],
@@ -18,45 +18,45 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                             "type": "object",
                             "required": ["query"],
                             "properties": {
-                                "query": {"type": "string", "description": "Symbol name, text string, or regex pattern. e.g. 'resolve_dependencies' or 'ServeHTTP,Next' for multi-symbol lookup. Commas mean multiple symbols (works under the default and kind:symbol/callers); for mixed symbol + content terms use separate query objects instead."},
+                                "query": {"type": "string", "description": "Symbol, text, or regex. Commas split up to five symbols only for any/symbol/callers; use separate entries for mixed terms."},
                                 "glob": {"type": "string"},
                                 "kind": {"type": "string", "enum": ["any", "symbol", "content", "regex", "callers"]}
                             }
                         },
                         "minItems": 1,
                         "maxItems": 10,
-                        "description": "Array of query objects, each run independently with optional per-entry `kind`/`glob` overriding the top-level values. A single-element array runs one search and returns a clean result; multiple entries concatenate under `## query: <q>` headers. For one search pass `queries: [{query: \"foo\"}]`."
+                        "description": "Required batch of 1-10 queries; entry kind/glob overrides top-level. Multiple results get query headers."
                     },
                     "scope": {
                         "type": "string",
-                        "description": "Only use scope to search a specific subdirectory. DO NOT USE scope if you want to search the current working directory (initial search)."
+                        "description": "Subdirectory only; omit for checkout-wide search."
                     },
                     "kind": {
                         "type": "string",
                         "enum": ["any", "symbol", "content", "regex", "callers"],
                         "default": "any",
-                        "description": "Search type. Omit or 'any' for the merged default: symbol + content + caller results in one call. symbol: structural definitions + usages. content: literal text. regex: regex pattern. callers: find all call sites of a symbol."
+                        "description": "any (default) merges symbol, content, and caller results; symbol finds definitions/usages; content is literal; regex is regex; callers finds call sites."
                     },
                     "expand": {
                         "type": "number",
                         "default": 2,
-                        "description": "Number of top matches to expand with full source code. Definitions show the full function/class body. Usages show ±10 context lines."
+                        "description": "Top matches expanded with full definitions or ±10 usage lines (default 2)."
                     },
                     "context": {
                         "type": "string",
-                        "description": "Path to the file the agent is currently editing. Boosts ranking of matches in the same directory or package."
+                        "description": "Edited file path; boosts nearby matches."
                     },
                     "budget": {
                         "type": "number",
-                        "description": "Max tokens in response."
+                        "description": "Max response tokens."
                     },
                     "glob": {
                         "type": "string",
-                        "description": "File pattern filter. Whitelist: \"*.rs\" (only Rust files). Exclude: \"!*.test.ts\" (skip test files). Brace expansion: \"*.{go,rs}\" (Go and Rust). Path patterns: \"src/**/*.ts\"."
+                        "description": "Glob filter: \"*.rs\" includes; \"!*.test.ts\" excludes; \"*.{go,rs}\" expands braces; \"src/**/*.ts\" matches paths."
                     },
                     "if_modified_since": {
                         "type": "string",
-                        "description": "ISO-8601 timestamp. Result sections for files unchanged since this return `(unchanged @ <ts>)` stubs instead of bodies."
+                        "description": "ISO-8601 timestamp; unchanged result files return stubs."
                     },
                     "cwd": cwd_prop.clone()
                 }
@@ -75,22 +75,22 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "items": { "type": "string" },
                         "minItems": 1,
                         "maxItems": 20,
-                        "description": "File paths (max 20). Suffix grammar on each path: `path#n-m` (line range), `path#n` (from line n), `path### Heading` (markdown heading), `path#symbol_name` (code symbol). Example: paths: [\"src/foo.rs#do_thing\", \"README.md#10-40\"]. Pass every file you need in one call; for a single file use a one-element array. Singular `path` is not accepted, and schema-validating hosts reject a bare string — always send an array."
+                        "description": "Required batch (max 20). Suffixes: `path#n-m`, `path#n` (from line n), `path### Heading`, or `path#symbol`."
                     },
                     "mode": {
                         "type": "string",
                         "enum": ["auto", "full", "signature", "stripped"],
                         "default": "auto",
-                        "description": "Defaults to `auto` — omit unless you need to override smart-sizing. auto: small files return full; large code returns signature lines with `<line>:<hash>` prefixes; large markdown returns headings + preview. full forces full content. signature forces outline. stripped removes plain comments, debug logs, and blank-line runs (non-editable view)."
+                        "description": "auto (default): small files full; large code signatures; large Markdown outline. full forces content; signature forces outline; stripped removes plain comments/debug logs/blank runs and is non-editable."
                     },
                     "if_modified_since": {
                         "type": "string",
-                        "description": "ISO-8601 timestamp. Files unchanged since this return `(unchanged @ <ts>)` stubs."
+                        "description": "ISO-8601 timestamp; unchanged files return stubs."
                     },
                     "cwd": cwd_prop.clone(),
                     "budget": {
                         "type": "number",
-                        "description": "Max tokens in response."
+                        "description": "Max response tokens."
                     }
                 }
             }
@@ -98,7 +98,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         serde_json::json!({
             "name": "tilth_list",
             "annotations": { "readOnlyHint": true },
-            "description": "List files as a directory tree with token-size rollups per directory. Replaces `ls -R`/`tree`. Use ONLY when you have no symbol or text to search for; for searching use tilth_search, for reading a known file use tilth_read. Example: tilth_list(patterns: [\"*.rs\"], cwd: \"/abs/checkout\").",
+            "description": "List a directory tree with token-size rollups. Use only without a search term; otherwise search/read. Example: tilth_list(patterns: [\"*.rs\", \"*.toml\"], cwd: \"/abs/repo\").",
             "inputSchema": {
                 "type": "object",
                 "required": ["cwd"],
@@ -108,19 +108,19 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "items": { "type": "string" },
                         "minItems": 1,
                         "maxItems": 20,
-                        "description": "Glob patterns rendered into one tree, e.g. ['*.rs'] or ['*.rs', '*.toml']. Capped at 20. Optional — omit for the full layout tree (default [\"*\"])."
+                        "description": "Optional batch (max 20); omission lists all files."
                     },
                     "depth": {
                         "type": "number",
-                        "description": "Cap directory depth (1 = top-level only)."
+                        "description": "Maximum directory depth; 1 is top-level."
                     },
                     "scope": {
                         "type": "string",
-                        "description": "Directory to root the tree at. Default: current working directory."
+                        "description": "Tree root directory; defaults to the checkout."
                     },
                     "budget": {
                         "type": "number",
-                        "description": "Max tokens in response."
+                        "description": "Max response tokens."
                     },
                     "cwd": cwd_prop.clone()
                 }
@@ -129,22 +129,22 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         serde_json::json!({
             "name": "tilth_deps",
             "annotations": { "readOnlyHint": true },
-            "description": "Blast-radius check before breaking changes. Shows what a file imports (local + external) and what other files call its exports, with symbol-level detail. Use ONLY when your planned edit changes a function signature, removes/renames an export, or modifies behavior that callers rely on. Do NOT use for reading files, adding new code, or internal-only changes — use tilth_read instead. Example: tilth_deps(path: \"src/cache.rs\", cwd: \"/abs/checkout\").",
+            "description": "Check a file's imports and dependent callers before changing/removing an export or relied-on behavior. DO NOT use for ordinary reads or internal edits. Example: tilth_deps(path: \"src/cache.rs\", cwd: \"/abs/repo\").",
             "inputSchema": {
                 "type": "object",
                 "required": ["path", "cwd"],
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "File to check before making breaking changes."
+                        "description": "File whose blast radius to check."
                     },
                     "scope": {
                         "type": "string",
-                        "description": "Directory to search for dependents. Default: project root."
+                        "description": "Dependent-search directory; defaults to the checkout."
                     },
                     "budget": {
                         "type": "number",
-                        "description": "Max tokens. Truncates 'Used by' first."
+                        "description": "Max tokens; truncates dependents first."
                     },
                     "cwd": cwd_prop.clone()
                 }
@@ -153,27 +153,27 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         serde_json::json!({
             "name": "tilth_grok",
             "annotations": { "readOnlyHint": true },
-            "description": "Get everything structural about a symbol in one call — definition, body, signature, doc, callees, callers, siblings, tests. Use ONLY for 'understand this symbol' questions. Do NOT use for concept search (use tilth_search) or reading file contents (use tilth_read). Example: tilth_grok(target: \"parse_unified_diff\", cwd: \"/abs/checkout\").",
+            "description": "Get one symbol's definition, body, signature, docs, callees, callers, siblings, and tests. DO NOT use for concept search or file reads. Example: tilth_grok(target: \"parse_unified_diff\", cwd: \"/abs/repo\").",
             "inputSchema": {
                 "type": "object",
                 "required": ["target", "cwd"],
                 "properties": {
                     "target": {
                         "type": "string",
-                        "description": "Symbol name, e.g. 'parse_unified_diff'. Also accepts 'src/diff/parse.rs:7' or 'Type::method'."
+                        "description": "Symbol, `file:line`, or `Type::method`."
                     },
                     "scope": {
                         "type": "string",
-                        "description": "Subdirectory to narrow the search. Default: project root."
+                        "description": "Subdirectory to disambiguate; defaults to the checkout."
                     },
                     "full": {
                         "type": "boolean",
                         "default": false,
-                        "description": "Widen caps: 50 callers, 30 callees, 30 siblings, 30 tests (default 5/5/8/8)."
+                        "description": "Widen caller/callee/sibling/test caps from 5/5/8/8 to 50/30/30/30."
                     },
                     "budget": {
                         "type": "number",
-                        "description": "Max tokens in response."
+                        "description": "Max response tokens."
                     },
                     "cwd": cwd_prop.clone()
                 }
@@ -182,7 +182,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         serde_json::json!({
             "name": "tilth_diff",
             "annotations": { "readOnlyHint": true },
-            "description": "Structural diff showing function-level changes. Replaces git diff — use for 'what changed' questions; do NOT use Bash(git diff) or git log --patch. git-based sources (uncommitted/staged/refs) diff the server's project directory; only patch/a/b anchor under cwd. Example: tilth_diff(cwd: \"/abs/checkout\") for uncommitted changes; tilth_diff(source: \"HEAD~1\", cwd: \"/abs/checkout\") for a commit.",
+            "description": "Structural function-level diff. DO NOT use shell git diff/log. Git sources use the server project; only patch/a/b paths anchor under cwd. Examples: tilth_diff(cwd: \"/abs/repo\"); tilth_diff(source: \"HEAD~1\", cwd: \"/abs/repo\").",
             "inputSchema": {
                 "type": "object",
                 "required": ["cwd"],
@@ -190,45 +190,45 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     "cwd": cwd_prop.clone(),
                     "source": {
                         "type": "string",
-                        "description": "Diff source: 'uncommitted' (default), 'staged', or a git ref (e.g. 'HEAD~1', 'main..feat'). Ignored when a, b, patch, or log is set."
+                        "description": "uncommitted (default), staged, or git ref; ignored with a/b, patch, or log."
                     },
                     "scope": {
                         "type": "string",
-                        "description": "Restrict diff output to a file (suffix-matched, e.g. 'a.rs'). In overview mode only, also accepts a repo-root-relative directory prefix (e.g. 'src/fanout'); log mode takes a file scope only."
+                        "description": "File suffix or, in overview only, checkout-relative directory; log accepts files only."
                     },
                     "a": {
                         "type": "string",
-                        "description": "First file for a file-to-file diff. Must be used together with b."
+                        "description": "First file; requires b."
                     },
                     "b": {
                         "type": "string",
-                        "description": "Second file for a file-to-file diff. Must be used together with a."
+                        "description": "Second file; requires a."
                     },
                     "patch": {
                         "type": "string",
-                        "description": "Path to a .patch file to parse instead of running git diff."
+                        "description": "Patch-file path instead of git diff."
                     },
                     "log": {
                         "type": "string",
-                        "description": "Git log range (e.g. 'HEAD~5..HEAD') — shows per-commit structural summaries."
+                        "description": "Git range for per-commit summaries, e.g. `HEAD~5..HEAD`."
                     },
                     "search": {
                         "type": "string",
-                        "description": "Filter output to symbols or files matching this substring (case-insensitive)."
+                        "description": "Case-insensitive symbol/file substring filter."
                     },
                     "blast": {
                         "type": "boolean",
                         "default": false,
-                        "description": "Show blast-radius warnings for signature-changed symbols."
+                        "description": "Warn on callers of changed signatures."
                     },
                     "expand": {
                         "type": "number",
                         "default": 0,
-                        "description": "Number of changed symbols to expand with full source context."
+                        "description": "Changed symbols to expand with source."
                     },
                     "budget": {
                         "type": "number",
-                        "description": "Max tokens in response."
+                        "description": "Max response tokens."
                     }
                 }
             }
@@ -239,20 +239,20 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         tools.push(serde_json::json!({
             "name": "tilth_write",
             "annotations": { "readOnlyHint": false },
-            "description": "Edit files with a JSON `edits` array of `{path, tag?, ops}` section objects. Replaces the host Edit and Write tools — DO NOT use those. Read first: tilth_read emits a `[path#TAG]` header then `N:content` lines; copy the 4-hex TAG into `tag` and reference those 1-based line numbers. Each op is tagged by `op`: replace {start,end,content}, delete {start,end}, insert_before/insert_after {line,content}, prepend/append {content}, replace_block/insert_after_block {at,content} and delete_block {at} where `at` is a line number or a \"#symbol\" string (leading `#` optional), delete_file, move_file {dest}. `content` is a single string with embedded newlines. Omit `tag` to seed a NEW file. The TAG binds the section to the content you read: if the file drifted, tilth 3-way-merges your ops onto it; if it can't, the section is rejected — re-read that file. Sections are independent (best-effort); results report per `## <path>`. Max 20 sections. Example: tilth_write(edits: [{path: \"src/x.rs\", tag: \"1A2B\", ops: [{op: \"replace\", start: 2, end: 2, content: \"let y = 1;\"}]}], cwd: \"/abs/checkout\").",
+            "description": "Edit after a tagged read. tilth_read prints `[path#TAG]` above `N:content`; copy its TAG and shown 1-based integer lines—NEVER invent either. `edits` contains `{path, tag?, ops}` sections; omit tag only for a new file. Ops: replace/delete use `{start,end}`; insert_before/after use `{line}`; prepend/append; block ops use `{at}`; delete_file; move_file. Escape JSON content as `\\t`/`\\n`; literal controls fail before the server. Drift 3-way-merges or rejects; re-read a rejected file. Sections are independent; max 20. Example: tilth_write(edits: [{path: \"a.rs\", tag: \"1A2B\", ops: [{op: \"delete\", start: 2, end: 2}, {op: \"append\", content: \"x\"}]}, {path: \"b.rs\", tag: \"3C4D\", ops: [{op: \"delete\", start: 3, end: 3}, {op: \"append\", content: \"y\"}]}], cwd: \"/abs/repo\").",
             "inputSchema": {
                 "type": "object",
                 "required": ["edits", "cwd"],
                 "properties": {
                     "edits": {
                         "type": "array",
-                        "description": "Array of {path, tag?, ops} section objects. Copy the 4-hex TAG from the edit-mode read into `tag`; omit `tag` to seed a new file. Max 20 sections.",
+                        "description": "Batch of `{path, tag?, ops}` sections. Copy read tags; omit tag only for new files. Max 20.",
                         "items": {
                             "type": "object",
                             "required": ["path", "ops"],
                             "properties": {
-                                "path": { "type": "string", "description": "File path, absolute or relative to `cwd`." },
-                                "tag": { "type": "string", "description": "4-hex whole-file tag from the edit-mode read. Omit to seed a new file." },
+                                "path": { "type": "string", "description": "Absolute path or relative to cwd." },
+                                "tag": { "type": "string", "description": "4-hex whole-file read tag; omit only for a new file." },
                                 "ops": {
                                     "type": "array",
                                     "items": {
@@ -279,7 +279,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     "diff": {
                         "type": "boolean",
                         "default": false,
-                        "description": "Set true to include a compact before/after diff per section."
+                        "description": "Include a compact diff per section."
                     },
                     "cwd": cwd_prop.clone()
                 }
@@ -293,7 +293,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
 /// The shared `cwd` schema property. The description text is model-facing
 /// and must always tell the model to set `cwd` explicitly.
 fn cwd_property() -> Value {
-    serde_json::json!({ "type": "string", "description": "Your absolute checkout directory — always set this explicitly. Relative paths/scopes anchor under it; absolute paths pass through. The server cannot see your shell cwd." })
+    serde_json::json!({ "type": "string", "description": "Absolute checkout directory; always set this explicitly. Relative paths/scopes anchor here; absolute paths pass; shell cwd is invisible." })
 }
 
 #[cfg(test)]

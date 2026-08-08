@@ -1,21 +1,23 @@
-tilth — code intelligence MCP server. Replaces grep, cat, find, ls, and git diff with AST-aware, token-efficient equivalents.
+tilth — code intelligence MCP server. Replaces grep, cat, find, ls, and git diff.
 
-Call tools by full MCP name: mcp__tilth__tilth_search, mcp__tilth__tilth_read, etc. DO NOT call bare names — they are not registered tools.
+DO NOT call bare names; use full names such as `mcp__tilth__tilth_search` and `mcp__tilth__tilth_read`.
 
-PATHS: set `cwd` to your ABSOLUTE checkout directory on every call. Relative paths/scopes anchor under `cwd`; absolute paths pass through as-is. DO NOT pass a relative path/scope without `cwd` — the server's cwd is frozen at startup and is NOT your shell's cwd. `..` traversal in a relative path is refused.
+DO NOT omit `cwd`: set it to the absolute checkout directory on every call. Relative paths/scopes anchor there; absolute paths pass through. The server cannot see your shell cwd; `..` in relative paths is refused.
 
-Arrays are REQUIRED: tilth_read → paths: [...]; tilth_list → patterns: [...]; tilth_search → queries: [{query}]. Singular query/path/pattern is rejected.
+BATCH related work; array parameters never accept singular values:
 
-ROUTE BY QUESTION:
+- `queries: [{query: "foo"}, {query: "bar", kind: "symbol"}]`
+- `paths: ["src/a.rs#12-40", "src/b.rs#parse"]`
+- `patterns: ["*.rs", "*.toml"]`
 
-- Find or explore anything → tilth_search(queries: [{query: "handleRequest"}], cwd: "/abs/checkout"). Omit kind to explore — merged defs+usages+callers in one call; set kind (symbol|content|regex|callers) when you know the shape. Batch related queries into one call.
-- Read a file, symbol, or range → tilth_read(paths: ["src/x.rs#parse_config", "README.md#10-40"], cwd: "/abs/checkout"). Smart-sized automatically.
-- Who uses this file / who imports it → tilth_deps(path: "src/cache.rs", cwd: "/abs/checkout"). One call for the whole blast radius. DO NOT assemble it from import-greps or symbol-by-symbol callers searches.
-- Understand ONE symbol deeply (def + callers + callees + tests) → tilth_grok(target: "parse_unified_diff", cwd: "/abs/checkout"). Replaces the search → expand → callers chain.
-- What changed → tilth_diff() for uncommitted work; tilth_diff(source: "HEAD~1") for a commit. DO NOT use Bash(git diff) or git log --patch.
-- Browse structure with no query in mind → tilth_list(patterns: ["*.rs"]).
+ROUTE:
 
-DO NOT cat/head/tail/sed repo files via shell → tilth_read.
-DO NOT grep/rg/ls/find via shell → tilth_search / tilth_list.
-Shell is for tests, builds, and non-file-IO commands only.
-DO NOT re-read content already shown in expanded results.
+- Find/explore → `tilth_search`; omitted `kind` merges definitions, usages, and callers; set `kind` (symbol|content|regex|callers) when the shape is known.
+- Read known files/symbols/ranges → `tilth_read`.
+- Importers/imports → `tilth_deps`; DO NOT assemble it from import-greps or repeated callers searches.
+- Understand one symbol → `tilth_grok(target: "parse_diff", cwd: "/abs/repo")`; replaces search → expand → callers.
+- Changes → `tilth_diff`, optional `source: "HEAD~1"`.
+- Browse without a search term → `tilth_list`.
+
+DO NOT use shell for repo files or history (cat/head/tail/sed/grep/rg/ls/find/git diff/git log); use `tilth_read`, `tilth_search`, `tilth_list`, `tilth_diff`. Shell is for tests, builds, and non-file operations.
+DO NOT re-read expanded search content.
