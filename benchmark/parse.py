@@ -446,6 +446,56 @@ def tool_call_counts(result: RunResult) -> dict[str, int]:
     return counts
 
 
+# Tools with a batch (array) form, matched on the bare server-side name so
+# mcp__tilth__-prefixed and bare call records both qualify. tilth_deps and the
+# native tools are single-target by design and must stay out of the metric.
+_BATCHABLE_TOOLS = ("tilth_read", "tilth_search", "tilth_list", "tilth_write")
+# Array params across schema generations: this fork uses paths/queries/
+# patterns/edits; the upstream and PR #196 binaries the pinned arms run use
+# files for tilth_write and singular path/query fallbacks for read/search.
+_BATCH_PARAMS = ("paths", "queries", "patterns", "files", "edits")
+_SINGULAR_PARAMS = ("path", "query", "pattern")
+
+
+def _is_batchable_tool(name: str) -> bool:
+    bare = str(name).rsplit("__", 1)[-1]
+    return bare in _BATCHABLE_TOOLS
+
+
+def _batch_size(tool_input: object) -> Optional[int]:
+    """Items in one call; None when the input carries no usable batch shape."""
+    if not isinstance(tool_input, dict):
+        return None
+    for param in _BATCH_PARAMS:
+        value = tool_input.get(param)
+        if isinstance(value, list):
+            # An empty array is a malformed call, not a batch of zero.
+            return len(value) or None
+        if isinstance(value, str):
+            # The server coerces a bare-string array param to one item — these
+            # are exactly the un-batched calls the metric must count.
+            return 1
+        if value is not None:
+            return None
+    for param in _SINGULAR_PARAMS:
+        if tool_input.get(param) is not None:
+            return 1
+    return None
+
+
+def tool_batch_sizes(result: RunResult) -> dict[str, list[int]]:
+    """Per-call batch sizes by tool, in call order, for batchable tools only."""
+    sizes: dict[str, list[int]] = {}
+    for turn in result.turns:
+        for tool_call in turn.tool_calls:
+            if not _is_batchable_tool(tool_call.name):
+                continue
+            size = _batch_size(tool_call.input)
+            if size is not None:
+                sizes.setdefault(tool_call.name, []).append(size)
+    return sizes
+
+
 def extract_stream_error(stdout: str) -> Optional[str]:
     """Pull the human-readable error out of a codex/opencode JSON event stream.
 
