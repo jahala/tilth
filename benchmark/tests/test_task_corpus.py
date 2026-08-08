@@ -109,17 +109,21 @@ def test_hardened_required_strings_are_discriminating() -> None:
         "express_render_chain": ["application.js", "app.render", "tryRender"],
         "express_res_send": ["response.js", "res.send", "Content-Length"],
         "gin_middleware_chain": [
-            "gin.go",
-            "Engine.ServeHTTP",
+            "gin.go|func (engine *Engine) ServeHTTP",
+            "Engine.ServeHTTP|func (engine *Engine) ServeHTTP",
             "HandlersChain",
-            "Context.Next",
+            "Context.Next|func (c *Context) Next",
         ],
-        "gin_context_next": ["context.go", "Context.Next", "HandlersChain"],
-        "grok_context_next": [
-            "context.go",
-            "Context.Next",
+        "gin_context_next": [
+            "context.go|func (c *Context) Next",
+            "Context.Next|func (c *Context) Next",
             "HandlersChain",
-            "Context.Abort",
+        ],
+        "grok_context_next": [
+            "context.go|func (c *Context) Next",
+            "Context.Next|func (c *Context) Next",
+            "HandlersChain",
+            "Context.Abort|func (c *Context) Abort|Abort()",
         ],
     }
     assert {
@@ -131,6 +135,31 @@ def test_hardened_required_strings_are_discriminating() -> None:
         for values in expected.values()
         for required in values
     )
+
+
+def test_observed_semantic_equivalents_are_not_literal_false_negatives() -> None:
+    examples = {
+        "fastapi_dependency_resolution": (
+            "get_dependant calls analyze_param for each Depends dependency"
+        ),
+        "fastapi_request_validation": (
+            "get_request_handler calls solve_dependencies, raises RequestValidationError, "
+            "and returns an inner async function app(request: Request)"
+        ),
+        "gin_context_next": (
+            "func (c *Context) Next advances HandlersChain in context.go"
+        ),
+        "gin_middleware_chain": (
+            "func (engine *Engine) ServeHTTP uses HandlersChain and func (c *Context) Next"
+        ),
+        "grok_context_next": (
+            "context.go defines func (c *Context) Next for HandlersChain; Abort() stops it"
+        ),
+    }
+
+    for name, result_text in examples.items():
+        correct, reason = TASKS[name].check_correctness(result_text, ".")
+        assert (correct, reason) == (True, "All checks passed")
 
 
 def test_new_lookup_and_control_tasks_require_fixture_specific_facts() -> None:

@@ -76,6 +76,24 @@ pub(crate) fn extract_definition_name(node: tree_sitter::Node, lines: &[&str]) -
         }
     }
 
+    // Go `type_declaration` wraps the named node: `type X struct{...}` parses
+    // as type_declaration → type_spec (or type_alias for `type X = Y`), and
+    // the `name` field lives on that inner node, so the field walk above finds
+    // nothing and every Go type definition would be dropped as nameless.
+    if node.kind() == "type_declaration" {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.kind() == "type_spec" || child.kind() == "type_alias" {
+                if let Some(name_node) = child.child_by_field_name("name") {
+                    let text = node_text_simple(name_node, lines, NodeTextMode::Full);
+                    if !text.is_empty() {
+                        return Some(text);
+                    }
+                }
+            }
+        }
+    }
+
     // JS/TS `lexical_declaration` and C# `variable_declaration` store the
     // identifier inside a `variable_declarator` child (field "declarations" /
     // unnamed children), not as a direct named field on the declaration node.
@@ -390,6 +408,33 @@ mod tests {
         assert_eq!(
             extract_definition_name(node, &lines),
             Some("Widget".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_definition_name_go_type_declaration_struct() {
+        // Go type_declaration carries no name field itself — the name lives on
+        // the inner type_spec. Without the descent every Go type definition is
+        // dropped as nameless (the gin HandlersChain grok failure).
+        let src = "type Engine struct {\n\tpool int\n}\n";
+        let tree = parse(src, Lang::Go);
+        let lines: Vec<&str> = src.lines().collect();
+        let node = find_by_kind(tree.root_node(), "type_declaration");
+        assert_eq!(
+            extract_definition_name(node, &lines),
+            Some("Engine".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_definition_name_go_type_declaration_slice_alias() {
+        let src = "type HandlersChain []HandlerFunc\n";
+        let tree = parse(src, Lang::Go);
+        let lines: Vec<&str> = src.lines().collect();
+        let node = find_by_kind(tree.root_node(), "type_declaration");
+        assert_eq!(
+            extract_definition_name(node, &lines),
+            Some("HandlersChain".to_string())
         );
     }
 

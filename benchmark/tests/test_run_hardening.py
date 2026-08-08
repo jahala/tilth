@@ -257,6 +257,8 @@ def test_run_single_uses_allowlisted_env_and_preserves_runner_flags(
         total_cache_creation_tokens=2,
         total_cache_read_tokens=1,
         result_text="correct answer",
+        available_tools=["Read", "Edit", "mcp__tilth__tilth_search"],
+        mcp_servers=[{"name": "tilth", "status": "connected"}],
     )
     parser_calls: list[tuple] = []
 
@@ -300,7 +302,9 @@ def test_run_single_uses_allowlisted_env_and_preserves_runner_flags(
         assert "--output-format" in cmd and "stream-json" in cmd
         assert "--strict-mcp-config" in cmd
         assert ["--mcp-config", "/controlled/tilth_mcp.json"] == cmd[-4:-2]
-        assert "--safe-mode" in cmd
+        sources_index = cmd.index("--setting-sources")
+        assert cmd[sources_index + 1] == ""
+        assert "--safe-mode" not in cmd
         assert "--bare" not in cmd
     elif runner == "codex":
         assert cmd[:3] == ["codex", "exec", "--json"]
@@ -415,6 +419,57 @@ def test_claude_streaming_run_does_not_inherit_stdin(
     assert (tmp_path / "stream.jsonl").read_text() == '{"type":"result"}\n'
     assert result["task"] == "runner_stream_task"
     assert result["model"] == "configured-claude-model"
+
+
+def test_mcp_armed_claude_cell_without_tilth_tools_raises(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A tilth-armed cell whose session exposes no mcp__tilth__ tools ran
+    native-only (exactly what --safe-mode caused) and must fail loudly, not
+    produce a silently invalid comparison row."""
+    task = _RunnerTask()
+    monkeypatch.setitem(run.TASKS, "runner_mcp_task", task)
+    monkeypatch.setitem(run.MODELS, "haiku", "configured-claude-model")
+    monkeypatch.setitem(run.RUNNERS, "haiku", "claude")
+    monkeypatch.setitem(
+        run.MODES,
+        "runner_mcp_mode",
+        ModeConfig(
+            name="runner_mcp_mode",
+            tools=["Read"],
+            mcp_config_path="/controlled/tilth_mcp.json",
+            description="mcp fail-fast test",
+            binary_path="/opt/tilth/bin/tilth",
+            tilth_version="9.9.9",
+        ),
+    )
+    monkeypatch.setattr(run, "get_repo_path", lambda _: tmp_path)
+    monkeypatch.setattr(run, "parse_stream_json", lambda _: RunResult(
+        session_id="session",
+        turns=[],
+        num_turns=1,
+        total_cost_usd=0.01,
+        duration_ms=1,
+        duration_api_ms=1,
+        total_input_tokens=1,
+        total_output_tokens=2,
+        total_cache_creation_tokens=0,
+        total_cache_read_tokens=0,
+        result_text="correct answer",
+        available_tools=["Bash", "Edit", "Glob", "Grep", "Read"],
+        mcp_servers=[],
+    ))
+    monkeypatch.setattr(
+        run.subprocess,
+        "run",
+        lambda *args, **kwargs: run.subprocess.CompletedProcess(
+            args, 0, stdout="{}", stderr="",
+        ),
+    )
+
+    with pytest.raises(run.McpUnavailableError, match="runner_mcp_mode"):
+        run.run_single("runner_mcp_task", "runner_mcp_mode", "haiku", 0)
 
 
 def test_cell_ceiling_rejects_an_expanded_experiment() -> None:

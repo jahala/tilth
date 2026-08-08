@@ -10,7 +10,7 @@ import argparse
 import json
 import math
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
 from statistics import mean, median, stdev
@@ -223,21 +223,17 @@ def find_median_run(runs: list[dict], metric: str) -> dict:
     return sorted_runs[len(sorted_runs) // 2]
 
 
-def merge_tool_calls(runs: list[dict]) -> dict[str, float]:
-    """Merge tool_calls dicts from multiple runs and compute median counts."""
-    # Collect all tool names
-    all_tools = set()
+def total_tool_calls(runs: list[dict]) -> dict[str, int]:
+    """Sum tool_calls across runs so every tool that got used shows up."""
+    totals: dict[str, int] = {}
     for run in runs:
-        if "tool_calls" in run:
-            all_tools.update(run["tool_calls"].keys())
-
-    # Compute median count for each tool
-    result = {}
-    for tool in all_tools:
-        counts = [run.get("tool_calls", {}).get(tool, 0) for run in runs]
-        result[tool] = median(counts)
-
-    return result
+        tool_calls = run.get("tool_calls")
+        if not isinstance(tool_calls, dict):
+            continue
+        for tool, count in tool_calls.items():
+            if isinstance(count, (int, float)):
+                totals[tool] = totals.get(tool, 0) + int(count)
+    return totals
 
 CAPABILITIES = ("locate", "trace", "fix", "debug", "control")
 
@@ -397,6 +393,207 @@ def _flags_section(results: list[dict]) -> list[str]:
     return lines
 
 
+def _failure_type(result: dict) -> tuple[str, str] | None:
+    """Classify an unsuccessful cell from runner error first, then grader reason."""
+    if result.get("correct", False):
+        return None
+    error = result.get("error")
+    if error:
+        error_text = str(error)
+        lowered = error_text.lower()
+        if "timeout" in lowered:
+            return "runner_error", "timeout"
+        if "budget" in lowered:
+            return "runner_error", "budget_exhausted"
+        return "runner_error", error_text
+
+    reason = str(result.get("correctness_reason") or "unspecified")
+    if reason.startswith("Missing: "):
+        return "missing_required_literal", reason.removeprefix("Missing: ")
+    if reason.startswith("Contains forbidden: "):
+        return "forbidden_literal", reason.removeprefix("Contains forbidden: ")
+    if reason.startswith("Diff missing: "):
+        return "diff_missing_literal", reason.removeprefix("Diff missing: ")
+    if reason.startswith("Test failed: "):
+        return "test_failed", reason.removeprefix("Test failed: ")
+    if reason == "No changes in target file":
+        return "missing_edit", reason
+    return "grader_failure", reason
+
+
+def _tilth_tool_call_count(result: dict) -> int:
+    """Count calls to any tool whose name identifies the tilth MCP server."""
+    tool_calls = result.get("tool_calls")
+    if not isinstance(tool_calls, dict):
+        return 0
+    return sum(
+        int(count)
+        for name, count in tool_calls.items()
+        if "tilth" in str(name).lower() and isinstance(count, (int, float))
+    )
+
+
+def _is_tilth_tool(name: str) -> bool:
+    # Call records may carry the bare server-side name (e.g. "tilth_search")
+    # instead of the registered "mcp__tilth__tilth_search" alias, so match by
+    # substring like _tilth_tool_call_count does.
+    return "tilth" in str(name).lower()
+
+
+def _tool_usage_section(valid_results: list[dict]) -> list[str]:
+    """Per-arm tool call totals: every native and tilth tool, with rollups."""
+    modes = ordered_modes({str(r.get("mode", "unknown")) for r in valid_results})
+    calls_by_mode: dict[str, Counter] = {mode: Counter() for mode in modes}
+    cells_by_mode: Counter = Counter()
+    tilth_cells_by_mode: Counter = Counter()
+    tilth_available_by_mode: Counter = Counter()
+    availability_known_by_mode: Counter = Counter()
+
+    for result in valid_results:
+        mode = str(result.get("mode", "unknown"))
+        cells_by_mode[mode] += 1
+        tool_calls = result.get("tool_calls")
+        if isinstance(tool_calls, dict):
+            for name, count in tool_calls.items():
+                if isinstance(count, (int, float)):
+                    calls_by_mode[mode][str(name)] += int(count)
+            if any(_is_tilth_tool(name) for name in tool_calls):
+                tilth_cells_by_mode[mode] += 1
+        available = result.get("available_tools")
+        if isinstance(available, list):
+            availability_known_by_mode[mode] += 1
+            if any(_is_tilth_tool(name) for name in available):
+                tilth_available_by_mode[mode] += 1
+
+    all_tools = sorted(
+        {name for counter in calls_by_mode.values() for name in counter},
+        key=lambda name: (_is_tilth_tool(name), name),
+    )
+    lines = [
+        "## Tool usage",
+        "",
+        "Call totals per arm across all valid cells. Tilth tools are any "
+        "tool names containing 'tilth' (registered as mcp__tilth__*, callable "
+        "by bare name); everything else is a native built-in. An arm with "
+        "tilth attached but zero tilth calls is measuring the model's tool "
+        "choice; an arm where tilth was never available is a misconfigured "
+        "comparison.",
+        "",
+        "| Tool | " + " | ".join(mode_label(mode) for mode in modes) + " |",
+        "|---|" + "|".join(["---:"] * len(modes)) + "|",
+    ]
+    for name in all_tools:
+        row = [name] + [str(calls_by_mode[mode].get(name, 0)) for mode in modes]
+        lines.append("| " + " | ".join(row) + " |")
+    for label, predicate in (
+        ("**Native subtotal**", lambda name: not _is_tilth_tool(name)),
+        ("**Tilth subtotal**", _is_tilth_tool),
+        ("**Total**", lambda name: True),
+    ):
+        row = [label] + [
+            str(sum(count for name, count in calls_by_mode[mode].items() if predicate(name)))
+            for mode in modes
+        ]
+        lines.append("| " + " | ".join(row) + " |")
+    lines.extend([
+        "",
+        "| Mode | Cells | Tilth available | Cells with ≥1 tilth call |",
+        "|---|---:|---:|---:|",
+    ])
+    for mode in modes:
+        cells = cells_by_mode[mode]
+        if availability_known_by_mode[mode]:
+            available = f"{tilth_available_by_mode[mode]}/{availability_known_by_mode[mode]}"
+        else:
+            available = "unrecorded"
+        lines.append(
+            f"| {mode_label(mode)} | {cells} | {available} | "
+            f"{tilth_cells_by_mode[mode]} |"
+        )
+    lines.append("")
+    return lines
+
+
+def _failure_taxonomy_section(results: list[dict]) -> list[str]:
+    """Report failure types, paired exclusivity, and direct tool-use signals."""
+    modes = ordered_modes({str(r.get("mode", "unknown")) for r in results})
+    failures = [
+        (result, failure)
+        for result in results
+        if (failure := _failure_type(result)) is not None
+    ]
+    lines = [
+        "## Failure taxonomy",
+        "",
+        "Failure type comes from the runner error first, then the grader reason. "
+        "A missing required literal is an exact-string failure, not proof that "
+        "the answer was semantically wrong.",
+        "",
+    ]
+    if not failures:
+        lines.extend(["No failures detected.", ""])
+        return lines
+
+    grouped: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    for result, failure in failures:
+        grouped[failure].append(result)
+
+    lines.append("| Failure type | Detail | " + " | ".join(mode_label(mode) for mode in modes) + " | Tasks |")
+    lines.append("|---|---|" + "|".join(["---:"] * len(modes)) + "|---|")
+    for (kind, detail), grouped_results in sorted(
+        grouped.items(), key=lambda item: (-len(item[1]), item[0])
+    ):
+        counts = Counter(str(result.get("mode", "unknown")) for result in grouped_results)
+        tasks = ", ".join(sorted({str(result.get("task", "unknown")) for result in grouped_results}))
+        row = [kind, detail.replace("|", "\\|")]
+        row.extend(str(counts[mode]) for mode in modes)
+        row.append(tasks)
+        lines.append("| " + " | ".join(row) + " |")
+    lines.append("")
+
+    comparisons = comparison_pairs(modes)
+    if comparisons:
+        lines.extend([
+            "**Paired failure transitions:**",
+            "_Cells join on task, model, and repetition. Experiment-only failures "
+            "are the cells that can support a causal claim; shared failures point "
+            "at the task or grader instead._",
+            "",
+            "| Comparison | Both failed | Experiment-only failed | Reference-only failed | Neither failed |",
+            "|---|---:|---:|---:|---:|",
+        ])
+        for experiment_mode, reference in comparisons:
+            transitions = Counter()
+            for tuples in pair_modes(results, experiment_mode, reference).values():
+                for _rep, reference_correct, experiment_correct, _reference_cost, _experiment_cost in tuples:
+                    transitions[(experiment_correct, reference_correct)] += 1
+            lines.append(
+                f"| {mode_label(experiment_mode)} vs {mode_label(reference)} | "
+                f"{transitions[(False, False)]} | {transitions[(False, True)]} | "
+                f"{transitions[(True, False)]} | {transitions[(True, True)]} |"
+            )
+        lines.append("")
+
+    lines.extend([
+        "**Direct tilth-tool signal in failed cells:**",
+        "",
+        "| Mode | Failed cells | Failed cells with tilth calls | Tilth calls in failed cells |",
+        "|---|---:|---:|---:|",
+    ])
+    for mode in modes:
+        mode_failures = [
+            result for result, _failure in failures
+            if str(result.get("mode", "unknown")) == mode
+        ]
+        call_counts = [_tilth_tool_call_count(result) for result in mode_failures]
+        lines.append(
+            f"| {mode_label(mode)} | {len(mode_failures)} | "
+            f"{sum(count > 0 for count in call_counts)} | {sum(call_counts)} |"
+        )
+    lines.append("")
+    return lines
+
+
 def generate_report(results: list[dict]) -> str:
     """Generate markdown report from results."""
     if not results:
@@ -439,6 +636,8 @@ def generate_report(results: list[dict]) -> str:
     lines.extend(_capability_section(valid_results, modes))
     lines.extend(_control_section(valid_results, modes))
     lines.extend(_flags_section(results))
+    lines.extend(_tool_usage_section(valid_results))
+    lines.extend(_failure_taxonomy_section(results))
     lines.extend([
         "## Context Efficiency",
         "",
@@ -525,6 +724,14 @@ def generate_report(results: list[dict]) -> str:
 
         lines.append("**Cost breakdown (median run):**")
         lines.append("")
+        lines.append(
+            "_Totals are the runner's native cost (prompt caching priced by "
+            "Claude Code itself, sidecar models included); the category split "
+            "is computed from recorded cache-tier tokens at pricing.yaml "
+            "rates. Δnative is the computed-minus-native residual — a large "
+            "value means the pricing table has drifted from native billing._"
+        )
+        lines.append("")
         for mode in present_modes:
             run = median_cost_runs[mode]
             total = run.get("total_cost_usd", 0.0)
@@ -533,6 +740,20 @@ def generate_report(results: list[dict]) -> str:
             label = mode_label(mode).ljust(label_width)
             lines.append(f"  {label}: {turns} turns, ${total:.2f}, {correct_str}")
             lines.append(format_cost_breakdown(median_costs[mode]))
+            computed_total = sum(median_costs[mode].values())
+            if total > 0:
+                residual = (computed_total - total) / total
+                lines.append(
+                    f"    native=${total:.4f} computed=${computed_total:.4f} "
+                    f"Δnative={residual:+.1%}"
+                )
+            model_usage = run.get("model_usage")
+            if isinstance(model_usage, dict) and model_usage:
+                per_model = ", ".join(
+                    f"{model}=${stats.get('costUSD', 0.0):.4f}"
+                    for model, stats in sorted(model_usage.items())
+                )
+                lines.append(f"    native per-model: {per_model}")
 
         if reference is not None and delta_modes:
             reference_run = median_cost_runs[reference]
@@ -573,20 +794,28 @@ def generate_report(results: list[dict]) -> str:
                 lines.append(f"  {label}: {spark} ({token_range})")
             lines.append("")
 
-        # Tool breakdown
+        # Tool breakdown — totals across reps, not medians: a tool used in a
+        # minority of reps must still show up as used.
         tools_by_mode = {
-            mode: merge_tool_calls(runs)
+            mode: total_tool_calls(runs)
             for mode, runs in runs_by_mode.items()
         }
         if any(tools_by_mode.values()):
-            lines.append("**Tool breakdown (median counts):**")
+            lines.append("**Tools used (total calls across reps):**")
             lines.append("")
             for mode in present_modes:
                 tools = tools_by_mode[mode]
-                if not tools:
-                    continue
-                tool_strs = [f"{name}={count:.0f}" for name, count in sorted(tools.items())]
                 label = mode_label(mode).ljust(label_width)
+                if not tools:
+                    lines.append(f"  {label}: (none)")
+                    continue
+                tool_strs = [
+                    f"{name}={count}"
+                    for name, count in sorted(
+                        tools.items(),
+                        key=lambda item: (_is_tilth_tool(item[0]), item[0]),
+                    )
+                ]
                 lines.append(f"  {label}: {', '.join(tool_strs)}")
             lines.append("")
 

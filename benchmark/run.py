@@ -236,6 +236,10 @@ def _agent_repo(repo_path: Path, hide_git: bool):
         yield workspace
 
 
+class McpUnavailableError(RuntimeError):
+    """A mode expected an MCP server that the session did not expose."""
+
+
 def run_single(
     task_name: str,
     mode_name: str,
@@ -341,11 +345,13 @@ def _run_single_in_repo(
             "--system-prompt", SYSTEM_PROMPT + f"\nYour current working directory is: {repo_path}",
         ]
 
-        # --safe-mode strips customizations while retaining OAuth/keychain auth.
-        # --bare would isolate more aggressively, but deliberately refuses those
-        # credentials and only supports ANTHROPIC_API_KEY or apiKeyHelper.
+        # --setting-sources "" loads no user/project/local settings (hooks, env,
+        # user MCP servers) while retaining OAuth/keychain auth and honoring
+        # --mcp-config. --safe-mode is documented to disable ALL MCP servers,
+        # including --mcp-config ones, which silently ran tilth arms
+        # native-only; --bare refuses OAuth and needs ANTHROPIC_API_KEY.
         if bare:
-            cmd += ["--safe-mode"]
+            cmd += ["--setting-sources", ""]
 
         tools_list = list(mode.tools)
 
@@ -463,6 +469,18 @@ def _run_single_in_repo(
     run_result.model_name = model_name
     run_result.repetition = repetition
 
+    # A tilth-armed claude cell without mcp__tilth__ tools silently degrades
+    # into a native-only run and poisons the whole comparison (--safe-mode did
+    # exactly this). Fail loudly instead; the main loop aborts the run.
+    if runner == "claude" and mode.mcp_config_path:
+        if not any(t.startswith("mcp__tilth__") for t in run_result.available_tools):
+            raise McpUnavailableError(
+                f"mode '{mode_name}' expects the tilth MCP server but the "
+                f"session exposed no mcp__tilth__ tools "
+                f"(tools={run_result.available_tools}, "
+                f"mcp_servers={run_result.mcp_servers})"
+            )
+
     # Override duration if needed (subprocess timing may be more accurate)
     if run_result.duration_ms == 0:
         run_result.duration_ms = elapsed_ms
@@ -532,6 +550,9 @@ def _run_single_in_repo(
         "correctness_reason": reason,
         "result_text": run_result.result_text[:5000],
         "tool_sequence": _compact_tool_sequence(run_result),
+        "available_tools": run_result.available_tools,
+        "mcp_servers": run_result.mcp_servers,
+        "model_usage": run_result.model_usage,
     }
 
 
@@ -627,8 +648,9 @@ Examples:
         action="store_true",
         help="Strip the harness to built-in tools + the per-mode MCP config; "
              "pinned experiments enable this automatically. "
-             "claude: passes --safe-mode (drops customizations while retaining "
-             "OAuth/keychain auth). "
+             'claude: passes --setting-sources "" (drops settings-borne '
+             "customizations while retaining OAuth/keychain auth and "
+             "--mcp-config servers). "
              "opencode: redirects XDG_CONFIG_HOME + sets OPENCODE_DISABLE_*. "
              "codex: always resets mcp_servers through CLI overrides.",
     )
@@ -838,6 +860,23 @@ Examples:
                             )
                             if not result["correct"]:
                                 print(f"  → {result['correctness_reason']}")
+
+                        except McpUnavailableError as error:
+                            # Config-level failure: every later cell in this
+                            # mode would fail identically. Abort instead of
+                            # burning budget on an invalid comparison.
+                            print(f"  ✗ MCP UNAVAILABLE: {error}")
+                            error_result = {
+                                **record_metadata,
+                                "error": f"mcp_unavailable: {error}",
+                                "correct": False,
+                                "correctness_reason": f"Exception: {error}",
+                            }
+                            output.write(json.dumps(error_result) + "\n")
+                            output.flush()
+                            print("\nAborting run: the MCP-armed mode is "
+                                  "misconfigured; fix it and re-run.")
+                            sys.exit(1)
 
                         except subprocess.TimeoutExpired:
                             print("  ✗ TIMEOUT (>600s)")

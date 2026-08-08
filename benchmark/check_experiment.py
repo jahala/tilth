@@ -78,6 +78,20 @@ def _validate_variant_metadata(row: dict, variant: Variant, row_number: int) -> 
             f"row {row_number} variant {variant.name} lacks a valid binary SHA-256"
         )
 
+    # A tilth-armed row that recorded its session tool list must actually have
+    # had tilth tools; otherwise the cell ran native-only and the arm
+    # comparison is invalid (rows without the field predate recording).
+    available_tools = row.get("available_tools")
+    if (
+        variant.binary_path is not None
+        and isinstance(available_tools, list)
+        and not any(str(name).startswith("mcp__tilth__") for name in available_tools)
+    ):
+        raise ValueError(
+            f"row {row_number} variant {variant.name} recorded no mcp__tilth__ "
+            "tools in its session; the cell ran native-only"
+        )
+
 
 def _block_key(row: dict, row_number: int) -> tuple[object, ...]:
     missing = [field for field in _BLOCK_FIELDS if field not in row]

@@ -23,6 +23,7 @@ TILTH_BIN = resolve_tilth_bin()
 MODELS = {
     "haiku": "claude-haiku-4-5-20251001",
     "sonnet": "claude-sonnet-4-6",
+    "sonnet5": "claude-sonnet-5",
     "opus": "claude-opus-5",
     "gpt5": "gpt-5.6-sol",
     "o3": "o3",
@@ -37,6 +38,7 @@ MODELS = {
 RUNNERS = {
     "haiku": "claude",
     "sonnet": "claude",
+    "sonnet5": "claude",
     "opus": "claude",
     "gpt5": "codex",
     "o3": "codex",

@@ -88,6 +88,45 @@ def test_validate_experiment_run_accepts_complete_error_free_block(
     assert summary.blocks == 1
 
 
+def test_validate_experiment_run_rejects_tilth_arm_that_ran_native_only(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A tilth-armed row whose recorded session tools lack mcp__tilth__ ran
+    native-only — the exact --safe-mode failure that invalidated a full run."""
+    variant_root = tmp_path / "variants"
+    monkeypatch.setenv("TILTH_BENCH_VARIANT_ROOT", str(variant_root))
+    manifest_path = _manifest(tmp_path)
+    result_path = tmp_path / "results.jsonl"
+    records = _records(manifest_path, variant_root)
+    for record in records:
+        if record["mode"] == "fork":
+            record["available_tools"] = ["Bash", "Edit", "Glob", "Grep", "Read"]
+    _write_records(result_path, records)
+
+    with pytest.raises(ValueError, match="ran native-only"):
+        check_experiment.validate_experiment_run(result_path, manifest_path)
+
+
+def test_validate_experiment_run_accepts_tilth_arm_with_recorded_tilth_tools(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    variant_root = tmp_path / "variants"
+    monkeypatch.setenv("TILTH_BENCH_VARIANT_ROOT", str(variant_root))
+    manifest_path = _manifest(tmp_path)
+    result_path = tmp_path / "results.jsonl"
+    records = _records(manifest_path, variant_root)
+    for record in records:
+        if record["mode"] != "no_tilth":
+            record["available_tools"] = ["Read", "mcp__tilth__tilth_search"]
+    _write_records(result_path, records)
+
+    summary = check_experiment.validate_experiment_run(result_path, manifest_path)
+
+    assert summary.rows == 3
+
+
 def test_validate_experiment_run_rejects_a_missing_complete_block(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

@@ -86,10 +86,10 @@ class GinMiddlewareChainTask(Task):
     def ground_truth(self) -> GroundTruth:
         return GroundTruth(
             required_strings=[
-                "gin.go",
-                "Engine.ServeHTTP",
+                "gin.go|func (engine *Engine) ServeHTTP",
+                "Engine.ServeHTTP|func (engine *Engine) ServeHTTP",
                 "HandlersChain",
-                "Context.Next",
+                "Context.Next|func (c *Context) Next",
             ],
         )
     @property
@@ -118,8 +118,8 @@ class GinContextNextTask(Task):
     def ground_truth(self) -> GroundTruth:
         return GroundTruth(
             required_strings=[
-                "context.go",
-                "Context.Next",
+                "context.go|func (c *Context) Next",
+                "Context.Next|func (c *Context) Next",
                 "HandlersChain",
             ],
         )

@@ -268,3 +268,101 @@ def test_three_way_report_prioritizes_fork_upstream_and_guardrails():
     assert "fork vs no_tilth" in report
     assert "upstream vs no_tilth" in report
     assert "task is the sampling unit" in report
+
+
+def test_failure_type_covers_runner_and_grader_reasons():
+    assert analyze._failure_type({"error": "timeout after 10m"}) == ("runner_error", "timeout")
+    assert analyze._failure_type({"correctness_reason": "Contains forbidden: TODO"}) == (
+        "forbidden_literal",
+        "TODO",
+    )
+    assert analyze._failure_type({"correctness_reason": "Test failed: pytest"}) == (
+        "test_failed",
+        "pytest",
+    )
+    assert analyze._failure_type({"correctness_reason": "No changes in target file"}) == (
+        "missing_edit",
+        "No changes in target file",
+    )
+
+
+def test_failure_taxonomy_reports_types_transitions_and_tool_signal():
+    baseline = _run(task="one", mode="baseline", cost=1.0, correct=False)
+    baseline["correctness_reason"] = "Missing: exact-symbol"
+    tilth = _run(task="one", mode="tilth", cost=1.0, correct=False)
+    tilth["correctness_reason"] = "Missing: exact-symbol"
+    tilth["tool_calls"] = {"mcp__tilth__tilth_search": 2}
+    passed_baseline = _run(task="two", mode="baseline", cost=1.0, correct=True)
+    passed_tilth = _run(task="two", mode="tilth", cost=1.0, correct=True)
+
+    report = analyze.generate_report([baseline, tilth, passed_baseline, passed_tilth])
+
+    assert report.index("## Failure taxonomy") < report.index("## Context Efficiency")
+    assert "| missing_required_literal | exact-symbol | 1 | 1 | one |" in report
+    assert "| tilth-added vs baseline | 1 | 0 | 0 | 1 |" in report
+    assert "| tilth-added | 1 | 1 | 2 |" in report
+
+
+def test_tool_usage_section_reports_per_arm_counts_and_availability():
+    """The tool-usage table must separate tilth from native calls per arm and
+    expose whether tilth was actually available — an arm with tilth attached
+    but zero availability is a misconfigured comparison, not evidence."""
+    baseline = _run(task="one", mode="baseline", cost=1.0, correct=True)
+    baseline["tool_calls"] = {"Grep": 3, "Read": 2}
+    baseline["available_tools"] = ["Bash", "Grep", "Read"]
+    tilth = _run(task="one", mode="tilth", cost=1.0, correct=True)
+    # Bare server-side names (e.g. from the mcp-shortening fork) must still
+    # count as tilth calls alongside the registered mcp__tilth__ alias.
+    tilth["tool_calls"] = {"Read": 1, "mcp__tilth__tilth_search": 4, "tilth_read": 2}
+    tilth["available_tools"] = ["Read", "mcp__tilth__tilth_search"]
+    legacy = _run(task="one", mode="tilth", cost=1.0, correct=True, repetition=1)
+    legacy["tool_calls"] = {"Grep": 1}
+
+    report = analyze.generate_report([baseline, tilth, legacy])
+
+    assert "## Tool usage" in report
+    assert "| Grep | 3 | 1 |" in report
+    assert "| mcp__tilth__tilth_search | 0 | 4 |" in report
+    assert "| tilth_read | 0 | 2 |" in report
+    assert "| **Native subtotal** | 5 | 2 |" in report
+    assert "| **Tilth subtotal** | 0 | 6 |" in report
+    assert "| **Total** | 5 | 8 |" in report
+    # Availability: baseline 0/1 recorded rows have tilth; tilth arm 1/1
+    # recorded (the legacy row lacks the field and only shrinks the known
+    # denominator); one tilth cell made >=1 tilth call.
+    assert "| baseline | 1 | 0/1 | 0 |" in report
+    assert "| tilth-added | 2 | 1/1 | 1 |" in report
+
+
+def test_per_task_tools_used_totals_and_native_cost_reconciliation():
+    """Per-task sections must show which tools each arm called (totals, so a
+    tool used in one of three reps still appears) and reconcile the computed
+    category breakdown against the runner's native caching-aware total."""
+    runs = []
+    for repetition, tilth_calls in enumerate([1, 0, 0]):
+        run = _run(task="one", mode="tilth", cost=1.0, correct=True,
+                   repetition=repetition, model="claude-sonnet-5")
+        run["tool_calls"] = {"Read": 2}
+        if tilth_calls:
+            run["tool_calls"]["mcp__tilth__tilth_search"] = tilth_calls
+        runs.append(run)
+    # Native total deliberately above the computed sum: the residual line
+    # must surface the gap instead of hiding it.
+    for run in runs:
+        run["model_usage"] = {
+            "claude-sonnet-5": {"costUSD": 0.9},
+            "claude-haiku-4-5-20251001": {"costUSD": 0.1},
+        }
+    baseline = _run(task="one", mode="baseline", cost=1.0, correct=True,
+                    model="claude-sonnet-5")
+    baseline["tool_calls"] = {"Grep": 4}
+
+    report = analyze.generate_report(runs + [baseline])
+
+    assert "**Tools used (total calls across reps):**" in report
+    assert "tilth-added: Read=6, mcp__tilth__tilth_search=1" in report
+    assert "baseline   : Grep=4" in report  # label ljust-padded to "tilth-added"
+    assert "Tool breakdown (median counts)" not in report
+    assert "native=$1.0000" in report
+    assert "Δnative=" in report
+    assert "native per-model: claude-haiku-4-5-20251001=$0.1000, claude-sonnet-5=$0.9000" in report

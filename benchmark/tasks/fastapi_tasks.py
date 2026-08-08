@@ -23,7 +23,7 @@ class FastAPIDependencyResolutionTask(Task):
     @property
     def ground_truth(self) -> GroundTruth:
         return GroundTruth(
-            required_strings=["param_functions.py", "Depends", "dependency"],
+            required_strings=["analyze_param", "Depends", "dependency"],
         )
 
     @property
@@ -56,7 +56,7 @@ class FastAPIRequestValidationTask(Task):
                 "get_request_handler",
                 "solve_dependencies",
                 "RequestValidationError",
-                "async def app",
+                "async def app|async function app|inner async function app|async app(",
             ],
         )
 

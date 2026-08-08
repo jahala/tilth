@@ -121,10 +121,10 @@ class GrokContextNextTask(Task):
     def ground_truth(self) -> GroundTruth:
         return GroundTruth(
             required_strings=[
-                "context.go",
-                "Context.Next",
+                "context.go|func (c *Context) Next",
+                "Context.Next|func (c *Context) Next",
                 "HandlersChain",
-                "Context.Abort",
+                "Context.Abort|func (c *Context) Abort|Abort()",
             ],
         )
     @property

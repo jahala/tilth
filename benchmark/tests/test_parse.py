@@ -112,6 +112,84 @@ def test_stream_json_counts_each_message_usage_once():
     assert result.turns[0].output_tokens == 10
 
 
+def test_stream_json_captures_init_tools_and_mcp_servers():
+    """The init event's tool list and MCP status are the only record of what
+    the session could actually call — a tilth arm whose init lacks
+    mcp__tilth__ tools ran native-only and must be detectable from the row."""
+    init = {
+        "type": "system",
+        "subtype": "init",
+        "session_id": "abc123",
+        "tools": ["Bash", "Read", "mcp__tilth__tilth_search"],
+        "mcp_servers": [{"name": "tilth", "status": "connected"}],
+    }
+    events = [init, _assistant_event("ok"), _result_event()]
+
+    result = parse_stream_json("\n".join(json.dumps(e) for e in events))
+
+    assert result.available_tools == ["Bash", "Read", "mcp__tilth__tilth_search"]
+    assert result.mcp_servers == [{"name": "tilth", "status": "connected"}]
+
+
+def test_stream_json_captures_native_model_usage():
+    """The result event's modelUsage is the native, caching-aware cost record
+    (including sidecar models); rows must keep tokens + costUSD per model and
+    drop static metadata like contextWindow."""
+    result_event = _result_event()
+    result_event["modelUsage"] = {
+        "claude-sonnet-5": {
+            "inputTokens": 6,
+            "outputTokens": 965,
+            "cacheReadInputTokens": 16415,
+            "cacheCreationInputTokens": 9163,
+            "costUSD": 0.0743955,
+            "contextWindow": 1000000,
+            "provider": "firstParty",
+        },
+        "claude-haiku-4-5-20251001": {
+            "inputTokens": 546,
+            "outputTokens": 19,
+            "cacheReadInputTokens": 0,
+            "cacheCreationInputTokens": 0,
+            "costUSD": 0.000641,
+            "contextWindow": 200000,
+        },
+    }
+    events = [_assistant_event("ok"), result_event]
+
+    result = parse_stream_json("\n".join(json.dumps(e) for e in events))
+
+    assert result.model_usage == {
+        "claude-sonnet-5": {
+            "inputTokens": 6,
+            "outputTokens": 965,
+            "cacheReadInputTokens": 16415,
+            "cacheCreationInputTokens": 9163,
+            "costUSD": 0.0743955,
+        },
+        "claude-haiku-4-5-20251001": {
+            "inputTokens": 546,
+            "outputTokens": 19,
+            "cacheReadInputTokens": 0,
+            "cacheCreationInputTokens": 0,
+            "costUSD": 0.000641,
+        },
+    }
+
+
+def test_stream_json_without_init_leaves_availability_empty():
+    events = [
+        {"type": "system", "session_id": "abc123"},
+        _assistant_event("ok"),
+        _result_event(),
+    ]
+
+    result = parse_stream_json("\n".join(json.dumps(e) for e in events))
+
+    assert result.available_tools == []
+    assert result.mcp_servers == []
+
+
 # --- codex exec --json ------------------------------------------------------
 
 
