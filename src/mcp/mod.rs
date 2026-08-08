@@ -626,7 +626,7 @@ mod tests {
     fn server_instructions_byte_lock() {
         assert_eq!(
             SERVER_INSTRUCTIONS.len(),
-            1420,
+            1315,
             "SERVER_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(SERVER_INSTRUCTIONS
@@ -649,9 +649,8 @@ mod tests {
             "search kind grammar must remain in SERVER_INSTRUCTIONS"
         );
         assert!(
-            SERVER_INSTRUCTIONS.contains("mcp__tilth__tilth_search")
-                && SERVER_INSTRUCTIONS.contains("mcp__tilth__tilth_read"),
-            "qualified-name guidance (mcp__tilth__<tool>) must remain in SERVER_INSTRUCTIONS"
+            !SERVER_INSTRUCTIONS.contains("mcp__"),
+            "server instructions must use protocol tool names, not client-specific prefixes"
         );
     }
 
@@ -659,7 +658,7 @@ mod tests {
     fn edit_mode_instructions_byte_lock() {
         assert_eq!(
             EDIT_MODE_INSTRUCTIONS.len(),
-            1777,
+            1673,
             "EDIT_MODE_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(EDIT_MODE_INSTRUCTIONS.starts_with(
@@ -680,6 +679,10 @@ mod tests {
         assert!(
             EDIT_MODE_INSTRUCTIONS.contains("must escape tabs/newlines"),
             "control-char escape rule must remain in EDIT_MODE_INSTRUCTIONS"
+        );
+        assert!(
+            !EDIT_MODE_INSTRUCTIONS.contains("mcp__"),
+            "edit instructions must use protocol tool names, not client-specific prefixes"
         );
     }
 

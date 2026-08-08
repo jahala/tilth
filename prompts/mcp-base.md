@@ -1,7 +1,5 @@
 tilth — code intelligence MCP server. Replaces grep, cat, find, ls, and git diff.
 
-DO NOT call bare names; use full names such as `mcp__tilth__tilth_search` and `mcp__tilth__tilth_read`.
-
 DO NOT omit `cwd`: set it to the absolute checkout directory on every call. Relative paths/scopes anchor there; absolute paths pass through. The server cannot see your shell cwd; `..` in relative paths is refused.
 
 BATCH related work; array parameters never accept singular values:
