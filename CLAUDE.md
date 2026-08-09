@@ -99,9 +99,9 @@ This is a **fork**. Some divergence from upstream is permanent and intentional; 
 
 **Sync mechanics:** pull upstream onto a `sync/upstream-<date>` branch (never straight onto the working branch), resolve the known conflicts to the fork side per the rules above, and verify the gates before merging.
 
-**Upstream contribution (contribute-back).** A weekly Claude Code cloud routine (registered out-of-repo — its prompt is *not* committed here) sends fork changes *out* to `jahala/tilth` and opens a sync-back PR when the fork falls behind. The **workflow** — what it PRs, how the maintainer is notified — lives in the routine's own prompt, not this repo. What lives here is the fork-specific, code-level machinery it drives:
+**Upstream contribution (contribute-back).** A weekly Claude Code cloud routine sends fork changes *out* to `jahala/tilth` and opens a sync-back PR when the fork falls behind. The routine — prompt, manifest, and scanner alike — lives in the **`paulnsorensen/routines`** repo under `routines/tilth-upstream/`; none of it is committed here any more. What remains here is the fork law it depends on:
 
-- **Detection.** `scripts/tilth-upstream-scan` computes the ahead/behind/clean-apply math and emits the candidate JSON; the manifest is `agents/tilth-upstream/sources.yaml` (`sync_branch`, keys, label). Edit these to change *how* changes are detected and pushed up — the routine acts only on the scanner's JSON, never on guesses.
+- **Detection.** `bin/tilth-upstream-scan` and `routines/tilth-upstream/sources.yaml`, both in the routines repo, compute the ahead/behind/clean-apply math and emit the candidate JSON; edit them there to change *how* changes are detected and pushed up. The scanner takes this checkout as an argument (`bin/tilth-upstream-scan <path-to-tilth>`) because it now runs from a different tree than the one it measures. The routine acts only on that JSON, never on guesses.
 - **Sync-back mechanics.** How upstream is pulled back down is the fork-law keep-ours rules above — see the **Fork law** / **Sync mechanics** blocks and `.hallouminate/wiki/`.
 - **Roadmap.** Contribute-back state is a wiki roadmap at `.hallouminate/wiki/roadmaps/upstream-contrib/` (ground or read it to see status); the routine owns advancing it.
 

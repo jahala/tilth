@@ -10,9 +10,11 @@ the fork gets a PR against `jahala/tilth`, and the fork stays reconciled
 against upstream's own progress.**
 
 This roadmap is populated and kept current by the `tilth-upstream` cloud
-routine (`agents/tilth-upstream/routine.md`), which runs weekly. Each run's
-scanner output (`scripts/tilth-upstream-scan`) becomes zero or more goal
-nodes below — one per contribution candidate the scanner classifies `easy`.
+routine, which runs weekly. The routine itself lives in the
+`paulnsorensen/routines` repo — its prompt at `routines/tilth-upstream/routine.md`
+and its scanner at `bin/tilth-upstream-scan` — not in this repo; only the
+roadmap state it advances lives here. Each run's scanner output becomes zero
+or more goal nodes below — one per contribution candidate the scanner classifies `easy`.
 A goal's state (`pending` / `pr-open` / `merged`) lives in that goal file's
 own frontmatter/body and is advanced only by the routine, from PR state it
 observed via `gh`, never guessed.
@@ -27,8 +29,9 @@ directly each run, not a one-time contribution to close out.
 No goal nodes are seeded yet — this index establishes the roadmap's
 structure and conventions ahead of the routine's first live run, which adds
 one goal file per `easy` candidate the scanner finds. See
-`agents/tilth-upstream/sources.yaml` for the "easy" thresholds and the
-upstreamable/exclude path globs that gate what can ever become a candidate.
+`routines/tilth-upstream/sources.yaml` in the `paulnsorensen/routines` repo
+for the "easy" thresholds and the upstreamable/exclude path globs that gate
+what can ever become a candidate.
 
 <!-- HALLOUMINATE:INDEX-START -->
 <!-- HALLOUMINATE:INDEX-END -->
