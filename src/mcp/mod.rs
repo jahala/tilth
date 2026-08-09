@@ -626,11 +626,12 @@ mod tests {
     fn server_instructions_byte_lock() {
         assert_eq!(
             SERVER_INSTRUCTIONS.len(),
-            1315,
+            1314,
             "SERVER_INSTRUCTIONS byte count drifted from baseline"
         );
-        assert!(SERVER_INSTRUCTIONS
-            .starts_with("tilth — code intelligence MCP server. Replaces grep, cat, find, ls"));
+        assert!(SERVER_INSTRUCTIONS.starts_with(
+            "tilth — code intelligence MCP server. Replaces grep, cat, find, ls, and git diff.\nDO NOT use shell for repo files or history (cat/head/tail/sed/grep/rg/ls/find/git diff/git log); use `tilth_read`, `tilth_search`, `tilth_list`, `tilth_diff`. Shell is for tests, builds, and non-file operations."
+        ));
         assert!(SERVER_INSTRUCTIONS.ends_with("DO NOT re-read expanded search content."));
         assert!(
             !SERVER_INSTRUCTIONS.contains("\n\n\n"),
@@ -658,11 +659,11 @@ mod tests {
     fn edit_mode_instructions_byte_lock() {
         assert_eq!(
             EDIT_MODE_INSTRUCTIONS.len(),
-            1673,
+            1672,
             "EDIT_MODE_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(EDIT_MODE_INSTRUCTIONS.starts_with(
-            "tilth — code intelligence MCP server. Replaces grep, cat, find, ls, git diff, and host edit tools"
+            "tilth — code intelligence MCP server. Replaces grep, cat, find, ls, git diff, and host edit tools.\nDO NOT use shell for repo files or history (cat/head/tail/sed/grep/rg/ls/find/git diff/git log) and DO NOT use host Edit/Write; use tilth tools. Shell is for tests, builds, and non-file operations."
         ));
         assert!(EDIT_MODE_INSTRUCTIONS.ends_with("DO NOT re-read expanded search content."));
         assert!(

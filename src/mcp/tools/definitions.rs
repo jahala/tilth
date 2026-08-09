@@ -239,20 +239,20 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         tools.push(serde_json::json!({
             "name": "tilth_write",
             "annotations": { "readOnlyHint": false },
-            "description": "Edit after a tagged read. tilth_read prints `[path#TAG]` above `N:content`; copy its TAG and shown 1-based integer lines—NEVER invent either. `edits` contains `{path, tag?, ops}` sections; omit tag only for a new file. Ops: replace/delete use `{start,end}`; insert_before/after use `{line}`; prepend/append; block ops use `{at}`; delete_file; move_file. Escape JSON content as `\\t`/`\\n`; literal controls fail before the server. Drift 3-way-merges or rejects; re-read a rejected file. Sections are independent; max 20. Example: tilth_write(edits: [{path: \"a.rs\", tag: \"1A2B\", ops: [{op: \"delete\", start: 2, end: 2}, {op: \"append\", content: \"x\"}]}, {path: \"b.rs\", tag: \"3C4D\", ops: [{op: \"delete\", start: 3, end: 3}, {op: \"append\", content: \"y\"}]}], cwd: \"/abs/repo\").",
+            "description": "Edit after a tagged read. tilth_read prints `[path#TAG]` above `N:content`; copy its TAG and shown 1-based integer lines—NEVER invent either. `edits` contains `{path, tag?, ops}` sections; omit tag only for a new file. Ops: replace/delete use `{start,end}`; insert_before/after use `{line}`; prepend/append; block ops use `{at}`; delete_file; move_file. Escape JSON content as `\\t`/`\\n`; literal controls fail before the server. Drift 3-way-merges or rejects; re-read a rejected file. Sections are independent; max 20. Example: tilth_write(edits: [{path: \"a.rs\", tag: \"1A2B\", ops: [{op: \"delete\", start: 2, end: 2}, {op: \"append\", content: \"x\"}]}], cwd: \"/abs/repo\").",
             "inputSchema": {
                 "type": "object",
                 "required": ["edits", "cwd"],
                 "properties": {
                     "edits": {
                         "type": "array",
-                        "description": "Batch of `{path, tag?, ops}` sections. Copy read tags; omit tag only for new files. Max 20.",
+                        "description": "Up to 20 `{path, tag?, ops}` sections. Copy read tags; omit only for new files.",
                         "items": {
                             "type": "object",
                             "required": ["path", "ops"],
                             "properties": {
-                                "path": { "type": "string", "description": "Absolute path or relative to cwd." },
-                                "tag": { "type": "string", "description": "4-hex whole-file read tag; omit only for a new file." },
+                                "path": { "type": "string", "description": "Absolute or cwd-relative path." },
+                                "tag": { "type": "string", "description": "4-hex whole-file read tag; omit only for new files." },
                                 "ops": {
                                     "type": "array",
                                     "items": {
@@ -279,7 +279,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     "diff": {
                         "type": "boolean",
                         "default": false,
-                        "description": "Include a compact diff per section."
+                        "description": "Include compact diffs per section."
                     },
                     "cwd": cwd_prop.clone()
                 }

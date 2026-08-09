@@ -1,4 +1,5 @@
 tilth — code intelligence MCP server. Replaces grep, cat, find, ls, git diff, and host edit tools.
+DO NOT use shell for repo files or history (cat/head/tail/sed/grep/rg/ls/find/git diff/git log) and DO NOT use host Edit/Write; use tilth tools. Shell is for tests, builds, and non-file operations.
 
 DO NOT omit `cwd`: set it to the absolute checkout directory on every call. Relative paths/scopes anchor there; absolute paths pass through. The server cannot see your shell cwd; `..` in relative paths is refused.
 
@@ -14,6 +15,4 @@ READ BEFORE WRITE: edit-mode `tilth_read` prints `[path#TAG]` above 1-based numb
 JSON string values must escape tabs/newlines as `\t` and `\n`; literal controls break the call before the server receives it.
 
 ROUTE: find/explore → `tilth_search`; read → `tilth_read`; importers/imports → `tilth_deps` (not import-greps); understand one symbol → `tilth_grok` (replaces search → expand → callers); changes → `tilth_diff`; browse → `tilth_list`; edit → `tilth_write`.
-
-DO NOT use shell for repo files or history (cat/head/tail/sed/grep/rg/ls/find/git diff/git log) and DO NOT use host Edit/Write; use tilth tools. Shell is for tests, builds, and non-file operations.
 DO NOT re-read expanded search content.

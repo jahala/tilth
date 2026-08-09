@@ -2,4 +2,4 @@ BATCH every needed file into one `tilth_read` call; `paths` never accepts a sing
 
 Output lines are `N:content`; ignore the `N:` prefix — line numbers are not file content. In edit mode, `[path#TAG]` appears above the numbered lines; copy that TAG and the shown 1-based line numbers into `tilth_write`—NEVER invent either. `mode=stripped` is non-editable.
 
-A leading JSON header may report `if_modified_since`, `view`, `original_line_count`, `next_view`, `lines_stripped`, `truncated`, and `truncated_at_line`. Reuse its timestamp for unchanged stubs. `next_view` means content is hidden; escalate `mode` to see it.
+A leading JSON header may report view/truncation metadata; reuse its timestamp for unchanged stubs. `next_view` means content is hidden; escalate `mode` to see it.
