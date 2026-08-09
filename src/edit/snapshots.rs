@@ -37,6 +37,25 @@ pub struct Snapshot {
     pub seen_lines: HashSet<u32>,
 }
 
+impl Snapshot {
+    /// The first anchor this snapshot never displayed, or `None` if all were
+    /// seen. A snapshot with no recorded provenance (empty `seen_lines`) admits
+    /// every anchor.
+    ///
+    /// Sole owner of the seen-lines rule: the gate and the session-chain replay
+    /// enforce it on different text and report it differently, but both ask
+    /// here so the two cannot drift apart.
+    pub(crate) fn first_unseen_anchor(
+        &self,
+        anchors: impl IntoIterator<Item = u32>,
+    ) -> Option<u32> {
+        if self.seen_lines.is_empty() {
+            return None;
+        }
+        anchors.into_iter().find(|a| !self.seen_lines.contains(a))
+    }
+}
+
 /// Weigh a path's version history by the sum of its retained text bytes.
 struct ByteScale;
 

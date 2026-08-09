@@ -62,6 +62,8 @@ pub enum Op {
         end: u32,
         payload: Vec<String>,
     },
+    /// Replace one exact text occurrence, expanding to its covering lines.
+    TextSwap { old: String, new: String },
     /// Delete lines `[start, end]` (inclusive).
     Del { start: u32, end: u32 },
     /// Insert `payload` at `cursor`.
@@ -75,6 +77,8 @@ pub enum Op {
         mode: BlockMode,
         payload: Vec<String>,
     },
+    /// Create a new file with exact raw content.
+    Create { content: String },
     /// Remove the file.
     Rem,
     /// Move/rename the file to `dest`.

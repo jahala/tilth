@@ -35,6 +35,20 @@ pub enum MismatchError {
              Re-read the region you intend to edit."
     )]
     UnseenAnchor { path: String, line: u32 },
+    /// A `replace_text` anchor did not resolve against the live file. The
+    /// specific match failure is what the caller must act on — reporting it as
+    /// generic drift sends the agent into a re-read loop that cannot help.
+    /// Carries the [`ApplyError`] itself so callers can branch on which kind of
+    /// match failure it was, rather than parsing its rendered text.
+    #[error(
+        "Edit rejected for {path}: {source}. The file also changed since the read \
+             that minted this tag — re-read to refresh it."
+    )]
+    TextMatch {
+        path: String,
+        #[source]
+        source: super::apply::ApplyError,
+    },
 }
 
 #[cfg(test)]

@@ -103,6 +103,12 @@ fn apply_section(section: &Section, ctx: &SectionCtx, seen_paths: &mut HashSet<S
 /// The per-section egress: read live content, verify/recover against the tag,
 /// carry out any file op, write, and record the fresh snapshot.
 fn commit_section(section: &Section, path: &Path, ctx: &SectionCtx) -> Result<String, TilthError> {
+    if section.ops.iter().any(|op| matches!(op, Op::Create { .. })) && section.tag.is_some() {
+        return Err(TilthError::EditRejected(format!(
+            "create_file requires a tagless section for a new file: {} — use a tagged read with replace instead",
+            path.display()
+        )));
+    }
     let session = ctx.session;
     // Read live content (missing file is allowed only for a tagless seed).
     let live = match std::fs::read_to_string(path) {
@@ -194,6 +200,22 @@ fn resolve_edit(
     match section.tag {
         // Tagless [path]: seed a new file or edit live with no provenance gate.
         None => {
+            if section
+                .ops
+                .iter()
+                .any(|op| matches!(op, Op::TextSwap { .. }))
+            {
+                // Naming only the requirement sent agents into a full re-read.
+                // A section read carries the whole-file tag, so the cheap route
+                // has to be part of the rejection.
+                return Err(TilthError::EditRejected(
+                    "replace_text requires a tag from an edit-mode read; a section read \
+                     (path#12-40) carries the whole-file tag without reading the file in \
+                     full, but `old` must occur in the lines it displayed. Files over the \
+                     tag cap mint no tag — use line ops there."
+                        .into(),
+                ));
+            }
             let snap = synthetic_snapshot(&key, live, live_tag);
             let r = gated_apply(&snap, path, &section.ops)?;
             Ok((r.text, r.file_op))
@@ -229,9 +251,7 @@ fn resolve_edit(
 /// The drift/collision egress: the recorded snapshot (if any) no longer matches
 /// live content. Honor the seen-lines gate against the recorded snapshot, carry
 /// a pure file op (`REM`/`MV`) through regardless of content drift, and
-/// otherwise 3-way-merge the content edit onto live. The file op is derived
-/// through the canonical [`FileOp::from_ops`] guard so this path rejects the
-/// same op combinations the matched/tagless paths do.
+/// otherwise 3-way-merge the content edit onto live.
 fn recover_edit(
     store: &SnapshotStore,
     section: &Section,
@@ -264,8 +284,15 @@ fn recover_edit(
     Ok((text, file_op))
 }
 
-/// Carry out a `REM`/`MV` file op with confinement, then reconcile the snapshot
-/// store (invalidate on remove, relocate on move).
+fn create_target_exists_error(path: &Path) -> TilthError {
+    TilthError::EditRejected(format!(
+        "create_file target already exists: {} — use a tagged read with replace instead",
+        path.display()
+    ))
+}
+
+/// Carry out a `CREATE`/`REM`/`MV` file op with confinement, then reconcile the
+/// snapshot store (invalidate on remove, relocate on move). CREATE writes exact raw content.
 fn commit_file_op(
     op: &FileOp,
     path: &Path,
@@ -275,6 +302,33 @@ fn commit_file_op(
 ) -> Result<String, TilthError> {
     let session = ctx.session;
     match op {
+        FileOp::Create(content) => {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| TilthError::IoError {
+                    path: parent.to_path_buf(),
+                    source: e,
+                })?;
+            }
+            crate::util::atomic_create_bytes_no_replace(path, content.as_bytes()).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    create_target_exists_error(path)
+                } else {
+                    TilthError::IoError {
+                        path: path.to_path_buf(),
+                        source: e,
+                    }
+                }
+            })?;
+            session.record_read(path);
+            let line_count = u32::try_from(content.split('\n').count()).unwrap_or(u32::MAX);
+            let new_tag = session.record_snapshot(path, content, 1..=line_count);
+            let mut block = format!("## {}\ncreated", path.display());
+            if let Some(tag) = new_tag {
+                let header = format_header(&path.display().to_string(), tag);
+                let _ = write!(block, "\n{header}");
+            }
+            Ok(block)
+        }
         FileOp::Remove => {
             // Capture the canonical key before the fs op: once the file is gone,
             // `normalize_path_key` falls back to a lexical (non-symlink-resolving)
@@ -627,7 +681,7 @@ mod tests {
         )
         .expect("per-section error returns Ok");
         assert!(
-            out.contains("only one file op"),
+            out.contains("at most one file op (CREATE/REM/MV)"),
             "delete_file + move_file in one drifted section must be a FileOpConflict, got:\n{out}"
         );
         assert!(p.exists(), "rejected conflict must not remove the file");
@@ -1114,6 +1168,300 @@ mod tests {
     }
 
     #[test]
+    fn tagless_text_swap_is_rejected_without_modifying_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("tagless.rs");
+        let original = "head target\n";
+        std::fs::write(&p, original).unwrap();
+        let (session, _bloom) = services();
+        let section = Section {
+            path: p.to_string_lossy().into_owned(),
+            tag: None,
+            ops: vec![Op::TextSwap {
+                old: "target".into(),
+                new: "replacement".into(),
+            }],
+        };
+        let err = resolve_edit(&section, &p, &session, original).unwrap_err();
+        match err {
+            // The rejection must name the cheap route to a tag; stating only
+            // the requirement drove agents into a full re-read of a large file
+            // when a section read would have supplied the same whole-file tag.
+            TilthError::EditRejected(message) => {
+                assert!(
+                    message.starts_with("replace_text requires a tag from an edit-mode read"),
+                    "unexpected rejection: {message}"
+                );
+                assert!(
+                    message.contains("section read"),
+                    "rejection must point at the section-read route: {message}"
+                );
+                assert!(
+                    message.contains("over the tag cap"),
+                    "rejection must name the over-cap case that has no tag: {message}"
+                );
+                // Pointing at the section read without this constraint sent
+                // agents into a second failed round trip via UnseenAnchor.
+                assert!(
+                    message.contains("must occur in the lines it displayed"),
+                    "rejection must state the seen-lines constraint: {message}"
+                );
+            }
+            other => panic!("expected EditRejected, got {other:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), original);
+    }
+
+    #[test]
+    fn replace_text_applies_through_tool_write_and_writes_exact_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("swap.rs");
+        std::fs::write(&p, "fn a() { target(); }\n").unwrap();
+        let (session, bloom) = services();
+        let tag = read_for_tag(&session, &p);
+        let ops = json!([{ "op": "replace_text", "old": "target", "new": "renamed" }]);
+        let out = tool_write(
+            &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("write ok");
+        assert!(out.contains("applied"), "expected applied, got:\n{out}");
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "fn a() { renamed(); }\n",
+            "replace_text must substitute the matched text exactly once, in place"
+        );
+    }
+
+    #[test]
+    fn replace_text_with_absent_old_is_a_per_section_error_and_leaves_file_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("absent.rs");
+        let original = "fn a() { present(); }\n";
+        std::fs::write(&p, original).unwrap();
+        let (session, bloom) = services();
+        let tag = read_for_tag(&session, &p);
+        let ops = json!([{ "op": "replace_text", "old": "missing", "new": "renamed" }]);
+        let out = tool_write(
+            &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("per-section error returns Ok");
+        assert_eq!(
+            out,
+            format!(
+                "## {}\nerror: text to replace was not found; re-read the file and retry (preview: missing)",
+                p.display()
+            )
+        );
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), original);
+    }
+
+    #[test]
+    fn replace_text_with_ambiguous_old_is_a_per_section_error_and_leaves_file_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("ambiguous.rs");
+        let original = "fn a() { target(); }\nfn b() { target(); }\n";
+        std::fs::write(&p, original).unwrap();
+        let (session, bloom) = services();
+        let tag = read_for_tag(&session, &p);
+        let ops = json!([{ "op": "replace_text", "old": "target", "new": "renamed" }]);
+        let out = tool_write(
+            &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("per-section error returns Ok");
+        assert_eq!(
+            out,
+            format!(
+                "## {}\nerror: text to replace matched at least 2 times; add context so it matches once",
+                p.display()
+            )
+        );
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), original);
+    }
+
+    #[test]
+    fn drift_with_unmatched_replace_text_names_text_match_not_bare_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("drift_swap.rs");
+        std::fs::write(&p, "alpha\nbeta\ngamma\n").unwrap();
+        let (session, bloom) = services();
+        let tag = read_for_tag(&session, &p);
+
+        // Drift the file so its hash no longer matches the tag, and make sure
+        // the replace_text anchor is absent from both the snapshot and the
+        // drifted live text so recovery cannot land the edit either way.
+        std::fs::write(&p, "alpha\nCHANGED\ngamma\n").unwrap();
+        let ops = json!([{ "op": "replace_text", "old": "missing-text", "new": "replacement" }]);
+        let out = tool_write(
+            &json!({"edits": edits(&p, Some(&tag), ops), "cwd": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("per-section error returns Ok");
+        assert!(
+            out.contains("Edit rejected for"),
+            "expected an Edit rejected message, got:\n{out}"
+        );
+        assert!(
+            out.contains("The file also changed since the read that minted this tag"),
+            "a drifted unmatched replace_text must report TextMatch, not bare Drift: {out}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "alpha\nCHANGED\ngamma\n",
+            "rejected edit must not touch the file"
+        );
+    }
+
+    #[test]
+    fn create_file_creates_missing_parent_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("newmod").join("thing.rs");
+        let content = "fn thing() {}\n";
+        let (session, bloom) = services();
+        let ops = json!([{ "op": "create_file", "content": content }]);
+
+        tool_write(
+            &json!({"edits": edits(&p, None, ops), "cwd": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("create_file creates missing parent directory");
+
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), content);
+    }
+
+    #[test]
+    fn create_file_new_file_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("created.rs");
+        let content = "fn created() {}\n// exact\n";
+        let (session, bloom) = services();
+        let ops = json!([{ "op": "create_file", "content": content }]);
+
+        let out = tool_write(
+            &json!({"edits": edits(&p, None, ops), "cwd": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("create_file succeeds");
+
+        let header_line = format!("[{}#", p.display());
+        assert!(
+            out.starts_with(&format!("## {}\ncreated\n{header_line}", p.display())),
+            "expected created output with tag header, got: {out}"
+        );
+        assert!(
+            !out.contains(content),
+            "created output must not echo file body: {out}"
+        );
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), content);
+    }
+
+    #[test]
+    fn create_file_existing_file_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("existing.rs");
+        let original = "original\n";
+        std::fs::write(&p, original).unwrap();
+        let (session, bloom) = services();
+        let ops = json!([{ "op": "create_file", "content": "replacement\n" }]);
+
+        let out = tool_write(
+            &json!({"edits": edits(&p, None, ops), "cwd": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("per-section error returns Ok");
+
+        assert_eq!(
+            out,
+            format!(
+                "## {}\nerror: create_file target already exists: {} — use a tagged read with replace instead",
+                p.display(),
+                p.display()
+            )
+        );
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_file_dangling_symlink_rejected_without_target_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let target = root.join("missing.rs");
+        let link = root.join("link.rs");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let (session, bloom) = services();
+        let ops = json!([{ "op": "create_file", "content": "replacement\n" }]);
+
+        let out = tool_write(
+            &json!({"edits": edits(&link, None, ops), "cwd": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("per-section error returns Ok");
+
+        assert_eq!(
+            out,
+            format!(
+                "## {}\nerror: create_file target already exists: {} — use a tagged read with replace instead",
+                link.display(),
+                link.display()
+            )
+        );
+        assert!(link.is_symlink(), "dangling symlink must remain untouched");
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+        assert!(
+            !target.exists(),
+            "create_file must not create the symlink target"
+        );
+    }
+
+    #[test]
+    fn create_file_tag_present_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("tagged.rs");
+        let (session, bloom) = services();
+        let ops = json!([{ "op": "create_file", "content": "new\n" }]);
+
+        let out = tool_write(
+            &json!({
+                "edits": edits(&p, Some("ABCD"), ops),
+                "cwd": root.to_str().unwrap()
+            }),
+            &session,
+            &bloom,
+        )
+        .expect("per-section error returns Ok");
+
+        assert_eq!(
+            out,
+            format!(
+                "## {}\nerror: create_file requires a tagless section for a new file: {} — use a tagged read with replace instead",
+                p.display(),
+                p.display()
+            )
+        );
+        assert!(!p.exists(), "tagged create must not create the file");
+    }
+
+    #[test]
     fn missing_edits_blob_rejected() {
         let (session, bloom) = services();
         let err = tool_write(&json!({}), &session, &bloom).expect_err("no edits → top-level error");
@@ -1513,6 +1861,64 @@ mod tests {
             std::fs::read_to_string(&a).unwrap(),
             "fn keep() {}\n",
             "the valid earlier section's file must be untouched when a later section fails to deserialize"
+        );
+    }
+
+    #[test]
+    fn create_file_combined_with_content_op_is_a_file_op_conflict_and_does_not_create() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("conflict_create.rs");
+        let (session, bloom) = services();
+        let ops = json!([
+            { "op": "create_file", "content": "fn created() {}\n" },
+            { "op": "append", "content": "fn extra() {}" }
+        ]);
+        let out = tool_write(
+            &json!({"edits": edits(&p, None, ops), "cwd": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("per-section error returns Ok");
+        assert_eq!(
+            out,
+            format!(
+                "## {}\nerror: CREATE/REM cannot combine with content ops; at most one file op (CREATE/REM/MV) per section",
+                p.display()
+            )
+        );
+        assert!(
+            !p.exists(),
+            "create_file combined with a content op must not create the file"
+        );
+    }
+
+    #[test]
+    fn two_create_file_ops_in_one_section_is_a_file_op_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("double_create.rs");
+        let (session, bloom) = services();
+        let ops = json!([
+            { "op": "create_file", "content": "first\n" },
+            { "op": "create_file", "content": "second\n" }
+        ]);
+        let out = tool_write(
+            &json!({"edits": edits(&p, None, ops), "cwd": root.to_str().unwrap()}),
+            &session,
+            &bloom,
+        )
+        .expect("per-section error returns Ok");
+        assert_eq!(
+            out,
+            format!(
+                "## {}\nerror: CREATE/REM cannot combine with content ops; at most one file op (CREATE/REM/MV) per section",
+                p.display()
+            )
+        );
+        assert!(
+            !p.exists(),
+            "two create_file ops in one section must not create the file"
         );
     }
 }

@@ -16,5 +16,5 @@ ROUTE:
 - Importers/imports → `tilth_deps`; DO NOT assemble it from import-greps or repeated callers searches.
 - Understand one symbol → `tilth_grok(target: "parse_diff", cwd: "/abs/repo")`; replaces search → expand → callers.
 - Changes → `tilth_diff`, optional `source: "HEAD~1"`.
-- Browse without a search term → `tilth_list`.
+- Browse without a search term → `tilth_list`; omit `patterns` for a project overview.
 DO NOT re-read expanded search content.

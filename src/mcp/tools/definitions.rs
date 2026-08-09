@@ -98,7 +98,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         serde_json::json!({
             "name": "tilth_list",
             "annotations": { "readOnlyHint": true },
-            "description": "List a directory tree with token-size rollups. Use only without a search term; otherwise search/read. Example: tilth_list(patterns: [\"*.rs\", \"*.toml\"], cwd: \"/abs/repo\").",
+            "description": "List a directory tree with token-size rollups; omit patterns for a project overview. Use only without a search term; otherwise search/read. Example: tilth_list(patterns: [\"*.rs\", \"*.toml\"], cwd: \"/abs/repo\").",
             "inputSchema": {
                 "type": "object",
                 "required": ["cwd"],
@@ -108,7 +108,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "items": { "type": "string" },
                         "minItems": 1,
                         "maxItems": 20,
-                        "description": "Optional batch (max 20); omission lists all files."
+                        "description": "Optional batch (max 20); omit patterns for a project overview."
                     },
                     "depth": {
                         "type": "number",
@@ -239,7 +239,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         tools.push(serde_json::json!({
             "name": "tilth_write",
             "annotations": { "readOnlyHint": false },
-            "description": "Edit after a tagged read. tilth_read prints `[path#TAG]` above `N:content`; copy its TAG and shown 1-based integer lines—NEVER invent either. `edits` contains `{path, tag?, ops}` sections; omit tag only for a new file. Ops: replace/delete use `{start,end}`; insert_before/after use `{line}`; prepend/append; block ops use `{at}`; delete_file; move_file. Escape JSON content as `\\t`/`\\n`; literal controls fail before the server. Drift 3-way-merges or rejects; re-read a rejected file. Sections are independent; max 20. Example: tilth_write(edits: [{path: \"a.rs\", tag: \"1A2B\", ops: [{op: \"delete\", start: 2, end: 2}, {op: \"append\", content: \"x\"}]}], cwd: \"/abs/repo\").",
+            "description": "Edit after a tagged read. tilth_read prints `[path#TAG]` above `N:content`; copy its TAG and shown 1-based integer lines—NEVER invent either. `edits` contains `{path, tag?, ops}` sections; omit tag only for a new or untaggable file. Ops: replace/delete use `{start,end}`; insert_before/after use `{line}`; prepend/append; block ops use `{at}`; replace_text uses {old,new}, must match once; create_file uses {content}; delete_file; move_file. Escape JSON content as `\\t`/`\\n`; literal controls fail before the server. Drift 3-way-merges or rejects; re-read a rejected file. Sections are independent. Example: tilth_write(edits: [{path: \"a.rs\", tag: \"1A2B\", ops: [{op: \"delete\", start: 2, end: 2}, {op: \"append\", content: \"x\"}]}], cwd: \"/abs/repo\").",
             "inputSchema": {
                 "type": "object",
                 "required": ["edits", "cwd"],
@@ -269,7 +269,9 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                                             { "required": ["op", "at"], "additionalProperties": false, "properties": { "op": { "const": "delete_block" }, "at": { "type": ["integer", "string"], "minimum": 1, "maximum": 4_294_967_295_u32 } } },
                                             { "required": ["op", "at", "content"], "additionalProperties": false, "properties": { "op": { "const": "insert_after_block" }, "at": { "type": ["integer", "string"], "minimum": 1, "maximum": 4_294_967_295_u32 }, "content": { "type": "string" } } },
                                             { "required": ["op"], "additionalProperties": false, "properties": { "op": { "const": "delete_file" } } },
-                                            { "required": ["op", "dest"], "additionalProperties": false, "properties": { "op": { "const": "move_file" }, "dest": { "type": "string" } } }
+                                            { "required": ["op", "dest"], "additionalProperties": false, "properties": { "op": { "const": "move_file" }, "dest": { "type": "string" } } },
+                                            { "required": ["op", "old", "new"], "additionalProperties": false, "properties": { "op": { "const": "replace_text" }, "old": { "type": "string", "minLength": 1 }, "new": { "type": "string" } } },
+                                            { "required": ["op", "content"], "additionalProperties": false, "properties": { "op": { "const": "create_file" }, "content": { "type": "string" } } }
                                         ]
                                     }
                                 }
@@ -324,7 +326,7 @@ mod tests {
             item_required.contains(&"path") && item_required.contains(&"ops"),
             "each section must require path and ops: {item_required:?}"
         );
-        // The ops oneOf must name every one of the 11 verbs via `op` const.
+        // The ops oneOf must name every one of the 13 verbs via `op` const.
         let ops_item = &schema["properties"]["edits"]["items"]["properties"]["ops"]["items"];
         let branches = ops_item["oneOf"].as_array().expect("ops oneOf present");
         let verbs: Vec<&str> = branches
@@ -343,12 +345,19 @@ mod tests {
             "insert_after_block",
             "delete_file",
             "move_file",
+            "replace_text",
+            "create_file",
         ] {
             assert!(
                 verbs.contains(&verb),
                 "ops oneOf must name '{verb}': {verbs:?}"
             );
         }
+        assert_eq!(
+            branches.len(),
+            13,
+            "exactly 13 verbs expected in the ops oneOf: {verbs:?}"
+        );
         // The old per-file `files` array surface stays gone.
         assert!(
             schema["properties"].get("files").is_none(),
@@ -601,10 +610,8 @@ mod tests {
         );
     }
 
-    /// `tilth_list` relaxed `patterns` to optional: a bare `{cwd}` call must
-    /// validate client-side (the `["*"]` default is applied at runtime), while
-    /// `cwd` stays required and a wrong-shape `patterns` is still rejected by
-    /// the schema before it reaches the server.
+    /// `tilth_list` treats an omitted `patterns` key as a project overview,
+    /// while present arrays retain glob-tree behavior and validation.
     #[test]
     fn tilth_list_schema_makes_patterns_optional_but_keeps_cwd_required() {
         let tools = tool_definitions(false);
@@ -629,8 +636,8 @@ mod tests {
             schema["properties"]["patterns"]["description"]
                 .as_str()
                 .expect("patterns description present")
-                .contains("Optional"),
-            "patterns description must advertise the omission default"
+                .contains("omit patterns for a project overview"),
+            "patterns description must advertise the overview omission"
         );
 
         let compiled = jsonschema::JSONSchema::compile(schema)
@@ -670,5 +677,64 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn tilth_write_schema_includes_replace_text_branch() {
+        let tools = tool_definitions(true);
+        let write = tools
+            .iter()
+            .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("tilth_write"))
+            .expect("tilth_write tool definition present");
+        let description = write["description"].as_str().expect("description");
+        assert!(description.contains("replace_text uses {old,new}, must match once"));
+        let branches = write["inputSchema"]["properties"]["edits"]["items"]["properties"]["ops"]
+            ["items"]["oneOf"]
+            .as_array()
+            .expect("ops oneOf");
+        let branch = branches
+            .iter()
+            .find(|branch| branch["properties"]["op"]["const"] == "replace_text")
+            .expect("replace_text branch");
+        assert_eq!(branch["required"], serde_json::json!(["op", "old", "new"]));
+    }
+    #[test]
+    fn tilth_write_schema_replace_text_old_requires_min_length() {
+        let tools = tool_definitions(true);
+        let write = tools
+            .iter()
+            .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("tilth_write"))
+            .expect("tilth_write tool definition present");
+        let branches = write["inputSchema"]["properties"]["edits"]["items"]["properties"]["ops"]
+            ["items"]["oneOf"]
+            .as_array()
+            .expect("ops oneOf");
+        let branch = branches
+            .iter()
+            .find(|branch| branch["properties"]["op"]["const"] == "replace_text")
+            .expect("replace_text branch");
+        assert_eq!(
+            branch["properties"]["old"]["minLength"],
+            serde_json::json!(1)
+        );
+    }
+    #[test]
+    fn tilth_write_schema_includes_create_file_branch() {
+        let tools = tool_definitions(true);
+        let write = tools
+            .iter()
+            .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("tilth_write"))
+            .expect("tilth_write tool definition present");
+        let description = write["description"].as_str().expect("description");
+        assert!(description.contains("create_file uses {content}"));
+        let branches = write["inputSchema"]["properties"]["edits"]["items"]["properties"]["ops"]
+            ["items"]["oneOf"]
+            .as_array()
+            .expect("ops oneOf");
+        let branch = branches
+            .iter()
+            .find(|branch| branch["properties"]["op"]["const"] == "create_file")
+            .expect("create_file branch");
+        assert_eq!(branch["required"], serde_json::json!(["op", "content"]));
     }
 }

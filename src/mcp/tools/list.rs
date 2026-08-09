@@ -8,8 +8,7 @@ use std::path::PathBuf;
 
 use serde_json::Value;
 
-const PATTERNS_SHAPE: &str = "\"patterns\" must be an array of glob strings: \
-     pass patterns: [\"*.rs\"], or omit it for the full tree.";
+const PATTERNS_SHAPE: &str = "\"patterns\" must be an array of glob strings; pass an array or omit patterns for a project overview.";
 
 pub(crate) fn tool_list(args: &Value) -> Result<String, String> {
     use globset::Glob;
@@ -18,7 +17,26 @@ pub(crate) fn tool_list(args: &Value) -> Result<String, String> {
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
 
     let patterns: Vec<String> = match args.get("patterns") {
-        None => vec!["*".to_string()],
+        None => {
+            // `scope` is an advertised parameter and is honored on the pattern
+            // branch; fingerprinting `cwd` here would silently widen a scoped
+            // request to the whole checkout.
+            let overview = crate::overview::fingerprint(&scope);
+            // fingerprint() is contractually fail-silent (it catch_unwinds to
+            // an empty string) because it began life as a cosmetic initialize
+            // banner. As a whole tool response that inverts tool_list's own
+            // contract, so an empty result becomes an error rather than a
+            // successful "this project is empty".
+            if overview.trim().is_empty() {
+                return Err(format!(
+                    "no project overview could be generated for {}",
+                    scope.display()
+                ));
+            }
+            let mut result = scope_warning.unwrap_or_default();
+            result.push_str(&overview);
+            return Ok(super::apply_budget(&result, budget));
+        }
         Some(value) => {
             let Some(arr) = value.as_array() else {
                 return Err(PATTERNS_SHAPE.to_string());
@@ -202,26 +220,98 @@ mod tests {
     }
 
     #[test]
-    fn omitted_patterns_defaults_to_full_tree() {
-        // Omitting `patterns` must behave exactly like patterns: ["*"] — the
-        // zero-ceremony layout-tree call — not error as a missing parameter.
+    fn omitted_patterns_returns_project_overview() {
         let tmp = tempfile::tempdir().unwrap();
-        let sub = tmp.path().join("sub");
-        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
         std::fs::write(tmp.path().join("a.rs"), "fn a() {}\n").unwrap();
-        std::fs::write(sub.join("b.md"), "# b\n").unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let omitted =
-            tool_list(&serde_json::json!({ "cwd": cwd })).expect("omitted patterns defaults");
-        let explicit = tool_list(&serde_json::json!({ "patterns": ["*"], "cwd": cwd }))
-            .expect("explicit [\"*\"] lists");
-        assert_eq!(
-            omitted, explicit,
-            "omitted patterns must be byte-identical to explicit [\"*\"]"
+
+        let omitted = tool_list(&serde_json::json!({ "cwd": cwd }))
+            .expect("omitted patterns return project overview");
+        let expected = crate::overview::fingerprint(tmp.path());
+
+        assert_eq!(omitted, expected);
+        assert!(omitted.starts_with("[tilth] Rust project"));
+        assert!(omitted.contains("source files"));
+        assert!(omitted.contains("manifest: Cargo.toml"));
+        assert!(
+            !omitted.contains("├──"),
+            "overview must not render a tree: {omitted}"
         );
         assert!(
-            omitted.contains("a.rs") && omitted.contains("b.md"),
-            "default tree must include all files: {omitted}"
+            !omitted.contains("a.rs"),
+            "overview must not list individual files: {omitted}"
+        );
+    }
+
+    /// `scope` is advertised and honored on the pattern branch; the overview
+    /// branch must not silently widen a scoped request to the whole checkout.
+    #[test]
+    fn omitted_patterns_honors_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"outer\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let inner = tmp.path().join("packages").join("api");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(
+            inner.join("Cargo.toml"),
+            "[package]\nname = \"scoped-inner\"\nversion = \"0.2.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(inner.join("lib.rs"), "fn inner() {}\n").unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+
+        let scoped = tool_list(&serde_json::json!({ "cwd": cwd, "scope": "packages/api" }))
+            .expect("scoped overview");
+        let unscoped = tool_list(&serde_json::json!({ "cwd": cwd })).expect("unscoped overview");
+
+        assert_ne!(
+            scoped, unscoped,
+            "a scoped overview must not equal the whole-checkout overview"
+        );
+        assert!(
+            scoped.starts_with("[tilth] Rust project"),
+            "scoped overview must render the inner package, got: {scoped}"
+        );
+        assert!(
+            scoped.contains("manifest: Cargo.toml"),
+            "scoped overview must name the inner manifest: {scoped}"
+        );
+        assert!(
+            !scoped.contains("outer"),
+            "scoped overview must not leak the outer package name: {scoped}"
+        );
+    }
+
+    /// A bad scope produces a warning on the pattern branch; the overview
+    /// branch must surface it too rather than dropping it.
+    #[test]
+    fn omitted_patterns_surfaces_scope_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("a.rs"), "fn a() {}\n").unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+
+        let out = tool_list(&serde_json::json!({ "cwd": cwd, "scope": "does/not/exist" }))
+            .expect("missing scope falls back with a warning");
+        let bare = tool_list(&serde_json::json!({ "cwd": cwd })).expect("bare overview");
+        assert_eq!(
+            out,
+            format!(
+                "scope \"does/not/exist\" is not a valid directory, searching the cwd/checkout directory instead.\n\n{bare}"
+            ),
+            "warning must name the bad scope and be prepended to the overview, got: {out}"
         );
     }
 
