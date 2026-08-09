@@ -17,6 +17,7 @@ from parse import (
     parse_opencode_json,
     parse_stream_json,
     tool_batch_sizes,
+    tool_op_kinds,
 )
 
 
@@ -115,6 +116,44 @@ def test_tool_batch_sizes_skips_malformed_inputs():
     result = parse_stream_json("\n".join(json.dumps(e) for e in events))
 
     assert tool_batch_sizes(result) == {}
+
+
+def test_tool_op_kinds_counts_ops_across_edits_sections_and_calls():
+    """Op-kind capture is the needle for replace_text adoption: counts by the
+    ops' "op" key across every edits section of every tilth_write call,
+    aggregated for the run."""
+    events = [
+        _tool_use_event("mcp__tilth__tilth_write", {"edits": [
+            {"path": "a", "ops": [{"op": "replace", "start": 1, "end": 1, "content": "x"}]},
+            {"path": "b", "ops": [{"op": "replace_text", "find": "x", "replace": "y"},
+                                   {"op": "create_file", "content": "z"}]},
+        ]}, "t1"),
+        _tool_use_event("mcp__tilth__tilth_write", {"edits": [
+            {"path": "c", "ops": [{"op": "replace_text", "find": "a", "replace": "b"}]},
+        ]}, "t2"),
+        _tool_use_event("Bash", {"command": "ls"}, "t3"),
+        _result_event(),
+    ]
+
+    result = parse_stream_json("\n".join(json.dumps(e) for e in events))
+
+    assert tool_op_kinds(result) == {"replace": 1, "replace_text": 2, "create_file": 1}
+
+
+def test_tool_op_kinds_skips_malformed_inputs():
+    """Malformed edits/ops shapes (non-list edits, non-list ops, missing or
+    non-string \"op\") are skipped, never fabricated into a count."""
+    events = [
+        _tool_use_event("mcp__tilth__tilth_write", {"edits": "not-a-list"}, "t1"),
+        _tool_use_event("mcp__tilth__tilth_write", {"edits": [{"path": "a", "ops": "not-a-list"}]}, "t2"),
+        _tool_use_event("mcp__tilth__tilth_write", {"edits": [{"path": "a", "ops": [{}]}]}, "t3"),
+        _tool_use_event("mcp__tilth__tilth_write", {}, "t4"),
+        _result_event(),
+    ]
+
+    result = parse_stream_json("\n".join(json.dumps(e) for e in events))
+
+    assert tool_op_kinds(result) == {}
 
 
 def test_stream_json_result_text_accumulates_across_all_assistant_turns():

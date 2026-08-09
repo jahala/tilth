@@ -512,6 +512,7 @@ def _tool_usage_section(valid_results: list[dict]) -> list[str]:
         )
     lines.append("")
     lines.extend(_batch_size_table(valid_results, modes))
+    lines.extend(_op_kinds_table(valid_results, modes))
     return lines
 
 
@@ -570,6 +571,52 @@ def _batch_size_table(valid_results: list[dict], modes: list[str]) -> list[str]:
     if partial:
         lines.append("")
         lines.append(f"_Batch sizes recorded on a subset of rows: {', '.join(partial)}._")
+    lines.append("")
+    return lines
+
+
+def _op_kinds_table(valid_results: list[dict], modes: list[str]) -> list[str]:
+    """Per-arm op-kind distribution for tilth_write calls."""
+    recorded = [r for r in valid_results if isinstance(r.get("op_kinds"), dict)]
+    if not recorded:
+        return ["_Op kinds unrecorded (rows predate op-kind capture)._", ""]
+
+    recorded_by_mode: Counter = Counter(str(r.get("mode", "unknown")) for r in recorded)
+    total_by_mode: Counter = Counter(str(r.get("mode", "unknown")) for r in valid_results)
+
+    # (kind, mode) -> total count
+    counts: Counter = Counter()
+    for r in recorded:
+        mode = str(r.get("mode", "unknown"))
+        for kind, count in r["op_kinds"].items():
+            if isinstance(count, (int, float)):
+                counts[(str(kind), mode)] += int(count)
+    if not counts:
+        return ["_No tilth_write op kinds recorded._", ""]
+
+    lines = [
+        "**Op kinds** (tilth_write ops by kind, per arm):",
+        "",
+        "| Op | " + " | ".join(mode_label(mode) for mode in modes) + " |",
+        "|---|" + "|".join(["---:"] * len(modes)) + "|",
+    ]
+    kinds = sorted({kind for kind, _ in counts})
+    for kind in kinds:
+        row = [kind]
+        for mode in modes:
+            if not recorded_by_mode[mode]:
+                row.append("unrecorded")
+                continue
+            row.append(str(counts.get((kind, mode), 0)))
+        lines.append("| " + " | ".join(row) + " |")
+    partial = [
+        f"{mode_label(mode)} {recorded_by_mode[mode]}/{total_by_mode[mode]}"
+        for mode in modes
+        if 0 < recorded_by_mode[mode] < total_by_mode[mode]
+    ]
+    if partial:
+        lines.append("")
+        lines.append(f"_Op kinds recorded on a subset of rows: {', '.join(partial)}._")
     lines.append("")
     return lines
 

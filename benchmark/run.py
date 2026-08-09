@@ -48,6 +48,7 @@ from parse import (
     parse_stream_json,
     tool_batch_sizes,
     tool_call_counts,
+    tool_op_kinds,
 )
 from tasks import TASKS
 from variants import (
@@ -555,6 +556,7 @@ def _run_single_in_repo(
         "mcp_servers": run_result.mcp_servers,
         "model_usage": run_result.model_usage,
         "batch_sizes": tool_batch_sizes(run_result),
+        "op_kinds": tool_op_kinds(run_result),
     }
 
 

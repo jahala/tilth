@@ -1,5 +1,6 @@
 import json
 import sys
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -494,6 +495,41 @@ def tool_batch_sizes(result: RunResult) -> dict[str, list[int]]:
             if size is not None:
                 sizes.setdefault(tool_call.name, []).append(size)
     return sizes
+
+
+def _is_write_tool(name: str) -> bool:
+    bare = str(name).rsplit("__", 1)[-1]
+    return bare == "tilth_write"
+
+
+def _op_kinds(tool_input: object) -> Counter:
+    """Op-kind counts in one tilth_write call's edits sections."""
+    kinds: Counter = Counter()
+    if not isinstance(tool_input, dict):
+        return kinds
+    edits = tool_input.get("edits")
+    if not isinstance(edits, list):
+        return kinds
+    for section in edits:
+        if not isinstance(section, dict):
+            continue
+        ops = section.get("ops")
+        if not isinstance(ops, list):
+            continue
+        for op in ops:
+            if isinstance(op, dict) and isinstance(op.get("op"), str):
+                kinds[op["op"]] += 1
+    return kinds
+
+
+def tool_op_kinds(result: RunResult) -> dict[str, int]:
+    """Op-kind counts across all tilth_write calls, aggregated for a run."""
+    counts: Counter = Counter()
+    for turn in result.turns:
+        for tool_call in turn.tool_calls:
+            if _is_write_tool(tool_call.name):
+                counts.update(_op_kinds(tool_call.input))
+    return dict(counts)
 
 
 def extract_stream_error(stdout: str) -> Optional[str]:

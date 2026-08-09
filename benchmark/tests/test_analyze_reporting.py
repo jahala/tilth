@@ -360,6 +360,23 @@ def test_batching_table_reports_multi_item_share_per_arm():
     assert "_Batch sizes unrecorded" not in report
 
 
+def test_op_kinds_table_reports_counts_per_arm():
+    """Op-kind capture is the needle for replace_text adoption: per-arm counts
+    by op kind, with the unrecorded/subset-of-rows degradation matching the
+    batch-size table's semantics."""
+    baseline = _run(task="one", mode="baseline", cost=1.0, correct=True)
+    baseline["op_kinds"] = {}
+    tilth = _run(task="one", mode="tilth", cost=1.0, correct=True)
+    tilth["op_kinds"] = {"replace_text": 5, "replace": 2}
+    legacy = _run(task="one", mode="tilth_forced", cost=1.0, correct=True)
+
+    report = analyze.generate_report([baseline, tilth, legacy])
+
+    assert "**Op kinds**" in report
+    assert "| replace | 0 | 2 | unrecorded |" in report
+    assert "| replace_text | 0 | 5 | unrecorded |" in report
+
+
 def test_per_task_tools_used_totals_and_native_cost_reconciliation():
     """Per-task sections must show which tools each arm called (totals, so a
     tool used in one of three reps still appears) and reconcile the computed
