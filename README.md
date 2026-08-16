@@ -208,6 +208,36 @@ claude --disallowedTools "Bash,Grep,Glob"
 
 Benchmarks show Haiku benefits significantly from tilth (54% → 73% accuracy) but may still fall back to built-in tools. Forced mode ensures consistent tool adoption.
 
+### Tool gating
+
+Descriptions alone do not flip write routing: in production telemetry across three model tiers, agents given a free choice preferred the host editor 3–9× over `tilth_write` (Sonnet: 10% tilth share), while the same tier ran 93% through tilth once the agent definition removed the host edit tools. Gate tools instead of prompting for them — in Claude Code subagents, allowlist tools and omit `Edit`/`Write`/`Grep`/`Glob`, keeping `Bash` for tests and builds:
+
+```yaml
+# .claude/agents/coder.md frontmatter
+tools: Bash, Read, ToolSearch, mcp__tilth
+```
+
+For headless runs, `--disallowedTools` (above) is the equivalent lever.
+
+### Bash guard hook
+
+Banning built-in Grep/Glob moves exploration into Bash (`grep`/`rg` lead `tilth_search` by up to 4.6:1 in the same telemetry), where the MCP surface cannot see it. `scripts/tilth-bash-guard` is a Claude Code PreToolUse hook that denies common leading `grep`/`rg`/`find`/`cat`/`ls` commands targeting project files (wrapper forms like `bash -c` are not inspected) and routes the agent to `tilth_search`/`tilth_read`/`tilth_list`; pipe filters (`cargo test | grep foo`) and paths outside the project pass through. Verify the guard with `python3 scripts/tilth-bash-guard --self-test`, then install it in a tilth-enabled project's `.claude/settings.json`; review the script itself like any other executable dependency before installing it, especially when checking out untrusted branches:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {"type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR\"/scripts/tilth-bash-guard"}
+        ]
+      }
+    ]
+  }
+}
+```
+
 ## How it decides what to show
 
 | Input | Behaviour |

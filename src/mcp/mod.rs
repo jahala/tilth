@@ -278,7 +278,7 @@ fn handle_request(req: &JsonRpcRequest, services: &Services) -> JsonRpcResponse 
     }
 }
 
-fn append_batch_nudge(body: String, tip: Option<String>) -> String {
+fn append_nudge(body: String, tip: Option<String>) -> String {
     let Some(tip) = tip else {
         return body;
     };
@@ -328,9 +328,10 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
         _ => Err(format!("unknown tool: {tool}")),
     };
     // Observe every dispatch — an errored call still advances/resets the
-    // streak — but only successful responses can carry the tip.
-    let tip = services.session().batch_nudge(tool, args, result.is_ok());
-    result.map(|body| append_batch_nudge(body, tip))
+    // batch streak — but only successful responses can carry a tip.
+    // `Session::nudge` resolves grok-vs-batch precedence internally.
+    let tip = services.session().nudge(tool, args, result.is_ok());
+    result.map(|body| append_nudge(body, tip))
 }
 
 // ---------------------------------------------------------------------------
@@ -485,6 +486,124 @@ mod tests {
             !second.ends_with(&format!("\n\n\n{tip}")),
             "double blank line before tip: {second:?}"
         );
+    }
+
+    #[test]
+    fn dispatch_tool_appends_grok_nudge_on_repeated_symbol_search() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn foo() {}\n").unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        let services = Services::new(false);
+
+        let first = dispatch_tool(
+            "tilth_search",
+            &serde_json::json!({ "queries": [{ "query": "foo" }], "cwd": cwd }),
+            &services,
+        )
+        .unwrap();
+        assert!(
+            !first.contains("TIP:"),
+            "first search must not tip: {first}"
+        );
+
+        let second = dispatch_tool(
+            "tilth_search",
+            &serde_json::json!({ "queries": [{ "query": "bar" }], "cwd": cwd }),
+            &services,
+        )
+        .unwrap();
+        assert!(
+            second.contains("TIP: batch into one call"),
+            "consecutive single-item searches must batch-tip: {second:?}"
+        );
+
+        let third = dispatch_tool(
+            "tilth_search",
+            &serde_json::json!({ "queries": [{ "query": "foo" }], "cwd": cwd }),
+            &services,
+        )
+        .unwrap();
+        let tip = "TIP: tilth_grok foo — definition, callers, callees, and tests in one call.";
+        assert!(
+            third.ends_with(&format!("\n\n{tip}")),
+            "grok tip must ride foo's second search: {third:?}"
+        );
+        assert!(
+            !third.contains("TIP: batch into one call"),
+            "grok tip must outrank the batch tip: {third:?}"
+        );
+
+        // Discriminator: the old wiring spent batch emission 2-of-2 on the
+        // preempted pair above, leaving nothing here; the fixed wiring
+        // observes with emit off, so this pair still tips.
+        let fourth = dispatch_tool(
+            "tilth_search",
+            &serde_json::json!({ "queries": [{ "query": "qux" }], "cwd": cwd }),
+            &services,
+        )
+        .unwrap();
+        assert!(
+            fourth.contains("TIP: batch into one call"),
+            "the batch emission preempted by the grok tip must not be burned: {fourth:?}"
+        );
+    }
+
+    /// The grok tip is gated to successful `tilth_search` responses: a
+    /// qualifying-but-withheld tip must not leak onto a read response.
+    #[test]
+    fn withheld_grok_tip_skips_reads_and_rides_the_next_search() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn foo() {}\n").unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        let services = Services::new(false);
+
+        // foo reaches candidacy count 2 inside one dispatch (both entries are
+        // symbol-kind searches — content/regex kinds no longer arm the nudge),
+        // then the third entry's unknown kind fails the whole call — the tip
+        // is withheld.
+        let err = dispatch_tool(
+            "tilth_search",
+            &serde_json::json!({ "queries": [
+                { "query": "foo" },
+                { "query": "foo", "kind": "symbol" },
+                { "query": "foo", "kind": "bogus" }
+            ], "cwd": cwd }),
+            &services,
+        );
+        assert!(err.is_err(), "unknown kind must fail the batched call");
+
+        let read = dispatch_tool(
+            "tilth_read",
+            &serde_json::json!({ "paths": ["a.rs"], "cwd": cwd }),
+            &services,
+        )
+        .unwrap();
+        assert!(
+            !read.contains("TIP: tilth_grok"),
+            "grok tip must not ride a read response: {read:?}"
+        );
+
+        let search = dispatch_tool(
+            "tilth_search",
+            &serde_json::json!({ "queries": [{ "query": "foo" }], "cwd": cwd }),
+            &services,
+        )
+        .unwrap();
+        assert!(
+            search.contains("TIP: tilth_grok foo"),
+            "withheld tip must ride the next successful search: {search:?}"
+        );
+    }
+
+    #[test]
+    fn edit_instructions_teach_replace_text_before_line_ops() {
+        let rt = EDIT_MODE_INSTRUCTIONS
+            .find("`replace_text` swaps")
+            .expect("replace_text taught in edit instructions");
+        let line_ops = EDIT_MODE_INSTRUCTIONS
+            .find("line ops use copied integer")
+            .expect("line ops taught in edit instructions");
+        assert!(rt < line_ops, "replace_text must lead the op teaching");
     }
 
     /// An errored dispatch of a different tool must break the streak — the
@@ -674,7 +793,7 @@ mod tests {
             "edits: [{path: \"src/a.rs\", tag: \"1A2B\", ops: [...]}, {path: \"src/b.rs\""
         ));
         assert!(
-            EDIT_MODE_INSTRUCTIONS.contains("Line ops use copied integer"),
+            EDIT_MODE_INSTRUCTIONS.contains("line ops use copied integer"),
             "op grammar pointer must remain in EDIT_MODE_INSTRUCTIONS"
         );
         assert!(

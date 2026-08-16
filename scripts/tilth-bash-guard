@@ -1,0 +1,640 @@
+#!/usr/bin/env python3
+"""Claude Code PreToolUse hook: route file exploration to tilth.
+
+Denies a Bash command when the leading command of a top-level statement is
+grep/rg/find/cat/ls aimed at files inside the project, answering with a
+message that routes to tilth_search/tilth_read/tilth_list (or tilth_write
+when the project-side target is an output redirect). Pipe filters
+(`cargo test | grep foo`), unresolvable paths (`"$HOME/x"`), heredoc
+bodies, multi-line quoted strings, fd redirects (`2>&1`, `2>/dev/null`),
+and paths outside the project are allowed. Fails open: any internal error
+allows the command (with a stderr note). A hand-rolled bash-grammar subset
+is used instead of the `bashlex` library to keep this a zero-install,
+single-file, dependency-free script — revisit only if that constraint
+changes.
+
+Run `tilth-bash-guard --self-test` to check the deny/allow matrix.
+Install: see README.md § Bash guard hook.
+"""
+
+import json
+import os
+import re
+import shlex
+import sys
+import traceback
+from pathlib import Path
+
+DENY = {"grep", "rg", "find", "cat", "ls"}
+PATTERN_FIRST = {"grep", "rg"}  # first positional is a pattern/value, not a path
+PATTERN_OPT_LONG = {"--regexp", "--file"}
+WRAPPERS = {"command", "time", "sudo", "env", "nice", "nohup", "stdbuf"}
+STATEMENT_BREAKS = {"&&", "||", ";", "&"}
+HEREDOC_OPENERS = {"<<"}
+LINE_CONTINUATION = re.compile(r"\\\n")
+ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# --help/--version read no files; -h/-V are excluded because -h means
+# no-filename in grep and would mask a real project read.
+INFO_FLAGS = {"--help", "--version"}
+# find's global options may precede the root path(s); skip them while
+# scanning for roots instead of treating them as a path-ending predicate.
+FIND_GLOBAL_FLAGS = {"-L", "-H", "-P"}
+FIND_GLOBAL_VALUE_OPTS = {"-maxdepth", "-mindepth", "-D"}
+
+# This routing table restates (but does not programmatically share) the
+# routing guidance in prompts/mcp-base.md — keep them in sync by hand; this
+# script must stay a dependency-free single file.
+ROUTE_BASE = (
+    "{cmd} on project files is replaced by tilth: tilth_search (grep/rg), "
+    "tilth_read (cat), tilth_list (ls/find), tilth_write (file writes). "
+    "Shell remains for tests, builds, and paths outside the project."
+)
+GENERATED_HINT = (
+    " Generated, lock, and binary files return a header only from "
+    "tilth_read — use head or sed for their contents."
+)
+WRITE_ROUTE = (
+    "{cmd} redirecting output into the project is replaced by tilth: "
+    "tilth_write (create_file / replace_text). Shell remains for tests, "
+    "builds, and paths outside the project."
+)
+
+
+def _is_generated_lock_or_binary(path):
+    name = os.path.basename(path)
+    if (
+        name
+        in {
+            "package-lock.json",
+            "yarn.lock",
+            "pnpm-lock.yaml",
+            "Cargo.lock",
+            "composer.lock",
+            "Gemfile.lock",
+            "poetry.lock",
+            "bun.lockb",
+        }
+        or name.endswith(".lock")
+    ):
+        return True
+    if re.search(r"\.min\.[^.]+$", name):
+        return True
+    _, ext = os.path.splitext(name)
+    return ext.lower() in {
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".pdf",
+        ".zip",
+        ".tar",
+        ".gz",
+        ".exe",
+        ".so",
+        ".dylib",
+        ".bin",
+        ".woff",
+        ".woff2",
+        ".ico",
+    }
+
+
+def tokenize(command):
+    """Tokenize the whole command in a single pass, pairing each token
+    with the source line (1-based) it starts on."""
+    lex = shlex.shlex(command, posix=True, punctuation_chars=True)
+    lex.whitespace_split = True
+    tokens = []
+    while True:
+        line = lex.lineno
+        tok = lex.get_token()
+        if tok is None:
+            break
+        tokens.append((tok, line))
+    return tokens
+
+
+def heredoc_delimiters(tokens):
+    """The delimiters of every heredoc opened by these same-line tokens,
+    in order.
+
+    `<<` inside `$(( ))` arithmetic is a shift, not a heredoc; quoted `<<`
+    never surfaces as its own token under posix shlex. `<<-EOF` tokenizes
+    as `<<` + `-EOF` (shlex's punctuation set doesn't include `-`), so the
+    leading dash is stripped from the recorded delimiter.
+    """
+    delims, arith = [], 0
+    for i, tok in enumerate(tokens):
+        if tok == "((":
+            arith += 1
+        elif tok == "))":
+            arith = max(0, arith - 1)
+        elif tok in HEREDOC_OPENERS and arith == 0 and i + 1 < len(tokens):
+            delim = tokens[i + 1]
+            if delim.startswith("-"):
+                delim = delim[1:]
+            delims.append(delim)
+    return delims
+
+
+def heredoc_body_lines(tokens, command):
+    """Line numbers (1-based) that fall inside a heredoc body or its
+    terminator line — data, never judged."""
+    tokens_by_line = {}
+    for tok, line in tokens:
+        tokens_by_line.setdefault(line, []).append(tok)
+
+    body_lines = set()
+    pending = []
+    for lineno, raw in enumerate(command.split("\n"), start=1):
+        if pending:
+            body_lines.add(lineno)
+            if raw.strip() == pending[0]:
+                pending.pop(0)
+            continue
+        pending = heredoc_delimiters(tokens_by_line.get(lineno, []))
+    return body_lines
+
+
+def statement_stream(tokens, body_lines):
+    """Flatten tokens into segment order, dropping heredoc-body tokens
+    and inserting a `;` wherever a bare newline (not absorbed by a
+    continuation or a multi-line quoted string) separates two
+    statements."""
+    flat = []
+    prev_end = None
+    for tok, line in tokens:
+        if line in body_lines:
+            continue
+        if prev_end is not None and line > prev_end:
+            flat.append(";")
+        flat.append(tok)
+        prev_end = line + tok.count("\n")
+    return flat
+
+
+def leading_segments(tokens):
+    """Yield the leading pipeline segment of each top-level statement."""
+    seg, in_filters = [], False
+    for tok in tokens:
+        if tok in STATEMENT_BREAKS:
+            if seg:
+                yield seg
+            seg, in_filters = [], False
+        elif in_filters:
+            continue
+        elif tok == "|":
+            # The rest of this statement is pipe filters — not leading.
+            if seg:
+                yield seg
+            seg, in_filters = [], True
+        else:
+            seg.append(tok)
+    if seg:
+        yield seg
+
+
+def command_and_args(segment):
+    """Split a segment into (command name, args, output-redirect targets).
+
+    Skips leading env assignments and bare wrapper commands. Heredoc
+    operator/delimiter pairs are dropped. Fd redirects `2>`/`2>>` and
+    above contribute nothing; `1>`/`1>>` (stdout) still routes to
+    out_targets since it's the primary write target. An input redirect's
+    target joins `args` (read semantics), an output redirect's target is
+    returned separately so `cat > notes.txt` can route to tilth_write.
+    """
+    i = 0
+    while i < len(segment) and ENV_ASSIGN.match(segment[i]):
+        i += 1
+    while i < len(segment) and os.path.basename(segment[i]) in WRAPPERS:
+        i += 1
+        while i < len(segment) and ENV_ASSIGN.match(segment[i]):
+            i += 1
+    if i >= len(segment):
+        return None, [], []
+    cmd = os.path.basename(segment[i])
+    args, out_targets = [], []
+    rest = segment[i + 1 :]
+    j = 0
+    while j < len(rest):
+        tok = rest[j]
+        if tok in HEREDOC_OPENERS:
+            j += 2  # skip the operator and its delimiter — not a path
+            continue
+        if tok and all(c in "<>&" for c in tok):
+            # `2> file` / `2>&1`: the fd digit was collected as an arg.
+            # fd 1 (stdout) is the primary write target and still routes;
+            # fd >= 2 keeps the no-op suppress behavior.
+            fd_redirect = bool(args) and args[-1].isdigit()
+            fd_digit = args[-1] if fd_redirect else None
+            if fd_redirect:
+                args.pop()
+            if j + 1 < len(rest):
+                target = rest[j + 1]
+                is_output = ">" in tok
+                suppressed = fd_redirect and not (is_output and fd_digit == "1")
+                if not suppressed and not target.isdigit():
+                    if is_output:
+                        out_targets.append(target)
+                    else:
+                        args.append(target)
+            j += 2
+            continue
+        if tok and tok[0] == "(":
+            break
+        args.append(tok)
+        j += 1
+    return cmd, args, out_targets
+
+
+def looks_pathlike(tok, cwd):
+    return (
+        os.path.isabs(tok)
+        or tok.startswith(("~", "$"))
+        or "/" in tok
+        or os.path.exists(os.path.join(cwd, tok))
+    )
+
+
+def _find_global_opt_skip(tok):
+    """Tokens to skip past when scanning find's roots: 1 for a flag, 2 for
+    an option that consumes a separate value, 0 if not a global option."""
+    if tok in FIND_GLOBAL_FLAGS:
+        return 1
+    if tok.startswith("-O") and tok[2:].isdigit():
+        return 1
+    if tok in FIND_GLOBAL_VALUE_OPTS:
+        return 2
+    return 0
+
+
+def _pattern_supplied_via_option(args):
+    """True when grep/rg's pattern arrives attached to an option
+    (`--regexp=foo`, `--file=x`, `-epat`, `-fpat`) instead of as a bare
+    positional — in that case there is no leading positional to drop."""
+    for t in args:
+        if t.startswith("--"):
+            name, _, value = t.partition("=")
+            if name in PATTERN_OPT_LONG and value:
+                return True
+        elif len(t) > 2 and t[0] == "-" and t[1] in {"e", "f"} and not t.startswith("--"):
+            return True
+    return False
+
+
+def path_args(cmd, args, cwd):
+    """The tokens that may name filesystem read targets for this command."""
+    if cmd == "find":
+        # Roots come before the first predicate (-name, !, ( ...), but
+        # global options (-L, -maxdepth 2, ...) may precede the roots too.
+        roots = []
+        i = 0
+        while i < len(args):
+            tok = args[i]
+            skip = _find_global_opt_skip(tok)
+            if skip:
+                i += skip
+                continue
+            if tok.startswith("-") or tok in {"!", "("}:
+                break
+            roots.append(tok)
+            i += 1
+        return roots
+    positional = [t for t in args if not t.startswith("-")]
+    if cmd in PATTERN_FIRST:
+        # Drop the first positional (the pattern or an option value), then
+        # keep only plausible paths — slashed patterns like 'http://' and
+        # repo-named patterns must not read as project paths. When the
+        # pattern is supplied via an attached option there is no bare
+        # positional pattern to drop.
+        if _pattern_supplied_via_option(args):
+            return [t for t in positional if looks_pathlike(t, cwd)]
+        return [t for t in positional[1:] if looks_pathlike(t, cwd)]
+    return positional
+
+
+def targets_project(paths, cwd, root):
+    """True if any path, resolved against cwd, falls under root."""
+    for p in paths:
+        p = os.path.expanduser(p)
+        if p.startswith("$"):
+            continue  # unexpanded shell variable — unresolvable, fail open
+        ap = p if os.path.isabs(p) else os.path.join(cwd, p)
+        rp = os.path.realpath(ap)
+        if Path(rp).is_relative_to(root):
+            return True
+    return False
+
+
+def judge(cmd, args, out_targets, cwd, root):
+    """Deny reason for one leading segment, or None."""
+    if cwd is None:
+        return None  # cd target unresolvable — fail open
+    candidates = path_args(cmd, args, cwd)
+    if candidates:
+        if targets_project(candidates, cwd, root):
+            reason = ROUTE_BASE.format(cmd=cmd)
+            if any(_is_generated_lock_or_binary(p) for p in candidates):
+                reason += GENERATED_HINT
+            return reason
+    elif not out_targets:
+        # No path was supplied at all — the command defaults to cwd, which
+        # only denies when that cwd is actually inside the project.
+        if cwd == root or Path(cwd).is_relative_to(root):
+            return ROUTE_BASE.format(cmd=cmd)
+    if targets_project(out_targets, cwd, root):
+        return WRITE_ROUTE.format(cmd=cmd)
+    return None
+
+
+def resolve_cd(args, cwd):
+    """The effective cwd after a `cd` segment, or None if unresolvable."""
+    if cwd is None:
+        return None
+    positional = [t for t in args if not t.startswith("-")]
+    if not positional:
+        return None  # bare `cd` (goes to $HOME) — unresolvable here
+    target = positional[0]
+    if target.startswith(("$", "~")):
+        return None  # unexpanded/home-relative — unresolvable, fail open
+    ap = target if os.path.isabs(target) else os.path.join(cwd, target)
+    return os.path.realpath(ap)
+
+
+def decide(command, root):
+    """Return the deny reason, or None to allow."""
+    command = LINE_CONTINUATION.sub("", command)
+    try:
+        tokens = tokenize(command)
+    except ValueError as exc:
+        print(
+            f"tilth-bash-guard: unbalanced quote, allowing: {command[:200]!r} ({exc})",
+            file=sys.stderr,
+        )
+        return None  # unbalanced quote: fail open
+
+    body_lines = heredoc_body_lines(tokens, command)
+    cwd = root  # effective cwd, threaded across `cd` segments; None if unknown
+    for segment in leading_segments(statement_stream(tokens, body_lines)):
+        cmd, args, out_targets = command_and_args(segment)
+        if cmd == "cd":
+            cwd = resolve_cd(args, cwd)
+            continue
+        if cmd in DENY:
+            if any(a in INFO_FLAGS for a in args):
+                continue  # reads no files
+            reason = judge(cmd, args, out_targets, cwd, root)
+            if reason:
+                return reason
+    return None
+
+
+def main():
+    command = ""
+    cwd_repr = None
+    try:
+        data = json.load(sys.stdin)
+        if data.get("tool_name") != "Bash":
+            return
+        command = (data.get("tool_input") or {}).get("command") or ""
+        cwd_repr = data.get("cwd") or os.getcwd()
+        root = os.path.realpath(cwd_repr)
+        reason = decide(command, root)
+        if reason:
+            print(
+                json.dumps(
+                    {
+                        "hookSpecificOutput": {
+                            "hookEventName": "PreToolUse",
+                            "permissionDecision": "deny",
+                            "permissionDecisionReason": reason,
+                        }
+                    }
+                )
+            )
+    except Exception as exc:  # fail open: never block the harness
+        print(
+            f"tilth-bash-guard: {exc!r} command={command[:200]!r} "
+            f"cwd={cwd_repr!r}\n{traceback.format_exc()}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    if "--self-test" in sys.argv[1:]:
+        SELF_TEST_CASES = [
+            ("grep foo src/", "deny"),
+            ("rg pat", "deny"),
+            ("rg foo | head -5", "deny"),
+            ("cargo test | grep foo", "allow"),
+            ("cat /tmp/other/file.txt", "allow"),
+            ("cd sub && rg pat", "deny"),
+            ("ls", "deny"),
+            ("find . -name '*.rs'", "deny"),
+            ("find /tmp/x -name '*.rs'", "allow"),
+            ("echo hi", "allow"),
+            ("git grep foo", "allow"),
+            ("cat README.md", "deny"),
+            ("ls /etc", "allow"),
+            ("grep -r pat /var/log", "allow"),
+            ("grep -A 3 pat /etc/hosts", "allow"),
+            ("grep -m 5 needle /var/log/syslog", "allow"),
+            ('cat "$HOME/.config/foo"', "allow"),
+            ('ls "$TMPDIR"', "allow"),
+            ('grep foo "$LOGDIR/app.log"', "allow"),
+            ("cat <<EOF > notes.txt\nhello world\nEOF", "deny"),
+            ("python3 - <<'EOF'\nls = 1\nprint(ls)\nEOF", "allow"),
+            ("time cat src/lib.rs", "deny"),
+            ("command grep foo src/", "deny"),
+            ("cargo test", "allow"),
+            ("FOO=1 grep pat src/", "deny"),
+            ("python3 benchmark/run.py --models haiku", "allow"),
+            ("rg 'http://' /var/log/app.log", "allow"),
+            ("grep 'a/b' /etc/hosts", "allow"),
+            ("grep README.md /var/log/syslog", "allow"),
+            ("grep foo < /etc/passwd", "allow"),
+            ("cat > notes.txt", "deny"),
+            ('echo "a << b"\ngrep -rn foo src/', "deny"),
+            ("x=$((1<<3))\ngrep -rn foo src/", "deny"),
+            ("/usr/bin/time cat src/lib.rs", "deny"),
+            ("cat /etc/hosts 2>&1", "allow"),
+            ("ls /etc 2>/dev/null", "allow"),
+            ("ls 2>/dev/null", "deny"),
+            ("cat /etc/hosts > notes.txt", "deny"),
+            ("cat > /tmp/out.txt", "allow"),
+            ('python3 -c "\nls = 1\nprint(ls)\n"', "allow"),
+            ('echo "a\ncat src/main.rs\nb"', "allow"),
+            ('echo "a\nb" && grep foo src/', "deny"),
+            ("python3 - <<A <<B\nx\nA\ngrep -rn foo src/\nB", "allow"),
+            ("find -L /tmp/elsewhere -name '*.rs'", "allow"),
+            ("find -maxdepth 2 /var/log", "allow"),
+            ("find -maxdepth 1 /etc", "allow"),
+            ("find -name '*.rs'", "deny"),
+            ("find /tmp -name x", "allow"),
+            ("cd /tmp && ls", "allow"),
+            ("cd /etc && cat hosts", "allow"),
+            ("rg --version", "allow"),
+            ("ls --help", "allow"),
+            ("cat Cargo.lock", "deny"),
+            # -h is not an info flag: in grep it means no-filename, so this is a real
+            # project read. Adding -h to INFO_FLAGS would silently open a bypass.
+            ("grep -h pat src/", "deny"),
+            # A cd chain that returns into the project is still a project read.
+            ("cd sub && cd .. && ls", "deny"),
+            # Bare cd goes to $HOME, which this hook cannot resolve — fail open.
+            ("cd && ls", "allow"),
+            # Backslash-continued commands are a single statement; the tail after
+            # the continuation must still be judged.
+            ("grep foo \\\nsrc/", "deny"),
+            ("rg pattern \\\n--glob '*.rs' src/", "deny"),
+            ("cat \\\nREADME.md", "deny"),
+            # The continuation itself must be elided (not left as a literal
+            # `\n` embedded in the following token) so it doesn't corrupt an
+            # otherwise-allowed path.
+            ("cat \\\n/etc/hosts", "allow"),
+            ("grep foo \\\n/var/log/syslog", "allow"),
+            # A bare newline separates statements, so the single-pass tokenizer must
+            # synthesize the break the old per-line loop got for free.
+            ("cargo build\ngrep foo src/", "deny"),
+            ("cd /tmp\nls", "allow"),
+            ("# just a note\ngrep foo src/", "deny"),
+            # `<<-EOF` strips the leading dash from the delimiter; the
+            # statement after the heredoc must still be judged. The
+            # heredoc's own leading `cat` redirects out of the project so
+            # it doesn't deny by itself and mask the heredoc-skip logic.
+            ("cat <<-EOF >/tmp/out.txt\nhi\nEOF\ngrep -rn foo src/", "deny"),
+            # Attached-option pattern forms leave no bare positional pattern
+            # to drop — the first positional is a real path, not the pattern.
+            ("grep --regexp=foo /etc/hosts", "allow"),
+            ("rg -epat /etc/hosts", "allow"),
+            ("grep --file=x /etc/hosts", "allow"),
+            ("grep --regexp=foo src/", "deny"),
+            ("env grep foo src/", "deny"),
+            # fd 1 (stdout) is the primary write target, unlike fd >= 2.
+            ("ls 1>/tmp/out.txt", "allow"),
+            ("cat /etc/hosts 1>>notes.txt", "deny"),
+        ]
+
+        def self_test():
+            import subprocess
+            import tempfile
+
+            with tempfile.TemporaryDirectory() as root_dir:
+                root = os.path.realpath(root_dir)
+                # A known project file, so pattern-vs-path cases are hermetic.
+                Path(root, "README.md").touch()
+                failures = 0
+                e2e_checks = 0
+                for command, want in SELF_TEST_CASES:
+                    got = "deny" if decide(command, root) else "allow"
+                    if got != want:
+                        failures += 1
+                        print(f"FAIL want={want} got={got}: {command!r}")
+                # End-to-end: the deny envelope must be the hook JSON the host expects.
+                e2e_checks += 1
+                proc = subprocess.run(
+                    [sys.executable, os.path.abspath(__file__)],
+                    input=json.dumps(
+                        {
+                            "tool_name": "Bash",
+                            "tool_input": {"command": "grep foo src/"},
+                            "cwd": root,
+                        }
+                    ),
+                    capture_output=True,
+                    text=True,
+                )
+                try:
+                    envelope = json.loads(proc.stdout)["hookSpecificOutput"]
+                    # Exit 0 on the deny path is part of the contract: PreToolUse treats
+                    # exit 2 as blocking, so a deny that exited 2 would stop the call
+                    # outright instead of surfacing this advisory envelope.
+                    envelope_ok = (
+                        envelope["permissionDecision"] == "deny"
+                        and envelope["hookEventName"] == "PreToolUse"
+                        and envelope["permissionDecisionReason"]
+                        and proc.returncode == 0
+                    )
+                except (ValueError, KeyError):
+                    envelope_ok = False
+                if not envelope_ok:
+                    failures += 1
+                    print(f"FAIL deny envelope malformed: {proc.stdout!r}")
+                # Malformed payload: fails open (nothing denied) with a stderr note.
+                e2e_checks += 1
+                malformed = subprocess.run(
+                    [sys.executable, os.path.abspath(__file__)],
+                    input="not json",
+                    capture_output=True,
+                    text=True,
+                )
+                malformed_ok = (
+                    malformed.stdout == ""
+                    and malformed.stderr.startswith("tilth-bash-guard:")
+                    and malformed.returncode == 1
+                )
+                if not malformed_ok:
+                    failures += 1
+                    print(
+                        f"FAIL malformed payload not fail-open: "
+                        f"stdout={malformed.stdout!r} stderr={malformed.stderr!r} "
+                        f"returncode={malformed.returncode}"
+                    )
+                # Unterminated quote: fails open on stdout with a stderr note,
+                # and does not raise into the outer exception handler.
+                e2e_checks += 1
+                unbalanced = subprocess.run(
+                    [sys.executable, os.path.abspath(__file__)],
+                    input=json.dumps(
+                        {
+                            "tool_name": "Bash",
+                            "tool_input": {"command": "cat 'unterminated"},
+                            "cwd": root,
+                        }
+                    ),
+                    capture_output=True,
+                    text=True,
+                )
+                unbalanced_ok = (
+                    unbalanced.stdout == ""
+                    and "unbalanced quote" in unbalanced.stderr
+                    and unbalanced.returncode == 0
+                )
+                if not unbalanced_ok:
+                    failures += 1
+                    print(
+                        f"FAIL unbalanced quote not fail-open: "
+                        f"stdout={unbalanced.stdout!r} stderr={unbalanced.stderr!r} "
+                        f"returncode={unbalanced.returncode}"
+                    )
+                # Generated/lock files get the tilth_read escape-hatch hint;
+                # plain source files never do, and neither ever names git show.
+                e2e_checks += 1
+                Path(root, "Cargo.lock").touch()
+                generated_reason = decide("cat Cargo.lock", root)
+                generated_ok = (
+                    generated_reason is not None
+                    and "use head or sed" in generated_reason
+                    and "git show" not in generated_reason
+                )
+                if not generated_ok:
+                    failures += 1
+                    print(f"FAIL generated-file hint missing: {generated_reason!r}")
+                e2e_checks += 1
+                plain_reason = decide("cat README.md", root)
+                plain_ok = (
+                    plain_reason is not None
+                    and "use head or sed" not in plain_reason
+                    and "git show" not in plain_reason
+                )
+                if not plain_ok:
+                    failures += 1
+                    print(f"FAIL plain-file hint scope leaked: {plain_reason!r}")
+                total = len(SELF_TEST_CASES) + e2e_checks
+                print(f"self-test: {total - failures}/{total} passed")
+                return 1 if failures else 0
+
+        sys.exit(self_test())
+    main()

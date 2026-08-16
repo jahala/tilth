@@ -159,7 +159,7 @@ fn tool_search_single(
             match symbols.len() {
                 0 => return Err("missing required parameter: query".into()),
                 1 => {
-                    session.record_search(symbols[0]);
+                    session.record_search(symbols[0], true);
                     search_merged_default(
                         symbols[0], &scope, cache, session, bloom, expand, context, glob,
                         edit_mode, budget,
@@ -168,7 +168,7 @@ fn tool_search_single(
                 2.. => {
                     let (run, dropped) = symbols.split_at(symbols.len().min(5));
                     for q in run {
-                        session.record_search(q);
+                        session.record_search(q, true);
                     }
                     let result = crate::search::search_multi_symbol_expanded(
                         run, &scope, cache, session, bloom, expand, context, glob, false,
@@ -191,7 +191,7 @@ fn tool_search_single(
             match queries.len() {
                 0 => return Err("missing required parameter: query".into()),
                 1 => {
-                    session.record_search(queries[0]);
+                    session.record_search(queries[0], true);
                     crate::search::search_symbol_expanded(
                         queries[0], &scope, cache, session, bloom, expand, context, glob, false,
                         edit_mode, budget,
@@ -200,7 +200,7 @@ fn tool_search_single(
                 2.. => {
                     let (run, dropped) = queries.split_at(queries.len().min(5));
                     for q in run {
-                        session.record_search(q);
+                        session.record_search(q, true);
                     }
                     let result = crate::search::search_multi_symbol_expanded(
                         run, &scope, cache, session, bloom, expand, context, glob, false,
@@ -215,13 +215,13 @@ fn tool_search_single(
             }
         }
         Some("content") => {
-            session.record_search(query);
+            session.record_search(query, false);
             crate::search::search_content_expanded(
                 query, &scope, cache, session, expand, context, glob, false, edit_mode, budget,
             )
         }
         Some("regex") => {
-            session.record_search(query);
+            session.record_search(query, false);
             crate::search::search_regex_expanded(
                 query, &scope, cache, session, expand, context, glob, false, edit_mode, budget,
             )
@@ -235,7 +235,7 @@ fn tool_search_single(
             match targets.len() {
                 0 => return Err("missing required parameter: query".into()),
                 1 => {
-                    session.record_search(targets[0]);
+                    session.record_search(targets[0], false);
                     crate::search::callers::search_callers_expanded(
                         targets[0], &scope, bloom, expand, context, glob, false,
                     )
@@ -243,7 +243,7 @@ fn tool_search_single(
                 2.. => {
                     let (run, dropped) = targets.split_at(targets.len().min(5));
                     for t in run {
-                        session.record_search(t);
+                        session.record_search(t, false);
                     }
                     let result = crate::search::callers::search_callers_multi_expanded(
                         run, &scope, bloom, expand, context, glob, false,
@@ -316,7 +316,7 @@ fn search_merged_default(
             query, scope, cache, session, expand, context, glob, false, edit_mode, budget,
         )?
     ));
-    if crate::classify::is_identifier(query) {
+    if crate::classify::is_bare_callable_name(query) {
         sections.push(format!(
             "## caller results\n\n{}",
             crate::search::callers::search_callers_expanded(
@@ -406,6 +406,69 @@ mod tests {
             "bare search must refuse without cwd: {err}"
         );
     }
+
+    /// Regression: a `::`-qualified query (`Session::new`) can never have a
+    /// real caller-search hit — the Rust callee query captures only the final
+    /// segment and `search::callers` compares the full query string against
+    /// it, so the section would always render empty with a false "no
+    /// syntactic call sites" dead-code signal. The merged default must omit
+    /// the caller-results section entirely for such queries.
+    #[test]
+    fn merged_default_omits_caller_section_for_qualified_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("lib.rs"),
+            "struct Session;\nimpl Session {\n    fn new() {}\n}\n",
+        )
+        .unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = std::sync::Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "queries": [{"query": "Session::new"}],
+            "scope": tmp.path().to_str().unwrap(),
+            "cwd": tmp.path().to_str().unwrap(),
+        });
+
+        let out = tool_search(&args, &cache, &session, &bloom, false).unwrap();
+
+        assert!(
+            !out.contains("## caller results"),
+            "qualified query must not get a caller-results section: {out}"
+        );
+    }
+    /// Positive control for the merged-default caller-results gate: a bare
+    /// callable name (no `.` qualifier) must still get a caller-results
+    /// section through the merged default path (kind omitted), so the H3
+    /// omission fix for qualified queries doesn't silently swallow the
+    /// common case too.
+    #[test]
+    fn merged_default_includes_caller_section_for_bare_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("lib.rs"),
+            "fn alpha() {}\nfn uses_alpha() { alpha(); }\n",
+        )
+        .unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = std::sync::Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "queries": [{"query": "alpha"}],
+            "scope": tmp.path().to_str().unwrap(),
+            "cwd": tmp.path().to_str().unwrap(),
+        });
+
+        let out = tool_search(&args, &cache, &session, &bloom, false).unwrap();
+
+        assert!(
+            out.contains("## caller results"),
+            "bare-name query must get a caller-results section: {out}"
+        );
+    }
+
     /// Regression for P0-3: `kind=callers` with a comma query must search each
     /// target separately, not for a literal symbol named "alpha,beta". Before
     /// the fix this returned an empty no-callers message ~70% of real sessions.

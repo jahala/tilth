@@ -42,3 +42,6 @@ benchmark/results/configs/
 
 # Local env (API keys, secrets)
 .env
+
+# Claude Code local settings (machine-specific)
+.claude/settings.local.json

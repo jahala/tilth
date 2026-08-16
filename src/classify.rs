@@ -210,6 +210,17 @@ pub fn is_identifier(s: &str) -> bool {
         })
 }
 
+/// Does `s` look like a bare callable name — an identifier with no `.`
+/// qualifier? Narrower than `is_identifier`: callers search can never
+/// match a dotted name (the callee queries capture only the final
+/// segment, and `search::callers` compares against the full query string),
+/// so gating the caller-results section on this instead of `is_identifier`
+/// avoids an always-empty section with a false "no syntactic call sites"
+/// dead-code signal for `obj.method` queries.
+pub fn is_bare_callable_name(s: &str) -> bool {
+    is_identifier(s) && !s.contains('.')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,6 +301,10 @@ mod tests {
             classify("import { X }", &scope),
             QueryType::Content(_)
         ));
+        assert!(matches!(
+            classify("Session::new", &scope),
+            QueryType::Content(_)
+        ));
     }
 
     #[test]
@@ -365,5 +380,14 @@ mod tests {
         assert!(!is_identifier(""));
         assert!(!is_identifier("has space"));
         assert!(!is_identifier("123start"));
+        assert!(!is_identifier("TODO:"));
+        assert!(!is_identifier("a:b"));
+    }
+
+    #[test]
+    fn is_bare_callable_name_checks() {
+        assert!(is_bare_callable_name("foo"));
+        assert!(!is_bare_callable_name("Session::new"));
+        assert!(!is_bare_callable_name("Auth.validate"));
     }
 }

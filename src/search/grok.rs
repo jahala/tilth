@@ -65,6 +65,10 @@ fn parse_target_spec(s: &str) -> TargetSpec {
     TargetSpec::Symbol(s.to_string())
 }
 
+pub fn is_path_line_target(s: &str) -> bool {
+    matches!(parse_target_spec(s), TargetSpec::PathLine { .. })
+}
+
 /// Resolve a target spec and return the loaded source plus its detected
 /// language. Single file read; single outline parse downstream.
 fn resolve_with_source(
@@ -133,6 +137,22 @@ fn split_qualified(name: &str) -> (Option<&str>, &str) {
         }
         None => (None, name),
     }
+}
+
+pub fn can_resolve(query: &str) -> bool {
+    let last_valid = query
+        .as_bytes()
+        .last()
+        .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_');
+    if !last_valid || names_a_known_file(query) {
+        return false;
+    }
+    let (qualifier, bare) = split_qualified(query);
+    crate::classify::is_identifier(bare) && qualifier.is_none_or(crate::classify::is_identifier)
+}
+
+fn names_a_known_file(query: &str) -> bool {
+    !matches!(detect_file_type(Path::new(query)), FileType::Other)
 }
 
 /// Search for `query` as a symbol and resolve a definition to a full target.
