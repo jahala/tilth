@@ -236,27 +236,7 @@ fn common_dir_prefix(mods: &[(String, usize)]) -> String {
 // ---------------------------------------------------------------------------
 
 fn lang_display_name(lang: Lang) -> &'static str {
-    match lang {
-        Lang::Rust => "Rust",
-        Lang::TypeScript => "TypeScript",
-        Lang::Tsx => "TSX",
-        Lang::JavaScript => "JavaScript",
-        Lang::Python => "Python",
-        Lang::Go => "Go",
-        Lang::Java => "Java",
-        Lang::Scala => "Scala",
-        Lang::C => "C",
-        Lang::Cpp => "C++",
-        Lang::Ruby => "Ruby",
-        Lang::Php => "PHP",
-        Lang::Swift => "Swift",
-        Lang::Kotlin => "Kotlin",
-        Lang::CSharp => "C#",
-        Lang::Elixir => "Elixir",
-        Lang::Bash => "Bash",
-        Lang::Dockerfile => "Docker",
-        Lang::Make => "Make",
-    }
+    crate::lang::spec::spec(lang).display
 }
 
 // ---------------------------------------------------------------------------
@@ -694,9 +674,7 @@ fn test_style(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opt
             .take(5)
             .any(|(path, _)| {
                 let full = root.join(path);
-                fs::read_to_string(&full)
-                    .ok()
-                    .is_some_and(|content| content.contains("#[cfg(test)]"))
+                fs::read_to_string(&full).is_ok_and(|content| content.contains("#[cfg(test)]"))
             });
         if has_cfg_test {
             styles.push("in-source #[cfg(test)]".to_string());

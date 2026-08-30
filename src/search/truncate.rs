@@ -372,7 +372,7 @@ mod tests {
     }
 
     /// Proximity test: the line immediately after the needle also survives with
-    /// the query boost (QUERY_PROXIMITY_BOOST lifts it above competitors).
+    /// the query boost (`QUERY_PROXIMITY_BOOST` lifts it above competitors).
     #[test]
     fn query_boost_preserves_neighbour() {
         // Same setup as above but we also check line 51 (needle + 1).
