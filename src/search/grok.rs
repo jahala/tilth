@@ -184,7 +184,9 @@ fn read_code_file(path: &Path) -> Result<(String, Lang), TilthError> {
     if crate::lang::detection::is_binary(&bytes) {
         return Err(TilthError::InvalidQuery {
             query: path.display().to_string(),
-            reason: "binary file — grok needs source code".to_string(),
+            reason: "binary or non-text file (null bytes in first 512B) — grok needs source; \
+                     use tilth_search \"<symbol>\" for matches in this file"
+                .to_string(),
         });
     }
     let content = String::from_utf8_lossy(&bytes).into_owned();
@@ -1197,9 +1199,10 @@ mod tests {
         let err = resolve_by_path_line(&path, 1).unwrap_err();
         match err {
             TilthError::InvalidQuery { reason, .. } => {
-                assert!(
-                    reason.contains("binary"),
-                    "expected binary refusal: {reason}"
+                assert_eq!(
+                    reason,
+                    "binary or non-text file (null bytes in first 512B) — grok needs source; \
+                     use tilth_search \"<symbol>\" for matches in this file"
                 );
             }
             other => panic!("expected InvalidQuery, got {other}"),
