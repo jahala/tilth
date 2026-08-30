@@ -39,6 +39,9 @@ use crate::format::rel;
 // gitignored files (docs/, configs, generated code) are still searchable.
 pub(crate) const SKIP_DIRS: &[&str] = &[
     ".git",
+    ".jj",
+    ".hg",
+    ".svn",
     "node_modules",
     "target",
     "dist",
@@ -1574,6 +1577,31 @@ mod tests {
         let exts = extensions(&all);
         assert!(exts.contains("rs"), "expected .rs files, got {exts:?}");
         assert!(!all.is_empty());
+    }
+
+    #[test]
+    fn walker_skips_vcs_internal_dirs() {
+        // `.jj`/`.hg`/`.svn` are VCS internals like `.git` — never source.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("real.rs"), "fn main() {}").unwrap();
+        for vcs in [".jj", ".hg", ".svn"] {
+            let dir = tmp.path().join(vcs);
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(dir.join("store.rs"), "fn buried() {}").unwrap();
+        }
+
+        let names: Vec<String> = walk_paths(tmp.path(), None)
+            .iter()
+            .filter_map(|p| Some(p.file_name()?.to_str()?.to_string()))
+            .collect();
+        assert!(
+            names.contains(&"real.rs".to_string()),
+            "source file must be found: {names:?}"
+        );
+        assert!(
+            !names.contains(&"store.rs".to_string()),
+            "VCS-internal file leaked through the walker: {names:?}"
+        );
     }
 
     #[test]
