@@ -47,14 +47,13 @@ pub fn search_header(
 
 /// Human-readable file size. Integer math only — no floats.
 fn format_size(bytes: u64) -> String {
+    const MB: u64 = 1024 * 1024;
+    const GB: u64 = 1024 * MB;
     match bytes {
         b if b < 1024 => format!("{b}B"),
-        b if b < 1024 * 1024 => format!("{}KB", b / 1024),
-        b => format!(
-            "{}.{}MB",
-            b / (1024 * 1024),
-            (b % (1024 * 1024)) * 10 / (1024 * 1024)
-        ),
+        b if b < MB => format!("{}KB", b / 1024),
+        b if b < GB => format!("{}.{}MB", b / MB, (b % MB) * 10 / MB),
+        b => format!("{}.{}GB", b / GB, (b % GB) * 10 / GB),
     }
 }
 
@@ -117,4 +116,22 @@ pub(crate) fn rel(path: &Path, scope: &Path) -> String {
         .unwrap_or(path)
         .display()
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_size_covers_every_tier() {
+        assert_eq!(format_size(512), "512B");
+        assert_eq!(format_size(8 * 1024), "8KB");
+        assert_eq!(format_size(3 * 1024 * 1024 + 512 * 1024), "3.5MB");
+        // Just under a GB stays in the MB tier…
+        assert_eq!(format_size(1024 * 1024 * 1024 - 1), "1023.9MB");
+        // …and from 1GB up the GB tier takes over: 8GB is not "8192.0MB".
+        assert_eq!(format_size(1024 * 1024 * 1024), "1.0GB");
+        assert_eq!(format_size(3 * 1024 * 1024 * 1024 / 2), "1.5GB");
+        assert_eq!(format_size(8 * 1024 * 1024 * 1024), "8.0GB");
+    }
 }
