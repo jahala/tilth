@@ -201,7 +201,15 @@ fn enrich_from_outline(
     name: String,
     other_def_count: usize,
 ) -> Result<(ResolvedTarget, String, Lang), TilthError> {
-    let (content, lang) = read_code_file(&path)?;
+    // On the symbol route the user asked for `name`, not the path the search
+    // resolved it to — a refusal must name their query, not our detour.
+    let (content, lang) = read_code_file(&path).map_err(|e| match e {
+        TilthError::InvalidQuery { reason, .. } => TilthError::InvalidQuery {
+            query: name.clone(),
+            reason,
+        },
+        other => other,
+    })?;
     let entries = get_outline_entries(&content, lang);
     let entry = find_by_start_line(&entries, start_line)
         .or_else(|| find_entry_at_line(&entries, start_line));
@@ -1264,6 +1272,21 @@ mod tests {
         // Relative path is joined with scope.
         let (target, _, _) = resolve_with_source("src/a.rs:3", tmp.path()).unwrap();
         assert_eq!(target.name, "two");
+    }
+
+    #[test]
+    fn resolve_by_name_refusal_names_the_query_not_the_path() {
+        // The refusal fires inside enrich_from_outline after the symbol search
+        // already resolved a path; the error must still name what the user
+        // asked for, not the file the search walked to.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("tainted.rs");
+        fs::write(&path, b"fn alpha() {}\n\x00\x01\x02").unwrap();
+        let err = resolve_by_name("alpha", tmp.path()).unwrap_err();
+        match err {
+            TilthError::InvalidQuery { query, .. } => assert_eq!(query, "alpha"),
+            other => panic!("expected InvalidQuery, got {other}"),
+        }
     }
 
     // -- collect_siblings ------------------------------------------------
