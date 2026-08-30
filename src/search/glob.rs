@@ -117,9 +117,8 @@ fn file_preview(path: &Path) -> Option<String> {
     // A byte/4 token estimate is meaningless for binary content (a PNG is not
     // ~N tokens of text). Classify like the read path and show size + type.
     if is_binary_file(path) {
-        let size = crate::format::format_size(meta.len());
         let mime = crate::read::mime_from_ext(path);
-        return Some(format!("binary, {size}, {mime}"));
+        return Some(crate::format::binary_summary(meta.len(), mime));
     }
     let tokens = estimate_tokens(meta.len());
     Some(format!("~{tokens} tokens"))

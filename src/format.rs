@@ -20,11 +20,14 @@ pub fn file_header(path: &Path, byte_len: u64, line_count: u32, mode: ViewMode) 
 
 /// Build header for binary files: `# path (binary, size, mime) [skipped]`
 pub fn binary_header(path: &Path, byte_len: u64, mime: &str) -> String {
+    let summary = binary_summary(byte_len, mime);
+    format!("# {} ({summary}) [skipped]", path.display())
+}
+
+/// The `binary, <size>, <mime>` fragment shared by read headers and glob previews.
+pub(crate) fn binary_summary(byte_len: u64, mime: &str) -> String {
     let size_str = format_size(byte_len);
-    format!(
-        "# {} (binary, {size_str}, {mime}) [skipped]",
-        path.display()
-    )
+    format!("binary, {size_str}, {mime}")
 }
 
 /// Build header for search results.
@@ -43,7 +46,7 @@ pub fn search_header(
 }
 
 /// Human-readable file size. Integer math only — no floats.
-pub(crate) fn format_size(bytes: u64) -> String {
+fn format_size(bytes: u64) -> String {
     match bytes {
         b if b < 1024 => format!("{b}B"),
         b if b < 1024 * 1024 => format!("{}KB", b / 1024),
