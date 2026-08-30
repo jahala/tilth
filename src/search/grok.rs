@@ -191,7 +191,10 @@ fn read_code_file(path: &Path) -> Result<(String, Lang), TilthError> {
                 .to_string(),
         });
     }
-    let content = String::from_utf8_lossy(&bytes).into_owned();
+    // Try the strict conversion first: it takes ownership of the buffer, so
+    // the (near-universal) valid-UTF-8 case decodes without a second copy.
+    let content = String::from_utf8(bytes)
+        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
     Ok((content, lang))
 }
 
