@@ -1,32 +1,9 @@
-use crate::lang::treesitter::node_text_simple;
+use crate::lang::treesitter::{node_text_simple, NodeTextMode};
 use crate::types::{Lang, OutlineEntry, OutlineKind};
 
 /// Get the tree-sitter Language for a given Lang variant.
 pub fn outline_language(lang: Lang) -> Option<tree_sitter::Language> {
-    let lang = match lang {
-        Lang::Rust => tree_sitter_rust::LANGUAGE,
-        Lang::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT,
-        Lang::Tsx => tree_sitter_typescript::LANGUAGE_TSX,
-        Lang::JavaScript => tree_sitter_javascript::LANGUAGE,
-        Lang::Python => tree_sitter_python::LANGUAGE,
-        Lang::Scala => tree_sitter_scala::LANGUAGE,
-        Lang::Go => tree_sitter_go::LANGUAGE,
-        Lang::Java => tree_sitter_java::LANGUAGE,
-        Lang::C => tree_sitter_c::LANGUAGE,
-        Lang::Cpp => tree_sitter_cpp::LANGUAGE,
-        Lang::Ruby => tree_sitter_ruby::LANGUAGE,
-        Lang::Php => tree_sitter_php::LANGUAGE_PHP,
-        // Languages without shipped grammars — fall back
-        Lang::CSharp => tree_sitter_c_sharp::LANGUAGE,
-        Lang::Swift => tree_sitter_swift::LANGUAGE,
-        Lang::Kotlin => tree_sitter_kotlin_ng::LANGUAGE,
-        Lang::Elixir => tree_sitter_elixir::LANGUAGE,
-        Lang::Bash => tree_sitter_bash::LANGUAGE,
-        Lang::Dockerfile | Lang::Make => {
-            return None;
-        }
-    };
-    Some(lang.into())
+    crate::lang::spec::spec(lang).grammar.map(Into::into)
 }
 
 /// Parse markdown content into a tree-sitter block tree.
@@ -90,7 +67,7 @@ pub fn heading_text(node: tree_sitter::Node, lines: &[&str]) -> String {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == "inline" {
-            let text = node_text_simple(child, lines);
+            let text = node_text_simple(child, lines, NodeTextMode::Full);
             return text.trim().trim_end_matches('#').trim().to_string();
         }
     }
@@ -432,26 +409,7 @@ fn assignment_name(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
 
 /// Get the text of a node, truncated to the first line.
 fn node_text(node: tree_sitter::Node, lines: &[&str]) -> String {
-    let row = node.start_position().row;
-    let col_start = node.start_position().column;
-    let end_row = node.end_position().row;
-
-    if row < lines.len() {
-        if row == end_row {
-            let col_end = node.end_position().column.min(lines[row].len());
-            lines[row][col_start..col_end].to_string()
-        } else {
-            // Multi-line — take first line only, truncated
-            let text = &lines[row][col_start..];
-            if text.len() > 80 {
-                format!("{}...", crate::types::truncate_str(text, 77))
-            } else {
-                text.to_string()
-            }
-        }
-    } else {
-        String::new()
-    }
+    node_text_simple(node, lines, NodeTextMode::Truncated)
 }
 
 /// Find the first identifier-like child.
@@ -514,7 +472,7 @@ fn extract_doc(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
 /// This is the subset of definition keywords handled uniformly (extract function
 /// name from arguments). Container keywords (`defmodule`, `defprotocol`, `defimpl`,
 /// `defstruct`, `defexception`) have their own match arms in `elixir_call_to_entry`.
-/// See also `ELIXIR_DEFINITION_TARGETS` in `treesitter.rs` for the complete set.
+/// See also `ELIXIR_DEFINITION_TARGETS` in `elixir.rs` for the complete set.
 const ELIXIR_DEF_KEYWORDS: &[&str] = &[
     "def",
     "defp",

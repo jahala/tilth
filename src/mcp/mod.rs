@@ -11,10 +11,11 @@ use crate::session::Session;
 use crate::timeout::{self, spawn_with_timeout, SpawnFailure, ThreadTracker};
 
 mod tools;
+pub(crate) mod tree;
 pub(crate) mod write;
 
 use tools::{
-    tool_definitions, tool_deps, tool_diff, tool_files, tool_grok, tool_read, tool_savings,
+    tool_definitions, tool_deps, tool_diff, tool_grok, tool_list, tool_read, tool_savings,
     tool_search, tool_session, tool_write,
 };
 
@@ -321,7 +322,17 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
     match tool {
         "tilth_read" => tool_read(args, services.cache(), services.session(), edit_mode),
         "tilth_search" => tool_search(args, services.cache(), services.session(), services.bloom()),
-        "tilth_files" => tool_files(args),
+        "tilth_list" => tool_list(args),
+        // Dispatch-only alias for one release: mid-session agents hold a
+        // pre-upgrade tool list that still names tilth_files. Never advertised
+        // (tools/list absence is pinned by `tilth_files_folded_into_tilth_list`);
+        // remove in the next minor.
+        "tilth_files" => tool_list(args).map(|out| {
+            format!(
+                "{}\nnote: tilth_files is now tilth_list — update your call",
+                out.trim_end_matches('\n')
+            )
+        }),
         "tilth_deps" => tool_deps(args, services.bloom()),
         "tilth_grok" => tool_grok(args, services.bloom(), services.session()),
         "tilth_diff" => tool_diff(args),
@@ -539,7 +550,7 @@ mod tests {
     fn server_instructions_byte_lock() {
         assert_eq!(
             SERVER_INSTRUCTIONS.len(),
-            1298,
+            1399,
             "SERVER_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(SERVER_INSTRUCTIONS
@@ -555,6 +566,10 @@ mod tests {
                 "DO NOT pass a relative path or scope without also setting root (absolute)"
             ),
             "require-root path discipline must lead the file-I/O guidance"
+        );
+        assert!(
+            SERVER_INSTRUCTIONS.contains("DO NOT pass a file as scope — scope is a directory"),
+            "file-valued-scope steering (#195) must stay in the PATHS guidance"
         );
         // De-dup (R1) moved per-tool usage into the schemas. Lock that the
         // native-vs-tilth steering for weaker models stays verbatim, and that the
@@ -597,5 +612,41 @@ mod tests {
         assert!(combined.contains(
             "DO NOT re-read files already shown in expanded search results.\n\ntilth_write replaces"
         ));
+    }
+
+    // -- dispatch_tool: tilth_files alias --------------------------------------
+
+    /// Mid-session upgrade compatibility: agents that fetched the tool list
+    /// before an upgrade still call `tilth_files`. Dispatch accepts the old
+    /// name for one release, serves the list handler, and appends a rename
+    /// note. The old name stays out of tools/list (pinned by
+    /// `tilth_files_folded_into_tilth_list`).
+    #[test]
+    fn dispatch_accepts_tilth_files_as_list_alias() {
+        let project = tempfile::tempdir().unwrap();
+        let p = project.path();
+        std::fs::create_dir(p.join("src")).unwrap();
+        std::fs::write(p.join("src/main.rs"), "fn main() {}").unwrap();
+        let args = serde_json::json!({
+            "patterns": ["*.rs"],
+            "scope": p.to_str().unwrap(),
+        });
+        let services = Services::new(false);
+
+        let out = dispatch_tool("tilth_files", &args, &services)
+            .expect("tilth_files must dispatch to the list handler");
+        assert!(out.contains("main.rs"), "expected tree output: {out}");
+        assert!(out.contains("tokens"), "expected token rollups: {out}");
+        assert!(
+            out.ends_with("note: tilth_files is now tilth_list — update your call"),
+            "rename note must close the response: {out}"
+        );
+
+        let canonical =
+            dispatch_tool("tilth_list", &args, &services).expect("tilth_list must dispatch");
+        assert!(
+            !canonical.contains("note: tilth_files"),
+            "canonical tilth_list must not carry the rename note: {canonical}"
+        );
     }
 }

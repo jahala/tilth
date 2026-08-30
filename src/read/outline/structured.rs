@@ -284,7 +284,7 @@ key = \"deep\"
         let out = toml_outline(content, 100);
         // The collapsed form names the key-count of the inner table.
         assert!(
-            out.contains("{") && out.contains("keys}"),
+            out.contains('{') && out.contains("keys}"),
             "deep table should collapse to key-count summary:\n{out}"
         );
     }

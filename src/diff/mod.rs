@@ -171,7 +171,10 @@ pub fn resolve_source(
 }
 
 /// Execute a git diff command and return raw unified diff output.
-fn run_git_diff(source: &DiffSource) -> Result<String, String> {
+///
+/// Git runs inside `repo` when one is provided (the caller's checkout);
+/// otherwise in the process cwd, exactly as before `repo` existed.
+fn run_git_diff(source: &DiffSource, repo: Option<&Path>) -> Result<String, String> {
     use std::process::Command;
 
     match source {
@@ -187,6 +190,9 @@ fn run_git_diff(source: &DiffSource) -> Result<String, String> {
     }
 
     let mut cmd = Command::new("git");
+    if let Some(dir) = repo {
+        cmd.current_dir(dir);
+    }
     cmd.args(["-c", "core.quotePath=false"]);
     cmd.arg("diff");
 
@@ -219,8 +225,13 @@ fn run_git_diff(source: &DiffSource) -> Result<String, String> {
 }
 
 /// Full diff orchestrator — parse → overlay → format pipeline.
+///
+/// `repo` anchors every git command and working-tree read to the caller's
+/// checkout. `None` keeps the process-cwd behavior (CLI, or an MCP call with
+/// no `root` arg).
 pub fn diff(
     source: &DiffSource,
+    repo: Option<&Path>,
     scope: Option<&str>,
     search: Option<&str>,
     blast: bool,
@@ -229,10 +240,10 @@ pub fn diff(
 ) -> Result<String, String> {
     // Log mode has its own pipeline.
     if let DiffSource::Log(range) = source {
-        return diff_log(range, scope, budget);
+        return diff_log(range, repo, scope, budget);
     }
 
-    let raw = run_git_diff(source)?;
+    let raw = run_git_diff(source, repo)?;
     if raw.is_empty() {
         return Ok("No changes.".to_string());
     }
@@ -249,7 +260,7 @@ pub fn diff(
     // crosses worker boundaries.
     let mut overlays: Vec<FileOverlay> = file_diffs
         .par_iter()
-        .map(|fd| overlay::compute_overlay(fd, source))
+        .map(|fd| overlay::compute_overlay(fd, source, repo))
         .collect();
 
     // 3. Cross-file move detection.
@@ -268,7 +279,7 @@ pub fn diff(
 
     // 6. Blast radius.
     if blast {
-        let mut blast_warnings = compute_blast(&overlays);
+        let mut blast_warnings = compute_blast(&overlays, repo);
         warnings.append(&mut blast_warnings);
     }
 
@@ -314,7 +325,7 @@ pub fn diff(
     if matches!(source, DiffSource::GitUncommitted) {
         let mut all_conflicts = Vec::new();
         for overlay in &overlays {
-            let conflicts = overlay::detect_conflicts(&overlay.path);
+            let conflicts = overlay::detect_conflicts(&overlay.path, repo);
             if !conflicts.is_empty() {
                 all_conflicts.push((&overlay.path, conflicts));
             }
@@ -394,7 +405,10 @@ fn filter_by_search(overlays: &mut Vec<FileOverlay>, term: &str) {
 }
 
 /// Find callers of signature-changed symbols and return warnings.
-fn compute_blast(overlays: &[FileOverlay]) -> Vec<String> {
+///
+/// The caller search runs over `repo` when provided — searching the process
+/// cwd for a diff anchored elsewhere would count the wrong checkout's callers.
+fn compute_blast(overlays: &[FileOverlay], repo: Option<&Path>) -> Vec<String> {
     let sig_changed: HashSet<String> = overlays
         .iter()
         .flat_map(|o| o.symbol_changes.iter())
@@ -406,7 +420,10 @@ fn compute_blast(overlays: &[FileOverlay]) -> Vec<String> {
         return Vec::new();
     }
 
-    let scope = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let scope = match repo {
+        Some(r) => r.to_path_buf(),
+        None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    };
     let bloom = crate::index::bloom::BloomFilterCache::new();
 
     match crate::search::callers::find_callers_batch(
@@ -437,9 +454,18 @@ fn compute_blast(overlays: &[FileOverlay]) -> Vec<String> {
 }
 
 /// Log mode pipeline: run per-commit diffs and format as commit summaries.
-fn diff_log(range: &str, scope: Option<&str>, budget: Option<u64>) -> Result<String, String> {
+fn diff_log(
+    range: &str,
+    repo: Option<&Path>,
+    scope: Option<&str>,
+    budget: Option<u64>,
+) -> Result<String, String> {
     // Get commit list.
-    let output = Command::new("git")
+    let mut cmd = Command::new("git");
+    if let Some(dir) = repo {
+        cmd.current_dir(dir);
+    }
+    let output = cmd
         .args(["log", "--format=%H %at %s%x00%an", range])
         .output()
         .map_err(|e| format!("failed to run git log: {e}"))?;
@@ -473,12 +499,12 @@ fn diff_log(range: &str, scope: Option<&str>, budget: Option<u64>) -> Result<Str
         // Run diff for this commit.
         let ref_str = format!("{hash}^..{hash}");
         let commit_source = DiffSource::GitRef(ref_str);
-        let raw = run_git_diff(&commit_source)?;
+        let raw = run_git_diff(&commit_source, repo)?;
         let file_diffs = parse::parse_unified_diff(&raw);
 
         let mut overlays: Vec<FileOverlay> = file_diffs
             .iter()
-            .map(|fd| overlay::compute_overlay(fd, &commit_source))
+            .map(|fd| overlay::compute_overlay(fd, &commit_source, repo))
             .collect();
         overlay::cross_file_matching(&mut overlays);
 
@@ -513,15 +539,17 @@ fn diff_log(range: &str, scope: Option<&str>, budget: Option<u64>) -> Result<Str
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Serializes tests that mutate the process-global cwd. Crate-wide on purpose:
+/// two module-local locks cannot protect against each other, and the MCP tool
+/// tests (`mcp::tools::diff`) pin cwd too.
+#[cfg(test)]
+pub(crate) static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
     use std::path::Path;
-    use std::sync::Mutex;
-
-    /// Mutex to serialize tests that change process cwd.
-    static CWD_LOCK: Mutex<()> = Mutex::new(());
 
     /// Create a test git repo with an initial commit containing a Rust file.
     fn setup_test_repo() -> tempfile::TempDir {
@@ -562,7 +590,8 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).into_owned()
     }
 
-    /// Run diff() from within the test repo directory, serialized via CWD_LOCK.
+    /// Run `diff()` from within the test repo directory, serialized via `CWD_LOCK`.
+    /// Passes `repo: None` on purpose — these tests pin the default cwd flow.
     fn run_diff_in(
         dir: &Path,
         source: &DiffSource,
@@ -574,7 +603,7 @@ mod tests {
         let _lock = CWD_LOCK.lock().unwrap();
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(dir).unwrap();
-        let result = diff(source, scope, search, blast, 0, budget);
+        let result = diff(source, None, scope, search, blast, 0, budget);
         std::env::set_current_dir(&prev).unwrap();
         result
     }

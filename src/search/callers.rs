@@ -756,16 +756,16 @@ mod tests {
             "glob-driven hint should appear when glob is Some: {msg}"
         );
     }
-    /// Regression test: when there are more than MAX_MATCHES (10) hop-1 call
-    /// sites but still <= IMPACT_FANOUT_THRESHOLD unique callers, the footer
+    /// Regression test: when there are more than `MAX_MATCHES` (10) hop-1 call
+    /// sites but still <= `IMPACT_FANOUT_THRESHOLD` unique callers, the footer
     /// "N functions affected across 2 hops" must use the pre-truncation unique
     /// count, not the post-truncation count.
     ///
     /// Setup: 8 unique functions, each calling `target_fn` twice = 16 call
-    /// sites. Truncation to MAX_MATCHES=10 only keeps the first ~5 functions,
+    /// sites. Truncation to `MAX_MATCHES=10` only keeps the first ~5 functions,
     /// dropping functions 6-8. The old code rebuilt the hop-1 set from
-    /// sorted_callers AFTER truncation and undercounted. The fix uses
-    /// all_caller_names (pre-truncation) which always holds 8.
+    /// `sorted_callers` AFTER truncation and undercounted. The fix uses
+    /// `all_caller_names` (pre-truncation) which always holds 8.
     #[test]
     fn footer_count_uses_pre_truncation_caller_set() {
         let dir = tempfile::tempdir().unwrap();
