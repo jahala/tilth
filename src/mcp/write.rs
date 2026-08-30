@@ -167,7 +167,7 @@ mod tests {
             mmap_race_body();
             return;
         }
-        let status = std::process::Command::new(
+        let out = std::process::Command::new(
             std::env::current_exe().expect("test binary path is readable"),
         )
         .args([
@@ -175,11 +175,18 @@ mod tests {
             "--exact",
         ])
         .env(CHILD_ENV, "1")
-        .status()
+        .output()
         .expect("re-exec of the test binary");
         assert!(
-            status.success(),
-            "a concurrent overwrite faulted an mmap reader: {status}"
+            out.status.success(),
+            "a concurrent overwrite faulted an mmap reader: {}",
+            out.status
+        );
+        // A filter that matches nothing also exits 0, which would make this
+        // test pass without ever running the race.
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("1 passed"),
+            "the child ran no test — the name filter matched nothing"
         );
     }
 
