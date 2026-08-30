@@ -152,7 +152,9 @@ fn resolve_by_path_line(
 /// Read `path` and detect its language. Errors if the file isn't a code file —
 /// grok requires source-level analysis, not a markdown / config / data file.
 fn read_code_file(path: &Path) -> Result<(String, Lang), TilthError> {
-    let content = fs::read_to_string(path).map_err(|e| TilthError::IoError {
+    // Stat before judging the extension: a missing path must report
+    // file-not-found, not "not a code file", whatever its suffix.
+    let meta = fs::metadata(path).map_err(|e| TilthError::IoError {
         path: path.to_path_buf(),
         source: e,
     })?;
@@ -162,6 +164,37 @@ fn read_code_file(path: &Path) -> Result<(String, Lang), TilthError> {
             reason: "not a code file — grok needs source code".to_string(),
         });
     };
+    // The binary probe below only inspects the first 512B, so a clean head
+    // followed by megabytes of garbage would still reach the lossy decode and
+    // the outline parser. Refuse on size first, before reading any bytes.
+    let cap = crate::read::full_read_size_cap();
+    if meta.len() > cap {
+        return Err(TilthError::InvalidQuery {
+            query: path.display().to_string(),
+            reason: format!(
+                "file too large for grok ({}B > {cap}B cap) — use tilth_search \"<symbol>\" for matches in this file",
+                meta.len()
+            ),
+        });
+    }
+    let bytes = fs::read(path).map_err(|e| TilthError::IoError {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    // Match the read path: refuse binary content instead of letting a strict
+    // UTF-8 decode surface a raw "stream did not contain valid UTF-8" error.
+    if crate::lang::detection::is_binary(&bytes) {
+        return Err(TilthError::InvalidQuery {
+            query: path.display().to_string(),
+            reason: "binary or non-text file (null bytes in first 512B) — grok needs source; \
+                     use tilth_search \"<symbol>\" for matches in this file"
+                .to_string(),
+        });
+    }
+    // Try the strict conversion first: it takes ownership of the buffer, so
+    // the (near-universal) valid-UTF-8 case decodes without a second copy.
+    let content = String::from_utf8(bytes)
+        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
     Ok((content, lang))
 }
 
@@ -173,7 +206,15 @@ fn enrich_from_outline(
     name: String,
     other_def_count: usize,
 ) -> Result<(ResolvedTarget, String, Lang), TilthError> {
-    let (content, lang) = read_code_file(&path)?;
+    // On the symbol route the user asked for `name`, not the path the search
+    // resolved it to — a refusal must name their query, not our detour.
+    let (content, lang) = read_code_file(&path).map_err(|e| match e {
+        TilthError::InvalidQuery { reason, .. } => TilthError::InvalidQuery {
+            query: name.clone(),
+            reason,
+        },
+        other => other,
+    })?;
     let entries = get_outline_entries(&content, lang);
     let entry = find_by_start_line(&entries, start_line)
         .or_else(|| find_entry_at_line(&entries, start_line));
@@ -1155,10 +1196,87 @@ mod tests {
 
     #[test]
     fn resolve_by_path_line_missing_file_is_io_error() {
+        // Missing-file wins over every content judgement — including for
+        // non-code extensions, where a typo'd path must not be reported as
+        // "not a code file".
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("nope.rs");
+        for missing in ["nope.rs", "nope.md"] {
+            let path = tmp.path().join(missing);
+            let err = resolve_by_path_line(&path, 1).unwrap_err();
+            assert!(
+                matches!(err, TilthError::IoError { .. }),
+                "{missing}: expected IoError, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_by_path_line_refuses_binary_code_file_by_design() {
+        // NUL bytes are valid UTF-8 — the old strict read grokked this file
+        // happily, so this refusal is a deliberate change, not a bug fix.
+        // Strict read_to_string doubled as an accidental DoS guard (garbage
+        // is almost never valid UTF-8, so it errored instantly); decoding
+        // lossily removes that guard (measured: 6.7s / 1.07GB peak RSS on a
+        // 5MB garbage .rs). The binary probe and the size cap replace it
+        // with explicit, recoverable refusals.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("tainted.rs");
+        fs::write(&path, b"fn alpha() {}\n\x00\x01\x02").unwrap();
         let err = resolve_by_path_line(&path, 1).unwrap_err();
-        assert!(matches!(err, TilthError::IoError { .. }));
+        match err {
+            TilthError::InvalidQuery { reason, .. } => {
+                assert_eq!(
+                    reason,
+                    "binary or non-text file (null bytes in first 512B) — grok needs source; \
+                     use tilth_search \"<symbol>\" for matches in this file"
+                );
+            }
+            other => panic!("expected InvalidQuery, got {other}"),
+        }
+    }
+
+    #[test]
+    fn resolve_by_path_line_reads_non_utf8_code_file_lossily() {
+        // Invalid UTF-8, no null byte — the read path shows this as text, so
+        // grok must outline it lossily rather than error.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("latin1.rs");
+        fs::write(&path, b"fn alpha() {} // caf\xff\n").unwrap();
+        let (target, _content, lang) = resolve_by_path_line(&path, 1).unwrap();
+        assert_eq!(target.name, "alpha");
+        assert_eq!(lang, Lang::Rust);
+    }
+
+    #[test]
+    fn resolve_by_path_line_refuses_over_cap_code_file() {
+        // The binary probe only inspects the first 512B, so a clean head
+        // followed by megabytes of garbage slips past it into the lossy
+        // decode and the outline parser. The size cap must refuse first.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cleanhead_garbage.rs");
+        let mut body = Vec::with_capacity(3_000_512);
+        body.extend_from_slice(b"fn cleanhead_alpha() { let x = 1; }\n");
+        body.resize(512, b'a');
+        let mut state: u32 = 0x9e37_79b9;
+        body.extend((0..3_000_000).map(|_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 24) as u8
+        }));
+        fs::write(&path, &body).unwrap();
+        let err = resolve_by_path_line(&path, 1).unwrap_err();
+        match err {
+            TilthError::InvalidQuery { reason, .. } => {
+                assert!(
+                    reason.contains("too large"),
+                    "expected size refusal: {reason}"
+                );
+                assert!(
+                    reason.contains("tilth_search"),
+                    "refusal must point at recovery: {reason}"
+                );
+            }
+            other => panic!("expected InvalidQuery, got {other}"),
+        }
     }
 
     // -- resolve_target — full spec dispatch -----------------------------
@@ -1172,6 +1290,21 @@ mod tests {
         // Relative path is joined with scope.
         let (target, _, _) = resolve_with_source("src/a.rs:3", tmp.path()).unwrap();
         assert_eq!(target.name, "two");
+    }
+
+    #[test]
+    fn resolve_by_name_refusal_names_the_query_not_the_path() {
+        // The refusal fires inside enrich_from_outline after the symbol search
+        // already resolved a path; the error must still name what the user
+        // asked for, not the file the search walked to.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("tainted.rs");
+        fs::write(&path, b"fn alpha() {}\n\x00\x01\x02").unwrap();
+        let err = resolve_by_name("alpha", tmp.path()).unwrap_err();
+        match err {
+            TilthError::InvalidQuery { query, .. } => assert_eq!(query, "alpha"),
+            other => panic!("expected InvalidQuery, got {other}"),
+        }
     }
 
     // -- collect_siblings ------------------------------------------------
