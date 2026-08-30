@@ -799,7 +799,7 @@ mod tests {
         assert!(suggest_headings(input, "###", 5).is_empty());
     }
 
-    /// CommonMark allows `~~~` as a fence delimiter. Headings inside
+    /// `CommonMark` allows `~~~` as a fence delimiter. Headings inside
     /// must not be treated as suggestable.
     #[test]
     fn suggest_headings_skips_tilde_fenced_blocks() {
@@ -815,7 +815,7 @@ mod tests {
         );
     }
 
-    /// CommonMark §4.6.1 limits ATX headings to 1–6 `#`s. Lines with 7+
+    /// `CommonMark` §4.6.1 limits ATX headings to 1–6 `#`s. Lines with 7+
     /// hashes are not headings, even with a space after.
     #[test]
     fn suggest_headings_rejects_seven_or_more_hashes() {
@@ -827,7 +827,7 @@ mod tests {
         );
     }
 
-    /// CommonMark §4.6.1: hashes must be followed by a space (or EOL).
+    /// `CommonMark` §4.6.1: hashes must be followed by a space (or EOL).
     /// `##foo` (no space) is not a heading.
     #[test]
     fn suggest_headings_rejects_hashes_without_space() {
@@ -1013,8 +1013,12 @@ mod tests {
 
     #[test]
     fn budgeted_omits_later_sections_when_exhausted() {
+        use std::fmt::Write as _;
         let big_line = "x".repeat(200);
-        let body: String = (0..30).map(|_| format!("{big_line}\n")).collect();
+        let body = (0..30).fold(String::new(), |mut s, _| {
+            let _ = writeln!(s, "{big_line}");
+            s
+        });
         let path = write_temp("tilth_test_budgeted_omit.txt", &body);
         let budget = 240u64;
         let out =
@@ -1039,9 +1043,11 @@ mod tests {
 
     #[test]
     fn budgeted_truncates_first_section_when_too_large() {
-        let body: String = (0..200)
-            .map(|i| format!("line-{i}-padding-padding-padding\n"))
-            .collect();
+        use std::fmt::Write as _;
+        let body = (0..200).fold(String::new(), |mut s, i| {
+            let _ = writeln!(s, "line-{i}-padding-padding-padding");
+            s
+        });
         let path = write_temp("tilth_test_budgeted_first_too_large.txt", &body);
         let budget = 100u64;
         let out = read_ranges_with_budget(&path, &["1-150"], false, budget).unwrap();
@@ -1059,8 +1065,12 @@ mod tests {
 
     #[test]
     fn budgeted_preserves_user_order_until_exhaustion() {
+        use std::fmt::Write as _;
         let big_line = "y".repeat(200);
-        let body: String = (0..30).map(|_| format!("{big_line}\n")).collect();
+        let body = (0..30).fold(String::new(), |mut s, _| {
+            let _ = writeln!(s, "{big_line}");
+            s
+        });
         let path = write_temp("tilth_test_budgeted_order.txt", &body);
         let budget = 240u64;
         let out =
@@ -1086,8 +1096,12 @@ mod tests {
 
     #[test]
     fn budgeted_never_exceeds_budget_even_when_markers_do_not_fit() {
+        use std::fmt::Write as _;
         let big_line = "z".repeat(50);
-        let body: String = (0..30).map(|_| format!("{big_line}\n")).collect();
+        let body = (0..30).fold(String::new(), |mut s, _| {
+            let _ = writeln!(s, "{big_line}");
+            s
+        });
         let path = write_temp("tilth_test_budgeted_strict_cap.txt", &body);
         let budget = 80u64;
         let out =
