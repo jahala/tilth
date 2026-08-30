@@ -158,6 +158,23 @@ fn read_code_file(path: &Path) -> Result<(String, Lang), TilthError> {
             reason: "not a code file — grok needs source code".to_string(),
         });
     };
+    // The binary probe below only inspects the first 512B, so a clean head
+    // followed by megabytes of garbage would still reach the lossy decode and
+    // the outline parser. Refuse on size first, before reading any bytes.
+    let meta = fs::metadata(path).map_err(|e| TilthError::IoError {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    let cap = crate::read::full_read_size_cap();
+    if meta.len() > cap {
+        return Err(TilthError::InvalidQuery {
+            query: path.display().to_string(),
+            reason: format!(
+                "file too large for grok ({}B > {cap}B cap) — use tilth_search \"<symbol>\" for matches in this file",
+                meta.len()
+            ),
+        });
+    }
     let bytes = fs::read(path).map_err(|e| TilthError::IoError {
         path: path.to_path_buf(),
         source: e,
@@ -1199,6 +1216,38 @@ mod tests {
         let (target, _content, lang) = resolve_by_path_line(&path, 1).unwrap();
         assert_eq!(target.name, "alpha");
         assert_eq!(lang, Lang::Rust);
+    }
+
+    #[test]
+    fn resolve_by_path_line_refuses_over_cap_code_file() {
+        // The binary probe only inspects the first 512B, so a clean head
+        // followed by megabytes of garbage slips past it into the lossy
+        // decode and the outline parser. The size cap must refuse first.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cleanhead_garbage.rs");
+        let mut body = Vec::with_capacity(3_000_512);
+        body.extend_from_slice(b"fn cleanhead_alpha() { let x = 1; }\n");
+        body.resize(512, b'a');
+        let mut state: u32 = 0x9e37_79b9;
+        body.extend((0..3_000_000).map(|_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 24) as u8
+        }));
+        fs::write(&path, &body).unwrap();
+        let err = resolve_by_path_line(&path, 1).unwrap_err();
+        match err {
+            TilthError::InvalidQuery { reason, .. } => {
+                assert!(
+                    reason.contains("too large"),
+                    "expected size refusal: {reason}"
+                );
+                assert!(
+                    reason.contains("tilth_search"),
+                    "refusal must point at recovery: {reason}"
+                );
+            }
+            other => panic!("expected InvalidQuery, got {other}"),
+        }
     }
 
     // -- resolve_target — full spec dispatch -----------------------------

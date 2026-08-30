@@ -24,9 +24,10 @@ const FILE_SIZE_CAP: u64 = 500_000; // 500KB
 
 /// Max file size for `full=true` reads. Files above this threshold get a
 /// warning header + outline instead of raw content, preventing multi-megabyte
-/// responses that cause MCP client timeouts.
+/// responses that cause MCP client timeouts. Grok shares this cap to bound
+/// its lossy decode + outline parse of code files.
 /// Override with `TILTH_FULL_SIZE_CAP` env var (bytes). Default: 2MB.
-fn full_read_size_cap() -> u64 {
+pub(crate) fn full_read_size_cap() -> u64 {
     std::env::var("TILTH_FULL_SIZE_CAP")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
