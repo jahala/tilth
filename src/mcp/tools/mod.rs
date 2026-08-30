@@ -82,27 +82,41 @@ pub(super) fn resolve_scope(
     args: &Value,
     root: Option<&std::path::Path>,
 ) -> Result<(PathBuf, Option<String>), String> {
+    let cwd = std::env::current_dir().ok();
+    resolve_scope_at(args, root, cwd.as_deref())
+}
+
+/// [`resolve_scope`] against an explicit cwd snapshot.
+///
+/// The cwd is process-global and mutable (the MCP roots/list handoff moves
+/// it), so it is read once per call and threaded through rather than sampled
+/// wherever it is needed. Reading it twice — `canonicalize(".")` and then
+/// `current_dir()` — and comparing the two results let a chdir land between
+/// the reads and return the stale directory as an absolute scope, silently
+/// searching the previous checkout.
+fn resolve_scope_at(
+    args: &Value,
+    root: Option<&std::path::Path>,
+    cwd: Option<&std::path::Path>,
+) -> Result<(PathBuf, Option<String>), String> {
     let scope_arg = args.get("scope").and_then(|v| v.as_str());
     let raw_str = scope_arg.unwrap_or(".");
     let raw: PathBuf = raw_str.into();
 
     // No explicit scope: behave exactly like main's default-cwd flow. Do not
     // apply the require-root discipline to a value the caller never passed.
+    // The default scope IS the server cwd, so it needs no resolution — only
+    // an unreadable cwd leaves nothing valid to search.
     if scope_arg.is_none() {
-        let resolved = raw.canonicalize().unwrap_or(raw);
-        let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-        if resolved == cwd {
-            return Ok((".".into(), None));
-        }
-        if !resolved.is_dir() {
-            return Ok((
+        return Ok(match cwd {
+            Some(_) => (".".into(), None),
+            None => (
                 ".".into(),
                 Some(format!(
                     "scope \"{raw_str}\" is not a valid directory, searching current directory instead.\n\n"
                 )),
-            ));
-        }
-        return Ok((resolved, None));
+            ),
+        });
     }
 
     let anchored = anchor_path(&raw, root, "scope")?;
@@ -149,6 +163,37 @@ pub(super) fn apply_budget(output: &str, budget: Option<u64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: the no-scope branch read the process cwd twice —
+    /// `canonicalize(".")` and then `current_dir()` — and compared the two. A
+    /// chdir landing between the reads (the MCP roots/list handoff) made the
+    /// comparison fail and returned the *stale* directory as an absolute
+    /// scope, silently searching the previous checkout.
+    ///
+    /// Passing the snapshot in pins that there is exactly one read: a cwd that
+    /// is deliberately not the process cwd must still resolve to ".", which
+    /// only holds if no second read happens behind the parameter.
+    #[test]
+    fn resolve_scope_uses_a_single_cwd_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = serde_json::json!({});
+        let (scope, warning) = resolve_scope_at(&args, None, Some(tmp.path())).unwrap();
+        assert_eq!(scope, PathBuf::from("."));
+        assert!(warning.is_none());
+    }
+
+    /// An unreadable cwd keeps the soft fallback (search "." with a warning)
+    /// rather than failing the call.
+    #[test]
+    fn resolve_scope_no_arg_warns_when_cwd_is_unreadable() {
+        let args = serde_json::json!({});
+        let (scope, warning) = resolve_scope_at(&args, None, None).unwrap();
+        assert_eq!(scope, PathBuf::from("."));
+        assert!(
+            warning.is_some_and(|w| w.contains("not a valid directory")),
+            "an unreadable cwd must warn, not error"
+        );
+    }
 
     #[test]
     fn resolve_scope_explicit_absolute_arg() {

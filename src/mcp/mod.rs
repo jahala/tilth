@@ -99,6 +99,8 @@ pub fn run(edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
 
     // Track pending roots/list request (for MCP roots protocol)
     let mut pending_roots_id: Option<Value> = None;
+    // Set once any tool has been dispatched — see `roots_handoff_allowed`.
+    let mut tool_dispatched = false;
 
     for line in stdin.lock().lines() {
         let line = line?;
@@ -120,9 +122,14 @@ pub fn run(edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
             if msg.get("id") == Some(roots_id) {
                 pending_roots_id = None;
                 // Only apply roots on success and if --scope was NOT explicitly provided
-                if !scope_is_explicit {
-                    if let Some(root_path) = extract_root_from_response(&msg) {
+                if let Some(root_path) = extract_root_from_response(&msg) {
+                    if roots_handoff_allowed(scope_is_explicit, tool_dispatched) {
                         let _ = std::env::set_current_dir(&root_path);
+                    } else if !scope_is_explicit {
+                        eprintln!(
+                            "tilth: warning: ignoring roots/list response that arrived after \
+                             tools started; searches keep resolving against the launch directory."
+                        );
                     }
                 }
                 continue;
@@ -151,6 +158,7 @@ pub fn run(edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
             params,
         };
 
+        tool_dispatched |= method == "tools/call";
         let response = handle_request(&req, &services);
         serde_json::to_writer(&mut stdout, &response)?;
         stdout.write_all(b"\n")?;
@@ -176,6 +184,19 @@ pub fn run(edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+/// Whether a roots/list response may still move the server's working
+/// directory.
+///
+/// The handoff mutates process-global state that every in-flight tool reads,
+/// and a tool that outlived its timeout keeps running after the main loop has
+/// moved on — so it would resolve its relative paths against a directory that
+/// changed underneath it. Honoring the handoff only before the first tool call
+/// keeps the mutation inside initialization, where nothing else is running.
+/// An explicit `--scope` outranks roots entirely.
+fn roots_handoff_allowed(scope_is_explicit: bool, tool_dispatched: bool) -> bool {
+    !scope_is_explicit && !tool_dispatched
 }
 
 /// Extract the first root directory path from a roots/list response.
@@ -402,6 +423,23 @@ mod tests {
     use super::*;
 
     // -- extract_root_from_response -------------------------------------------
+
+    #[test]
+    fn roots_handoff_is_confined_to_initialization() {
+        assert!(
+            roots_handoff_allowed(false, false),
+            "the handoff is the whole point before any tool runs"
+        );
+        assert!(
+            !roots_handoff_allowed(false, true),
+            "a chdir after tools start moves ground under an in-flight tool"
+        );
+        assert!(
+            !roots_handoff_allowed(true, false),
+            "an explicit --scope outranks roots"
+        );
+        assert!(!roots_handoff_allowed(true, true));
+    }
 
     #[test]
     fn extract_root_valid_file_uri() {
