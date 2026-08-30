@@ -245,6 +245,10 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     "budget": {
                         "type": "number",
                         "description": "Max tokens in response."
+                    },
+                    "root": {
+                        "type": "string",
+                        "description": "Absolute project root; anchors relative paths and scopes. Required with any relative path/scope."
                     }
                 }
             }
