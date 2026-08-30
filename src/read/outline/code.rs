@@ -258,7 +258,7 @@ type UserId = String
 
     #[test]
     fn php_outline_constructs() {
-        let php_code = r#"<?php
+        let php_code = r"<?php
 namespace App\Services;
 
 use App\Support\Client;
@@ -276,7 +276,7 @@ class UserService {
         return $this->client->loadUser($id);
     }
 }
-"#;
+";
 
         let outline = outline(php_code, Lang::Php, 1000);
 
@@ -384,7 +384,7 @@ fun main() {
         // emitted `export export async function foo(`. Leaf-fallback cases
         // (`export { ... }`, `export * from ...`) keep `OutlineKind::Export`
         // but strip the leading `export ` from the name to avoid duplication.
-        let ts_code = r#"
+        let ts_code = r"
 export async function foo() {}
 
 export class Foo {}
@@ -396,7 +396,7 @@ export { foo };
 export * from './bar';
 
 export default class Bar {}
-"#;
+";
 
         let outline = outline(ts_code, Lang::TypeScript, 1000);
 

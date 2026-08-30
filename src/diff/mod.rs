@@ -562,7 +562,7 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).into_owned()
     }
 
-    /// Run diff() from within the test repo directory, serialized via CWD_LOCK.
+    /// Run `diff()` from within the test repo directory, serialized via `CWD_LOCK`.
     fn run_diff_in(
         dir: &Path,
         source: &DiffSource,

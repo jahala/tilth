@@ -7,9 +7,9 @@
 use std::path::Path;
 
 use crate::cache::OutlineCache;
+use crate::lang::elixir::{extract_elixir_definition_name, is_elixir_definition};
 use crate::lang::treesitter::{
-    extract_definition_name, extract_elixir_definition_name, is_elixir_definition,
-    node_text_simple, DEFINITION_KINDS,
+    extract_definition_name, node_text_simple, NodeTextMode, DEFINITION_KINDS,
 };
 
 /// Type-like node kinds that can enclose a function definition.
@@ -161,7 +161,7 @@ fn elixir_kind_label(node: tree_sitter::Node, lines: &[&str]) -> &'static str {
     let Some(target) = node.child_by_field_name("target") else {
         return "definition";
     };
-    match node_text_simple(target, lines).as_str() {
+    match node_text_simple(target, lines, NodeTextMode::Full).as_str() {
         "defmodule" => "module",
         "defprotocol" => "protocol",
         "defimpl" => "impl",
