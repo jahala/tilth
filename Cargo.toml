@@ -20,6 +20,7 @@ clap_complete = "4"
 
 # Tree-sitter (AST outlines)
 tree-sitter = "0.26"
+tree-sitter-language = "0.1"
 streaming-iterator = "0.1"
 tree-sitter-rust = "0.24"
 tree-sitter-javascript = "0.25"

@@ -1,49 +1,8 @@
-use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex};
-
 use streaming_iterator::StreamingIterator;
 
 use crate::lang::outline::outline_language;
+use crate::lang::treesitter::with_query;
 use crate::types::{Lang, OutlineEntry, OutlineKind};
-
-/// Global cache of compiled tree-sitter queries for sibling extraction.
-/// Keyed by `(node_kind_count, field_count, query_str_ptr)` so that distinct
-/// query strings for the same language (the main sibling query vs the Go
-/// receiver query) are stored under separate keys. We avoid `Language::name()`
-/// because ABI < 15 grammars (e.g. tree-sitter-kotlin-ng) return `None`.
-#[allow(clippy::type_complexity)]
-static QUERY_CACHE: LazyLock<Mutex<HashMap<(usize, usize, usize), tree_sitter::Query>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// Look up or compile `query_str` for `ts_lang`, then invoke `f` with a
-/// reference to the cached `Query`.  Returns `None` if compilation fails.
-///
-/// `query_str` must be `'static` so its pointer address is stable across
-/// calls and can serve as part of the cache key.
-fn with_query<R>(
-    ts_lang: &tree_sitter::Language,
-    query_str: &'static str,
-    f: impl FnOnce(&tree_sitter::Query) -> R,
-) -> Option<R> {
-    use std::collections::hash_map::Entry;
-    // Pointer address distinguishes different queries for the same language.
-    let key = (
-        ts_lang.node_kind_count(),
-        ts_lang.field_count(),
-        query_str.as_ptr() as usize,
-    );
-    let mut cache = QUERY_CACHE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let query = match cache.entry(key) {
-        Entry::Occupied(e) => e.into_mut(),
-        Entry::Vacant(e) => {
-            let q = tree_sitter::Query::new(ts_lang, query_str).ok()?;
-            e.insert(q)
-        }
-    };
-    Some(f(query))
-}
 
 /// A sibling field or method resolved from the same parent struct/class/impl.
 #[derive(Debug)]
@@ -61,37 +20,7 @@ const MAX_SIBLINGS: usize = 6;
 /// Tree-sitter query for self/this field and method references by language.
 /// Each pattern captures `@ref` on the accessed member name.
 fn sibling_query_str(lang: Lang) -> Option<&'static str> {
-    match lang {
-        Lang::Rust => Some(concat!(
-            "(field_expression value: (self) field: (field_identifier) @ref)\n",
-            "(call_expression function: (field_expression value: (self) field: (field_identifier) @ref))\n",
-        )),
-        Lang::Python => Some(
-            "(attribute object: (identifier) @obj attribute: (identifier) @ref)\n",
-        ),
-        Lang::TypeScript | Lang::JavaScript | Lang::Tsx => Some(
-            "(member_expression object: (this) property: (property_identifier) @ref)\n",
-        ),
-        Lang::Java => Some(concat!(
-            "(field_access object: (this) field: (identifier) @ref)\n",
-            "(method_invocation object: (this) name: (identifier) @ref)\n",
-        )),
-        Lang::Scala => Some(concat!(
-            "(field_expression (identifier) @obj (identifier) @ref)\n",
-            "(call_expression function: (field_expression (identifier) @obj (identifier) @ref))\n",
-        )),
-        Lang::Go => Some(
-            "(selector_expression operand: (identifier) @recv field: (field_identifier) @ref)\n",
-        ),
-        Lang::CSharp => Some(concat!(
-            "(member_access_expression expression: (this_expression) name: (identifier) @ref)\n",
-            "(invocation_expression function: (member_access_expression expression: (this_expression) name: (identifier) @ref))\n",
-        )),
-        Lang::Swift => Some(
-            "(navigation_expression target: (self_expression) suffix: (navigation_suffix suffix: (simple_identifier) @ref))\n",
-        ),
-        _ => None,
-    }
+    crate::lang::spec::spec(lang).sibling_query
 }
 
 /// Extract self/this member references from within a definition's line range.
@@ -109,12 +38,12 @@ pub fn extract_sibling_references(content: &str, lang: Lang, def_range: (u32, u3
     };
 
     // For Go, resolve the receiver name before entering the query cache lock to
-    // avoid re-entrancy on `QUERY_CACHE` (extract_go_receiver_name also uses it).
-    let go_receiver = if lang == Lang::Go {
-        extract_go_receiver_name(content, &ts_lang)
-    } else {
-        None
-    };
+    // avoid re-entrancy on `QUERY_CACHE` (the receiver extractor also uses it).
+    // The extractor is supplied per-language via `spec(lang).extract_receiver`
+    // (only Go has one).
+    let go_receiver = crate::lang::spec::spec(lang)
+        .extract_receiver
+        .and_then(|extract| extract(content, &ts_lang));
 
     let mut parser = tree_sitter::Parser::new();
     if parser.set_language(&ts_lang).is_err() {
@@ -211,37 +140,6 @@ pub fn extract_sibling_references(content: &str, lang: Lang, def_range: (u32, u3
     names.sort();
     names.dedup();
     names
-}
-
-/// For Go methods, extract the receiver parameter name from the first method
-/// in the file. Go receiver is the first parameter in `func (r *Type) Name()`.
-fn extract_go_receiver_name(content: &str, ts_lang: &tree_sitter::Language) -> Option<String> {
-    // `'static` so its pointer address is a stable cache key.
-    const GO_RECV_QUERY: &str = "(method_declaration receiver: (parameter_list (parameter_declaration name: (identifier) @recv)))";
-
-    let mut parser = tree_sitter::Parser::new();
-    parser.set_language(ts_lang).ok()?;
-    let tree = parser.parse(content, None)?;
-
-    let bytes = content.as_bytes();
-
-    // `with_query` returns `Option<Option<String>>`; flatten to `Option<String>`.
-    with_query(ts_lang, GO_RECV_QUERY, |query| {
-        let recv_idx = query.capture_index_for_name("recv")?;
-        let mut cursor = tree_sitter::QueryCursor::new();
-        let mut matches = cursor.matches(query, tree.root_node(), bytes);
-
-        if let Some(m) = matches.next() {
-            for cap in m.captures {
-                if cap.index == recv_idx {
-                    return cap.node.utf8_text(bytes).ok().map(String::from);
-                }
-            }
-        }
-
-        None
-    })
-    .flatten()
 }
 
 /// Match extracted sibling names against a parent entry's children.
