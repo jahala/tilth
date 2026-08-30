@@ -438,14 +438,14 @@ mod tests {
 
     #[test]
     fn extract_php_callee_names() {
-        let php = r#"<?php
+        let php = r"<?php
 function run($svc): void {
     local_helper();
     Foo\Bar::staticCall();
     $svc->methodCall();
     $svc?->nullableCall();
 }
-"#;
+";
 
         let names = extract_callee_names(php, Lang::Php, None);
 

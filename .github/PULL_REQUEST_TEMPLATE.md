@@ -7,5 +7,5 @@
 <!-- How to verify this works. CI checks fmt + clippy + test on every push. -->
 
 - [ ] `cargo fmt --check`
-- [ ] `cargo clippy -- -D warnings`
+- [ ] `cargo clippy --all-targets -- -D warnings`
 - [ ] `cargo test`
