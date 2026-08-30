@@ -106,7 +106,10 @@ jobs:
           files: |
             tilth-*.tar.gz
             tilth-*.zip
-          generate_release_notes: true
+          # Notes on ONE leg only: when the release already exists, the action
+          # appends freshly generated notes to the current body, so every extra
+          # matrix leg adds another "What's Changed" copy (#189).
+          generate_release_notes: ${{ matrix.target == 'x86_64-unknown-linux-musl' }}
 
   # After all builds, publish to crates.io
   publish-crate:
