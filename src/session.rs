@@ -160,6 +160,26 @@ impl Session {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(key, mtime);
     }
+
+    /// Check-and-record in one lock acquisition: returns what
+    /// [`Self::is_expanded`] would have returned, and records this expansion
+    /// if it did not.
+    ///
+    /// Callers that check first and record after the body is assembled hold
+    /// no lock in between, so two concurrent calls for the same target both
+    /// see "not expanded" and both inline the full body — the dedup pays for
+    /// itself only when exactly one caller can win the claim.
+    pub fn claim_expand(&self, path: &Path, line: u32, mtime: SystemTime) -> bool {
+        let key = format!("{}:{}", path.display(), line);
+        let mut expanded = self
+            .expanded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match expanded.insert(key, mtime) {
+            Some(previous) => previous == mtime,
+            None => false,
+        }
+    }
 }
 
 impl Default for Session {
