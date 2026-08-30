@@ -69,7 +69,6 @@ pub(crate) const SKIP_DIRS: &[&str] = &[
     ".gradle",
     ".idea",
     ".scala-build",
-    "target",
     ".bloop",
     ".metals",
 ];
