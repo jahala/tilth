@@ -1211,9 +1211,14 @@ mod tests {
     }
 
     #[test]
-    fn resolve_by_path_line_rejects_binary_code_file() {
-        // A .rs with a null byte is binary; the old strict read surfaced a raw
-        // "stream did not contain valid UTF-8" error. Now it's a clean refusal.
+    fn resolve_by_path_line_refuses_binary_code_file_by_design() {
+        // NUL bytes are valid UTF-8 — the old strict read grokked this file
+        // happily, so this refusal is a deliberate change, not a bug fix.
+        // Strict read_to_string doubled as an accidental DoS guard (garbage
+        // is almost never valid UTF-8, so it errored instantly); decoding
+        // lossily removes that guard (measured: 6.7s / 1.07GB peak RSS on a
+        // 5MB garbage .rs). The binary probe and the size cap replace it
+        // with explicit, recoverable refusals.
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("tainted.rs");
         fs::write(&path, b"fn alpha() {}\n\x00\x01\x02").unwrap();
