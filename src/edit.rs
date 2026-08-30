@@ -1,13 +1,38 @@
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 
+use dashmap::DashMap;
 use rayon::prelude::*;
 
 use crate::error::TilthError;
 use crate::format;
 use crate::index::bloom::BloomFilterCache;
+use crate::util::WriteOutcome;
+
+/// One write guard per file, keyed by [`normalize_path_key`].
+///
+/// [`detect_duplicate_paths`] only sees one batch, so it cannot stop a second
+/// `apply_batch` call — a tool call that outlived its timeout, or a second MCP
+/// session — from landing on a file mid-edit. Both would verify against the
+/// same snapshot and both would rename, dropping one edit while telling both
+/// callers "Applied". Holding this guard across the read → verify → write pass
+/// makes the loser read the winner's output and either apply cleanly on top or
+/// report a hash mismatch.
+///
+/// Guards are per process. Two tilth processes editing one file still race,
+/// which is why the write itself re-checks the file's content immediately
+/// before the rename.
+///
+/// Entries are never removed: a file edited once costs a key and an `Arc` for
+/// the process lifetime, and evicting one would race a caller that already
+/// cloned it.
+static IN_FLIGHT: LazyLock<DashMap<String, Arc<Mutex<()>>>> = LazyLock::new(DashMap::new);
+
+fn file_guard(path: &Path) -> Arc<Mutex<()>> {
+    Arc::clone(&IN_FLIGHT.entry(normalize_path_key(path)).or_default())
+}
 
 /// A single edit operation targeting a line range by hash anchors.
 #[derive(Debug, Clone)]
@@ -73,6 +98,13 @@ fn apply_edits(path: &Path, edits: &[Edit]) -> Result<EditResult, TilthError> {
             parse: None,
         });
     }
+
+    // Held until this file's replacement is renamed into place, so a
+    // concurrent call verifies against the content this one leaves behind.
+    let guard = file_guard(path);
+    let _in_flight = guard
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     // Read file
     let content = fs::read_to_string(path).map_err(|e| match e.kind() {
@@ -219,11 +251,21 @@ fn apply_edits(path: &Path, edits: &[Edit]) -> Result<EditResult, TilthError> {
 
     // Write atomically: temp file in the same directory, then rename so a
     // crash or full-disk mid-write never corrupts the original. Permissions
-    // on the temp are set to match the original before rename.
-    crate::util::atomic_write_bytes(path, output.as_bytes()).map_err(|e| TilthError::IoError {
-        path: path.to_path_buf(),
-        source: e,
-    })?;
+    // on the temp are set to match the original before rename. The rename is
+    // conditional on the file still holding what Phase 1 verified, so a writer
+    // this process cannot see (another tilth process) costs the caller a
+    // retryable error instead of costing the other writer its edit.
+    let outcome =
+        crate::util::atomic_write_bytes_if_unchanged(path, output.as_bytes(), content.as_bytes())
+            .map_err(|e| TilthError::IoError {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+    if outcome == WriteOutcome::Stale {
+        return Err(TilthError::ConcurrentModification {
+            path: path.to_path_buf(),
+        });
+    }
 
     // Phase 4: Build diffs and context around each edit site.
     // Process edits in start_line order. Track cumulative offset since
@@ -404,8 +446,10 @@ fn lexical_normalize(path: &Path) -> PathBuf {
 
 /// Return an error if any two `Ready` tasks resolve to the same file. Called
 /// from `apply_batch` before any worker starts so the invariant lives with
-/// the code that depends on it — two rayon workers racing `fs::write` against
-/// the same inode would silently lose an edit.
+/// the code that depends on it. [`IN_FLIGHT`] would serialize such a pair
+/// rather than lose an edit, but two entries for one file in a single batch
+/// are a malformed request: the second set of hashes was computed against
+/// content the first set is about to replace, so it can only fail.
 pub(crate) fn detect_duplicate_paths(tasks: &[FileEditTask]) -> Option<String> {
     use std::collections::HashSet;
     let mut seen: HashSet<String> = HashSet::new();
@@ -1207,6 +1251,82 @@ mod tests {
         assert!(err.contains("duplicate file path"), "unexpected: {err}");
         // File must be untouched — no worker ran.
         assert_eq!(std::fs::read_to_string(&a).unwrap(), "x\n");
+    }
+
+    // ------------------------------------------------- cross-call concurrency
+
+    /// Two `apply_batch` calls targeting the SAME file from different threads,
+    /// released together by a barrier, editing non-overlapping lines.
+    ///
+    /// `detect_duplicate_paths` only dedups WITHIN one batch, so it cannot see
+    /// a second call. Without per-file serialization both calls verify against
+    /// the same pre-edit snapshot, both splice their own copy of the whole
+    /// file, and the second rename silently drops the first's edit — while
+    /// both callers were told "Applied".
+    ///
+    /// The invariant is "no silent loss": a caller told Applied must find its
+    /// edit on disk. A staleness refusal is the other acceptable outcome — the
+    /// one thing that must never happen is a success report for a vanished edit.
+    #[test]
+    fn concurrent_batches_on_one_file_never_lose_an_edit() {
+        const ITERATIONS: usize = 40;
+        let bloom = fresh_bloom();
+
+        for i in 0..ITERATIONS {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("shared.txt");
+            let content = "aaa\nbbb\nccc\nddd\neee\n";
+            std::fs::write(&path, content).unwrap();
+            let h1 = hash_at(content, 1);
+            let h5 = hash_at(content, 5);
+
+            let barrier = std::sync::Barrier::new(2);
+            let one_edit = |line: usize, hash: u16, text: &str| {
+                vec![Edit {
+                    start_line: line,
+                    start_hash: hash,
+                    end_line: line,
+                    end_hash: hash,
+                    content: text.into(),
+                }]
+            };
+
+            let (res_a, res_b) = std::thread::scope(|s| {
+                let a = s.spawn(|| {
+                    let task = ready_task(path.clone(), one_edit(1, h1, "AAA"));
+                    barrier.wait();
+                    apply_batch(vec![task], &bloom, false)
+                });
+                let b = s.spawn(|| {
+                    let task = ready_task(path.clone(), one_edit(5, h5, "EEE"));
+                    barrier.wait();
+                    apply_batch(vec![task], &bloom, false)
+                });
+                (a.join().unwrap(), b.join().unwrap())
+            });
+
+            let after = std::fs::read_to_string(&path).unwrap();
+            if res_a.is_ok() {
+                assert!(
+                    after.contains("AAA"),
+                    "iteration {i}: writer A was told Applied but its edit vanished:\n{after}"
+                );
+            }
+            if res_b.is_ok() {
+                assert!(
+                    after.contains("EEE"),
+                    "iteration {i}: writer B was told Applied but its edit vanished:\n{after}"
+                );
+            }
+            // Serialized rather than merely refused: the second call reads the
+            // first's output, so non-overlapping edits both land and neither
+            // caller has to retry.
+            assert!(
+                res_a.is_ok() && res_b.is_ok(),
+                "iteration {i}: both non-overlapping edits should apply — a={res_a:?} b={res_b:?}"
+            );
+            assert_eq!(after, "AAA\nbbb\nccc\nddd\nEEE\n", "iteration {i}");
+        }
     }
 
     // ------------------------------------------------- parse check

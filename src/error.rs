@@ -23,6 +23,8 @@ pub enum TilthError {
     },
     #[error("parse error in {}: {reason}", path.display())]
     ParseError { path: PathBuf, reason: String },
+    #[error("{} changed on disk while the edit was being applied — re-read the file and retry with the new hashes; nothing was written", path.display())]
+    ConcurrentModification { path: PathBuf },
 }
 
 impl TilthError {
@@ -30,7 +32,10 @@ impl TilthError {
     #[must_use]
     pub fn exit_code(&self) -> i32 {
         match self {
-            Self::NotFound { .. } | Self::IoError { .. } | Self::AlreadyExists { .. } => 2,
+            Self::NotFound { .. }
+            | Self::IoError { .. }
+            | Self::AlreadyExists { .. }
+            | Self::ConcurrentModification { .. } => 2,
             Self::InvalidQuery { .. } | Self::ParseError { .. } => 3,
             Self::PermissionDenied { .. } => 4,
         }
