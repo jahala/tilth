@@ -152,6 +152,12 @@ fn resolve_by_path_line(
 /// Read `path` and detect its language. Errors if the file isn't a code file —
 /// grok requires source-level analysis, not a markdown / config / data file.
 fn read_code_file(path: &Path) -> Result<(String, Lang), TilthError> {
+    // Stat before judging the extension: a missing path must report
+    // file-not-found, not "not a code file", whatever its suffix.
+    let meta = fs::metadata(path).map_err(|e| TilthError::IoError {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
     let FileType::Code(lang) = detect_file_type(path) else {
         return Err(TilthError::InvalidQuery {
             query: path.display().to_string(),
@@ -161,10 +167,6 @@ fn read_code_file(path: &Path) -> Result<(String, Lang), TilthError> {
     // The binary probe below only inspects the first 512B, so a clean head
     // followed by megabytes of garbage would still reach the lossy decode and
     // the outline parser. Refuse on size first, before reading any bytes.
-    let meta = fs::metadata(path).map_err(|e| TilthError::IoError {
-        path: path.to_path_buf(),
-        source: e,
-    })?;
     let cap = crate::read::full_read_size_cap();
     if meta.len() > cap {
         return Err(TilthError::InvalidQuery {
@@ -1191,10 +1193,18 @@ mod tests {
 
     #[test]
     fn resolve_by_path_line_missing_file_is_io_error() {
+        // Missing-file wins over every content judgement — including for
+        // non-code extensions, where a typo'd path must not be reported as
+        // "not a code file".
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("nope.rs");
-        let err = resolve_by_path_line(&path, 1).unwrap_err();
-        assert!(matches!(err, TilthError::IoError { .. }));
+        for missing in ["nope.rs", "nope.md"] {
+            let path = tmp.path().join(missing);
+            let err = resolve_by_path_line(&path, 1).unwrap_err();
+            assert!(
+                matches!(err, TilthError::IoError { .. }),
+                "{missing}: expected IoError, got {err}"
+            );
+        }
     }
 
     #[test]
