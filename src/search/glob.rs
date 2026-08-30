@@ -128,14 +128,16 @@ fn file_preview(path: &Path) -> Option<String> {
 /// 512 bytes marks binary.
 fn is_binary_file(path: &Path) -> bool {
     use std::io::Read;
-    let Ok(mut file) = std::fs::File::open(path) else {
+    let Ok(file) = std::fs::File::open(path) else {
         return false;
     };
-    let mut head = [0u8; 512];
-    let Ok(n) = file.read(&mut head) else {
+    // A bare read() may legally return fewer than 512 bytes before EOF;
+    // take + read_to_end retries until the cap or EOF, guaranteeing the window.
+    let mut head = Vec::with_capacity(512);
+    if file.take(512).read_to_end(&mut head).is_err() {
         return false;
-    };
-    crate::lang::detection::is_binary(&head[..n])
+    }
+    crate::lang::detection::is_binary(&head)
 }
 
 #[cfg(test)]
@@ -158,6 +160,28 @@ mod tests {
         assert!(
             file_preview(&src).unwrap().ends_with("tokens"),
             "text files still show a token estimate"
+        );
+    }
+
+    #[test]
+    fn binary_probe_window_is_exactly_512_bytes() {
+        // 600 bytes with the first NUL at byte 550 — beyond the probe window.
+        // The probe must cover exactly the first 512 bytes: never fewer (a
+        // short read must not shrink it), never more (a NUL past 512 must not
+        // flip the classification).
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("late_nul.dat");
+        let mut content = vec![b'a'; 600];
+        content[550] = 0;
+        std::fs::write(&path, &content).unwrap();
+
+        assert!(
+            !is_binary_file(&path),
+            "a NUL beyond the 512-byte window must not mark the file binary"
+        );
+        assert!(
+            file_preview(&path).unwrap().ends_with("tokens"),
+            "the preview must stay on the text path"
         );
     }
 
