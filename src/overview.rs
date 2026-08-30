@@ -674,9 +674,7 @@ fn test_style(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opt
             .take(5)
             .any(|(path, _)| {
                 let full = root.join(path);
-                fs::read_to_string(&full)
-                    .ok()
-                    .is_some_and(|content| content.contains("#[cfg(test)]"))
+                fs::read_to_string(&full).is_ok_and(|content| content.contains("#[cfg(test)]"))
             });
         if has_cfg_test {
             styles.push("in-source #[cfg(test)]".to_string());

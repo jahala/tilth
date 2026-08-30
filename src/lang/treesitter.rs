@@ -244,6 +244,46 @@ pub(crate) fn definition_weight(kind: &str) -> u16 {
     }
 }
 
+/// Global cache of compiled tree-sitter queries, shared by symbol/caller
+/// search (`search::siblings`) and per-language extractors (e.g. Go's
+/// receiver-name lookup). Keyed by `(node_kind_count, field_count,
+/// query_str_ptr)` so that distinct query strings for the same language are
+/// stored under separate keys. We avoid `Language::name()` because ABI < 15
+/// grammars (e.g. tree-sitter-kotlin-ng) return `None`.
+#[allow(clippy::type_complexity)]
+static QUERY_CACHE: LazyLock<Mutex<HashMap<(usize, usize, usize), tree_sitter::Query>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Look up or compile `query_str` for `ts_lang`, then invoke `f` with a
+/// reference to the cached `Query`. Returns `None` if compilation fails.
+///
+/// `query_str` must be `'static` so its pointer address is stable across
+/// calls and can serve as part of the cache key.
+pub(crate) fn with_query<R>(
+    ts_lang: &tree_sitter::Language,
+    query_str: &'static str,
+    f: impl FnOnce(&tree_sitter::Query) -> R,
+) -> Option<R> {
+    use std::collections::hash_map::Entry;
+    // Pointer address distinguishes different queries for the same language.
+    let key = (
+        ts_lang.node_kind_count(),
+        ts_lang.field_count(),
+        query_str.as_ptr() as usize,
+    );
+    let mut cache = QUERY_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let query = match cache.entry(key) {
+        Entry::Occupied(e) => e.into_mut(),
+        Entry::Vacant(e) => {
+            let q = tree_sitter::Query::new(ts_lang, query_str).ok()?;
+            e.insert(q)
+        }
+    };
+    Some(f(query))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,44 +434,4 @@ mod tests {
         let node = find_by_kind(tree.root_node(), "impl_item");
         assert_eq!(extract_definition_name(node, &lines), None);
     }
-}
-
-/// Global cache of compiled tree-sitter queries, shared by symbol/caller
-/// search (`search::siblings`) and per-language extractors (e.g. Go's
-/// receiver-name lookup). Keyed by `(node_kind_count, field_count,
-/// query_str_ptr)` so that distinct query strings for the same language are
-/// stored under separate keys. We avoid `Language::name()` because ABI < 15
-/// grammars (e.g. tree-sitter-kotlin-ng) return `None`.
-#[allow(clippy::type_complexity)]
-static QUERY_CACHE: LazyLock<Mutex<HashMap<(usize, usize, usize), tree_sitter::Query>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// Look up or compile `query_str` for `ts_lang`, then invoke `f` with a
-/// reference to the cached `Query`. Returns `None` if compilation fails.
-///
-/// `query_str` must be `'static` so its pointer address is stable across
-/// calls and can serve as part of the cache key.
-pub(crate) fn with_query<R>(
-    ts_lang: &tree_sitter::Language,
-    query_str: &'static str,
-    f: impl FnOnce(&tree_sitter::Query) -> R,
-) -> Option<R> {
-    use std::collections::hash_map::Entry;
-    // Pointer address distinguishes different queries for the same language.
-    let key = (
-        ts_lang.node_kind_count(),
-        ts_lang.field_count(),
-        query_str.as_ptr() as usize,
-    );
-    let mut cache = QUERY_CACHE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let query = match cache.entry(key) {
-        Entry::Occupied(e) => e.into_mut(),
-        Entry::Vacant(e) => {
-            let q = tree_sitter::Query::new(ts_lang, query_str).ok()?;
-            e.insert(q)
-        }
-    };
-    Some(f(query))
 }
