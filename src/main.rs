@@ -233,6 +233,7 @@ fn main() {
                 let budget_opt = if budget == 0 { None } else { Some(budget) };
                 match tilth::diff::diff(
                     &diff_source,
+                    None, // repo: the CLI already runs in the caller's checkout
                     scope.as_deref(),
                     search.as_deref(),
                     blast,
