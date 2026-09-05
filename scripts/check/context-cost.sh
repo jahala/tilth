@@ -10,8 +10,11 @@
 #   TILTH_BIN   binary to probe (default target/release/tilth)
 #   PROBE_DIR   directory the server is launched in (default: this repo)
 #   BAR         instructions token bar (default 120)
+#   --json      print the measurement as JSON and exit 0 (no bar applied); the
+#               manifest check consumes this so there is one measurement, not two
 set -euo pipefail
 cd "$(dirname "$0")/../.."
+json=""; [[ ${1:-} == --json ]] && json=1
 
 bin="${TILTH_BIN:-target/release/tilth}"
 [[ -x $bin ]] || { echo "no binary at $bin — cargo build --release, or set TILTH_BIN" >&2; exit 2; }
@@ -25,7 +28,8 @@ list='{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
 tokens() { echo $(( ($1 + 3) / 4 )); }
 
 status=0
-printf '%-10s %14s %14s %14s\n' mode instructions tools total
+ro_i=0; ro_t=0; ro_c=0; ed_i=0; ed_t=0; ed_c=0
+[[ -n $json ]] || printf '%-10s %14s %14s %14s\n' mode instructions tools total
 for mode in read-only edit; do
   args=(--mcp)
   [[ $mode == edit ]] && args+=(--edit)
@@ -34,11 +38,20 @@ for mode in read-only edit; do
   tools=$(jq -cs '.[] | select(.id==2) | .result.tools' <<<"$out")
   ic=${#instr}; tc=${#tools}
   it=$(tokens "$ic"); tt=$(tokens "$tc")
+  count=$(jq -r 'length' <<<"$tools")
+  if [[ $mode == edit ]]; then ed_i=$it; ed_t=$tt; ed_c=$count; else ro_i=$it; ro_t=$tt; ro_c=$count; fi
+  [[ -n $json ]] && continue
   printf '%-10s %6d ch %5d tk %6d ch %5d tk %6d ch %5d tk\n' "$mode" "$ic" "$it" "$tc" "$tt" $((ic+tc)) $((it+tt))
   if (( it > bar )); then
     echo "  ✗ $mode: instructions are $it tokens, bar is $bar" >&2
     status=1
   fi
 done
-echo "tools advertised: $(jq -r 'length' <<<"$tools") (edit mode)"
+if [[ -n $json ]]; then
+  jq -n --argjson ri "$ro_i" --argjson rt "$ro_t" --argjson rc "$ro_c" \
+        --argjson ei "$ed_i" --argjson et "$ed_t" --argjson ec "$ed_c" \
+        '{unit:"tokens (characters over four)", read_only:{instructions:$ri, tool_schemas:$rt, tools:$rc}, edit:{instructions:$ei, tool_schemas:$et, tools:$ec}}'
+  exit 0
+fi
+echo "tools advertised: $ed_c (edit mode)"
 exit $status
