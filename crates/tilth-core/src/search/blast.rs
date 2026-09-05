@@ -2,10 +2,10 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::Path;
 
-use crate::edit::Edit;
 use crate::lang::detect_file_type;
 use crate::lang::outline::get_outline_entries;
 use crate::search::callers::{find_callers_batch, CallerMatch};
+use crate::types::Edit;
 use crate::types::{is_test_file, FileType, OutlineEntry, OutlineKind};
 
 pub(crate) struct TouchedSymbol {
@@ -62,7 +62,8 @@ fn collect_touched(
 /// Returns a formatted string describing external callers of any definitions
 /// touched by the edits. Returns `None` if no definitions were touched or no
 /// external callers exist.
-pub(crate) fn blast_radius(
+#[must_use]
+pub fn blast_radius(
     path: &Path,
     edits: &[Edit],
     scope: &Path,

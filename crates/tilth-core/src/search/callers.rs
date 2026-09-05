@@ -17,7 +17,7 @@ const IMPACT_FANOUT_THRESHOLD: usize = 10;
 /// Max 2nd-hop results to display.
 const IMPACT_MAX_RESULTS: usize = 15;
 /// Stop the batch caller walk once we have this many raw matches. Generous headroom for dedup + ranking.
-pub(crate) const BATCH_EARLY_QUIT: usize = 50;
+pub const BATCH_EARLY_QUIT: usize = 50;
 
 /// Match-count cap when `--full` is set. Mirrors the symbol/content search caps.
 const FULL_MAX_MATCHES: usize = 100;
@@ -104,9 +104,18 @@ fn target_seen_in_scope(target: &str, scope: &Path, glob: Option<&str>) -> bool 
     seen.load(Ordering::Relaxed)
 }
 
-/// Find all call sites of any symbol in `targets` across the codebase using a single walk.
+/// Find all call sites of any symbol in `targets` across `scope` using a single walk.
 /// Returns tuples of (`target_name`, match) so callers know which symbol was matched.
-pub(crate) fn find_callers_batch(
+///
+/// `bloom` is a per-file "does this file mention the symbol?" pre-filter, shared
+/// across calls so repeated queries skip files they have already indexed; a fresh
+/// [`BloomFilterCache::new`](crate::index::bloom::BloomFilterCache::new) is fine for
+/// a one-off query. The walk stops early once `early_quit_threshold` raw matches
+/// have been collected; pass a generous number when completeness matters.
+// The negotiated signature names `&HashSet<String>`; generalizing the hasher
+// would change the API shape weed pins.
+#[allow(clippy::implicit_hasher)]
+pub fn find_callers_batch(
     targets: &HashSet<String>,
     scope: &Path,
     bloom: &crate::index::bloom::BloomFilterCache,

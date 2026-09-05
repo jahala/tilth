@@ -15,6 +15,7 @@
 - [ ] (code) `.brand/products/tilth/` carries identity, colors, and voice in the shape the umbrella's other products use · scripts/check/brand-layer.sh
 - [ ] (code) the landing page footer names every bed of the garden · scripts/check/footer.sh
 - [ ] (code) the metric result the page and README cite is committed under `benchmark/results/` with the version it was measured on · scripts/check/metric-result.sh
+- [ ] (code) the release workflow publishes `tilth-core` to crates.io before `tilth` and holds both crate versions to the tag · scripts/check/release-order.sh
 - [ ] (human) the owner decides the footer's entry for the judge once its name is confirmed
 
 ## Needs #skill
@@ -24,5 +25,6 @@
 - 2026-09-05 no manifest schema exists yet in contracts; `garden.json` is shaped from the fit contract's field list in building-the-garden.md §3 and re-validated once the schema lands
 - 2026-09-05 `benchmark/results/` holds only a `.gitkeep` on main while README and the page cite figures measured on v0.5.0; the committed result F5 asks for does not exist yet
 - 2026-09-05 this loop needs #skill because the manifest declares the post-diet context cost, not today's
+- 2026-09-05 rulings from the umbrella, binding every bed: the umbrella-derived brand files stay pulled and ignored while `.brand/products/tilth/` is committed (`.brand/*` ignored, `!.brand/products/` re-included); F5 wants a small committed summary (latest value, interval, date, version, pointer to the signed copeca artifact) at `docs/metrics/latest.md`, raw results stay ignored; `skills/SKILL.md` stays where it is and `garden.json` declares it under faces.skill.path; the release publishes `tilth-core` before `tilth`, checked here
 </script>
 <script src="loop.js"></script>

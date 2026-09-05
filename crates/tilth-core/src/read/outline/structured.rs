@@ -1,6 +1,7 @@
 use std::path::Path;
 
 /// Depth-limited outline for JSON, YAML, TOML.
+#[must_use]
 pub fn outline(path: &Path, content: &str, max_lines: usize) -> String {
     match path.extension().and_then(|e| e.to_str()) {
         Some("json") => json_outline(content, max_lines),

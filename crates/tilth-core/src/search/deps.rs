@@ -21,6 +21,7 @@ const MAX_EXPORTED_SYMBOLS: usize = 25;
 const MAX_DEPENDENTS: usize = 15;
 
 /// Result of a full dependency analysis for a single file.
+#[derive(Debug)]
 pub struct DepsResult {
     pub target: PathBuf,
     pub uses_local: Vec<LocalDep>,
@@ -34,12 +35,14 @@ pub struct DepsResult {
 }
 
 /// A local file dependency with the symbols used from it.
+#[derive(Debug)]
 pub struct LocalDep {
     pub path: PathBuf,
     pub symbols: Vec<String>,
 }
 
 /// A file that depends on the target, with symbol-level call detail.
+#[derive(Debug)]
 pub struct Dependent {
     pub path: PathBuf,
     /// (`calling_function`, `called_symbol`, `line`) triples.
@@ -246,6 +249,7 @@ pub fn analyze_deps(
 /// 2. Truncate "Uses (external)" to count only
 /// 3. Truncate "Uses (local)" symbol lists to file paths only
 /// 4. Never truncate the header line
+#[must_use]
 pub fn format_deps(result: &DepsResult, scope: &Path, budget: Option<usize>) -> String {
     let dep_count = result.total_dependents;
     let (prod_deps, test_deps): (Vec<_>, Vec<_>) = result.used_by.iter().partition(|d| !d.is_test);

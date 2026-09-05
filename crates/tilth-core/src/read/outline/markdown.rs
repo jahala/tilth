@@ -5,6 +5,7 @@
 /// `fenced_code_block` nodes and never produce false-positive headings.
 use crate::lang::outline::{heading_level, heading_text, parse_markdown};
 
+#[must_use]
 pub fn outline(buf: &[u8], max_lines: usize) -> String {
     let Ok(content) = std::str::from_utf8(buf) else {
         return String::new();

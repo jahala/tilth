@@ -854,7 +854,6 @@ dependencies = [
  "clap_complete",
  "crossbeam-channel",
  "dashmap",
- "fastbloom",
  "globset",
  "grep-regex",
  "grep-searcher",
@@ -872,6 +871,27 @@ dependencies = [
  "strsim",
  "tempfile",
  "terminal_size",
+ "tilth-core",
+ "toml",
+ "tree-sitter",
+]
+
+[[package]]
+name = "tilth-core"
+version = "0.10.1"
+dependencies = [
+ "dashmap",
+ "fastbloom",
+ "grep-regex",
+ "grep-searcher",
+ "ignore",
+ "memchr",
+ "memmap2",
+ "rayon",
+ "regex-syntax",
+ "serde_json",
+ "streaming-iterator",
+ "tempfile",
  "thiserror",
  "toml",
  "tree-sitter",

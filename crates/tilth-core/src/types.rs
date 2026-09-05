@@ -192,8 +192,11 @@ pub enum OutlineKind {
     TestCase,
 }
 
-/// Detect test files by path patterns.
-pub(crate) fn is_test_file(path: &std::path::Path) -> bool {
+/// Classify a path as a test file by its name: `.test.`, `.spec.`, or a
+/// `__tests__/` directory. These are the JavaScript conventions; consumers
+/// that need `test_*.py`, `*_test.go`, or `#[cfg(test)]` layer them on top.
+#[must_use]
+pub fn is_test_file(path: &std::path::Path) -> bool {
     let s = path.to_string_lossy();
     s.contains(".test.") || s.contains(".spec.") || s.contains("__tests__/")
 }
@@ -212,4 +215,17 @@ pub fn truncate_str(s: &str, max: usize) -> &str {
     } else {
         &s[..s.floor_char_boundary(max)]
     }
+}
+
+/// A single edit operation targeting a line range by hash anchors.
+///
+/// Applied by the binary's hash-anchored editor; read here by blast-radius
+/// analysis, which only needs the line range each edit touches.
+#[derive(Debug, Clone)]
+pub struct Edit {
+    pub start_line: usize,
+    pub start_hash: u16,
+    pub end_line: usize,
+    pub end_hash: u16,
+    pub content: String,
 }

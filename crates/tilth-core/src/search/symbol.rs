@@ -631,8 +631,8 @@ fn find_usages(
 /// Markdown heading definition detector.
 ///
 /// An ATX heading (`^#{1,6}\s+<text>`) in a `.md`/`.mdx`/`.rst` file is
-/// treated as a soft definition of the section about <query> when <query>
-/// appears in <text> as a whole identifier (flanked by non-word chars).
+/// treated as a soft definition of the section about `<query>` when `<query>`
+/// appears in `<text>` as a whole identifier (flanked by non-word chars).
 /// Setext headings, indented code blocks, and lines inside fenced code
 /// blocks are filtered out by the tree-sitter-md parser before we see them.
 ///

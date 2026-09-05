@@ -34,15 +34,9 @@ fn file_guard(path: &Path) -> Arc<Mutex<()>> {
     Arc::clone(&IN_FLIGHT.entry(normalize_path_key(path)).or_default())
 }
 
-/// A single edit operation targeting a line range by hash anchors.
-#[derive(Debug, Clone)]
-pub struct Edit {
-    pub start_line: usize,
-    pub start_hash: u16,
-    pub end_line: usize,
-    pub end_hash: u16,
-    pub content: String,
-}
+// `Edit` is a shared value type: blast-radius analysis in `tilth-core` reads
+// the same line ranges this module applies.
+pub use tilth_core::types::Edit;
 
 /// One file's worth of work for a batch `tilth_write` (hash mode). Parse errors are deferred
 /// onto the task so a malformed entry surfaces as a per-file failure instead of

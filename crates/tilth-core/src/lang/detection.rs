@@ -1,11 +1,13 @@
 /// Any null byte in the first 512 bytes → binary.
 /// Uses memchr for the scan — single SIMD pass, no branching.
+#[must_use]
 pub fn is_binary(buf: &[u8]) -> bool {
     let window = &buf[..buf.len().min(512)];
     memchr::memchr(0, window).is_some()
 }
 
 /// Check filename against known generated/lock files.
+#[must_use]
 pub fn is_generated_by_name(name: &str) -> bool {
     matches!(
         name,
@@ -37,6 +39,7 @@ const GENERATED_MARKERS: &[&[u8]] = &[
 ];
 
 /// Scan first 512 bytes for generated-file markers using SIMD memmem.
+#[must_use]
 pub fn is_generated_by_content(buf: &[u8]) -> bool {
     let window = &buf[..buf.len().min(512)];
     GENERATED_MARKERS
@@ -51,6 +54,7 @@ pub const MINIFIED_CHECK_THRESHOLD: u64 = 100_000;
 /// Strong, decade-old industry convention — `.min.js`, `app.min.css`,
 /// `bundle-min.js`. Bundler defaults like `vendor.js` or `bundle.js`
 /// are not flagged here; the content heuristic catches those.
+#[must_use]
 pub fn is_minified_by_name(name: &str) -> bool {
     let Some(stem_end) = name.rfind('.') else {
         return false;
@@ -86,6 +90,7 @@ pub fn is_minified_by_name(name: &str) -> bool {
 /// in 2KB is a strong signal: real source has line breaks every ~80 bytes,
 /// while minified bundles routinely have zero. A threshold of `< 4` would
 /// flag legitimate single-block license headers and compact one-line JSON.
+#[must_use]
 pub fn is_minified_by_content(buf: &[u8]) -> bool {
     let sample = &buf[..buf.len().min(2048)];
     let newlines = memchr::memchr_iter(b'\n', sample).count();
