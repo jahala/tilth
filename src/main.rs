@@ -52,8 +52,9 @@ struct Cli {
     #[arg(long)]
     edit: bool,
 
-    /// Disable project fingerprint in MCP init.
-    #[arg(long)]
+    /// Accepted for existing host configs; the project fingerprint is no
+    /// longer served at MCP init (`tilth overview` still prints it).
+    #[arg(long, hide = true)]
     no_overview: bool,
 
     /// Inline source for top N search matches (default 2 when flag bare).
@@ -253,9 +254,8 @@ fn main() {
 
     // MCP mode: JSON-RPC server
     if cli.mcp {
-        if cli.no_overview {
-            std::env::set_var("TILTH_NO_OVERVIEW", "1");
-        }
+        // `--no-overview` is inert: initialize no longer carries the fingerprint.
+        let _ = cli.no_overview;
         // Pass --scope to MCP if it's not the default "."
         let mcp_scope = if cli.scope.as_os_str() == "." {
             None

@@ -92,7 +92,7 @@ src/                     The tilth binary.
 ├── budget.rs        Token cap (truncate output to a token budget)
 ├── session.rs       Per-MCP-process counters: reads, searches, top
 │                    queries, hot dirs, expanded-set dedup
-├── overview.rs      Project fingerprint emitted at MCP `initialize`
+├── overview.rs      Project fingerprint (`tilth overview`)
 ├── map.rs           tilth --map: structural tree of the codebase
 ├── install.rs       Writes MCP server entries into ~20 host configs
 ├── edit.rs          Hash-anchored line edits + EditResult diff preview
@@ -137,8 +137,8 @@ free-form path:
 - `tilth install <host>` — delegates to `install::run`.
 - `tilth diff [<source>]` — bypasses `lib.rs` entirely and goes
   through `diff::resolve_source` + `diff::diff`.
-- `tilth overview` — prints the project fingerprint that the MCP
-  `initialize` response would inject.
+- `tilth overview` — prints the project fingerprint (languages,
+  manifest, hot files, git state) for a human or an agent that asks.
 
 The default (no-subcommand) mode dispatches into `lib::run` (or
 `run_full`, `run_expanded`, `run_callers`, `run_deps`,
@@ -173,12 +173,11 @@ methods worth describing in detail:
 - `initialize` — emits `protocolVersion`, capabilities, `serverInfo`,
   and an `instructions` string. The instructions are the
   `SERVER_INSTRUCTIONS` constant, loaded at compile time via
-  `include_str!("../../prompts/mcp-base.md")` and rewritten on `fd3de77`
-  as a pre-flight gate naming the exact Bash commands and host tools to
-  avoid, with concrete `<bad>→<good>` rewrites. When
-  `TILTH_NO_OVERVIEW` is unset, `overview::fingerprint(cwd)` is
-  prepended — a project summary built in <250ms (a stderr warning fires
-  if it overruns).
+  `include_str!("../../prompts/mcp-base.md")`: a pointer under 120
+  tokens carrying the native-tool prohibition, the root rule, and where
+  the full guide lives (`skills/SKILL.md`). Nothing else rides along;
+  the project fingerprint that used to be prepended is `tilth overview`
+  now, so a session pays for tilth's presence only when tilth speaks.
 - `tools/list` — returns the tool schemas. `tools/call` is the workhorse
   and goes through `handle_tool_call`.
 
@@ -741,17 +740,16 @@ shapes; the in-process `dispatch_tool` and the per-tool functions
 (`tool_search`, `tool_read`, etc.) parse them by `serde_json::Value`
 lookups rather than typed structs.
 
-**Instructions injection.** The `SERVER_INSTRUCTIONS` constant is the
-strategic guidance every host gets at `initialize`. It lives in
-`prompts/mcp-base.md` and is wired in at compile time via
-`include_str!`. The text names exact bad commands
-(`Bash(grep/cat/find)`) and provides `<bad>→<good>` rewrites because
-agents kept reaching for those despite earlier "DO NOT use
-Grep/Read/Glob" rules. Edit mode appends an `EDIT_MODE_EXTRA` block
-from `prompts/mcp-edit.md` with the `tilth_write` instructions.
-`overview::fingerprint(cwd)` is prepended unless `TILTH_NO_OVERVIEW`
-is set — a brief summary of language counts, manifests, hot files,
-and git context.
+**Instructions injection.** The `SERVER_INSTRUCTIONS` constant is what
+every host gets at `initialize`: a pointer, not a manual. It lives in
+`prompts/mcp-base.md` and is wired in at compile time via `include_str!`.
+It names the host tools and shell commands to avoid (`Grep`, `Read`,
+`Glob`, `Bash(grep/rg/cat/find/ls/git diff)`) and the tilth tools to use
+instead, states the root rule, and points at `skills/SKILL.md`, which
+carries the full guidance the block used to. Edit mode appends an
+`EDIT_MODE_EXTRA` block from `prompts/mcp-edit.md`: `tilth_write`
+replaces the host editor. Both modes stay under 120 tokens; a unit test
+pins the bar and `scripts/check/context-cost.sh` measures a live server.
 
 `AGENTS.md` at the repo root is the user-facing copy of these
 instructions for hosts that read prompts from disk rather than via
@@ -790,8 +788,8 @@ user-facing.
   `package.json`, `go.mod`, `pyproject.toml`), reads `git` context
   (`branch`, `uncommitted`, `recent commits`), and emits a few
   hot-file lines. Wrapped in `catch_unwind` and a 250ms wall-clock
-  budget; warn-on-overrun via stderr. Output is the project summary
-  that the MCP `initialize` response prepends to `SERVER_INSTRUCTIONS`.
+  budget; warn-on-overrun via stderr. Printed by `tilth overview`; no
+  longer prepended to the MCP `initialize` instructions.
 - **`map.rs`** — `tilth --map` generates a structural codebase tree:
   per-directory token estimates, top-level symbols per file, depth
   control. CLI-only — the MCP boundary doesn't expose it (no schema
