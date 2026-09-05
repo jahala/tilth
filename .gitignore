@@ -10,6 +10,7 @@
 !/docs/tend2/
 !/docs/ab/
 !/docs/proof-2026-09.md
+!/docs/metrics/
 
 # OS
 .DS_Store
@@ -34,6 +35,9 @@ benchmark/results/*.jsonl
 benchmark/results/*.md
 !benchmark/results/.gitkeep
 
-# Brand (petals) — pulled from the plotplot umbrella, kept local (never committed)
+# Brand (petals). The umbrella-derived files (.brand/*.md, tokens.css,
+# tokens.json, assets/) are pulled from plotplot and kept local; the product
+# layer .brand/products/tilth/ is this bed's own identity and is committed.
 .petalsrc
-.brand/
+.brand/*
+!.brand/products/

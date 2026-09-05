@@ -1,0 +1,9 @@
+# .petalsrc — drop this at the root of the tilth repo (rename to `.petalsrc`)
+brand:
+  # plotplot is the umbrella brand and the brand repo.
+  source: https://github.com/jahala/plotplot-ai.git
+  version: v2.0.0
+  # tilth's product layer is authored in this repo at .brand/products/tilth/;
+  # the fetch brings the umbrella files beside it.
+  product: tilth
+  overrides: {}

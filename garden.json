@@ -1,0 +1,77 @@
+{
+  "name": "tilth",
+  "kind": [
+    "capability",
+    "channel"
+  ],
+  "version": "0.10.1",
+  "description": "Structural code reading for agents: tree-sitter outlines, definition-first search, callers, blast-radius deps, structural diff. Also the parser substrate (tilth-core) other garden tools build on.",
+  "repository": "https://github.com/jahala/tilth",
+  "page": "https://jahala.github.io/tilth/",
+  "license": "MIT",
+  "faces": {
+    "cli": {
+      "command": "tilth"
+    },
+    "mcp": {
+      "command": "tilth",
+      "args": [
+        "--mcp"
+      ],
+      "transport": "stdio",
+      "tools": 7,
+      "edit_mode": {
+        "args": [
+          "--mcp",
+          "--edit"
+        ],
+        "tools": 8
+      }
+    },
+    "skill": {
+      "path": "skills/SKILL.md"
+    },
+    "library": {
+      "crate": "tilth-core",
+      "path": "crates/tilth-core"
+    }
+  },
+  "install": {
+    "cargo": "cargo install tilth",
+    "npm": "npm install -g tilth",
+    "binaries": "https://github.com/jahala/tilth/releases",
+    "platforms": [
+      "x86_64-unknown-linux-musl",
+      "aarch64-unknown-linux-musl",
+      "x86_64-apple-darwin",
+      "aarch64-apple-darwin",
+      "x86_64-pc-windows-msvc"
+    ]
+  },
+  "check": null,
+  "metric": {
+    "name": "cost per correct answer",
+    "command": "copeca run --task scenarios/full-sonnet.yaml --runner claude",
+    "where": "the copeca repository (github.com/jahala/copeca), whose corpus and scenarios hold tilth's baseline-versus-tilth run",
+    "latest": "docs/metrics/latest.md",
+    "next": "docs/ab/skill-vs-mcp-2026-09.md"
+  },
+  "context_cost": {
+    "unit": "tokens (characters over four)",
+    "measured_by": "scripts/check/context-cost.sh",
+    "measured_on": "2026-09-05",
+    "instructions": {
+      "read_only": 89,
+      "edit": 109
+    },
+    "tool_schemas": {
+      "read_only": 2158,
+      "edit": 3069
+    },
+    "total": {
+      "read_only": 2247,
+      "edit": 3178
+    }
+  },
+  "map": "docs/tend2"
+}
