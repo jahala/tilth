@@ -167,17 +167,19 @@ Task definitions are in `benchmark/tasks/*.py`. Each has `name`, `prompt`, `grou
 
 ## MCP instructions
 
-Server instructions sent via MCP protocol live in `prompts/`:
+What the MCP server says at `initialize` is a pointer under 120 tokens, in `prompts/`:
 
-- `prompts/mcp-base.md` — base instructions for all modes (wired in as `SERVER_INSTRUCTIONS`)
-- `prompts/mcp-edit.md` — appended in edit mode (wired in as `EDIT_MODE_EXTRA`)
+- `prompts/mcp-base.md` — served in every mode (`SERVER_INSTRUCTIONS`): the native-tool prohibition, the root rule, and where the guide lives
+- `prompts/mcp-edit.md` — appended in edit mode (`EDIT_MODE_EXTRA`): `tilth_write` replaces the host editor
 
-`src/mcp/mod.rs` embeds both at compile time via `include_str!`. `AGENTS.md` is the user-facing copy; regenerate it via `./scripts/regen-agents-md.sh` after any change so both surfaces stay in lockstep. The byte-lock tests in `src/mcp/mod.rs` (`server_instructions_byte_lock`, `edit_mode_extra_byte_lock`) flag accidental drift and must be updated alongside intentional prompt edits.
+The guide itself is `skills/SKILL.md`: a one-sentence description and a body that carries every instruction the served block used to carry, plus the CLI usage. The project fingerprint is no longer prepended at `initialize` (`tilth overview` still prints it); `--no-overview` is accepted and inert.
 
-Changes to MCP instructions must be surgical — no bloat. Haiku is sensitive to:
+`src/mcp/mod.rs` embeds both prompt files at compile time via `include_str!`. `AGENTS.md` is the user-facing copy; regenerate it via `./scripts/regen-agents-md.sh` after any change so both surfaces stay in lockstep. The byte-lock tests in `src/mcp/mod.rs` (`server_instructions_byte_lock`, `edit_mode_extra_byte_lock`, `served_instructions_are_under_the_token_bar_in_both_modes`) flag drift and must be updated alongside intentional prompt edits. `scripts/check/context-cost.sh` measures what a live server serves; `scripts/check/skill-body.sh` checks the skill still carries every line the v0.10.1 block did.
+
+Changes to the pointer and the skill must be surgical — no bloat. Haiku is sensitive to:
 
 - Instruction positioning (top-weighted — put important guidance first)
 - Framing ("DO NOT" works better than "IMPORTANT:" for weaker models)
 - Concrete examples (tool call patterns, not abstract descriptions)
 
-Test instruction changes with haiku benchmarks on hard tasks (`rg_search_dispatch`, `rg_trait_implementors`, `gin_servehttp_flow`).
+Instruction changes are measured by a copeca A/B (the skill-versus-MCP brief is `docs/ab/skill-vs-mcp-2026-09.md`), not by the in-repo benchmark.
