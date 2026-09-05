@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>skill · tilth</title>
+<link rel="stylesheet" href="loop.css">
+<body>
+<noscript>This page renders its markdown payload with JavaScript — enable JS, or read the raw payload in the page source.</noscript>
+<script type="text/markdown" id="loop">
+# skill — zero context tax
+**Goal.** tilth costs an agent nothing at startup unless it is speaking. The instruction block the MCP server sends at `initialize` moves into `skills/SKILL.md`, whose description is one sentence and whose body carries everything the block carried; what the server still serves is a pointer under 120 tokens, with no project fingerprint prepended. `AGENTS.md` keeps tracking the prompt sources. Whether tilth as a CLI behind the skill keeps its measured cost-per-correct gain is an open measurement for copeca: the A/B is drafted here and run there.
+
+## Tests
+- [ ] (code) `skills/SKILL.md` has a one-sentence description under 160 characters, and every instruction line the v0.10.1 `SERVER_INSTRUCTIONS` and `EDIT_MODE_EXTRA` carried appears in its body · scripts/check/skill-body.sh
+- [ ] (code) the served `instructions` block, read from a live `initialize` in both read-only and edit mode, is under 120 tokens at four characters per token · scripts/check/context-cost.sh
+- [ ] (code) `AGENTS.md` regenerates from `prompts/` as a no-op and keeps the tend2 block · scripts/check/agents-md.sh
+- [ ] (human) the owner hands the copeca agent the skill-versus-MCP A/B brief at `docs/ab/skill-vs-mcp-2026-09.md` with its pre-registered bars unchanged: CLI-plus-skill becomes the documented default only if its cost per correct is within 5 percent of the MCP arm
+
+## Tried
+- 2026-09-05 measured before the diet with the umbrella's probe (spawn the server, read `initialize.instructions` and `tools/list`, count characters over four), v0.10.1 launched in the gin fixture: read-only instructions 1718 characters / 430 tokens and tool schemas 8632 / 2158; edit mode 2028 / 507 and 12276 / 3069; seven tools read-only, eight in edit mode
+- 2026-09-05 the project fingerprint accounts for 327 of those instruction characters in gin and 566 when launched in this repository; without it the instructions are 1391 characters / 348 tokens read-only and 1701 / 426 in edit mode, so the diet must remove roughly three quarters of what is served, not trim it
+- 2026-09-05 the probe is `scripts/check/context-cost.sh` and fails today by design; it is the evidence for the context-cost check
+- 2026-09-05 PR #196 shortens the prompts to 1642 and 1838 bytes and keeps them in the initialize payload; that is a trim, not the diet, so the diet does not build on it, and its one shared move, dropping the fingerprint, happens here for the same reason (it busts prompt-prefix caching every session)
+- 2026-09-05 the skill file stays at `skills/SKILL.md`, where main already keeps one, until the stem's bundles say where a bed's skill is picked up from
+</script>
+<script src="loop.js"></script>
