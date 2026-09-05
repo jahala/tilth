@@ -15,7 +15,7 @@ use crate::lang::treesitter::{
 use crate::types::Lang;
 
 /// All per-language data and behavior in one record. Read via `spec(lang)`.
-pub(crate) struct LangSpec {
+pub struct LangSpec {
     /// Human-readable language name (`lang_display_name`).
     pub display: &'static str,
     /// File extensions that map to this language (`detect_file_type`).
@@ -49,7 +49,7 @@ pub(crate) struct LangSpec {
 /// How an import source is recognised as standard-library (and thus noise that
 /// `tilth_deps` suppresses). Replaces the per-language `is_stdlib` match. Each
 /// variant encodes one language's historical rule byte-for-byte.
-pub(crate) enum StdlibRule {
+pub enum StdlibRule {
     /// Language has no stdlib suppression.
     None,
     /// Source matches if it starts with any of these prefixes (Rust:
@@ -80,7 +80,7 @@ impl StdlibRule {
 /// Coarse 6-way grouping of comment / log syntax for `strip::strip_noise`.
 /// Deliberately *not* a 1:1 sibling of `Lang` (many languages share a family).
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum StripFamily {
+pub enum StripFamily {
     Rust,
     Python,
     Go,
@@ -93,7 +93,7 @@ pub(crate) enum StripFamily {
 /// Definition-name extraction + semantic weight for a language. The default
 /// (`DEFAULT_DEFS`) walks standard field names; Elixir overrides both because
 /// its definitions are `call` nodes.
-pub(crate) struct DefinitionOps {
+pub struct DefinitionOps {
     /// Extract the defined symbol name from a definition node.
     pub extract_name: fn(tree_sitter::Node, &[&str]) -> Option<String>,
     /// Semantic ranking weight for a definition node.
@@ -118,7 +118,8 @@ pub(crate) const DEFAULT_DEFS: DefinitionOps = DefinitionOps {
 
 /// The single surviving full-`Lang` dispatch. Every other former `match lang`
 /// reads a field on the returned spec.
-pub(crate) fn spec(lang: Lang) -> &'static LangSpec {
+#[must_use]
+pub fn spec(lang: Lang) -> &'static LangSpec {
     use crate::lang;
     match lang {
         Lang::Rust => &lang::rust::SPEC,

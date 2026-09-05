@@ -5,8 +5,7 @@
     clippy::cast_possible_wrap,        // u32→i32 for tree-sitter APIs
     clippy::module_name_repetitions,   // Rust naming conventions
     clippy::similar_names,             // common in parser/search code
-    clippy::too_many_lines,            // crate-wide to cover find_definitions in src/search/symbol.rs;
-                                       // narrow to a per-function allow once a refactor shrinks that file
+    clippy::too_many_lines,            // crate-wide; the largest offenders are the formatters in src/search/mod.rs
     clippy::too_many_arguments,        // internal recursive AST walker
     clippy::unnecessary_wraps,         // Result return for API consistency
     clippy::struct_excessive_bools,    // CLI struct derives clap
@@ -15,16 +14,16 @@
 )]
 
 pub(crate) mod budget;
-pub mod cache;
+pub use tilth_core::cache;
 pub(crate) mod classify;
 pub mod diff;
 pub(crate) mod edit;
 pub(crate) mod edit_parse_check;
-pub mod error;
+pub use tilth_core::error;
 pub(crate) mod format;
-pub mod index;
+pub use tilth_core::index;
 pub mod install;
-pub(crate) mod lang;
+pub(crate) use tilth_core::lang;
 pub mod map;
 pub mod mcp;
 pub mod overview;
@@ -32,7 +31,7 @@ pub(crate) mod read;
 pub(crate) mod search;
 pub(crate) mod session;
 pub(crate) mod timeout;
-pub(crate) mod types;
+pub(crate) use tilth_core::types;
 pub(crate) mod util;
 
 /// Re-exports for the fuzz harness. Not stable; do not depend on this.

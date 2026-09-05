@@ -1,6 +1,7 @@
 use std::fmt::Write;
 
 /// Unknown file types: first 50 lines + last 10 lines.
+#[must_use]
 pub fn head_tail(content: &str) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len();
@@ -17,6 +18,7 @@ pub fn head_tail(content: &str) -> String {
 }
 
 /// Log files: first 10 lines + last 5 lines + total line count.
+#[must_use]
 pub fn log_view(content: &str) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len();

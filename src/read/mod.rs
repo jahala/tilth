@@ -1,5 +1,6 @@
-pub mod imports;
-pub mod outline;
+// Outlines and import resolution live in `tilth-core`; re-exported so every
+// `crate::read::outline::…` path in this crate stays valid.
+pub use tilth_core::read::{imports, outline};
 
 use std::fmt::Write;
 use std::fs;

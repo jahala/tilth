@@ -6,13 +6,18 @@ to capture the *durable* shape — the type alphabet, dispatch flow, and
 extension seams — not file sizes or specific commits, which decay
 faster than they can be re-checked.
 
-Tilth is a single Rust binary that exposes two surfaces: a CLI
-(`tilth`) and an MCP server (`tilth --mcp`). Both speak to the same
-core: a query classifier, a tree-sitter-driven search engine, a smart
-file reader, and supporting subsystems for diff, edit, blast-radius
-analysis, and codebase mapping. There's also a Cargo workspace, an
+Tilth is a Cargo workspace of two crates. `tilth` is the binary and
+exposes two surfaces: a CLI (`tilth`) and an MCP server (`tilth --mcp`).
+`tilth-core` (`crates/tilth-core`) is the parsing substrate both surfaces
+and other tools link: language detection, tree-sitter outlines, the
+symbol index and search, callers and callees, dependency analysis, and
+blast radius. The binary adds the query classifier, the smart file
+reader, formatting and budgeting, diff, edit, codebase mapping, an
 `install.rs` that writes MCP-host configs, a benchmark harness, and an
-npm wrapper that fetches a prebuilt binary on `npm install`.
+npm wrapper that fetches a prebuilt binary on `npm install`. Inside the
+binary every `crate::lang::…`, `crate::types::…`, `crate::search::symbol::…`
+path still resolves: `src/lib.rs`, `src/read/mod.rs`, and `src/search/mod.rs`
+re-export the library's modules under the names the code always used.
 
 The single most useful function for orienting yourself is
 `lib.rs::run_inner` — every search query funnels through it.
@@ -20,85 +25,91 @@ The single most useful function for orienting yourself is
 ## Layout map
 
 ```
-src/
-├── lib.rs           Public API + dispatch (run / run_full / run_expanded /
-│                    run_callers / run_deps)
-├── main.rs          CLI binary (clap parser → lib calls or mcp::run)
-├── mcp.rs           MCP server: JSON-RPC stdio loop, tool dispatch,
-│                    per-request timeout / abandoned-thread tracking
-├── classify.rs      Query string → QueryType (8-rule precedence ladder)
+crates/tilth-core/src/   The library. Root re-exports are the documented API;
+│                        the modules are #[doc(hidden)] internals.
+├── lib.rs           Lint policy + the negotiated surface: detect_file_type,
+│                    get_outline_entries, is_test_file, test_entries, the
+│                    import fns, find_callers_batch, analyze_deps, TilthError
 ├── types.rs         Shared types: QueryType, Lang, FileType, ViewMode,
-│                    Match, SearchResult, FacetTotals, OutlineEntry
-├── error.rs         TilthError (NotFound, PermissionDenied,
-│                    InvalidQuery, IoError, ParseError)
-├── format.rs        Output headers, line numbering, hashlines
-├── budget.rs        Token cap (truncate output to a token budget)
-├── session.rs       Per-MCP-process counters: reads, searches, top
-│                    queries, hot dirs, expanded-set dedup
+│                    Match, SearchResult, FacetTotals, OutlineEntry, Edit
+├── error.rs         TilthError (NotFound, PermissionDenied, InvalidQuery,
+│                    IoError, ParseError, …) with exit codes
 ├── cache.rs         OutlineCache: rendered outlines + parsed
 │                    tree_sitter::Tree, both keyed by (path, mtime)
-├── overview.rs      Project fingerprint emitted at MCP `initialize`
-├── map.rs           tilth --map: structural tree of the codebase
-├── install.rs       Writes MCP server entries into ~20 host configs
-├── edit.rs          Hash-anchored line edits + EditResult diff preview
-│
-├── search/          Search engine
-│   ├── mod.rs           Walker, ignore policy, formatter, dispatch
-│   ├── symbol.rs        Tree-sitter definition detection per language;
-│   │                    markdown-heading defs; usage matching
-│   ├── content.rs       Literal content search (ripgrep internals)
-│   ├── rank.rs          Match scoring: 11 boosts/penalties + recency
-│   ├── facets.rs        Group matches into definitions /
-│   │                    implementations / tests / usages_local /
-│   │                    usages_cross
-│   ├── truncate.rs      Display cap policy (per-facet limits)
-│   ├── strip.rs         Cognitive-load stripping in expanded source
-│   ├── siblings.rs      Tree-sitter sibling extraction (with cached
-│   │                    Query objects)
-│   ├── callers.rs       Find call sites of a symbol (`tilth_search
-│   │                    kind:callers`); enclosing-scope annotation
-│   ├── callees.rs       Resolve function calls inside a definition
-│   ├── deps.rs          Blast-radius analysis (`tilth_deps`)
-│   ├── grok.rs          One-call symbol bundle (`tilth_grok`)
-│   ├── glob.rs          Glob query → file list (`tilth_files`)
-│   ├── blast.rs         Symbol-level blast radius
-│   ├── bloom_walk.rs    Shared walker preamble (size gating, mtime,
-│   │                    bloom filter) factored out of callers/callees
-│   ├── callee_query.rs  Cached tree-sitter `Query` objects for callee
-│   │                    extraction across languages
-│   └── scope.rs         `enclosing_definition_at` — walks up the AST
-│                        from a match to find the enclosing function /
-│                        type, used by both `callers` annotation and
-│                        the search-time `[in foo]` suffix
-│
-├── read/            Read engine
-│   ├── mod.rs           read_file decision tree, multi-section reader
-│   │                    (`read_ranges`), heading resolver, suggestion
-│   │                    fallback
-│   ├── imports.rs       Resolve "Related: file1, file2" hints
+├── lang/            Language detection + tree-sitter wrapper
+│   ├── mod.rs           detect_file_type, package_root, FileType ↔ Lang
+│   ├── spec.rs          Per-language LangSpec table (extensions, grammar,
+│   │                    queries, stdlib rule, definition ops)
+│   ├── <lang>.rs        One file per language filling the table
+│   ├── detection.rs     Binary / generated / minified detection
+│   ├── treesitter.rs    DEFINITION_KINDS, extract_definition_name
+│   └── outline.rs       outline_language(Lang) → tree_sitter::Language;
+│                        node_to_entry walker; parse_markdown / heading
+│                        helpers; extract_import_source
+├── read/
+│   ├── imports.rs       is_import_line, is_external, resolve related files
 │   └── outline/
 │       ├── mod.rs       Dispatch by FileType
 │       ├── code.rs      Tree-sitter outline for code
 │       ├── markdown.rs  Tree-sitter-md outline: walks `section` nodes
 │       ├── structured.rs JSON/YAML/TOML "keys" view
 │       ├── tabular.rs   CSV/TSV head/tail + column count
-│       ├── test_file.rs Test-suite outline (describe/it grouping)
+│       ├── test_file.rs describe/it/test structure: test_entries() as
+│       │                data, outline() rendered over it
 │       └── fallback.rs  Last-resort head/tail
-│
-├── lang/            Language detection + tree-sitter wrapper
-│   ├── mod.rs           detect_file_type, package_root, FileType ↔ Lang
-│   ├── detection.rs     Binary / generated / minified detection
-│   ├── treesitter.rs    DEFINITION_KINDS, extract_definition_name
-│   └── outline.rs       outline_language(Lang) → tree_sitter::Language;
-│                        node_to_entry walker (the bulk of this file);
-│                        parse_markdown / heading_level / heading_text
-│                        helpers shared by markdown outline + search defs
-│
-├── index/           Pre-computed indexes used by the relational-query paths
-│   ├── mod.rs
+├── index/
 │   └── bloom.rs         Per-file Bloom filter for fast "does X contain Y?"
 │                        (BloomFilterCache wraps the per-file filters)
-│
+└── search/
+    ├── mod.rs           The shared walker (SKIP_DIRS, base_walk_builder,
+    │                    walker), file_metadata, format_token_count
+    ├── symbol.rs        Tree-sitter definition detection per language;
+    │                    markdown-heading defs; usage matching
+    ├── rank.rs          Match scoring: 11 boosts/penalties + recency
+    ├── facets.rs        Group matches into definitions / implementations /
+    │                    tests / usages_local / usages_cross
+    ├── siblings.rs      Tree-sitter sibling extraction (cached Queries)
+    ├── callers.rs       Find call sites of a symbol; enclosing-scope
+    │                    annotation; find_callers_batch
+    ├── callees.rs       Resolve function calls inside a definition
+    ├── deps.rs          Blast-radius analysis (`tilth_deps`); analyze_deps
+    ├── blast.rs         Symbol-level blast radius for edits
+    ├── bloom_walk.rs    Shared walker preamble (size gating, mtime, bloom)
+    ├── callee_query.rs  Cached tree-sitter `Query` objects for callee
+    │                    extraction across languages
+    └── scope.rs         `enclosing_definition_at` — walks up the AST to
+                         the enclosing function / type
+
+src/                     The tilth binary.
+├── lib.rs           Public API + dispatch (run / run_full / run_expanded /
+│                    run_callers / run_deps); re-exports tilth-core's
+│                    cache, error, index, lang, types
+├── main.rs          CLI binary (clap parser → lib calls or mcp::run)
+├── mcp/             MCP server: JSON-RPC stdio loop, tool dispatch,
+│                    per-request timeout / abandoned-thread tracking
+├── classify.rs      Query string → QueryType (8-rule precedence ladder)
+├── format.rs        Output headers, line numbering, hashlines
+├── budget.rs        Token cap (truncate output to a token budget)
+├── session.rs       Per-MCP-process counters: reads, searches, top
+│                    queries, hot dirs, expanded-set dedup
+├── overview.rs      Project fingerprint emitted at MCP `initialize`
+├── map.rs           tilth --map: structural tree of the codebase
+├── install.rs       Writes MCP server entries into ~20 host configs
+├── edit.rs          Hash-anchored line edits + EditResult diff preview
+│                    (the Edit type itself lives in tilth-core)
+├── search/          Search orchestration and formatting
+│   ├── mod.rs           Formatter, dispatch; re-exports the walker and the
+│   │                    structural queries from tilth-core
+│   ├── content.rs       Literal content search (ripgrep internals)
+│   ├── truncate.rs      Display cap policy (per-facet limits)
+│   ├── strip.rs         Cognitive-load stripping in expanded source
+│   ├── grok.rs          One-call symbol bundle (`tilth_grok`)
+│   ├── glob.rs          Glob query → file list (`tilth_list`)
+│   └── alloc.rs         Value-based budget allocation
+├── read/
+│   └── mod.rs           read_file decision tree, multi-section reader
+│                        (`read_ranges`), heading resolver, suggestion
+│                        fallback; re-exports imports + outline
 └── diff/            Structural diff
     ├── mod.rs           DiffSource resolution; diff() pipeline orchestrator
     ├── parse.rs         Parse unified diff text → FileDiff structs

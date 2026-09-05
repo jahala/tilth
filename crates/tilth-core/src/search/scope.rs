@@ -96,6 +96,7 @@ pub(super) fn walk_to_enclosing_definition<'a>(
 ///
 /// Returns `None` if the file isn't a code file, the parse fails, or `line`
 /// sits at the top level outside any definition.
+#[must_use]
 pub fn enclosing_definition_at(
     path: &Path,
     line: u32,

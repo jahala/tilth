@@ -18,6 +18,7 @@ pub fn outline_language(lang: Lang) -> Option<tree_sitter::Language> {
 /// Centralised so both `read::outline::markdown` and
 /// `search::symbol::find_defs_markdown_buf` configure the parser the same
 /// way.
+#[must_use]
 pub fn parse_markdown(content: &str) -> Option<tree_sitter::Tree> {
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&tree_sitter_md::LANGUAGE.into()).ok()?;
@@ -26,6 +27,7 @@ pub fn parse_markdown(content: &str) -> Option<tree_sitter::Tree> {
 
 /// Map an `atx_heading` or `setext_heading` node to its 1-6 level by
 /// inspecting the marker child. Returns `None` for malformed nodes.
+#[must_use]
 pub fn heading_level(node: tree_sitter::Node) -> Option<u8> {
     let kind = node.kind();
     if kind == "atx_heading" {
@@ -62,6 +64,7 @@ pub fn heading_level(node: tree_sitter::Node) -> Option<u8> {
 /// pre-split source lines. Returns the inline content with surrounding
 /// whitespace + trailing `#`s (for ATX-closed headings like `## Foo ##`)
 /// trimmed, matching the previous hand-rolled scanner's output.
+#[must_use]
 pub fn heading_text(node: tree_sitter::Node, lines: &[&str]) -> String {
     // Both heading kinds expose their inline content as an `inline` child.
     let mut cursor = node.walk();
@@ -785,7 +788,8 @@ fn elixir_extract_doc_string(node: tree_sitter::Node, lines: &[&str]) -> Option<
 ///
 /// The `lang` parameter is needed to disambiguate `use` (Rust path vs Elixir module)
 /// and `import` (JS/TS `from` syntax vs Elixir/Python/Go bare module name).
-pub(crate) fn extract_import_source(text: &str, lang: Option<crate::types::Lang>) -> String {
+#[must_use]
+pub fn extract_import_source(text: &str, lang: Option<crate::types::Lang>) -> String {
     let trimmed = text.trim().trim_end_matches(';');
 
     // Bash: `source ./lib.sh`, `. ./lib.sh`, or tab-separated variants
@@ -864,6 +868,7 @@ pub(crate) fn extract_import_source(text: &str, lang: Option<crate::types::Lang>
 }
 
 /// Get structured outline entries for file content.
+#[must_use]
 pub fn get_outline_entries(content: &str, lang: Lang) -> Vec<OutlineEntry> {
     let Some(ts_lang) = outline_language(lang) else {
         return Vec::new();

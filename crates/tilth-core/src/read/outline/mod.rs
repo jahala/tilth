@@ -12,6 +12,7 @@ use crate::types::FileType;
 const OUTLINE_CAP: usize = 100; // max outline lines for huge files
 
 /// Generate a smart view based on file type.
+#[must_use]
 pub fn generate(
     path: &Path,
     file_type: FileType,

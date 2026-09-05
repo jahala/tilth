@@ -1,6 +1,7 @@
 /// CSV/TSV outline: column headers + row count + first 5 + last 3 rows.
 /// Uses memchr for line counting on the raw bytes, then only collects
 /// the head/tail slices needed for display.
+#[must_use]
 pub fn outline(content: &str, _max_lines: usize) -> String {
     let buf = content.as_bytes();
     if buf.is_empty() {

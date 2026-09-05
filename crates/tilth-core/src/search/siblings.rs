@@ -28,6 +28,7 @@ fn sibling_query_str(lang: Lang) -> Option<&'static str> {
 /// Parses the file with tree-sitter and runs per-language queries to find
 /// field accesses and method calls on `self`/`this`. Returns deduplicated,
 /// sorted member names.
+#[must_use]
 pub fn extract_sibling_references(content: &str, lang: Lang, def_range: (u32, u32)) -> Vec<String> {
     let Some(ts_lang) = outline_language(lang) else {
         return Vec::new();
@@ -145,6 +146,7 @@ pub fn extract_sibling_references(content: &str, lang: Lang, def_range: (u32, u3
 /// Match extracted sibling names against a parent entry's children.
 ///
 /// Returns up to `MAX_SIBLINGS` resolved siblings, preferring methods over fields.
+#[must_use]
 pub fn resolve_siblings(
     sibling_names: &[String],
     parent_children: &[OutlineEntry],
@@ -183,6 +185,7 @@ pub fn resolve_siblings(
 
 /// Find the parent entry (struct/class/impl) whose children contain a member
 /// at the given line number.
+#[must_use]
 pub fn find_parent_entry(entries: &[OutlineEntry], method_line: u32) -> Option<&OutlineEntry> {
     for entry in entries {
         for child in &entry.children {
