@@ -3,8 +3,13 @@
 /result
 /result-*
 
-# Internal docs (reviews, feedback, specs)
-/docs
+# Internal docs (reviews, feedback, specs) stay local. The garden's papers do
+# not: the tend2 map, the copeca A/B briefs, and the output-parity proof are
+# part of the repository.
+/docs/*
+!/docs/tend2/
+!/docs/ab/
+!/docs/proof-2026-09.md
 
 # OS
 .DS_Store
