@@ -38,6 +38,7 @@ pub mod types;
 
 pub use error::TilthError;
 pub use index::bloom::BloomFilterCache;
+pub use lang::counts::{span_counts, SpanCounts};
 pub use lang::detect_file_type;
 pub use lang::outline::{extract_import_source, get_outline_entries};
 pub use read::imports::{is_external, is_import_line, resolve_related_files_with_content};
