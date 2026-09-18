@@ -255,3 +255,21 @@ fn an_outline_entrys_span_can_be_counted() {
 fn an_uncounted_language_says_so_instead_of_zero() {
     assert!(span_counts("def f\nend\n", Lang::Ruby, &[(1, 2)]).is_none());
 }
+
+#[test]
+fn outlines_of_the_samples_are_the_bytes_they_were() {
+    // The counts are an addition. This pins what the crate already said about the four
+    // samples, so an addition that moved an existing answer by one byte fails here.
+    use std::fmt::Write as _;
+    let mut got = String::new();
+    for sample in SAMPLES {
+        writeln!(got, "== {}", sample.file).expect("writing to a String cannot fail");
+        writeln!(
+            got,
+            "{:#?}",
+            get_outline_entries(sample.source, sample.lang)
+        )
+        .expect("writing to a String cannot fail");
+    }
+    assert_eq!(got, include_str!("fixtures/sample_outlines.txt"));
+}

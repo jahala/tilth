@@ -62,19 +62,6 @@ struct CountTable {
     branches: &'static [&'static str],
 }
 
-/// The languages [`span_counts`] can count.
-const COUNTED: &[Lang] = &[
-    Lang::Rust,
-    Lang::TypeScript,
-    Lang::Tsx,
-    Lang::JavaScript,
-    Lang::Python,
-    Lang::Go,
-    Lang::Java,
-    Lang::CSharp,
-    Lang::Php,
-];
-
 const ECMASCRIPT: CountTable = CountTable {
     decisions: &[
         "if_statement",
@@ -261,11 +248,100 @@ fn table(lang: Lang) -> Option<&'static CountTable> {
 }
 
 /// Decision points and nesting depth for each of `spans`, in the same order.
+///
+/// A span is a pair of 1-based, inclusive line numbers, as an outline entry carries them.
+/// A span that holds no code gives zeros. Returns `None` when `lang` has no count table or
+/// `content` cannot be parsed, so "not counted" is never read as "zero".
 #[must_use]
-pub fn span_counts(_content: &str, lang: Lang, _spans: &[(u32, u32)]) -> Option<Vec<SpanCounts>> {
-    let _table = table(lang)?;
-    let _grammar = outline_language(lang)?;
-    None
+pub fn span_counts(content: &str, lang: Lang, spans: &[(u32, u32)]) -> Option<Vec<SpanCounts>> {
+    let table = table(lang)?;
+    let grammar = outline_language(lang)?;
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&grammar).ok()?;
+    let tree = parser.parse(content, None)?;
+    Some(
+        spans
+            .iter()
+            .map(|&(start, end)| count_span(tree.root_node(), table, start, end))
+            .collect(),
+    )
+}
+
+/// Walks the nodes that overlap `start..=end` with an explicit stack: a long chain of
+/// operators is a tree as deep as it is long, and recursion would overflow on it.
+fn count_span(root: tree_sitter::Node<'_>, table: &CountTable, start: u32, end: u32) -> SpanCounts {
+    let mut counts = SpanCounts::default();
+    let mut pending = vec![(root, None::<tree_sitter::Node<'_>>, 0u32)];
+    while let Some((node, parent, depth)) = pending.pop() {
+        let first = line(node.start_position().row);
+        let last = line(node.end_position().row);
+        if last < start || first > end {
+            continue;
+        }
+        let mut depth_here = depth;
+        if (start..=end).contains(&first) {
+            let kind = node.kind();
+            if node.is_named() {
+                if table.decisions.contains(&kind) {
+                    counts.decision_points += 1;
+                }
+                if table.nesting.contains(&kind) {
+                    if !continues_an_else(node, parent, table) {
+                        depth_here += 1;
+                    }
+                    counts.max_nesting = counts.max_nesting.max(depth_here);
+                }
+            } else if table.decision_tokens.contains(&kind)
+                || (table.operators.contains(&kind) && is_the_operator_of(node, parent, table))
+            {
+                counts.decision_points += 1;
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            pending.push((child, Some(node), depth_here));
+        }
+    }
+    counts
+}
+
+/// A 1-based line number from a 0-based row; a file longer than `u32::MAX` lines saturates.
+fn line(row: usize) -> u32 {
+    u32::try_from(row).map_or(u32::MAX, |row| row.saturating_add(1))
+}
+
+/// Whether `node` is an `if` that continues its parent's `else`: `else if` is written flat,
+/// and grammars nest it either under an `else_clause` or as the parent `if`'s `alternative`.
+fn continues_an_else(
+    node: tree_sitter::Node<'_>,
+    parent: Option<tree_sitter::Node<'_>>,
+    table: &CountTable,
+) -> bool {
+    let Some(parent) = parent else {
+        return false;
+    };
+    if !table.branches.contains(&node.kind()) {
+        return false;
+    }
+    parent.kind() == "else_clause"
+        || (table.branches.contains(&parent.kind())
+            && parent
+                .child_by_field_name("alternative")
+                .is_some_and(|alternative| alternative.id() == node.id()))
+}
+
+/// Whether `node` is the operator of a binary expression, and not the same token elsewhere.
+fn is_the_operator_of(
+    node: tree_sitter::Node<'_>,
+    parent: Option<tree_sitter::Node<'_>>,
+    table: &CountTable,
+) -> bool {
+    parent.is_some_and(|parent| {
+        table.operator_parents.contains(&parent.kind())
+            && parent
+                .child_by_field_name("operator")
+                .is_some_and(|operator| operator.id() == node.id())
+    })
 }
 
 #[cfg(test)]
@@ -286,8 +362,12 @@ mod tests {
 
     #[test]
     fn every_kind_the_table_names_exists_in_its_grammar() {
-        for &lang in COUNTED {
-            let table = table(lang).expect("a counted language has a table");
+        let mut counted = 0;
+        for &lang in crate::lang::mod_all_langs_for_test() {
+            let Some(table) = table(lang) else {
+                continue;
+            };
+            counted += 1;
             let grammar = outline_language(lang).expect("a counted language has a grammar");
             let named = table
                 .decisions
@@ -310,6 +390,7 @@ mod tests {
                 );
             }
         }
+        assert_eq!(counted, 9, "the table counts nine languages");
     }
 
     #[test]
