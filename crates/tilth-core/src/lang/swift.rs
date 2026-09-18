@@ -21,6 +21,8 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     manifests: &[],
     definition_kinds: DEFAULT_DEF_KINDS,
     has_lifetimes: false,
+    triple_quoted_strings: true,
+    hash_comments: false,
     strip_family: None,
     extract_receiver: None,
     definitions: DEFAULT_DEFS,

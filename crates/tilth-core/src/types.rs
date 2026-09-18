@@ -52,6 +52,18 @@ impl Lang {
     pub(crate) fn has_lifetimes(self) -> bool {
         crate::lang::spec::spec(self).has_lifetimes
     }
+
+    /// Returns `true` if `"""` and `'''` delimit a string that may hold bare
+    /// quotes. A lexer that reads such a string quote by quote loses its place
+    /// at the first quote inside it.
+    pub(crate) fn has_triple_quoted_strings(self) -> bool {
+        crate::lang::spec::spec(self).triple_quoted_strings
+    }
+
+    /// Returns `true` if a `#` that starts a word opens a line comment.
+    pub(crate) fn has_hash_comments(self) -> bool {
+        crate::lang::spec::spec(self).hash_comments
+    }
 }
 
 /// File type as detected by extension. Determines outline strategy.

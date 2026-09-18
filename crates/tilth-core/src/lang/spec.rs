@@ -38,6 +38,12 @@ pub struct LangSpec {
     /// Whether `'` denotes a lifetime tick rather than a char delimiter
     /// (`Lang::has_lifetimes`).
     pub has_lifetimes: bool,
+    /// Whether `"""` and `'''` delimit a string that may hold bare quotes
+    /// (`Lang::has_triple_quoted_strings`).
+    pub triple_quoted_strings: bool,
+    /// Whether a `#` that starts a word opens a line comment
+    /// (`Lang::has_hash_comments`).
+    pub hash_comments: bool,
     /// Coarse comment-syntax family for cognitive-load stripping (`StripLang`).
     pub strip_family: Option<StripFamily>,
     /// Go-only: extract the method receiver name from file content.
@@ -244,6 +250,46 @@ mod tests {
                 spec(lang).has_lifetimes,
                 matches!(lang, Lang::Rust),
                 "{lang:?} lifetime flag mismatch — only Rust uses `'` for lifetime ticks"
+            );
+        }
+    }
+
+    #[test]
+    fn triple_quoted_string_languages() {
+        for &lang in mod_all_langs_for_test() {
+            assert_eq!(
+                spec(lang).triple_quoted_strings,
+                matches!(
+                    lang,
+                    Lang::Python
+                        | Lang::Scala
+                        | Lang::Kotlin
+                        | Lang::Swift
+                        | Lang::Java
+                        | Lang::CSharp
+                        | Lang::Elixir
+                ),
+                "{lang:?} triple-quoted string flag mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn hash_comment_languages() {
+        for &lang in mod_all_langs_for_test() {
+            assert_eq!(
+                spec(lang).hash_comments,
+                matches!(
+                    lang,
+                    Lang::Python
+                        | Lang::Ruby
+                        | Lang::Bash
+                        | Lang::Elixir
+                        | Lang::Make
+                        | Lang::Dockerfile
+                        | Lang::Php
+                ),
+                "{lang:?} hash comment flag mismatch"
             );
         }
     }

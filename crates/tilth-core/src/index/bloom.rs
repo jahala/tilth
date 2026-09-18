@@ -79,13 +79,21 @@ fn code_lang(path: &Path) -> Option<Lang> {
 }
 
 /// Build a Bloom filter from file content by extracting all identifiers.
+/// The seed of every filter. The crate's default seed is drawn at random per
+/// filter, which makes false positives, and so which files a batch search
+/// reads, differ between runs over the same tree. A fixed seed makes a filter's
+/// answers a function of the content alone. The value spells `tilth_bloom_seed`.
+const FILTER_SEED: u128 = 0x7469_6c74_685f_626c_6f6f_6d5f_7365_6564;
+
 fn build_filter(content: &str, lang: Option<Lang>) -> BloomFilter {
     let idents: Vec<&str> = extract_identifiers(content, lang).collect();
     // Sized for total token count, not unique identifiers -- duplicates over-allocate
     // the filter, so the achieved FPR is well below the 0.01 target in practice.
     let expected = idents.len().max(1);
 
-    let mut filter = BloomFilter::with_false_pos(0.01).expected_items(expected);
+    let mut filter = BloomFilter::with_false_pos(0.01)
+        .seed(&FILTER_SEED)
+        .expected_items(expected);
     for ident in idents {
         filter.insert(ident);
     }
@@ -107,6 +115,9 @@ fn build_filter(content: &str, lang: Option<Lang>) -> BloomFilter {
 /// `lang` gates language-specific lexing: the Rust lifetime heuristic only
 /// applies when `lang` is `Some(Lang::Rust)`. For every other language a `'`
 /// opens a single-quoted string, matching their actual syntax.
+/// Triple-quoted strings and `#` line comments are read as such only in the
+/// languages that have them; read quote by quote, a quote or an apostrophe
+/// inside one would swallow the identifiers that follow it.
 fn extract_identifiers(content: &str, lang: Option<Lang>) -> impl Iterator<Item = &str> {
     IdentifierIter::new(content, lang)
 }
@@ -122,7 +133,9 @@ enum ScanState {
     StringSingle,
     /// Inside a backtick string (JS template literals, Go raw strings).
     StringBacktick,
-    /// Inside a line comment (// ...).
+    /// Inside a triple-quoted string, closed by three of the given quote byte.
+    StringTriple(u8),
+    /// Inside a line comment (`// ...`, or `# ...` where the language has it).
     LineComment,
     /// Inside a block comment (/* ... */).
     BlockComment,
@@ -134,6 +147,8 @@ struct IdentifierIter<'a> {
     pos: usize,
     state: ScanState,
     lang: Option<Lang>,
+    triple_quotes: bool,
+    hash_comments: bool,
 }
 
 impl<'a> IdentifierIter<'a> {
@@ -144,6 +159,8 @@ impl<'a> IdentifierIter<'a> {
             pos: 0,
             state: ScanState::Code,
             lang,
+            triple_quotes: lang.is_some_and(Lang::has_triple_quoted_strings),
+            hash_comments: lang.is_some_and(Lang::has_hash_comments),
         }
     }
 }
@@ -161,6 +178,31 @@ impl<'a> Iterator for IdentifierIter<'a> {
 
             match self.state {
                 ScanState::Code => {
+                    // A triple-quoted string first: read quote by quote, `"""` is
+                    // an empty string and then an open one, and the first quote
+                    // inside flips code and string for the rest of the file.
+                    if self.triple_quotes
+                        && (b == b'"' || b == b'\'')
+                        && bytes[i..].starts_with(&[b, b, b])
+                    {
+                        self.state = ScanState::StringTriple(b);
+                        self.pos += 3;
+                        continue;
+                    }
+
+                    // A `#` that starts a word opens a line comment where the
+                    // language says so. Inside a word (`${#name}`, `$#`) and before
+                    // `[` (an attribute) it is code, so nothing after it is lost.
+                    if b == b'#'
+                        && self.hash_comments
+                        && (i == 0 || bytes[i - 1].is_ascii_whitespace())
+                        && !(i + 1 < len && bytes[i + 1] == b'[')
+                    {
+                        self.state = ScanState::LineComment;
+                        self.pos += 1;
+                        continue;
+                    }
+
                     // Check for start of string literals
                     if b == b'"' {
                         self.state = ScanState::StringDouble;
@@ -253,6 +295,17 @@ impl<'a> Iterator for IdentifierIter<'a> {
                     } else if b == b'`' {
                         self.state = ScanState::Code;
                         self.pos += 1;
+                    } else {
+                        self.pos += 1;
+                    }
+                }
+
+                ScanState::StringTriple(quote) => {
+                    if b == b'\\' && i + 1 < len {
+                        self.pos += 2; // skip escaped character
+                    } else if bytes[i..].starts_with(&[quote, quote, quote]) {
+                        self.state = ScanState::Code;
+                        self.pos += 3;
                     } else {
                         self.pos += 1;
                     }
@@ -505,7 +558,12 @@ mod tests {
 
     /// A source of `n` distinct identifiers, enough to fill a filter to its target rate.
     fn many_identifiers(n: usize) -> String {
-        (0..n).map(|i| format!("fn present_{i}() {{}}\n")).collect()
+        use std::fmt::Write as _;
+        let mut source = String::new();
+        for i in 0..n {
+            writeln!(source, "fn present_{i}() {{}}").expect("writing to a String cannot fail");
+        }
+        source
     }
 
     #[test]

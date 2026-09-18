@@ -25,6 +25,8 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     manifests: &["Cargo.toml"],
     definition_kinds: DEFAULT_DEF_KINDS,
     has_lifetimes: true,
+    triple_quoted_strings: false,
+    hash_comments: false,
     strip_family: Some(StripFamily::Rust),
     extract_receiver: None,
     definitions: DEFAULT_DEFS,
