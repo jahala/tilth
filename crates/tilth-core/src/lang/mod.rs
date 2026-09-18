@@ -1,3 +1,4 @@
+pub mod counts;
 pub mod detection;
 pub mod outline;
 pub mod treesitter;

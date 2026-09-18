@@ -9,9 +9,9 @@ use std::path::Path;
 
 use tilth_core::{
     analyze_deps, detect_file_type, extract_import_source, find_callers_batch, get_outline_entries,
-    is_external, is_import_line, is_test_file, resolve_related_files_with_content, test_entries,
-    BloomFilterCache, CallerMatch, Dependent, DepsResult, FileType, Lang, LocalDep, OutlineEntry,
-    OutlineKind, TestEntry, TestKind, TilthError,
+    is_external, is_import_line, is_test_file, resolve_related_files_with_content, span_counts,
+    test_entries, BloomFilterCache, CallerMatch, Dependent, DepsResult, FileType, Lang, LocalDep,
+    OutlineEntry, OutlineKind, SpanCounts, TestEntry, TestKind, TilthError,
 };
 
 struct Sample {
@@ -230,4 +230,46 @@ fn dependency_analysis_runs_on_a_file_in_scope() {
 fn the_error_type_is_a_real_error() {
     fn assert_error<E: std::error::Error + Send + Sync + 'static>() {}
     assert_error::<TilthError>();
+}
+
+#[test]
+fn an_outline_entrys_span_can_be_counted() {
+    // The composition a consumer uses: outline the content, then count each function's
+    // span. One `if` with one `&&` is two decision points at depth one.
+    let source =
+        "fn pick(a: u32) -> u32 {\n    if a > 1 && a < 9 {\n        return 1;\n    }\n    0\n}\n";
+    let entries = get_outline_entries(source, Lang::Rust);
+    let pick = find_entry(&entries, "pick").expect("the outline names the function");
+    let counts = span_counts(source, Lang::Rust, &[(pick.start_line, pick.end_line)])
+        .expect("rust is a counted language");
+    assert_eq!(
+        counts,
+        vec![SpanCounts {
+            decision_points: 2,
+            max_nesting: 1
+        }]
+    );
+}
+
+#[test]
+fn an_uncounted_language_says_so_instead_of_zero() {
+    assert!(span_counts("def f\nend\n", Lang::Ruby, &[(1, 2)]).is_none());
+}
+
+#[test]
+fn outlines_of_the_samples_are_the_bytes_they_were() {
+    // The counts are an addition. This pins what the crate already said about the four
+    // samples, so an addition that moved an existing answer by one byte fails here.
+    use std::fmt::Write as _;
+    let mut got = String::new();
+    for sample in SAMPLES {
+        writeln!(got, "== {}", sample.file).expect("writing to a String cannot fail");
+        writeln!(
+            got,
+            "{:#?}",
+            get_outline_entries(sample.source, sample.lang)
+        )
+        .expect("writing to a String cannot fail");
+    }
+    assert_eq!(got, include_str!("fixtures/sample_outlines.txt"));
 }
