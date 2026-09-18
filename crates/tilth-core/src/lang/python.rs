@@ -47,6 +47,8 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     manifests: &["pyproject.toml", "setup.py"],
     definition_kinds: DEFAULT_DEF_KINDS,
     has_lifetimes: false,
+    triple_quoted_strings: true,
+    hash_comments: true,
     strip_family: Some(StripFamily::Python),
     extract_receiver: None,
     definitions: DEFAULT_DEFS,

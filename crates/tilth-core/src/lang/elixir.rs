@@ -46,6 +46,8 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     manifests: &["mix.exs"],
     definition_kinds: ELIXIR_DEFINITION_TARGETS,
     has_lifetimes: false,
+    triple_quoted_strings: true,
+    hash_comments: true,
     strip_family: None,
     extract_receiver: None,
     definitions: DefinitionOps {
