@@ -9,38 +9,27 @@ readme = "README.md"
 keywords = ["mcp", "code-search", "tree-sitter", "developer-tools"]
 categories = ["command-line-utilities", "development-tools"]
 
+[workspace]
+members = [".", "crates/tilth-core"]
+exclude = ["fuzz"]
+
 [[bin]]
 name = "tilth"
 path = "src/main.rs"
 
 [dependencies]
+# The parsing substrate: outlines, language detection, symbol/callers/deps queries
+tilth-core = { path = "crates/tilth-core", version = "0.10.1" }
+
 # CLI
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 
-# Tree-sitter (AST outlines)
+# Tree-sitter types still named by the diff and formatting layers
 tree-sitter = "0.26"
-tree-sitter-language = "0.1"
 streaming-iterator = "0.1"
-tree-sitter-rust = "0.24"
-tree-sitter-javascript = "0.25"
-tree-sitter-typescript = "0.23"
-tree-sitter-python = "0.25"
-tree-sitter-go = "0.25"
-tree-sitter-java = "0.23"
-tree-sitter-c = "0.24"
-tree-sitter-cpp = "0.23"
-tree-sitter-ruby = "0.23"
-tree-sitter-php = "0.24"
-tree-sitter-scala = "0.26"
-tree-sitter-c-sharp = "0.23"
-tree-sitter-swift = "0.7"
-tree-sitter-kotlin-ng = "1.1"
-tree-sitter-elixir = "0.3"
-tree-sitter-bash = "0.25.1"
-tree-sitter-md = "0.5"
 
-# Search (ripgrep internals)
+# Search (ripgrep internals) — content / regex search
 grep-regex = "0.1"
 grep-searcher = "0.1"
 ignore = "0.4"
@@ -56,24 +45,18 @@ memmap2 = "0.9"
 # Parallelism
 rayon = "1"
 
+# Concurrent map for the editor's per-file locks
+dashmap = "6"
+
 # Channel with select! for the timeout wrapper (sibling of crossbeam-deque/-utils
 # already pulled in transitively by rayon; gives the closer-to-Java-Future
 # ergonomics that std::sync::mpsc::recv_timeout cannot express on multiple arms).
 crossbeam-channel = "0.5"
 
-# Concurrent cache
-dashmap = "6"
-
 # Structured data parsing
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1.1"
-
-# Error types
-thiserror = "2"
-
-# Bloom filter (fast SIMD-optimized impl)
-fastbloom = "0.17"
 
 # MCP protocol (JSON-RPC over stdio)
 # (handled manually — no framework needed)

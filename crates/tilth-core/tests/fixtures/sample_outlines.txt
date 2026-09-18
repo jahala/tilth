@@ -1,0 +1,126 @@
+== greet.ts
+[
+    OutlineEntry {
+        kind: Import,
+        name: "import { readFileSync } from \"fs\";",
+        start_line: 1,
+        end_line: 1,
+        signature: None,
+        children: [],
+        doc: None,
+    },
+    OutlineEntry {
+        kind: Function,
+        name: "greet",
+        start_line: 3,
+        end_line: 5,
+        signature: Some(
+            "export function greet(name: string): string",
+        ),
+        children: [],
+        doc: None,
+    },
+]
+== greet.py
+[
+    OutlineEntry {
+        kind: Function,
+        name: "greet",
+        start_line: 4,
+        end_line: 5,
+        signature: Some(
+            "def greet(name)",
+        ),
+        children: [],
+        doc: None,
+    },
+    OutlineEntry {
+        kind: Function,
+        name: "test_greet",
+        start_line: 8,
+        end_line: 9,
+        signature: Some(
+            "def test_greet()",
+        ),
+        children: [],
+        doc: None,
+    },
+]
+== greet.rs
+[
+    OutlineEntry {
+        kind: Import,
+        name: "use std::fs;",
+        start_line: 1,
+        end_line: 1,
+        signature: None,
+        children: [],
+        doc: None,
+    },
+    OutlineEntry {
+        kind: Function,
+        name: "greet",
+        start_line: 3,
+        end_line: 5,
+        signature: Some(
+            "pub fn greet(name: &str) -> String",
+        ),
+        children: [],
+        doc: None,
+    },
+    OutlineEntry {
+        kind: Module,
+        name: "tests",
+        start_line: 8,
+        end_line: 13,
+        signature: None,
+        children: [
+            OutlineEntry {
+                kind: Function,
+                name: "greets",
+                start_line: 10,
+                end_line: 12,
+                signature: Some(
+                    "fn greets()",
+                ),
+                children: [],
+                doc: None,
+            },
+        ],
+        doc: None,
+    },
+]
+== greet.go
+[
+    OutlineEntry {
+        kind: Import,
+        name: "import \"fmt\"",
+        start_line: 3,
+        end_line: 3,
+        signature: None,
+        children: [],
+        doc: None,
+    },
+    OutlineEntry {
+        kind: Function,
+        name: "Greet",
+        start_line: 5,
+        end_line: 7,
+        signature: Some(
+            "func Greet(name string) string",
+        ),
+        children: [],
+        doc: None,
+    },
+    OutlineEntry {
+        kind: Function,
+        name: "TestGreet",
+        start_line: 9,
+        end_line: 13,
+        signature: Some(
+            "func TestGreet(t *testing.T)",
+        ),
+        children: [],
+        doc: None,
+    },
+]

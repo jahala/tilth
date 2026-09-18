@@ -20,10 +20,15 @@ jobs:
         run: |
           TAG="${GITHUB_REF#refs/tags/v}"
           CARGO_VER=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          CORE_VER=$(grep '^version' crates/tilth-core/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
           NPM_VER=$(node -p "require('./npm/package.json').version")
-          echo "Tag: $TAG  Cargo: $CARGO_VER  npm: $NPM_VER"
+          echo "Tag: $TAG  Cargo: $CARGO_VER  tilth-core: $CORE_VER  npm: $NPM_VER"
           if [ "$CARGO_VER" != "$TAG" ]; then
             echo "::error::Cargo.toml version ($CARGO_VER) does not match tag ($TAG)"
+            exit 1
+          fi
+          if [ "$CORE_VER" != "$TAG" ]; then
+            echo "::error::crates/tilth-core/Cargo.toml version ($CORE_VER) does not match tag ($TAG) — the crates move in lockstep"
             exit 1
           fi
           if [ "$NPM_VER" != "$TAG" ]; then
@@ -111,14 +116,21 @@ jobs:
           # matrix leg adds another "What's Changed" copy (#189).
           generate_release_notes: ${{ matrix.target == 'x86_64-unknown-linux-musl' }}
 
-  # After all builds, publish to crates.io
+  # After all builds, publish to crates.io. tilth depends on tilth-core by
+  # version, so the library must be on the registry before the binary is
+  # published; cargo verifies the dependency exists at publish time.
   publish-crate:
     needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # ratchet:actions/checkout@v6
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # ratchet:dtolnay/rust-toolchain@stable
-      - run: cargo publish --locked
+      - name: Publish tilth-core (the library the binary depends on)
+        run: cargo publish --locked -p tilth-core
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      - name: Publish tilth
+        run: cargo publish --locked -p tilth
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 

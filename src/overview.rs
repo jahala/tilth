@@ -818,8 +818,11 @@ mod tests {
 
     #[test]
     fn test_fingerprint_on_tilth() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let output = fingerprint(root);
+        // Fingerprint a real Rust crate: tilth-core. The repository root is a
+        // workspace whose Rust sources sit below the depth-2 walk, so at the
+        // root the benchmark's Python outnumbers the Rust the walk can see.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("crates/tilth-core");
+        let output = fingerprint(&root);
 
         assert!(!output.is_empty(), "fingerprint should not be empty");
         assert!(

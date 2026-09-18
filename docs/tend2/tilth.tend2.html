@@ -32,5 +32,7 @@ weed needs outlines, symbol search, callers, dependency analysis, and test-file 
 - 2026-09-05 scope-out: the host installer (`tilth install <host>`) stays as a fallback and its host table is not extended; once the stem's bundles exist it stops being the documented primary install path
 - 2026-09-05 closed arcs stay closed without new evidence: the concept-intent footer, the scout hook, the cross-encoder reranker, the image channel, and tilth_run
 - 2026-09-05 A/Bs are copeca runs drafted here and run by the copeca agent; the in-repo benchmark is not used for A/Bs
+- 2026-09-05 the parity proof compares stdout, stderr, and exit code together, runs the reference three times, and compares any case where the reference disagrees with itself modulo list order (commas and JSON newline escapes as separators, tokens sorted per line, lines sorted) so v0.10.1's own nondeterminism is named in the table rather than hidden; ten of 128 cases needed that, all in the fingerprint or in diff symbol order
+- 2026-09-05 CI now runs `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace`; plain `cargo test` at the root runs only the binary's tests
 </script>
 <script src="loop.js"></script>

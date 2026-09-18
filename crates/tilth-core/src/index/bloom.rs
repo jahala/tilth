@@ -1,0 +1,683 @@
+//! Per-file Bloom filters for fast "does file X contain symbol Y?" queries.
+//!
+//! Used to pre-filter candidate files before expensive tree-sitter parsing
+//! in callee/caller resolution. A Bloom filter can definitively say "no"
+//! (symbol is NOT in this file) but may produce false positives.
+//!
+//! Identifier extraction uses a simple byte-level state machine -- no
+//! tree-sitter needed -- making it fast enough to run on every uncached file.
+
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+
+use dashmap::DashMap;
+use fastbloom::BloomFilter;
+
+use crate::lang::detect_file_type;
+use crate::types::{FileType, Lang};
+
+// ---------------------------------------------------------------------------
+// BloomFilterCache
+// ---------------------------------------------------------------------------
+
+/// Thread-safe cache of per-file Bloom filters, keyed by path and validated
+/// by mtime. Stale entries are automatically rebuilt on access.
+pub struct BloomFilterCache {
+    filters: DashMap<PathBuf, (BloomFilter, SystemTime)>,
+}
+
+impl Default for BloomFilterCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BloomFilterCache {
+    /// Create an empty cache.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            filters: DashMap::new(),
+        }
+    }
+
+    /// Check if `symbol` might appear in the file at `path`.
+    ///
+    /// - If a cached filter exists with matching `mtime`, queries it directly.
+    /// - Otherwise, builds a new filter from `content`, caches it, then queries.
+    ///
+    /// Returns `true` if the symbol MIGHT be in the file (possible false positive),
+    /// `false` if it is DEFINITELY absent.
+    #[must_use]
+    pub fn contains(&self, path: &Path, mtime: SystemTime, content: &str, symbol: &str) -> bool {
+        // Fast path: check existing cached entry
+        if let Some(entry) = self.filters.get(path) {
+            let (ref filter, cached_mtime) = *entry;
+            if cached_mtime == mtime {
+                return filter.contains(symbol);
+            }
+        }
+
+        // Cache miss or stale: build and cache a new filter
+        let filter = build_filter(content, code_lang(path));
+        let result = filter.contains(symbol);
+        self.filters.insert(path.to_path_buf(), (filter, mtime));
+        result
+    }
+}
+
+/// The source language of `path`, or `None` when it is not a known code file.
+fn code_lang(path: &Path) -> Option<Lang> {
+    match detect_file_type(path) {
+        FileType::Code(lang) => Some(lang),
+        FileType::Markdown
+        | FileType::StructuredData
+        | FileType::Tabular
+        | FileType::Log
+        | FileType::Other => None,
+    }
+}
+
+/// Build a Bloom filter from file content by extracting all identifiers.
+/// The seed of every filter. The crate's default seed is drawn at random per
+/// filter, which makes false positives, and so which files a batch search
+/// reads, differ between runs over the same tree. A fixed seed makes a filter's
+/// answers a function of the content alone. The value spells `tilth_bloom_seed`.
+const FILTER_SEED: u128 = 0x7469_6c74_685f_626c_6f6f_6d5f_7365_6564;
+
+fn build_filter(content: &str, lang: Option<Lang>) -> BloomFilter {
+    let idents: Vec<&str> = extract_identifiers(content, lang).collect();
+    // Sized for total token count, not unique identifiers -- duplicates over-allocate
+    // the filter, so the achieved FPR is well below the 0.01 target in practice.
+    let expected = idents.len().max(1);
+
+    let mut filter = BloomFilter::with_false_pos(0.01)
+        .seed(&FILTER_SEED)
+        .expected_items(expected);
+    for ident in idents {
+        filter.insert(ident);
+    }
+    filter
+}
+
+// ---------------------------------------------------------------------------
+// Identifier extraction (byte-level state machine)
+// ---------------------------------------------------------------------------
+
+/// Extract identifier tokens from source code using a simple byte-level
+/// state machine. Skips string literals and block/line comments.
+///
+/// An identifier is `[a-zA-Z_][a-zA-Z0-9_]*`.
+///
+/// This is intentionally approximate -- it does not understand all language
+/// syntaxes perfectly, but is fast and good enough for Bloom filter population.
+///
+/// `lang` gates language-specific lexing: the Rust lifetime heuristic only
+/// applies when `lang` is `Some(Lang::Rust)`. For every other language a `'`
+/// opens a single-quoted string, matching their actual syntax.
+/// Triple-quoted strings and `#` line comments are read as such only in the
+/// languages that have them; read quote by quote, a quote or an apostrophe
+/// inside one would swallow the identifiers that follow it.
+fn extract_identifiers(content: &str, lang: Option<Lang>) -> impl Iterator<Item = &str> {
+    IdentifierIter::new(content, lang)
+}
+
+/// States for the identifier extraction state machine.
+#[derive(Clone, Copy)]
+enum ScanState {
+    /// Normal code scanning.
+    Code,
+    /// Inside a double-quoted string.
+    StringDouble,
+    /// Inside a single-quoted string/char.
+    StringSingle,
+    /// Inside a backtick string (JS template literals, Go raw strings).
+    StringBacktick,
+    /// Inside a triple-quoted string, closed by three of the given quote byte.
+    StringTriple(u8),
+    /// Inside a line comment (`// ...`, or `# ...` where the language has it).
+    LineComment,
+    /// Inside a block comment (/* ... */).
+    BlockComment,
+}
+
+struct IdentifierIter<'a> {
+    bytes: &'a [u8],
+    src: &'a str,
+    pos: usize,
+    state: ScanState,
+    lang: Option<Lang>,
+    triple_quotes: bool,
+    hash_comments: bool,
+}
+
+impl<'a> IdentifierIter<'a> {
+    fn new(content: &'a str, lang: Option<Lang>) -> Self {
+        Self {
+            bytes: content.as_bytes(),
+            src: content,
+            pos: 0,
+            state: ScanState::Code,
+            lang,
+            triple_quotes: lang.is_some_and(Lang::has_triple_quoted_strings),
+            hash_comments: lang.is_some_and(Lang::has_hash_comments),
+        }
+    }
+}
+
+impl<'a> Iterator for IdentifierIter<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<&'a str> {
+        let bytes = self.bytes;
+        let len = bytes.len();
+
+        while self.pos < len {
+            let i = self.pos;
+            let b = bytes[i];
+
+            match self.state {
+                ScanState::Code => {
+                    // A triple-quoted string first: read quote by quote, `"""` is
+                    // an empty string and then an open one, and the first quote
+                    // inside flips code and string for the rest of the file.
+                    if self.triple_quotes
+                        && (b == b'"' || b == b'\'')
+                        && bytes[i..].starts_with(&[b, b, b])
+                    {
+                        self.state = ScanState::StringTriple(b);
+                        self.pos += 3;
+                        continue;
+                    }
+
+                    // A `#` that starts a word opens a line comment where the
+                    // language says so. Inside a word (`${#name}`, `$#`) and before
+                    // `[` (an attribute) it is code, so nothing after it is lost.
+                    if b == b'#'
+                        && self.hash_comments
+                        && (i == 0 || bytes[i - 1].is_ascii_whitespace())
+                        && !(i + 1 < len && bytes[i + 1] == b'[')
+                    {
+                        self.state = ScanState::LineComment;
+                        self.pos += 1;
+                        continue;
+                    }
+
+                    // Check for start of string literals
+                    if b == b'"' {
+                        self.state = ScanState::StringDouble;
+                        self.pos += 1;
+                        continue;
+                    }
+                    if b == b'\'' {
+                        // Distinguish a Rust lifetime (`'a`, `'static`) from a char
+                        // literal (`'a'`, `'\n'`). A char literal has a closing quote
+                        // right after a single char/escape; a lifetime is a tick
+                        // followed by an identifier with no closing quote. Treating a
+                        // lifetime as a string opener would swallow every following
+                        // identifier up to the next tick, dropping them from the filter
+                        // and producing a false negative (the one thing Bloom forbids).
+                        // Lifetimes are Rust-only; in other languages a `'` opens a
+                        // single-quoted string, so the heuristic is gated on
+                        // `has_lifetimes` to avoid swallowing identifiers after a
+                        // `'foo'` string there.
+                        let is_lifetime = self.lang.is_some_and(Lang::has_lifetimes)
+                            && i + 1 < len
+                            && is_ident_start(bytes[i + 1])
+                            && !(i + 2 < len && bytes[i + 2] == b'\'');
+                        if is_lifetime {
+                            self.pos += 1;
+                            continue;
+                        }
+                        self.state = ScanState::StringSingle;
+                        self.pos += 1;
+                        continue;
+                    }
+                    if b == b'`' {
+                        self.state = ScanState::StringBacktick;
+                        self.pos += 1;
+                        continue;
+                    }
+
+                    // Check for comments
+                    if b == b'/' && i + 1 < len {
+                        if bytes[i + 1] == b'/' {
+                            self.state = ScanState::LineComment;
+                            self.pos += 2;
+                            continue;
+                        }
+                        if bytes[i + 1] == b'*' {
+                            self.state = ScanState::BlockComment;
+                            self.pos += 2;
+                            continue;
+                        }
+                    }
+
+                    // Check for start of identifier
+                    if is_ident_start(b) {
+                        let start = i;
+                        self.pos += 1;
+                        while self.pos < len && is_ident_continue(bytes[self.pos]) {
+                            self.pos += 1;
+                        }
+                        // Safety: identifiers are pure ASCII, so byte slicing is valid UTF-8
+                        return Some(&self.src[start..self.pos]);
+                    }
+
+                    self.pos += 1;
+                }
+
+                ScanState::StringDouble => {
+                    if b == b'\\' && i + 1 < len {
+                        self.pos += 2; // skip escaped character
+                    } else if b == b'"' {
+                        self.state = ScanState::Code;
+                        self.pos += 1;
+                    } else {
+                        self.pos += 1;
+                    }
+                }
+
+                ScanState::StringSingle => {
+                    if b == b'\\' && i + 1 < len {
+                        self.pos += 2; // skip escaped character
+                    } else if b == b'\'' {
+                        self.state = ScanState::Code;
+                        self.pos += 1;
+                    } else {
+                        self.pos += 1;
+                    }
+                }
+
+                ScanState::StringBacktick => {
+                    if b == b'\\' && i + 1 < len {
+                        self.pos += 2;
+                    } else if b == b'`' {
+                        self.state = ScanState::Code;
+                        self.pos += 1;
+                    } else {
+                        self.pos += 1;
+                    }
+                }
+
+                ScanState::StringTriple(quote) => {
+                    if b == b'\\' && i + 1 < len {
+                        self.pos += 2; // skip escaped character
+                    } else if bytes[i..].starts_with(&[quote, quote, quote]) {
+                        self.state = ScanState::Code;
+                        self.pos += 3;
+                    } else {
+                        self.pos += 1;
+                    }
+                }
+
+                ScanState::LineComment => {
+                    if b == b'\n' {
+                        self.state = ScanState::Code;
+                    }
+                    self.pos += 1;
+                }
+
+                ScanState::BlockComment => {
+                    if b == b'*' && i + 1 < len && bytes[i + 1] == b'/' {
+                        self.state = ScanState::Code;
+                        self.pos += 2;
+                    } else {
+                        self.pos += 1;
+                    }
+                }
+            }
+        }
+
+        None
+    }
+}
+
+#[inline]
+fn is_ident_start(b: u8) -> bool {
+    b.is_ascii_alphabetic() || b == b'_'
+}
+
+#[inline]
+fn is_ident_continue(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_basic_membership() {
+        let mut bf = BloomFilter::with_false_pos(0.01).expected_items(100);
+        bf.insert("foo");
+        bf.insert("bar");
+        bf.insert("baz");
+
+        assert!(bf.contains("foo"));
+        assert!(bf.contains("bar"));
+        assert!(bf.contains("baz"));
+    }
+
+    #[test]
+    fn extracts_identifiers_across_rust_lifetimes() {
+        let src = "fn longest<'a>(x: &'a str, y: &'a str) -> &'a str { x }";
+        let idents: Vec<&str> = extract_identifiers(src, Some(Lang::Rust)).collect();
+        for want in ["fn", "longest", "x", "y", "str"] {
+            assert!(
+                idents.contains(&want),
+                "lifetime tick swallowed identifier {want:?}; got {idents:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn char_literal_is_still_skipped() {
+        let src = "let c = 'a'; let d = '\\n'; fn target() {}";
+        let idents: Vec<&str> = extract_identifiers(src, Some(Lang::Rust)).collect();
+        assert!(idents.contains(&"target"), "got {idents:?}");
+        assert!(
+            !idents.contains(&"a"),
+            "char-literal body leaked: {idents:?}"
+        );
+    }
+
+    #[test]
+    fn non_rust_single_quote_string_does_not_swallow_following_idents() {
+        // In JS/Python/Ruby/PHP a `'...'` is a string, not a Rust lifetime. The
+        // lifetime heuristic must stay off for them: if it fired, the closing
+        // quote of `'foo'` would open a spurious string that swallows every
+        // identifier up to the next quote -- a Bloom false negative.
+        let src = "let x = 'foo'; bar();";
+        let idents: Vec<&str> = extract_identifiers(src, Some(Lang::JavaScript)).collect();
+        assert!(
+            idents.contains(&"bar"),
+            "closing quote opened a swallowing string: {idents:?}"
+        );
+        assert!(idents.contains(&"let"), "got {idents:?}");
+        assert!(idents.contains(&"x"), "got {idents:?}");
+    }
+
+    #[test]
+    fn test_definitely_not_present() {
+        let mut bf = BloomFilter::with_false_pos(0.01).expected_items(10);
+        bf.insert("alpha");
+        bf.insert("beta");
+        bf.insert("gamma");
+
+        // With only 3 items in a filter sized for 10 at 1% FPR,
+        // these should almost certainly return false.
+        let mut false_positives = 0;
+        let test_items = [
+            "delta", "epsilon", "zeta", "eta", "theta", "iota", "kappa", "lambda", "mu", "nu",
+            "xi", "omicron", "pi", "rho", "sigma", "tau", "upsilon", "phi", "chi", "psi", "omega",
+        ];
+        for item in &test_items {
+            if bf.contains(item) {
+                false_positives += 1;
+            }
+        }
+        // At most 1 false positive out of 21 items is generous
+        assert!(
+            false_positives <= 1,
+            "too many false positives: {false_positives}/{}",
+            test_items.len()
+        );
+    }
+
+    #[test]
+    fn test_false_positive_rate() {
+        let n = 500;
+        let mut bf = BloomFilter::with_false_pos(0.01).expected_items(n);
+
+        // Insert N items
+        for i in 0..n {
+            bf.insert(&format!("item_{i}"));
+        }
+
+        // Verify all inserted items are found
+        for i in 0..n {
+            assert!(bf.contains(&format!("item_{i}")), "missing item_{i}");
+        }
+
+        // Test M random items that were NOT inserted
+        let m = 10_000;
+        let mut false_positives = 0;
+        for i in 0..m {
+            if bf.contains(&format!("notinserted_{i}")) {
+                false_positives += 1;
+            }
+        }
+
+        let fpr = f64::from(false_positives) / f64::from(m);
+        // Target is 1%, allow up to 5% for statistical variance
+        assert!(
+            fpr < 0.05,
+            "false positive rate too high: {fpr:.4} ({false_positives}/{m})"
+        );
+    }
+
+    #[test]
+    fn test_identifier_extraction() {
+        let code = "fn foo(bar: Baz) { qux() }";
+        let idents: Vec<&str> = extract_identifiers(code, Some(Lang::Rust)).collect();
+        assert_eq!(idents, vec!["fn", "foo", "bar", "Baz", "qux"]);
+    }
+
+    #[test]
+    fn test_identifier_extraction_skips_strings() {
+        let code = r#"let x = "hello world"; let y = 42;"#;
+        let idents: Vec<&str> = extract_identifiers(code, Some(Lang::Rust)).collect();
+        assert!(idents.contains(&"let"));
+        assert!(idents.contains(&"x"));
+        assert!(idents.contains(&"y"));
+        // "hello" and "world" are inside a string -- should be skipped
+        assert!(!idents.contains(&"hello"));
+        assert!(!idents.contains(&"world"));
+    }
+
+    #[test]
+    fn test_identifier_extraction_skips_comments() {
+        let code = "fn real() // fn fake()\n/* fn also_fake() */\nfn another()";
+        let idents: Vec<&str> = extract_identifiers(code, Some(Lang::Rust)).collect();
+        assert!(idents.contains(&"real"));
+        assert!(idents.contains(&"another"));
+        assert!(!idents.contains(&"fake"));
+        assert!(!idents.contains(&"also_fake"));
+    }
+
+    #[test]
+    fn test_identifier_extraction_underscores_and_numbers() {
+        let code = "_private __dunder var_123 _0 a1b2c3";
+        let idents: Vec<&str> = extract_identifiers(code, Some(Lang::Rust)).collect();
+        assert_eq!(
+            idents,
+            vec!["_private", "__dunder", "var_123", "_0", "a1b2c3"]
+        );
+    }
+
+    #[test]
+    fn test_identifier_extraction_empty() {
+        let idents: Vec<&str> = extract_identifiers("", Some(Lang::Rust)).collect();
+        assert!(idents.is_empty());
+    }
+
+    #[test]
+    fn test_identifier_extraction_no_identifiers() {
+        let idents: Vec<&str> = extract_identifiers("123 + 456 = 789", Some(Lang::Rust)).collect();
+        assert!(idents.is_empty());
+    }
+
+    #[test]
+    fn test_cache_mtime_invalidation() {
+        let cache = BloomFilterCache::new();
+        let path = Path::new("/tmp/test_bloom.rs");
+
+        let old_content = "fn old_function() {}";
+        let new_content = "fn new_function() {}";
+
+        let mtime_old = SystemTime::UNIX_EPOCH;
+        let mtime_new = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1);
+
+        // Cache with old content
+        assert!(cache.contains(path, mtime_old, old_content, "old_function"));
+        assert!(!cache.contains(path, mtime_old, old_content, "new_function"));
+
+        // Same mtime: should use cached filter (old content), even though
+        // we pass new content -- the cache trusts the mtime.
+        assert!(cache.contains(path, mtime_old, new_content, "old_function"));
+
+        // Different mtime: should rebuild from new content
+        assert!(cache.contains(path, mtime_new, new_content, "new_function"));
+        assert!(!cache.contains(path, mtime_new, new_content, "old_function"));
+    }
+
+    #[test]
+    fn test_identifier_extraction_escaped_strings() {
+        let code = r#"let s = "escaped \"quote\" inside"; let t = 1;"#;
+        let idents: Vec<&str> = extract_identifiers(code, Some(Lang::Rust)).collect();
+        assert!(idents.contains(&"s"));
+        assert!(idents.contains(&"t"));
+        // "quote" and "inside" are inside the string -- should be skipped
+        assert!(!idents.contains(&"quote"));
+        assert!(!idents.contains(&"inside"));
+    }
+
+    #[test]
+    fn test_identifier_extraction_single_quotes() {
+        let code = "let c = 'a'; let d = 'b';";
+        let idents: Vec<&str> = extract_identifiers(code, Some(Lang::Rust)).collect();
+        assert!(idents.contains(&"let"));
+        assert!(idents.contains(&"c"));
+        assert!(idents.contains(&"d"));
+    }
+
+    /// A source of `n` distinct identifiers, enough to fill a filter to its target rate.
+    fn many_identifiers(n: usize) -> String {
+        use std::fmt::Write as _;
+        let mut source = String::new();
+        for i in 0..n {
+            writeln!(source, "fn present_{i}() {{}}").expect("writing to a String cannot fail");
+        }
+        source
+    }
+
+    #[test]
+    fn filter_answers_are_a_function_of_the_content() {
+        // Two filters built from the same content must answer every question alike,
+        // false positives included. With a random seed per filter they do not, and a
+        // caller search over the same tree then returns different call sites on
+        // different runs (tilth 228).
+        let content = many_identifiers(2_000);
+        let first = build_filter(&content, Some(Lang::Rust));
+        let second = build_filter(&content, Some(Lang::Rust));
+        let answers = |filter: &BloomFilter| -> Vec<bool> {
+            (0..20_000)
+                .map(|i| filter.contains(format!("absent_{i}").as_str()))
+                .collect()
+        };
+        assert_eq!(
+            answers(&first),
+            answers(&second),
+            "two filters over the same content disagree: the seed is not fixed"
+        );
+    }
+
+    #[test]
+    fn python_triple_quoted_string_does_not_swallow_following_idents() {
+        // A quote inside a triple-quoted string must not flip the scanner, or the
+        // apostrophe after it opens a string that swallows the rest of the file: a
+        // Bloom false negative (tilth 228, from a real test file).
+        let src = concat!(
+            "def before():\n",
+            "    pass\n",
+            "\n",
+            "FIXTURE = \"\"\"\n",
+            "{\"prompt\": \"count ripgrep's lines\"}\n",
+            "\"\"\"\n",
+            "\n",
+            "def after_the_apostrophe():\n",
+            "    pass\n",
+            "\n",
+            "after_the_apostrophe()\n",
+        );
+        let idents: Vec<&str> = extract_identifiers(src, Some(Lang::Python)).collect();
+        assert!(idents.contains(&"before"), "got {idents:?}");
+        assert!(
+            idents.contains(&"after_the_apostrophe"),
+            "the triple-quoted string swallowed the code after it: {idents:?}"
+        );
+        assert!(
+            !idents.contains(&"prompt"),
+            "the body of the triple-quoted string leaked: {idents:?}"
+        );
+    }
+
+    #[test]
+    fn python_single_triple_quoted_string_is_one_string() {
+        let src = "DOC = '''it's \"quoted\" here'''\ndef after():\n    pass\n";
+        let idents: Vec<&str> = extract_identifiers(src, Some(Lang::Python)).collect();
+        assert!(idents.contains(&"after"), "got {idents:?}");
+        assert!(!idents.contains(&"quoted"), "got {idents:?}");
+    }
+
+    #[test]
+    fn hash_comment_apostrophe_does_not_swallow_following_idents() {
+        // `#` opens a line comment in Python, Ruby, shell and others. Read as code,
+        // the apostrophe in "don't" opens a string that swallows what follows.
+        let src = "# don't call this twice\ndef after_the_comment():\n    pass\n";
+        for lang in [Lang::Python, Lang::Ruby, Lang::Bash, Lang::Elixir] {
+            let idents: Vec<&str> = extract_identifiers(src, Some(lang)).collect();
+            assert!(
+                idents.contains(&"after_the_comment"),
+                "{lang:?}: the comment's apostrophe swallowed the code after it: {idents:?}"
+            );
+            assert!(
+                !idents.contains(&"twice"),
+                "{lang:?}: the comment body leaked: {idents:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hash_inside_a_word_is_not_a_comment() {
+        // Shell `${#name}` and `$#` are code. Only a `#` that starts a word opens a
+        // comment, so nothing after such a `#` is lost.
+        let src = "count=${#items}; next_step\n";
+        let idents: Vec<&str> = extract_identifiers(src, Some(Lang::Bash)).collect();
+        assert!(idents.contains(&"next_step"), "got {idents:?}");
+    }
+
+    #[test]
+    fn rust_attribute_hash_is_not_a_comment() {
+        let src = "#[derive(Debug)]\nstruct After;\n";
+        let idents: Vec<&str> = extract_identifiers(src, Some(Lang::Rust)).collect();
+        assert!(idents.contains(&"derive"), "got {idents:?}");
+        assert!(idents.contains(&"After"), "got {idents:?}");
+    }
+
+    #[test]
+    fn php_attribute_hash_is_not_a_comment() {
+        let src = "<?php\n#[Route(path)]\nfunction after() {}\n";
+        let idents: Vec<&str> = extract_identifiers(src, Some(Lang::Php)).collect();
+        assert!(idents.contains(&"Route"), "got {idents:?}");
+        assert!(idents.contains(&"after"), "got {idents:?}");
+    }
+
+    #[test]
+    fn test_build_filter_integration() {
+        let content = "pub fn search(query: &str) -> Vec<Match> { find(query) }";
+        let filter = build_filter(content, Some(Lang::Rust));
+
+        assert!(filter.contains("search"));
+        assert!(filter.contains("query"));
+        assert!(filter.contains("Vec"));
+        assert!(filter.contains("Match"));
+        assert!(filter.contains("find"));
+        assert!(!filter.contains("nonexistent_symbol_xyz"));
+    }
+}
