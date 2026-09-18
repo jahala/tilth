@@ -503,6 +503,113 @@ mod tests {
         assert!(idents.contains(&"d"));
     }
 
+    /// A source of `n` distinct identifiers, enough to fill a filter to its target rate.
+    fn many_identifiers(n: usize) -> String {
+        (0..n).map(|i| format!("fn present_{i}() {{}}\n")).collect()
+    }
+
+    #[test]
+    fn filter_answers_are_a_function_of_the_content() {
+        // Two filters built from the same content must answer every question alike,
+        // false positives included. With a random seed per filter they do not, and a
+        // caller search over the same tree then returns different call sites on
+        // different runs (tilth 228).
+        let content = many_identifiers(2_000);
+        let first = build_filter(&content, Some(Lang::Rust));
+        let second = build_filter(&content, Some(Lang::Rust));
+        let answers = |filter: &BloomFilter| -> Vec<bool> {
+            (0..20_000)
+                .map(|i| filter.contains(format!("absent_{i}").as_str()))
+                .collect()
+        };
+        assert_eq!(
+            answers(&first),
+            answers(&second),
+            "two filters over the same content disagree: the seed is not fixed"
+        );
+    }
+
+    #[test]
+    fn python_triple_quoted_string_does_not_swallow_following_idents() {
+        // A quote inside a triple-quoted string must not flip the scanner, or the
+        // apostrophe after it opens a string that swallows the rest of the file: a
+        // Bloom false negative (tilth 228, from a real test file).
+        let src = concat!(
+            "def before():\n",
+            "    pass\n",
+            "\n",
+            "FIXTURE = \"\"\"\n",
+            "{\"prompt\": \"count ripgrep's lines\"}\n",
+            "\"\"\"\n",
+            "\n",
+            "def after_the_apostrophe():\n",
+            "    pass\n",
+            "\n",
+            "after_the_apostrophe()\n",
+        );
+        let idents: Vec<&str> = extract_identifiers(src, Some(Lang::Python)).collect();
+        assert!(idents.contains(&"before"), "got {idents:?}");
+        assert!(
+            idents.contains(&"after_the_apostrophe"),
+            "the triple-quoted string swallowed the code after it: {idents:?}"
+        );
+        assert!(
+            !idents.contains(&"prompt"),
+            "the body of the triple-quoted string leaked: {idents:?}"
+        );
+    }
+
+    #[test]
+    fn python_single_triple_quoted_string_is_one_string() {
+        let src = "DOC = '''it's \"quoted\" here'''\ndef after():\n    pass\n";
+        let idents: Vec<&str> = extract_identifiers(src, Some(Lang::Python)).collect();
+        assert!(idents.contains(&"after"), "got {idents:?}");
+        assert!(!idents.contains(&"quoted"), "got {idents:?}");
+    }
+
+    #[test]
+    fn hash_comment_apostrophe_does_not_swallow_following_idents() {
+        // `#` opens a line comment in Python, Ruby, shell and others. Read as code,
+        // the apostrophe in "don't" opens a string that swallows what follows.
+        let src = "# don't call this twice\ndef after_the_comment():\n    pass\n";
+        for lang in [Lang::Python, Lang::Ruby, Lang::Bash, Lang::Elixir] {
+            let idents: Vec<&str> = extract_identifiers(src, Some(lang)).collect();
+            assert!(
+                idents.contains(&"after_the_comment"),
+                "{lang:?}: the comment's apostrophe swallowed the code after it: {idents:?}"
+            );
+            assert!(
+                !idents.contains(&"twice"),
+                "{lang:?}: the comment body leaked: {idents:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hash_inside_a_word_is_not_a_comment() {
+        // Shell `${#name}` and `$#` are code. Only a `#` that starts a word opens a
+        // comment, so nothing after such a `#` is lost.
+        let src = "count=${#items}; next_step\n";
+        let idents: Vec<&str> = extract_identifiers(src, Some(Lang::Bash)).collect();
+        assert!(idents.contains(&"next_step"), "got {idents:?}");
+    }
+
+    #[test]
+    fn rust_attribute_hash_is_not_a_comment() {
+        let src = "#[derive(Debug)]\nstruct After;\n";
+        let idents: Vec<&str> = extract_identifiers(src, Some(Lang::Rust)).collect();
+        assert!(idents.contains(&"derive"), "got {idents:?}");
+        assert!(idents.contains(&"After"), "got {idents:?}");
+    }
+
+    #[test]
+    fn php_attribute_hash_is_not_a_comment() {
+        let src = "<?php\n#[Route(path)]\nfunction after() {}\n";
+        let idents: Vec<&str> = extract_identifiers(src, Some(Lang::Php)).collect();
+        assert!(idents.contains(&"Route"), "got {idents:?}");
+        assert!(idents.contains(&"after"), "got {idents:?}");
+    }
+
     #[test]
     fn test_build_filter_integration() {
         let content = "pub fn search(query: &str) -> Vec<Match> { find(query) }";
