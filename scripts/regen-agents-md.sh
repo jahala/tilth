@@ -6,6 +6,11 @@
 # via include_str! in src/mcp/mod.rs; running this script keeps the human-facing
 # AGENTS.md in lockstep with what MCP hosts receive in the `instructions` field.
 #
+# One region of AGENTS.md is owned by tend2, not by prompts/: the block between
+# `<!-- tend2:begin -->` and `<!-- tend2:end -->` that `tend2 init` writes and
+# maintains. This script carries that block over verbatim so regenerating the
+# prompt half never erases the agent contract.
+#
 # Idempotent: running twice produces no diff.
 set -euo pipefail
 
@@ -24,6 +29,13 @@ if [[ ! -f $edit ]]; then
   exit 1
 fi
 
+# Preserve the tend2-managed block from the current AGENTS.md, if present.
+# `$(...)` strips trailing newlines; the printf below restores exactly one.
+tend2_block=""
+if [[ -f $out ]]; then
+  tend2_block=$(sed -n '/^<!-- tend2:begin -->$/,/^<!-- tend2:end -->$/p' "$out")
+fi
+
 # Concatenate the two source files verbatim. mcp-edit.md starts with a leading
 # blank-line pair to separate it visually from mcp-base.md in both the rendered
 # AGENTS.md and the runtime instructions string (where format!("{S}{E}") relies
@@ -33,6 +45,9 @@ fi
   cat "$base"
   cat "$edit"
   printf '\n'
+  if [[ -n $tend2_block ]]; then
+    printf '\n%s\n' "$tend2_block"
+  fi
 } > "$out"
 
 echo "wrote $out ($(wc -c < "$out" | tr -d ' ') bytes)"
