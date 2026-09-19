@@ -1,5 +1,6 @@
-//! Project fingerprint for MCP initialization.
-//! Gives agents instant orientation without a tool call.
+//! Project fingerprint: languages, manifest, hot files, git state.
+//! Printed by `tilth overview`. It used to ride on the MCP `initialize`
+//! response; since the context diet the server serves only a pointer.
 
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -15,9 +16,8 @@ use crate::read::imports::is_import_line;
 use crate::search::SKIP_DIRS;
 use crate::types::{FileType, Lang};
 
-/// Compute a project fingerprint for MCP initialization.
-/// Must be fast (<250ms) — runs synchronously in the initialize handler.
-/// Returns empty string on any failure (no error propagation).
+/// Compute a project fingerprint for `root`.
+/// Fast (<250ms) and total: returns an empty string on any failure.
 #[must_use]
 pub fn fingerprint(root: &Path) -> String {
     let start = Instant::now();
