@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>core · tilth</title>
+<link rel="stylesheet" href="loop.css">
+<body>
+<noscript>This page renders its markdown payload with JavaScript — enable JS, or read the raw payload in the page source.</noscript>
+<script type="text/markdown" id="loop">
+# core — tilth-core, the parser as a library
+**Goal.** A `tilth-core` library crate in a Cargo workspace beside the `tilth` binary, carrying tree-sitter outlines, the symbol index and search, callers and callees, dependency analysis and blast radius, and file classification including `is_test_file` and generated and binary detection. weed depends on it as a git dependency pinned to a commit until the owner publishes it; the tilth binary is its first consumer. Its documented public surface is exactly what weed asked for on the channel, nothing speculative, and the split changes no behaviour of the binary.
+
+## The seam
+
+The public API is negotiated with weed's builder, peer bandung, not guessed. What the tilth binary needs beyond that surface travels through a `#[doc(hidden)]` module, the pattern the crate already uses for its fuzz harness, so the documented API stays small while the binary keeps every internal path it had.
+
+## Tests
+- [ ] (code) `tilth-core` builds alone as a library and its dependency tree carries no CLI or MCP crate: clap, clap_complete, terminal_size, home, percent-encoding · scripts/check/core-deps.sh
+- [ ] (code) an external test compiles against every function and type in the negotiated API list, and `cargo doc` with missing docs denied passes for the documented surface · scripts/check/core-api.sh
+- [ ] (code) the workspace runs at least the 654 tests v0.10.1 ran (650 in the library, 4 in the binary), all passing, none ignored · scripts/check/test-count.sh
+- [ ] (code) the library introduces no dependency the v0.10.1 package did not already carry: the set of package names in Cargo.lock equals the set at tag v0.10.1 · scripts/check/no-new-deps.sh
+- [ ] (human) bandung confirms on the channel that the exposed API covers weed's rules, and weed pins the commit named in the handback
+
+## Tried
+- 2026-09-05 the module edges that decide the split, measured from `use crate::` imports: lang/*, types, read/outline/*, read/imports, index/bloom, and search/{symbol,callers,callees,deps,blast,rank,scope,callee_query,bloom_walk,siblings,strip,facets} reach only each other plus error and cache; search/mod.rs, read/mod.rs, grok, glob, content, session, budget, format, map, mcp, diff, edit, and install stay in the binary
+- 2026-09-05 two edges cross the seam and move with the split: `search::format_token_count` (a seven-line formatter callers.rs uses) and `edit::Edit` (the line-range type blast.rs reads); both are values, not behaviour
+- 2026-09-05 the tree-sitter grammars are referenced only under lang/ and in search/callee_query.rs, so they move whole; grep-regex and grep-searcher move only because search/symbol.rs uses them for the usage scan
+- 2026-09-05 bandung's worktree at weed/bandung/.context/tilth-core sits on a branch named `tilth-core` at 08ae11a (the v0.9.0 release commit) with no commits of its own; the landing branch here is named to avoid that collision
+- 2026-09-05 main's symbol search still carries the early-quit walker (symbol.rs `find_definitions`), so identical searches can return different match sets run to run; the parity proof runs the reference binary three times per command and reports commands whose reference output is itself unstable instead of hiding them
+- 2026-09-05 waiting on the channel: the API list from bandung; until it lands no public surface is written
+</script>
+<script src="loop.js"></script>

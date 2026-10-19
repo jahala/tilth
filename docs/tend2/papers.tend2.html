@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>papers · tilth</title>
+<link rel="stylesheet" href="loop.css">
+<body>
+<noscript>This page renders its markdown payload with JavaScript — enable JS, or read the raw payload in the page source.</noscript>
+<script type="text/markdown" id="loop">
+# papers — the bed's manifest, brand layer, and footer
+**Goal.** The files that let the umbrella verify tilth belongs to the garden: `garden.json` at the root declaring what tilth is, how it installs, how it is measured, and what it costs an agent in context; `.brand/products/tilth/` in the umbrella's product shape; a landing-page footer that lists every bed; and a committed result for the declared metric. The umbrella's fit checks F1, F3, F4, F5, and F6 read these files; this loop makes them true.
+
+## Tests
+- [ ] (code) `garden.json` parses and declares name, kind, version equal to both `Cargo.toml` and `npm/package.json`, faces, install per platform, metric command, and a declared context cost no lower than the measured one · scripts/check/garden-json.sh
+- [ ] (code) `.brand/products/tilth/` carries identity, colors, and voice in the shape the umbrella's other products use · scripts/check/brand-layer.sh
+- [ ] (code) the landing page footer names every bed of the garden · scripts/check/footer.sh
+- [ ] (code) the metric result the page and README cite is committed under `benchmark/results/` with the version it was measured on · scripts/check/metric-result.sh
+- [ ] (human) the owner decides the footer's entry for the judge once its name is confirmed
+
+## Needs #skill
+
+## Tried
+- 2026-09-05 the footer today lists tilth, tend, petals, pleach, umbel, and copeca; pollen and the judge are missing, and tend links to the v1 page
+- 2026-09-05 no manifest schema exists yet in contracts; `garden.json` is shaped from the fit contract's field list in building-the-garden.md §3 and re-validated once the schema lands
+- 2026-09-05 `benchmark/results/` holds only a `.gitkeep` on main while README and the page cite figures measured on v0.5.0; the committed result F5 asks for does not exist yet
+- 2026-09-05 this loop needs #skill because the manifest declares the post-diet context cost, not today's
+</script>
+<script src="loop.js"></script>

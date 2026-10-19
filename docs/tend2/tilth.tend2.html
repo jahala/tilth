@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tilth</title>
+<link rel="stylesheet" href="loop.css">
+<body>
+<noscript>This page renders its markdown payload with JavaScript — enable JS, or read the raw payload in the page source.</noscript>
+<script type="text/markdown" id="loop">
+# tilth — the reader, and the parser the judge uses
+**Goal.** tilth stays what it is, structural reading of code for agents with a measured cost-per-correct gain, and becomes the parsing substrate the garden's judge is built on. Three bets on this map: a `tilth-core` library crate that weed depends on, landed with zero behaviour change; an instruction block that moves into `skills/SKILL.md` so tilth costs an agent nothing at startup; and the bed's papers, the manifest, brand layer, and footer the umbrella verifies. The umbrella's fit checks live on plotplot's map; this map holds whether the modules work.
+
+## One parser, two consumers
+
+weed needs outlines, symbol search, callers, dependency analysis, and test-file classification in fourteen languages. Copying that into a second crate would fork the parser and every grammar bump twice over. A library crate in this repository ([core](core.tend2.html)) keeps one parser with two consumers, and the tilth binary is the first of them, which is what makes a byte-identical output proof possible: the same code path, linked from another crate. Evidence on this map is shell; the verifier runs it with `tend2 verify <loop> --runner "bash {evidence}"`.
+
+## Tests
+- [ ] (code) the workspace is green on stable: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test --workspace` pass in both crates · scripts/check/workspace-green.sh
+- [ ] (code) the tilth binary built from the workspace produces byte-identical CLI and MCP output to the v0.10.1 binary across the fixture corpus, ripgrep, fastapi, gin, and express at their pinned commits, and the proof is committed as `docs/proof-2026-09.md` · scripts/check/output-parity.sh
+- [ ] (human) the owner reads `docs/proof-2026-09.md` and the before-and-after context numbers and confirms nothing changed for a user that was not meant to
+
+## Children
+- #core
+- #skill
+- #papers
+
+## Tried
+- 2026-09-05 map planted by `tend2 init` on a fresh worktree from origin/main at f5c0afa (v0.10.1); the almaty workspace on integration/bench-146-151 holds 116 uncommitted paths of July scout and bench work and is left exactly as it is
+- 2026-09-05 `scripts/regen-agents-md.sh` now carries the tend2 block of AGENTS.md across a regeneration, so the CI no-op check and the agent contract coexist in one file with two owners and two regions
+- 2026-09-05 the byte-identical proof compares against the v0.10.1 binary built from origin/main, kept aside as the reference, not against recorded text, so anyone can rebuild the reference
+- 2026-09-05 scope-out: no version bump on any garden branch; release PRs are the owner's, and version references on README and the page track the released version
+- 2026-09-05 scope-out: the host installer (`tilth install <host>`) stays as a fallback and its host table is not extended; once the stem's bundles exist it stops being the documented primary install path
+- 2026-09-05 closed arcs stay closed without new evidence: the concept-intent footer, the scout hook, the cross-encoder reranker, the image channel, and tilth_run
+- 2026-09-05 A/Bs are copeca runs drafted here and run by the copeca agent; the in-repo benchmark is not used for A/Bs
+</script>
+<script src="loop.js"></script>
