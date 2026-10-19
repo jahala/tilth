@@ -15,8 +15,8 @@ pub(crate) mod tree;
 pub(crate) mod write;
 
 use tools::{
-    tool_definitions, tool_deps, tool_diff, tool_grok, tool_list, tool_read, tool_search,
-    tool_session, tool_write,
+    tool_config, tool_definitions, tool_deps, tool_diff, tool_grok, tool_list, tool_read,
+    tool_search, tool_session, tool_write,
 };
 
 /// Shared dependencies passed through the request → dispatch pipeline.
@@ -248,6 +248,7 @@ struct JsonRpcError {
 
 fn handle_request(req: &JsonRpcRequest, services: &Services) -> JsonRpcResponse {
     let edit_mode = services.edit_mode();
+    let server_instructions = SERVER_INSTRUCTIONS.trim_end();
     match req.method.as_str() {
         "initialize" => {
             let overview = if std::env::var("TILTH_NO_OVERVIEW").is_ok() {
@@ -258,14 +259,14 @@ fn handle_request(req: &JsonRpcRequest, services: &Services) -> JsonRpcResponse 
             };
             let instructions = if edit_mode {
                 if overview.is_empty() {
-                    format!("{SERVER_INSTRUCTIONS}{EDIT_MODE_EXTRA}")
+                    format!("{server_instructions}{EDIT_MODE_EXTRA}")
                 } else {
-                    format!("{overview}\n\n{SERVER_INSTRUCTIONS}{EDIT_MODE_EXTRA}")
+                    format!("{overview}\n\n{server_instructions}{EDIT_MODE_EXTRA}")
                 }
             } else if overview.is_empty() {
-                SERVER_INSTRUCTIONS.to_string()
+                server_instructions.to_string()
             } else {
-                format!("{overview}\n\n{SERVER_INSTRUCTIONS}")
+                format!("{overview}\n\n{server_instructions}")
             };
             JsonRpcResponse {
                 jsonrpc: "2.0",
@@ -318,28 +319,42 @@ fn handle_request(req: &JsonRpcRequest, services: &Services) -> JsonRpcResponse 
 /// Execute a tool by name with the given arguments. Returns formatted output or error string.
 /// No classifier involved — the caller specifies the tool explicitly.
 fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String, String> {
-    let edit_mode = services.edit_mode();
-    match tool {
-        "tilth_read" => tool_read(args, services.cache(), services.session(), edit_mode),
-        "tilth_search" => tool_search(args, services.cache(), services.session(), services.bloom()),
-        "tilth_list" => tool_list(args),
-        // Dispatch-only alias for one release: mid-session agents hold a
-        // pre-upgrade tool list that still names tilth_files. Never advertised
-        // (tools/list absence is pinned by `tilth_files_folded_into_tilth_list`);
-        // remove in the next minor.
-        "tilth_files" => tool_list(args).map(|out| {
-            format!(
-                "{}\nnote: tilth_files is now tilth_list — update your call",
-                out.trim_end_matches('\n')
-            )
-        }),
-        "tilth_deps" => tool_deps(args, services.bloom()),
-        "tilth_grok" => tool_grok(args, services.bloom(), services.session()),
-        "tilth_diff" => tool_diff(args),
-        "tilth_session" => tool_session(args, services.session()),
-        "tilth_write" if edit_mode => tool_write(args, services.session(), services.bloom()),
-        _ => Err(format!("unknown tool: {tool}")),
-    }
+    let gitignore = match args.get("gitignore") {
+        None => None,
+        Some(value) => Some(value.as_bool().ok_or("gitignore must be a boolean")?),
+    };
+    let gitignore = if tool == "tilth_config" {
+        None
+    } else {
+        gitignore
+    };
+    crate::search::with_gitignore_override(gitignore, || {
+        let edit_mode = services.edit_mode();
+        match tool {
+            "tilth_config" => tool_config(args),
+            "tilth_read" => tool_read(args, services.cache(), services.session(), edit_mode),
+            "tilth_search" => {
+                tool_search(args, services.cache(), services.session(), services.bloom())
+            }
+            "tilth_list" => tool_list(args),
+            // Dispatch-only alias for one release: mid-session agents hold a
+            // pre-upgrade tool list that still names tilth_files. Never advertised
+            // (tools/list absence is pinned by `tilth_files_folded_into_tilth_list`);
+            // remove in the next minor.
+            "tilth_files" => tool_list(args).map(|out| {
+                format!(
+                    "{}\nnote: tilth_files is now tilth_list — update your call",
+                    out.trim_end_matches('\n')
+                )
+            }),
+            "tilth_deps" => tool_deps(args, services.bloom()),
+            "tilth_grok" => tool_grok(args, services.bloom(), services.session()),
+            "tilth_diff" => tool_diff(args),
+            "tilth_session" => tool_session(args, services.session()),
+            "tilth_write" if edit_mode => tool_write(args, services.session(), services.bloom()),
+            _ => Err(format!("unknown tool: {tool}")),
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -548,13 +563,14 @@ mod tests {
     #[test]
     fn server_instructions_byte_lock() {
         assert_eq!(
-            SERVER_INSTRUCTIONS.len(),
-            1399,
+            SERVER_INSTRUCTIONS.trim_end().len(),
+            1674,
             "SERVER_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(SERVER_INSTRUCTIONS
             .starts_with("tilth — code intelligence MCP server. Replaces grep, cat, find, ls"));
         assert!(SERVER_INSTRUCTIONS
+            .trim_end()
             .ends_with("DO NOT re-read files already shown in expanded search results."));
         assert!(
             !SERVER_INSTRUCTIONS.contains("\n\n\n"),
@@ -574,6 +590,7 @@ mod tests {
         // native-vs-tilth steering for weaker models stays verbatim, and that the
         // per-tool parameter manuals are gone from the always-on instructions field.
         assert!(SERVER_INSTRUCTIONS.contains("DO NOT use Grep, Read, or Glob."));
+        assert!(SERVER_INSTRUCTIONS.contains("tilth_config(action: \"set\""));
         assert!(SERVER_INSTRUCTIONS
             .contains("To check what changed, use tilth_diff instead of Bash(git diff/git log)."));
         assert!(SERVER_INSTRUCTIONS.contains("DO NOT use Bash(git diff) or Bash(git log --patch)."));
@@ -607,7 +624,7 @@ mod tests {
         // Pre-refactor: format!("{S}{E}") relied on EDIT_MODE_EXTRA's leading
         // "\n\n" to produce one blank line between the base and edit sections.
         // This asserts the composition still has that shape.
-        let combined = format!("{SERVER_INSTRUCTIONS}{EDIT_MODE_EXTRA}");
+        let combined = format!("{}{EDIT_MODE_EXTRA}", SERVER_INSTRUCTIONS.trim_end());
         assert!(combined.contains(
             "DO NOT re-read files already shown in expanded search results.\n\ntilth_write replaces"
         ));

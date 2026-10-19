@@ -1,3 +1,4 @@
+mod config;
 mod definitions;
 mod deps;
 mod diff;
@@ -8,6 +9,7 @@ mod search;
 mod session;
 mod write;
 
+pub(super) use config::tool_config;
 pub(super) use definitions::tool_definitions;
 pub(super) use deps::tool_deps;
 pub(super) use diff::tool_diff;

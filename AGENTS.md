@@ -16,7 +16,9 @@ To read files, use tilth_read instead of Read or Bash(cat).
 To find files, use tilth_list instead of Glob or Bash(find/ls).
 To check what changed, use tilth_diff instead of Bash(git diff/git log).
 DO NOT use Bash(git diff) or Bash(git log --patch). Use tilth_diff instead.
+Use tilth_config(action: "set", respect_gitignore: true) when the user wants searches and file walks to honor .gitignore, .ignore, and Git exclude rules. Use action "get" to inspect the current setting and "reset" to restore startup behavior. .tilthignore is always honored.
 DO NOT re-read files already shown in expanded search results.
+
 
 tilth_write replaces the host Edit and Write tools. Its full usage — hash/overwrite/append modes, hash anchors from tilth_read, grouping multi-file writes into one call, per-file partial success — is in the tilth_write tool description.
 DO NOT use the host Edit or Write tool. Use tilth_write for all writes.

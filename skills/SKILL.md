@@ -61,7 +61,8 @@ Output per match:
 ## Files
 
 ```bash
-tilth "*.test.ts" --scope <dir>   # glob (respects .gitignore)
+tilth "*.test.ts" --scope <dir>   # glob files (.tilthignore honored)
+tilth --respect-gitignore <symbol> --scope <dir>  # opt into .gitignore/.ignore
 tilth --map --scope <dir>         # codebase skeleton with directory token rollups
 ```
 

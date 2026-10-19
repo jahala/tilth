@@ -20,8 +20,8 @@ pub struct GlobResult {
     pub available_extensions: Vec<String>,
 }
 
-/// Glob search using `ignore::WalkBuilder` (parallel via `super::walker` —
-/// deliberately NOT .gitignore-aware, see `walker`'s doc comment).
+/// Glob search using `ignore::WalkBuilder` (parallel via `super::walker`,
+/// with the same `.tilthignore` and opt-in gitignore policy).
 pub fn search(pattern: &str, scope: &Path) -> Result<GlobResult, TilthError> {
     let glob = Glob::new(pattern).map_err(|e| TilthError::InvalidQuery {
         query: pattern.to_string(),
