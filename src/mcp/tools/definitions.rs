@@ -355,6 +355,16 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         }));
     }
 
+    for tool in &mut tools {
+        let name = tool["name"].as_str().unwrap_or("");
+        if name == "tilth_search" || name == "tilth_list" {
+            tool["inputSchema"]["properties"]["gitignore"] = serde_json::json!({
+                "type": "boolean",
+                "description": "For this call, honor .gitignore, .ignore, and Git exclude rules when true; bypass them when false. Omit to use the startup setting: off unless the server runs with TILTH_RESPECT_GITIGNORE=1. .tilthignore is always honored."
+            });
+        }
+    }
+
     tools
 }
 
@@ -467,6 +477,29 @@ mod tests {
                 !names.contains(&"tilth_savings"),
                 "tilth_savings must not be advertised (edit_mode={edit_mode})"
             );
+        }
+    }
+
+    /// Only the two tools that walk on the agent's behalf carry the per-call
+    /// `gitignore` flag, so other schemas pay nothing for it. Its description
+    /// names the startup setting, which is the only thing that sets the default.
+    #[test]
+    fn gitignore_param_only_on_search_and_list() {
+        for edit_mode in [false, true] {
+            for tool in tool_definitions(edit_mode) {
+                let name = tool["name"].as_str().unwrap_or("");
+                let param = &tool["inputSchema"]["properties"]["gitignore"];
+                if name == "tilth_search" || name == "tilth_list" {
+                    assert_eq!(param["type"], "boolean", "{name} lacks gitignore");
+                    let desc = param["description"].as_str().unwrap_or("");
+                    assert!(
+                        desc.contains("TILTH_RESPECT_GITIGNORE"),
+                        "{name} gitignore description must name the startup setting: {desc}"
+                    );
+                } else {
+                    assert!(param.is_null(), "{name} must not carry gitignore");
+                }
+            }
         }
     }
 }

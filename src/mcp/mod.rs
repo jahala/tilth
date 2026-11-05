@@ -318,28 +318,36 @@ fn handle_request(req: &JsonRpcRequest, services: &Services) -> JsonRpcResponse 
 /// Execute a tool by name with the given arguments. Returns formatted output or error string.
 /// No classifier involved — the caller specifies the tool explicitly.
 fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String, String> {
-    let edit_mode = services.edit_mode();
-    match tool {
-        "tilth_read" => tool_read(args, services.cache(), services.session(), edit_mode),
-        "tilth_search" => tool_search(args, services.cache(), services.session(), services.bloom()),
-        "tilth_list" => tool_list(args),
-        // Dispatch-only alias for one release: mid-session agents hold a
-        // pre-upgrade tool list that still names tilth_files. Never advertised
-        // (tools/list absence is pinned by `tilth_files_folded_into_tilth_list`);
-        // remove in the next minor.
-        "tilth_files" => tool_list(args).map(|out| {
-            format!(
-                "{}\nnote: tilth_files is now tilth_list — update your call",
-                out.trim_end_matches('\n')
-            )
-        }),
-        "tilth_deps" => tool_deps(args, services.bloom()),
-        "tilth_grok" => tool_grok(args, services.bloom(), services.session()),
-        "tilth_diff" => tool_diff(args),
-        "tilth_session" => tool_session(args, services.session()),
-        "tilth_write" if edit_mode => tool_write(args, services.session(), services.bloom()),
-        _ => Err(format!("unknown tool: {tool}")),
-    }
+    let gitignore = match args.get("gitignore") {
+        None => None,
+        Some(value) => Some(value.as_bool().ok_or("gitignore must be a boolean")?),
+    };
+    crate::search::with_gitignore_override(gitignore, || {
+        let edit_mode = services.edit_mode();
+        match tool {
+            "tilth_read" => tool_read(args, services.cache(), services.session(), edit_mode),
+            "tilth_search" => {
+                tool_search(args, services.cache(), services.session(), services.bloom())
+            }
+            "tilth_list" => tool_list(args),
+            // Dispatch-only alias for one release: mid-session agents hold a
+            // pre-upgrade tool list that still names tilth_files. Never advertised
+            // (tools/list absence is pinned by `tilth_files_folded_into_tilth_list`);
+            // remove in the next minor.
+            "tilth_files" => tool_list(args).map(|out| {
+                format!(
+                    "{}\nnote: tilth_files is now tilth_list — update your call",
+                    out.trim_end_matches('\n')
+                )
+            }),
+            "tilth_deps" => tool_deps(args, services.bloom()),
+            "tilth_grok" => tool_grok(args, services.bloom(), services.session()),
+            "tilth_diff" => tool_diff(args),
+            "tilth_session" => tool_session(args, services.session()),
+            "tilth_write" if edit_mode => tool_write(args, services.session(), services.bloom()),
+            _ => Err(format!("unknown tool: {tool}")),
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------

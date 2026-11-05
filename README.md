@@ -358,7 +358,9 @@ tilth is about 35,000 lines of Rust with no runtime dependencies.
 
 - **tree-sitter** parses 17 languages: Rust, TypeScript, TSX, JavaScript, Python, Go, Java, Scala, C, C++, Ruby, PHP, C#, Swift, Kotlin, Elixir and Bash. tilth uses it for definitions, callees, callers and outlines. Dockerfile and Make files are recognised but not parsed.
 - **ripgrep's crates** (`grep-regex`, `grep-searcher`) run content search.
-- The **ignore** crate walks directories in parallel. tilth searches every file, including gitignored ones, and skips common build and dependency folders such as `node_modules`, `target` and `.venv`.
+- The **ignore** crate walks directories in parallel. By default tilth searches every file, including gitignored ones, and skips common build and dependency folders such as `node_modules`, `target` and `.venv`.
+- To honor `.gitignore`, `.ignore` and Git exclude rules as well, set `TILTH_RESPECT_GITIGNORE=1` before starting tilth, or pass `--respect-gitignore` on the CLI. Over MCP, `tilth_search` and `tilth_list` take `gitignore: true` or `false` to choose for a single call.
+- A `.tilthignore` file uses the `.gitignore` syntax and is always honored, whatever the gitignore setting. It applies to its own directory and everything below, also when the search scope starts deeper. Use it for folders tilth should never search.
 - **memmap2** reads files through memory maps.
 - **DashMap** holds the outline cache, which is invalidated when a file's modified time changes.
 
