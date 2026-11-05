@@ -1,8 +1,8 @@
 use streaming_iterator::StreamingIterator;
 
-use crate::lang::outline::outline_language;
-use crate::lang::treesitter::with_query;
-use crate::types::{Lang, OutlineEntry, OutlineKind};
+use tilth_core::lang::outline::outline_language;
+use tilth_core::lang::treesitter::with_query;
+use tilth_core::types::{Lang, OutlineEntry, OutlineKind};
 
 /// A sibling field or method resolved from the same parent struct/class/impl.
 #[derive(Debug)]
@@ -20,7 +20,7 @@ const MAX_SIBLINGS: usize = 6;
 /// Tree-sitter query for self/this field and method references by language.
 /// Each pattern captures `@ref` on the accessed member name.
 fn sibling_query_str(lang: Lang) -> Option<&'static str> {
-    crate::lang::spec::spec(lang).sibling_query
+    tilth_core::lang::spec::spec(lang).sibling_query
 }
 
 /// Extract self/this member references from within a definition's line range.
@@ -41,7 +41,7 @@ pub fn extract_sibling_references(content: &str, lang: Lang, def_range: (u32, u3
     // avoid re-entrancy on `QUERY_CACHE` (the receiver extractor also uses it).
     // The extractor is supplied per-language via `spec(lang).extract_receiver`
     // (only Go has one).
-    let go_receiver = crate::lang::spec::spec(lang)
+    let go_receiver = tilth_core::lang::spec::spec(lang)
         .extract_receiver
         .and_then(|extract| extract(content, &ts_lang));
 

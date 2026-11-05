@@ -7,14 +7,14 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::error::TilthError;
-use crate::index::bloom::BloomFilterCache;
-use crate::lang::detect_file_type;
-use crate::lang::outline::get_outline_entries;
-use crate::search::callees::{extract_callee_names, resolve_callees, ResolvedCallee};
-use crate::search::callers::{find_callers_batch, CallerMatch, BATCH_EARLY_QUIT};
 use crate::search::search_symbol_raw;
-use crate::types::{is_test_file, FileType, Lang, OutlineEntry, OutlineKind};
+use tilth_core::error::TilthError;
+use tilth_core::index::bloom::BloomFilterCache;
+use tilth_core::lang::detect_file_type;
+use tilth_core::lang::outline::get_outline_entries;
+use tilth_core::search::callees::{extract_callee_names, resolve_callees, ResolvedCallee};
+use tilth_core::search::callers::{find_callers_batch, CallerMatch, BATCH_EARLY_QUIT};
+use tilth_core::types::{is_test_file, FileType, Lang, OutlineEntry, OutlineKind};
 
 /// What grok resolved the user's target string to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -187,7 +187,7 @@ fn read_code_file(path: &Path) -> Result<(String, Lang), TilthError> {
     })?;
     // Match the read path: refuse binary content instead of letting a strict
     // UTF-8 decode surface a raw "stream did not contain valid UTF-8" error.
-    if crate::lang::detection::is_binary(&bytes) {
+    if tilth_core::lang::detection::is_binary(&bytes) {
         return Err(TilthError::InvalidQuery {
             query: path.display().to_string(),
             reason: "binary or non-text file (null bytes in first 512B) — grok needs source; \
@@ -554,7 +554,7 @@ pub fn grok(
                 &callee.file,
                 &target.path,
                 &content,
-                super::bloom_walk::MAX_FILE_SIZE,
+                tilth_core::search::bloom_walk::MAX_FILE_SIZE,
             );
             callee_content.map(|cc| {
                 // Build a minimal ResolvedTarget so body_with_dedup can handle dedup.
@@ -2282,7 +2282,7 @@ impl OutlineCache {
         write_fixture(
             tmp.path(),
             "main.go",
-            crate::lang::go::GO_DECLARATIONS_FIXTURE,
+            tilth_core::lang::go::GO_DECLARATIONS_FIXTURE,
         );
 
         let bloom = BloomFilterCache::default();

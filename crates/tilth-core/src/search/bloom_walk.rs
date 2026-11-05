@@ -10,7 +10,7 @@ use crate::index::bloom::BloomFilterCache;
 
 /// Skip files larger than this; tree-sitter parses on huge files dominate
 /// query latency without surfacing useful matches.
-pub(super) const MAX_FILE_SIZE: u64 = 500_000;
+pub const MAX_FILE_SIZE: u64 = 500_000;
 
 /// Read `path`, validate size, and pass through only when at least one
 /// target is bloom-positive. Returns `(content, mtime)` for the next stage,

@@ -2,15 +2,15 @@ pub mod detection;
 pub mod outline;
 pub mod treesitter;
 
-pub(crate) mod spec;
+pub mod spec;
 
 pub(crate) mod bash;
-pub(crate) mod c;
-pub(crate) mod cpp;
+pub mod c;
+pub mod cpp;
 pub(crate) mod csharp;
 pub(crate) mod dockerfile;
-pub(crate) mod elixir;
-pub(crate) mod go;
+pub mod elixir;
+pub mod go;
 pub(crate) mod java;
 pub(crate) mod javascript;
 pub(crate) mod kotlin;
@@ -115,7 +115,8 @@ fn file_type_from_name(path: &Path) -> FileType {
 /// directory is a package root if it contains *any* manifest; order is
 /// irrelevant because the matched directory is returned regardless of which
 /// manifest hit.
-pub(crate) fn package_root(path: &Path) -> Option<&Path> {
+#[must_use]
+pub fn package_root(path: &Path) -> Option<&Path> {
     let mut dir = path;
     loop {
         for &lang in ALL_LANGS {

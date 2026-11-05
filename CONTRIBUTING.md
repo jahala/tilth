@@ -7,13 +7,13 @@ Thanks for your interest. tilth is small and intentionally so — clean, focused
 1. Fork, branch, change.
 2. Run the gates locally:
    ```bash
-   cargo fmt --check
-   cargo clippy --all-targets -- -D warnings
-   cargo test
+   cargo fmt --all --check
+   cargo clippy --workspace --all-targets -- -D warnings
+   cargo test --workspace
    ```
 3. Open a PR. Describe what changed and how to test it.
 
-CI runs the same three commands on every push.
+CI runs the same three commands on every push, plus a publish dry-run of `tilth-core`.
 
 ## What helps
 

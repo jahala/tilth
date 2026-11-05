@@ -4,12 +4,12 @@ use std::sync::Mutex;
 
 use super::file_metadata;
 
-use crate::error::TilthError;
 use crate::search::rank;
 use crate::types::{FacetTotals, Match, SearchResult};
 use grep_regex::RegexMatcher;
 use grep_searcher::sinks::UTF8;
 use grep_searcher::Searcher;
+use tilth_core::error::TilthError;
 
 const MAX_MATCHES: usize = 10;
 const FULL_MAX_MATCHES: usize = 100;
@@ -62,7 +62,7 @@ fn search_capped(
     // Relaxed is correct: walker.run() joins all threads before we read the final value.
     let total_found = AtomicUsize::new(0);
 
-    let walker = super::walker(scope, glob)?;
+    let walker = tilth_core::search::walk::walker(scope, glob)?;
 
     walker.run(|| {
         let matcher = &matcher;
@@ -84,7 +84,7 @@ fn search_capped(
             if path
                 .file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(crate::lang::detection::is_minified_by_name)
+                .is_some_and(tilth_core::lang::detection::is_minified_by_name)
             {
                 return ignore::WalkState::Continue;
             }
@@ -109,8 +109,8 @@ fn search_capped(
             };
 
             // Catch unmarked minified bundles in the 100KB–500KB range.
-            if file_size >= crate::lang::detection::MINIFIED_CHECK_THRESHOLD
-                && crate::lang::detection::is_minified_by_content(&bytes)
+            if file_size >= tilth_core::lang::detection::MINIFIED_CHECK_THRESHOLD
+                && tilth_core::lang::detection::is_minified_by_content(&bytes)
             {
                 return ignore::WalkState::Continue;
             }

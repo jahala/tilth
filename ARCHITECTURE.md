@@ -6,13 +6,33 @@ to capture the *durable* shape — the type alphabet, dispatch flow, and
 extension seams — not file sizes or specific commits, which decay
 faster than they can be re-checked.
 
-Tilth is a single Rust binary that exposes two surfaces: a CLI
-(`tilth`) and an MCP server (`tilth --mcp`). Both speak to the same
-core: a query classifier, a tree-sitter-driven search engine, a smart
-file reader, and supporting subsystems for diff, edit, blast-radius
-analysis, and codebase mapping. There's also a Cargo workspace, an
-`install.rs` that writes MCP-host configs, and an
-npm wrapper that fetches a prebuilt binary on `npm install`.
+Tilth is a Rust binary that exposes two surfaces: a CLI (`tilth`) and
+an MCP server (`tilth --mcp`). Both speak to the same core: a query
+classifier, a tree-sitter-driven search engine, a smart file reader,
+and supporting subsystems for diff, edit, blast-radius analysis, and
+codebase mapping. There's also an `install.rs` that writes MCP-host
+configs, and an npm wrapper that fetches a prebuilt binary on
+`npm install`.
+
+The repository is a Cargo workspace of two crates:
+
+- **`crates/tilth-core`** is the parsing substrate as a library:
+  language detection and the per-language spec table, tree-sitter
+  outline entries, test structure, import resolution, the shared
+  directory walker, call sites, callees, enclosing scopes, file-level
+  dependency analysis, the bloom pre-filter, the outline cache, and
+  the error type. It returns data and renders nothing.
+- **The root package, `tilth`,** is the binary: CLI, MCP server, and
+  everything that turns that data into text (outlines, search results,
+  caller buckets, deps reports, grok bundles, diffs) plus symbol
+  search, ranking, editing and install.
+
+The line between them is data versus rendering, so a change to what a
+tool prints stays in the binary. Other crates depend on `tilth-core`,
+so the items re-exported at its root are a public API, pinned by
+`crates/tilth-core/tests/api.rs`. Its modules are `#[doc(hidden)]`:
+the binary reaches into them, nothing else should. The two crates
+share one version; `release.yml` publishes `tilth-core` first.
 
 The single most useful function for orienting yourself is
 `lib.rs::run_inner` — every search query funnels through it.
@@ -20,6 +40,46 @@ The single most useful function for orienting yourself is
 ## Layout map
 
 ```
+crates/tilth-core/src/
+├── lib.rs           The public API: re-exports at the crate root
+├── types.rs         Shared types: Lang, FileType, OutlineEntry, OutlineKind
+├── error.rs         TilthError (NotFound, PermissionDenied,
+│                    InvalidQuery, IoError, ParseError, …)
+├── cache.rs         OutlineCache: rendered outlines + parsed
+│                    tree_sitter::Tree, both keyed by (path, mtime)
+├── imports.rs       Import lines, import sources, related-file resolution
+├── test_structure.rs describe/it/test calls as TestEntry data
+│
+├── search/          Cross-file queries
+│   ├── walk.rs          Walker and ignore policy (SKIP_DIRS, .tilthignore,
+│   │                    gitignore switch, glob overrides)
+│   ├── callers.rs       find_callers_batch: call sites of N symbols in one walk
+│   ├── callees.rs       Resolve function calls inside a definition
+│   ├── callee_query.rs  Cached tree-sitter `Query` objects for callee
+│   │                    extraction across languages
+│   ├── deps.rs          analyze_deps → DepsResult
+│   ├── bloom_walk.rs    Shared walker preamble (size gating, mtime,
+│   │                    bloom filter) factored out of callers/callees
+│   └── scope.rs         `enclosing_definition_at` — walks up the AST
+│                        from a match to find the enclosing function /
+│                        type, used by both `callers` annotation and
+│                        the search-time `[in foo]` suffix
+│
+├── lang/            Language detection + tree-sitter wrapper
+│   ├── mod.rs           detect_file_type, package_root, FileType ↔ Lang
+│   ├── spec.rs          Per-language spec table, one `<lang>.rs` per language
+│   ├── detection.rs     Binary / generated / minified detection
+│   ├── treesitter.rs    DEFINITION_KINDS, extract_definition_name
+│   └── outline.rs       outline_language(Lang) → tree_sitter::Language;
+│                        node_to_entry walker (the bulk of this file);
+│                        parse_markdown / heading_level / heading_text
+│                        helpers shared by markdown outline + search defs
+│
+└── index/           Pre-computed indexes used by the relational-query paths
+    ├── mod.rs
+    └── bloom.rs         Per-file Bloom filter for fast "does X contain Y?"
+                         (BloomFilterCache wraps the per-file filters)
+
 src/
 ├── lib.rs           Public API + dispatch (run / run_full / run_expanded /
 │                    run_callers / run_deps)
@@ -27,23 +87,19 @@ src/
 ├── mcp.rs           MCP server: JSON-RPC stdio loop, tool dispatch,
 │                    per-request timeout / abandoned-thread tracking
 ├── classify.rs      Query string → QueryType (8-rule precedence ladder)
-├── types.rs         Shared types: QueryType, Lang, FileType, ViewMode,
-│                    Match, SearchResult, FacetTotals, OutlineEntry
-├── error.rs         TilthError (NotFound, PermissionDenied,
-│                    InvalidQuery, IoError, ParseError)
+├── types.rs         Binary types: QueryType, ViewMode, Match,
+│                    SearchResult, FacetTotals
 ├── format.rs        Output headers, line numbering, hashlines
 ├── budget.rs        Token cap (truncate output to a token budget)
 ├── session.rs       Per-MCP-process counters: reads, searches, top
 │                    queries, hot dirs, expanded-set dedup
-├── cache.rs         OutlineCache: rendered outlines + parsed
-│                    tree_sitter::Tree, both keyed by (path, mtime)
 ├── overview.rs      Project fingerprint emitted at MCP `initialize`
 ├── map.rs           tilth --map: structural tree of the codebase
 ├── install.rs       Writes MCP server entries into ~20 host configs
 ├── edit.rs          Hash-anchored line edits + EditResult diff preview
 │
 ├── search/          Search engine
-│   ├── mod.rs           Walker, ignore policy, formatter, dispatch
+│   ├── mod.rs           Formatter, dispatch
 │   ├── symbol.rs        Tree-sitter definition detection per language;
 │   │                    markdown-heading defs; usage matching
 │   ├── content.rs       Literal content search (ripgrep internals)
@@ -55,49 +111,25 @@ src/
 │   ├── strip.rs         Cognitive-load stripping in expanded source
 │   ├── siblings.rs      Tree-sitter sibling extraction (with cached
 │   │                    Query objects)
-│   ├── callers.rs       Find call sites of a symbol (`tilth_search
-│   │                    kind:callers`); enclosing-scope annotation
-│   ├── callees.rs       Resolve function calls inside a definition
-│   ├── deps.rs          Blast-radius analysis (`tilth_deps`)
+│   ├── callers.rs       Caller search output (`tilth_search
+│   │                    kind:callers`): ranking, buckets, 2nd hop
+│   ├── deps.rs          `tilth_deps` output: renders a DepsResult
 │   ├── grok.rs          One-call symbol bundle (`tilth_grok`)
 │   ├── glob.rs          Glob query → file list (`tilth_list`)
-│   ├── blast.rs         Symbol-level blast radius
-│   ├── bloom_walk.rs    Shared walker preamble (size gating, mtime,
-│   │                    bloom filter) factored out of callers/callees
-│   ├── callee_query.rs  Cached tree-sitter `Query` objects for callee
-│   │                    extraction across languages
-│   └── scope.rs         `enclosing_definition_at` — walks up the AST
-│                        from a match to find the enclosing function /
-│                        type, used by both `callers` annotation and
-│                        the search-time `[in foo]` suffix
+│   └── blast.rs         Symbol-level blast radius
 │
 ├── read/            Read engine
 │   ├── mod.rs           read_file decision tree, multi-section reader
 │   │                    (`read_ranges`), heading resolver, suggestion
 │   │                    fallback
-│   ├── imports.rs       Resolve "Related: file1, file2" hints
 │   └── outline/
 │       ├── mod.rs       Dispatch by FileType
 │       ├── code.rs      Tree-sitter outline for code
 │       ├── markdown.rs  Tree-sitter-md outline: walks `section` nodes
 │       ├── structured.rs JSON/YAML/TOML "keys" view
 │       ├── tabular.rs   CSV/TSV head/tail + column count
-│       ├── test_file.rs Test-suite outline (describe/it grouping)
+│       ├── test_file.rs Test-suite outline, rendered over test_entries
 │       └── fallback.rs  Last-resort head/tail
-│
-├── lang/            Language detection + tree-sitter wrapper
-│   ├── mod.rs           detect_file_type, package_root, FileType ↔ Lang
-│   ├── detection.rs     Binary / generated / minified detection
-│   ├── treesitter.rs    DEFINITION_KINDS, extract_definition_name
-│   └── outline.rs       outline_language(Lang) → tree_sitter::Language;
-│                        node_to_entry walker (the bulk of this file);
-│                        parse_markdown / heading_level / heading_text
-│                        helpers shared by markdown outline + search defs
-│
-├── index/           Pre-computed indexes used by the relational-query paths
-│   ├── mod.rs
-│   └── bloom.rs         Per-file Bloom filter for fast "does X contain Y?"
-│                        (BloomFilterCache wraps the per-file filters)
 │
 └── diff/            Structural diff
     ├── mod.rs           DiffSource resolution; diff() pipeline orchestrator
@@ -308,14 +340,18 @@ and one rule. The ordering encodes the precedence policy ("globs
 before paths," "regex first if metachars present," "filesystem only
 checked when the shape suggests a file").
 
-## Search subsystem (`src/search/`)
+## Search subsystem (`src/search/`, `crates/tilth-core/src/search/`)
 
-The search subsystem is the largest area of code. The walker preamble
-(size gating + mtime + bloom filter) is factored into `bloom_walk.rs`
-so all relational paths share it; AST-scope walking is in `scope.rs`;
-cached tree-sitter `Query` objects live in `callee_query.rs`.
+The search subsystem is the largest area of code. Symbol search,
+content search, ranking, faceting and every formatter live in the
+binary's `src/search/`. The cross-file queries that return data live in
+`tilth-core`'s `search/`: the walker, call sites, callees, enclosing
+scopes and dependency analysis. The walker preamble (size gating +
+mtime + bloom filter) is factored into `bloom_walk.rs` so all
+relational paths share it; AST-scope walking is in `scope.rs`; cached
+tree-sitter `Query` objects live in `callee_query.rs`.
 
-### Walker and ignore policy (`mod.rs`)
+### Walker and ignore policy (`tilth-core` `search/walk.rs`)
 
 `walker(scope, glob)` builds an `ignore::WalkParallel` with tilth's
 opinionated defaults:
@@ -441,14 +477,14 @@ Java/Kotlin/C#, C/C++).
 These produce derived views from the same walker + tree-sitter
 machinery:
 
-- **Callers** (`callers.rs`). `find_callers_batch` is the single
-  tree-sitter walk that resolves call sites for any number of target
+- **Callers** (`callers.rs`, both crates). `find_callers_batch`
+  (`tilth-core`) is the single tree-sitter walk that resolves call sites for any number of target
   symbols (1 to N) — `search_callers_expanded` calls it with a
   one-element set, the deps / blast / 2nd-hop paths call it with the
   full set. Each caller is annotated with its enclosing scope via
   `scope::walk_to_enclosing_definition` so the user sees
   `[caller: foo]` instead of just a line number. When the walk returns
-  empty, a small `target_seen_in_scope` helper does an mmap-based
+  empty, a small `target_seen_in_scope` helper in the binary does an mmap-based
   literal scan so `no_callers_message` can distinguish typo from
   "real symbol with no direct callers" (indirect dispatch, dead code,
   framework registration).
@@ -462,9 +498,10 @@ machinery:
   them in a process-wide `LazyLock<Mutex<HashMap>>`. The cache key
   uses the query string's pointer address (`&'static str`) so distinct
   queries against the same language stay separated.
-- **Deps** (`deps.rs`) — `analyze_deps` is what `tilth_deps` runs.
-  Returns a `DepsResult` with `Uses` (local + external) and `Used by`.
-  `format_deps` does the human output. The external-dep stdlib
+- **Deps** (`deps.rs`, both crates) — `analyze_deps` (`tilth-core`)
+  is what `tilth_deps` runs. Returns a `DepsResult` with `Uses` (local
+  + external) and `Used by`. `format_deps` (binary) does the human
+  output. The external-dep stdlib
   heuristic (`is_stdlib`) is per-language; module-path validation
   (`is_valid_module_path`) avoids treating relative paths as packages.
 - **Blast** (`blast.rs`) — symbol-level blast radius for diff
@@ -525,7 +562,8 @@ The `outline/` submodule dispatches on `FileType`:
 - `structured.rs` — JSON/YAML/TOML "keys" view (top-level keys + their
   shapes).
 - `tabular.rs` — CSV/TSV header + first/last few rows.
-- `test_file.rs` — describe/it grouping for test files.
+- `test_file.rs` — describe/it grouping for test files, rendered over
+  `tilth_core::test_entries`.
 - `fallback.rs` — last-resort head/tail when nothing else applies.
 
 Two helpers feed the MCP layer:
@@ -533,16 +571,16 @@ Two helpers feed the MCP layer:
 - `would_outline(path)` lets MCP decide whether to append related-file
   hints (`"Related: foo.ts, bar.ts"`) — only meaningful when the user
   is going to see an outline.
-- `imports::resolve_related_files` does the related-file resolution
-  for the same hint.
+- `tilth_core::imports::resolve_related_files` does the related-file
+  resolution for the same hint.
 
-## Language layer (`src/lang/`)
+## Language layer (`crates/tilth-core/src/lang/`)
 
 `Lang` and `FileType` are carried through the type system so downstream
 code never re-detects file kind. Adding a language is mechanical — the
 compiler tells you every site to update:
 
-- Add an arm to the `Lang` enum (`types.rs`).
+- Add an arm to the `Lang` enum (`tilth-core`'s `types.rs`).
 - Add an extension match to `lang::detect_file_type`.
 - Add a tree-sitter binding to `lang::outline::outline_language` (or
   return `None` to skip outlines).
@@ -579,7 +617,7 @@ Tilth keeps three pieces of state across calls. Lifetimes are
 deliberately scoped — only `OutlineCache`, `Session`, and
 `BloomFilterCache` survive between MCP requests.
 
-### `OutlineCache` (`cache.rs`)
+### `OutlineCache` (`tilth-core` `cache.rs`)
 
 Two `DashMap` tables, both keyed by `(PathBuf, SystemTime)`:
 
@@ -615,7 +653,7 @@ maps. Poison handling is uniform via
 try to handle a poisoned mutex specially; the data is best-effort
 telemetry.
 
-### `BloomFilterCache` (`index/bloom.rs`)
+### `BloomFilterCache` (`tilth-core` `index/bloom.rs`)
 
 Per-file Bloom filters that answer "does file X contain symbol Y?" in
 constant time. Used by `callers.rs` and `callees.rs` to skip files
@@ -760,14 +798,14 @@ A handful of small files cut across every subsystem.
   the line-numbering / hash-anchored variants.
 - **`budget.rs`** — `apply(output, budget)` truncates a finished
   output string to a token budget. Used by every entry point and tool.
-- **`error.rs`** — `TilthError` enum (`NotFound`, `PermissionDenied`,
+- **`error.rs`** (`tilth-core`) — `TilthError` enum (`NotFound`, `PermissionDenied`,
   `InvalidQuery`, `IoError`, `ParseError`) with `Display` impls that
   format human-readable messages and include suggestions where
   relevant.
 - **`types.rs`** — already covered above; the type alphabet that every
-  module speaks. `Match` / `SearchResult` / `FacetTotals` / `Lang` /
-  `FileType` / `ViewMode` / `OutlineEntry` / `OutlineKind` are the
-  ones that span many modules.
+  module speaks. `Lang` / `FileType` / `OutlineEntry` / `OutlineKind`
+  live in `tilth-core`; `Match` / `SearchResult` / `FacetTotals` /
+  `ViewMode` / `QueryType` live in the binary.
 
 ## Auxiliary modules
 
@@ -797,7 +835,7 @@ user-facing.
 
 Concrete "if you wanted to change X, edit Y":
 
-- **Add a new language.** `Lang` arm in `types.rs` → extension match in
+- **Add a new language.** `Lang` arm in `tilth-core`'s `types.rs` → extension match in
   `lang::detect_file_type` → tree-sitter binding in
   `lang::outline::outline_language`. The compiler will tell you what
   else needs touching (the `match` over `Lang` in
@@ -816,7 +854,7 @@ Concrete "if you wanted to change X, edit Y":
   per-facet limit in `search/truncate.rs` → renderer entry in
   `search/mod.rs::format_search_result`.
 - **Add a new outline strategy** (e.g. for a non-code structured
-  format). `FileType` arm in `types.rs` → extension match in
+  format). `FileType` arm in `tilth-core`'s `types.rs` → extension match in
   `lang::detect_file_type` → outline file in `read/outline/` →
   dispatch arm in `read/outline/mod.rs`.
 - **Add a new edit policy** (e.g. structured-edit instead of

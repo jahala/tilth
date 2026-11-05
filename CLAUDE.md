@@ -4,7 +4,33 @@ Rust MCP server + CLI for AST-aware code intelligence. Tree-sitter outlines, sym
 
 ## Project structure
 
+A Cargo workspace of two crates. The root package is the `tilth` binary: CLI, MCP server, and the rendering of every tool's output. `crates/tilth-core` is the parsing substrate as a library: it returns data, and the binary renders it. Other crates depend on `tilth-core` too, so its root re-exports are a public API (`crates/tilth-core/tests/api.rs` pins them).
+
 ```
+crates/tilth-core/src/
+  lib.rs               Public API: the re-exports at the crate root. Every module is #[doc(hidden)] and shared with the binary.
+  lang/
+    mod.rs             Shared language infrastructure: detect_file_type(), package_root().
+    spec.rs            Per-language spec table (grammar, definition kinds, callee/sibling queries, stdlib rule, lexer flags).
+    outline.rs         Tree-sitter outline extraction: outline_language(), walk_top_level(), get_outline_entries().
+    treesitter.rs      Shared AST constants: DEFINITION_KINDS, extract_definition_name(), definition_weight().
+    detection.rs       Generated file detection (lockfiles, .min.js) and binary detection.
+    <lang>.rs          One spec per language. c.rs, cpp.rs and go.rs also hold test fixtures, shared with the binary's tests through the `test-fixtures` feature.
+  search/
+    walk.rs            The shared directory walker: SKIP_DIRS, .tilthignore, the gitignore switch, glob overrides.
+    callers.rs         Structural call-site detection (tree-sitter + memchr pre-filter): find_callers_batch(), CallerMatch.
+    callees.rs         Callee extraction and resolution for expanded definitions.
+    callee_query.rs    Per-language tree-sitter call-expression queries + compiled-Query cache, shared by callers.rs and callees.rs.
+    scope.rs           Enclosing-scope lookup: nearest definition at a line, qualified by containing type/module.
+    deps.rs            File-level dependency analysis: analyze_deps() → DepsResult.
+    bloom_walk.rs      Shared file-prefilter for relational queries (callers/callees/deps): size gate + bloom-filter pre-check before a full parse.
+  index/
+    bloom.rs           Bloom filter cache for fast "file contains symbol?" pre-check.
+  imports.rs           Import detection and resolution: is_import_line(), is_external(), resolve_related_files_with_content().
+  test_structure.rs    describe/it/test structure of a test file as data: test_entries().
+  cache.rs             OutlineCache — DashMap of path → (mtime, outline) and parsed trees. Shared across tools.
+  types.rs             Shared types: Lang, FileType, OutlineEntry, OutlineKind.
+  error.rs             TilthError, with exit codes.
 src/
   main.rs              CLI entry (clap). Dispatches to MCP, map, or single-query mode.
   lib.rs               Public API: classify query → read/search/glob → formatted output.
@@ -23,11 +49,6 @@ src/
       grok.rs          tool_grok — one-call symbol bundle, default vs full caps.
       session.rs       tool_session — summary/reset actions for grok dedup state.
   classify.rs          Query type detection (file path, glob, symbol, content, fallthrough).
-  lang/
-    mod.rs             Shared language infrastructure: detect_file_type(), package_root().
-    outline.rs         Tree-sitter outline extraction: outline_language(), walk_top_level(), get_outline_entries().
-    treesitter.rs      Shared AST constants: DEFINITION_KINDS, extract_definition_name(), definition_weight().
-    detection.rs       Generated file detection (lockfiles, .min.js) and binary detection.
   diff/
     mod.rs             Structural diff types, source resolution, orchestrator pipeline (diff()).
     parse.rs           Unified diff parser: git diff output → Vec<FileDiff>.
@@ -43,30 +64,22 @@ src/
       structured.rs    JSON/YAML/TOML structured outlines.
       tabular.rs       CSV/TSV outline: headers + row count + first 5 / last 3 rows via memchr.
       fallback.rs      head_tail() / log_view() — unknown files and logs with no outline support.
-      test_file.rs     Test file detection (suppresses outline noise).
-    imports.rs         Import extraction for deps analysis.
+      test_file.rs     Test-suite outline, rendered over tilth_core::test_entries().
   search/
     mod.rs             Search orchestration. Symbol, content, regex, callers search types.
     symbol.rs          AST-based symbol search (definitions first, then usages).
     content.rs         Literal text / regex search via ripgrep internals.
-    callers.rs         Structural call-site detection (tree-sitter + memchr pre-filter).
-    callees.rs         Callee extraction and resolution for expanded definitions.
-    callee_query.rs    Per-language tree-sitter call-expression queries + compiled-Query cache, shared by callers.rs and callees.rs.
+    callers.rs         Caller search output: ranks tilth_core's call sites, renders buckets and the 2nd-hop impact block.
     siblings.rs        Sibling symbol surfacing in search results.
-    scope.rs           Enclosing-scope lookup: nearest definition at a line, qualified by containing type/module.
     grok.rs            One-call symbol bundle (def + body + callers + callees + siblings + tests).
-    deps.rs            File-level dependency analysis (imports + dependents with symbols).
+    deps.rs            tilth_deps output: renders tilth_core's DepsResult with budget truncation.
     rank.rs            Result ranking (definition weight, basename boost, context proximity).
     facets.rs          Faceted result grouping (definitions, usages, implementations).
     strip.rs           Cognitive load stripping (comments, blank lines in expanded code).
     truncate.rs        Smart truncation to fit budget constraints.
     alloc.rs           Value-based budget allocation — keeps the highest-value blocks when output exceeds budget, not just positional tail-cut.
-    bloom_walk.rs      Shared file-prefilter for relational queries (callers/callees/deps): size gate + bloom-filter pre-check before a full parse.
     glob.rs            File glob search.
     blast.rs           Blast radius — find callers of definitions touched by edits.
-  index/
-    bloom.rs           Bloom filter cache for fast "file contains symbol?" pre-check.
-  cache.rs             OutlineCache — DashMap of path → (mtime, outline). Shared across tools.
   session.rs           MCP session state — tracks previously expanded definitions for dedup.
   edit.rs              Hash-anchored editing (tilth_write hash mode). Hashline verification + atomic apply.
   edit_parse_check.rs  Post-edit tree-sitter parse check — diffs pre/post ERROR/MISSING nodes so tilth_write reports only errors the edit introduced.
@@ -77,8 +90,7 @@ src/
   overview.rs          Project fingerprint for MCP initialization (manifest, languages, modules, deps, git). Instant orientation without a tool call.
   timeout.rs           Per-request wall-clock timeout for sync tool calls — worker thread + bounded channel, tracks abandoned threads on expiry.
   util.rs              atomic_write_bytes() — shared by edit.rs and install.rs.
-  types.rs             Shared types (QueryType, Lang, OutlineEntry, etc.).
-  error.rs             Error types with exit codes.
+  types.rs             Binary-only types (QueryType, ViewMode, Match, SearchResult, FacetTotals) and estimate_tokens().
 npm/                   npm wrapper — postinstall downloads binary, run.js proxies to it.
 scripts/fixtures/      setup_repos.py clones four real-world repos at pinned commits (README examples, speed table, parity checks).
 prompts/               MCP server instruction source (mcp-base.md + mcp-edit.md). Embedded into the binary at compile time and regenerated into AGENTS.md.
@@ -93,18 +105,20 @@ Dockerfile, Make detected but have no tree-sitter grammar (outline returns None)
 ## Build, test, install
 
 ```bash
-cargo build --release        # release build
-cargo test                   # unit tests (in-source #[cfg(test)] modules)
-cargo clippy --all-targets -- -D warnings  # lint (incl. tests)
-cargo fmt --check            # format check
+cargo build --release        # release build of the tilth binary
+cargo test --workspace       # unit tests of both crates + tilth-core's tests/api.rs
+cargo clippy --workspace --all-targets -- -D warnings  # lint (incl. tests)
+cargo fmt --all --check      # format check
 cargo install --path .       # install to ~/.cargo/bin/tilth
+cargo publish --dry-run -p tilth-core  # the library packages on its own
+python3 scripts/check/output_parity.py --base OLD --new NEW --repos <fixture repos>  # byte-for-byte output parity of two tilth builds
 ```
 
-CI runs `fmt --check`, `clippy --all-targets -D warnings`, `cargo test` on every push/PR.
+CI runs `fmt --all --check`, `clippy --workspace --all-targets -D warnings`, `cargo test --workspace` and the tilth-core publish dry-run on every push/PR.
 
 ## Version bumps
 
-Update version in **both** `Cargo.toml` and `npm/package.json`. Tag with `v<version>` on main.
+`tilth` and `tilth-core` share one version. Update it in `Cargo.toml` (the package version and both `tilth-core` dependency lines), `crates/tilth-core/Cargo.toml` and `npm/package.json`. Tag with `v<version>` on main. `release.yml` refuses a tag that any of these disagree with, and publishes `tilth-core` to crates.io before `tilth`, because the binary depends on it by version.
 
 Releases publish **two npm names** from the same `npm/` wrapper: the canonical unscoped `tilth` and the org anchor `@plotplot/tilth` (the `publish-npm` job renames the artifact and republishes with `--access public`). Both names have an OIDC trusted publisher on npmjs.com (`jahala/tilth` + `release.yml`), so releases need no token. `@plotplot/tilth` was bootstrapped with a one-time manual publish — npm cannot configure trusted publishing for a package that does not exist yet.
 

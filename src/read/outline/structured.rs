@@ -113,7 +113,7 @@ fn truncate_json_value(v: &serde_json::Value, max: usize) -> String {
     if s.len() > max {
         format!(
             "{}...",
-            crate::types::truncate_str(&s, max.saturating_sub(3))
+            tilth_core::types::truncate_str(&s, max.saturating_sub(3))
         )
     } else {
         s
@@ -151,7 +151,7 @@ fn yaml_outline(content: &str, max_lines: usize) -> String {
                     entries.push(format!("[{}] {prefix}{key}:", i + 1));
                 } else {
                     let val = if after_colon.len() > 40 {
-                        format!("{}...", crate::types::truncate_str(after_colon, 37))
+                        format!("{}...", tilth_core::types::truncate_str(after_colon, 37))
                     } else {
                         after_colon.to_string()
                     };
@@ -206,7 +206,7 @@ fn walk_toml(
                 _ => {
                     let val_str = val.to_string();
                     let truncated = if val_str.len() > 40 {
-                        format!("{}...", crate::types::truncate_str(&val_str, 37))
+                        format!("{}...", tilth_core::types::truncate_str(&val_str, 37))
                     } else {
                         val_str
                     };

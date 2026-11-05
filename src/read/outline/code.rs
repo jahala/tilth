@@ -1,5 +1,5 @@
-use crate::lang::outline::{extract_import_source, outline_language, walk_top_level};
-use crate::types::{Lang, OutlineEntry, OutlineKind};
+use tilth_core::lang::outline::{extract_import_source, outline_language, walk_top_level};
+use tilth_core::types::{Lang, OutlineEntry, OutlineKind};
 
 /// Generate a code outline using tree-sitter. Walks top-level AST nodes,
 /// emitting signatures without bodies.
@@ -192,7 +192,7 @@ fn format_entry(entry: &OutlineEntry, indent: usize, lang: Lang) -> String {
     let doc = match &entry.doc {
         Some(d) => {
             let truncated = if d.len() > 60 {
-                format!("{}...", crate::types::truncate_str(d, 57))
+                format!("{}...", tilth_core::types::truncate_str(d, 57))
             } else {
                 d.clone()
             };

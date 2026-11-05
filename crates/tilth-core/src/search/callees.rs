@@ -30,6 +30,7 @@ pub struct ResolvedCalleeNode {
 /// If `def_range` is `Some((start, end))`, only callees whose match position
 /// falls within lines `start..=end` (1-indexed) are returned.
 /// Returns a deduplicated, sorted list of callee names.
+#[must_use]
 pub fn extract_callee_names(
     content: &str,
     lang: Lang,
@@ -210,8 +211,7 @@ pub fn resolve_callees(
     }
 
     // 2. Check imported files
-    let imported =
-        crate::read::imports::resolve_related_files_with_content(source_path, source_content);
+    let imported = crate::imports::resolve_related_files_with_content(source_path, source_content);
 
     for import_path in imported {
         if remaining.is_empty() {
@@ -311,6 +311,7 @@ fn resolve_same_package(
 ///
 /// `budget` caps the total number of 2nd-hop (child) callees across all parents.
 /// Cycle detection prevents infinite loops via `(file, start_line)` tracking.
+#[must_use]
 pub fn resolve_callees_transitive(
     initial_names: &[String],
     source_path: &Path,

@@ -5,10 +5,10 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::cache::OutlineCache;
-use crate::index::bloom::BloomFilterCache;
 use crate::session::Session;
 use crate::timeout::{self, spawn_with_timeout, SpawnFailure, ThreadTracker};
+use tilth_core::cache::OutlineCache;
+use tilth_core::index::bloom::BloomFilterCache;
 
 mod tools;
 pub(crate) mod tree;
@@ -88,7 +88,7 @@ pub fn run(edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
         }
     } else {
         let cwd = std::env::current_dir().unwrap_or_default();
-        if let Some(root) = crate::lang::package_root(&cwd) {
+        if let Some(root) = tilth_core::lang::package_root(&cwd) {
             let _ = std::env::set_current_dir(root);
         }
     }
@@ -322,7 +322,7 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
         None => None,
         Some(value) => Some(value.as_bool().ok_or("gitignore must be a boolean")?),
     };
-    crate::search::with_gitignore_override(gitignore, || {
+    tilth_core::search::walk::with_gitignore_override(gitignore, || {
         let edit_mode = services.edit_mode();
         match tool {
             "tilth_read" => tool_read(args, services.cache(), services.session(), edit_mode),
@@ -528,7 +528,7 @@ mod tests {
         std::fs::create_dir_all(&subdir).unwrap();
 
         // package_root from the nested subdir should find the project root
-        let root = crate::lang::package_root(&subdir);
+        let root = tilth_core::lang::package_root(&subdir);
         assert!(root.is_some(), "package_root should find the project");
         // Compare canonicalized paths to handle macOS /var -> /private/var symlinks
         let root_canon = root.unwrap().canonicalize().unwrap();

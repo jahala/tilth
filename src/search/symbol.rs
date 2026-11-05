@@ -5,21 +5,22 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 
 use super::file_metadata;
-use crate::lang::elixir::is_elixir_definition;
-use crate::lang::spec::{spec, DefinitionOps, DEFAULT_DEFS, DEFAULT_DEF_KINDS};
-use crate::lang::treesitter::{
+use tilth_core::lang::elixir::is_elixir_definition;
+use tilth_core::lang::spec::{spec, DefinitionOps, DEFAULT_DEFS, DEFAULT_DEF_KINDS};
+use tilth_core::lang::treesitter::{
     extract_definition_name, extract_impl_trait, extract_impl_type, extract_implemented_interfaces,
     is_or_body_of, node_text_simple, NodeTextMode, NAMESPACE_KINDS, PASS_THROUGH_KINDS,
 };
 
-use crate::error::TilthError;
-use crate::lang::detect_file_type;
-use crate::lang::outline::{heading_text, outline_language, parse_markdown};
 use crate::search::rank;
-use crate::types::{FacetTotals, FileType, Match, SearchResult};
+use crate::types::{FacetTotals, Match, SearchResult};
 use grep_regex::RegexMatcher;
 use grep_searcher::sinks::UTF8;
 use grep_searcher::Searcher;
+use tilth_core::error::TilthError;
+use tilth_core::lang::detect_file_type;
+use tilth_core::lang::outline::{heading_text, outline_language, parse_markdown};
+use tilth_core::types::FileType;
 
 const MAX_MATCHES: usize = 10;
 /// Stop walking once we have this many raw definition matches.
@@ -81,15 +82,15 @@ pub fn search(
         reason: e.to_string(),
     })?;
 
-    let gitignore = super::call_gitignore_override();
+    let gitignore = tilth_core::search::walk::call_gitignore_override();
     let (defs, usages) = rayon::join(
         || {
-            super::with_gitignore_override(gitignore, || {
+            tilth_core::search::walk::with_gitignore_override(gitignore, || {
                 find_definitions(query, scope, glob, def_threshold)
             })
         },
         || {
-            super::with_gitignore_override(gitignore, || {
+            tilth_core::search::walk::with_gitignore_override(gitignore, || {
                 find_usages(query, &matcher, scope, glob, usage_threshold)
             })
         },
@@ -174,7 +175,7 @@ fn find_definitions(
     let found_count = AtomicUsize::new(0);
     let needle = query.as_bytes();
 
-    let walker = super::walker(scope, glob)?;
+    let walker = tilth_core::search::walk::walker(scope, glob)?;
 
     walker.run(|| {
         let matches = &matches;
@@ -200,7 +201,7 @@ fn find_definitions(
             if path
                 .file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(crate::lang::detection::is_minified_by_name)
+                .is_some_and(tilth_core::lang::detection::is_minified_by_name)
             {
                 return ignore::WalkState::Continue;
             }
@@ -227,8 +228,8 @@ fn find_definitions(
             }
 
             // Catch unmarked minified bundles that slipped past the filename check.
-            if file_size >= crate::lang::detection::MINIFIED_CHECK_THRESHOLD
-                && crate::lang::detection::is_minified_by_content(content.as_bytes())
+            if file_size >= tilth_core::lang::detection::MINIFIED_CHECK_THRESHOLD
+                && tilth_core::lang::detection::is_minified_by_content(content.as_bytes())
             {
                 return ignore::WalkState::Continue;
             }
@@ -305,7 +306,7 @@ fn find_defs_treesitter(
     path: &Path,
     query: &str,
     ts_lang: &tree_sitter::Language,
-    lang: Option<crate::types::Lang>,
+    lang: Option<tilth_core::types::Lang>,
     content: &str,
     file_lines: u32,
     mtime: SystemTime,
@@ -339,7 +340,7 @@ fn walk_for_definitions(
     file_lines: u32,
     mtime: SystemTime,
     defs: &mut Vec<Match>,
-    lang: Option<crate::types::Lang>,
+    lang: Option<tilth_core::types::Lang>,
     depth: usize,
 ) {
     if depth > 3 {
@@ -445,7 +446,7 @@ fn walk_for_definitions(
                 });
             }
         }
-    } else if lang == Some(crate::types::Lang::Elixir) && is_elixir_definition(node, lines) {
+    } else if lang == Some(tilth_core::types::Lang::Elixir) && is_elixir_definition(node, lines) {
         // Elixir: definitions are `call` nodes — check separately. Name and
         // weight come from `spec(Elixir).definitions` via `def_ops`.
         if let Some(name) = (def_ops.extract_name)(node, lines) {
@@ -567,7 +568,7 @@ fn find_usages(
     // Relaxed: same reasoning as find_definitions — approximate early-quit, joined before read
     let found_count = AtomicUsize::new(0);
 
-    let walker = super::walker(scope, glob)?;
+    let walker = tilth_core::search::walk::walker(scope, glob)?;
 
     walker.run(|| {
         let matches = &matches;
@@ -593,7 +594,7 @@ fn find_usages(
             if path
                 .file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(crate::lang::detection::is_minified_by_name)
+                .is_some_and(tilth_core::lang::detection::is_minified_by_name)
             {
                 return ignore::WalkState::Continue;
             }
@@ -617,8 +618,8 @@ fn find_usages(
 
             // Catch unmarked minified bundles between 100KB and 500KB — they
             // were not skipped by the filename check or the size cap above.
-            if file_size >= crate::lang::detection::MINIFIED_CHECK_THRESHOLD
-                && crate::lang::detection::is_minified_by_content(&bytes)
+            if file_size >= tilth_core::lang::detection::MINIFIED_CHECK_THRESHOLD
+                && tilth_core::lang::detection::is_minified_by_content(&bytes)
             {
                 return ignore::WalkState::Continue;
             }
@@ -878,13 +879,14 @@ pub(crate) fn dispatch_tool(tool: &str) -> Result<String, String> {
     }
 }
 "#;
-        let ts_lang = crate::lang::outline::outline_language(crate::types::Lang::Rust).unwrap();
+        let ts_lang =
+            tilth_core::lang::outline::outline_language(tilth_core::types::Lang::Rust).unwrap();
 
         let defs = find_defs_treesitter(
             std::path::Path::new("test.rs"),
             "hello",
             &ts_lang,
-            Some(crate::types::Lang::Rust),
+            Some(tilth_core::types::Lang::Rust),
             code,
             15,
             SystemTime::now(),
@@ -897,7 +899,7 @@ pub(crate) fn dispatch_tool(tool: &str) -> Result<String, String> {
             std::path::Path::new("test.rs"),
             "Foo",
             &ts_lang,
-            Some(crate::types::Lang::Rust),
+            Some(tilth_core::types::Lang::Rust),
             code,
             15,
             SystemTime::now(),
@@ -908,7 +910,7 @@ pub(crate) fn dispatch_tool(tool: &str) -> Result<String, String> {
             std::path::Path::new("test.rs"),
             "dispatch_tool",
             &ts_lang,
-            Some(crate::types::Lang::Rust),
+            Some(tilth_core::types::Lang::Rust),
             code,
             15,
             SystemTime::now(),
@@ -925,14 +927,15 @@ export const anotherConst = 42;
 const unexported = "hello";
 "#;
         let ts_lang =
-            crate::lang::outline::outline_language(crate::types::Lang::TypeScript).unwrap();
+            tilth_core::lang::outline::outline_language(tilth_core::types::Lang::TypeScript)
+                .unwrap();
         let lines = code.lines().count() as u32;
 
         let defs = find_defs_treesitter(
             std::path::Path::new("test.ts"),
             "UNTAGGED_REQUESTS_SQL",
             &ts_lang,
-            Some(crate::types::Lang::TypeScript),
+            Some(tilth_core::types::Lang::TypeScript),
             code,
             lines,
             SystemTime::now(),
@@ -949,7 +952,7 @@ const unexported = "hello";
             std::path::Path::new("test.ts"),
             "unexported",
             &ts_lang,
-            Some(crate::types::Lang::TypeScript),
+            Some(tilth_core::types::Lang::TypeScript),
             code,
             lines,
             SystemTime::now(),
@@ -960,13 +963,14 @@ const unexported = "hello";
 
     /// Helper: search for an Elixir definition by name in a code snippet.
     fn elixir_find(code: &str, name: &str) -> Vec<Match> {
-        let ts_lang = crate::lang::outline::outline_language(crate::types::Lang::Elixir).unwrap();
+        let ts_lang =
+            tilth_core::lang::outline::outline_language(tilth_core::types::Lang::Elixir).unwrap();
         let lines = code.lines().count() as u32;
         find_defs_treesitter(
             std::path::Path::new("test.ex"),
             name,
             &ts_lang,
-            Some(crate::types::Lang::Elixir),
+            Some(tilth_core::types::Lang::Elixir),
             code,
             lines,
             SystemTime::now(),
@@ -1407,7 +1411,7 @@ Body to end.
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             dir.path().join("main.go"),
-            crate::lang::go::GO_DECLARATIONS_FIXTURE,
+            tilth_core::lang::go::GO_DECLARATIONS_FIXTURE,
         )
         .expect("write fixture");
         let result = search(query, dir.path(), None, None, false).expect("search");
@@ -1441,12 +1445,13 @@ Body to end.
 
     /// Find Go definitions of `name` in `code` with the tree-sitter walker.
     fn go_find(code: &str, name: &str) -> Vec<Match> {
-        let ts_lang = crate::lang::outline::outline_language(crate::types::Lang::Go).unwrap();
+        let ts_lang =
+            tilth_core::lang::outline::outline_language(tilth_core::types::Lang::Go).unwrap();
         find_defs_treesitter(
             std::path::Path::new("main.go"),
             name,
             &ts_lang,
-            Some(crate::types::Lang::Go),
+            Some(tilth_core::types::Lang::Go),
             code,
             code.lines().count() as u32,
             SystemTime::now(),
@@ -1455,7 +1460,7 @@ Body to end.
 
     #[test]
     fn go_package_level_declarations_detected() {
-        let code = crate::lang::go::GO_DECLARATIONS_FIXTURE;
+        let code = tilth_core::lang::go::GO_DECLARATIONS_FIXTURE;
         for (name, line) in [
             ("StatusInactive", 5),
             ("Version", 7),
@@ -1556,7 +1561,7 @@ func run() {
         // prototype of `add` (line 9) is not a definition, nor is the forward
         // `struct point;` (line 3) or the bodiless `struct point` return type
         // of `origin` (line 17).
-        let fixture = crate::lang::c::C_DEFINITIONS_FIXTURE;
+        let fixture = tilth_core::lang::c::C_DEFINITIONS_FIXTURE;
         for (query, expected) in [
             ("add", vec![11]),
             ("make", vec![14]),
@@ -1583,7 +1588,7 @@ func run() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             dir.path().join("shapes.c"),
-            crate::lang::c::C_DEFINITIONS_FIXTURE,
+            tilth_core::lang::c::C_DEFINITIONS_FIXTURE,
         )
         .expect("write fixture");
         let result = search("add", dir.path(), None, None, false).expect("search");
@@ -1607,7 +1612,7 @@ func run() {
         // In-class declarations (lines 4, 8), the namespace-level prototype
         // (line 14) and the forward `class Forward;` (line 12) are not. A
         // constructor defines its class's name too (line 10).
-        let fixture = crate::lang::cpp::CPP_DEFINITIONS_FIXTURE;
+        let fixture = tilth_core::lang::cpp::CPP_DEFINITIONS_FIXTURE;
         for (query, expected) in [
             ("ref", vec![1]),
             ("Shape", vec![2, 10]),
@@ -1635,14 +1640,15 @@ func run() {
     fn cpp_destructor_and_operator_definitions_keep_their_spelling() {
         // `~Shape` and `operator==` are not words the usage regex can match, so
         // check the definition walker directly.
-        let code = crate::lang::cpp::CPP_DEFINITIONS_FIXTURE;
-        let ts_lang = crate::lang::outline::outline_language(crate::types::Lang::Cpp).unwrap();
+        let code = tilth_core::lang::cpp::CPP_DEFINITIONS_FIXTURE;
+        let ts_lang =
+            tilth_core::lang::outline::outline_language(tilth_core::types::Lang::Cpp).unwrap();
         for (name, line) in [("~Shape", 5), ("operator==", 7)] {
             let defs = find_defs_treesitter(
                 std::path::Path::new("shapes.cpp"),
                 name,
                 &ts_lang,
-                Some(crate::types::Lang::Cpp),
+                Some(tilth_core::types::Lang::Cpp),
                 code,
                 code.lines().count() as u32,
                 SystemTime::now(),

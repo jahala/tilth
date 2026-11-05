@@ -2,7 +2,8 @@ use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 
-use crate::types::{is_test_file, Match};
+use crate::types::Match;
+use tilth_core::types::is_test_file;
 
 const VENDOR_DIRS: &[&str] = &[
     "node_modules",
@@ -24,7 +25,7 @@ pub fn sort(matches: &mut [Match], query: &str, scope: &Path, context: Option<&P
     // Pre-compute context's package root once (same for entire batch)
     let ctx_parent = context.and_then(|c| c.parent());
     let ctx_pkg_root = context
-        .and_then(crate::lang::package_root)
+        .and_then(tilth_core::lang::package_root)
         .map(std::path::Path::to_path_buf);
 
     // Cache package roots for match paths — avoids repeated stat walks
@@ -74,7 +75,7 @@ pub(crate) fn retain_top_k(
 
     let ctx_parent = context.and_then(|c| c.parent());
     let ctx_pkg_root = context
-        .and_then(crate::lang::package_root)
+        .and_then(tilth_core::lang::package_root)
         .map(std::path::Path::to_path_buf);
     let mut pkg_cache: HashMap<PathBuf, Option<PathBuf>> = HashMap::new();
     let now = SystemTime::now();
@@ -230,7 +231,7 @@ fn context_proximity(
             None => return score,
         };
         let match_root = pkg_cache.entry(match_dir).or_insert_with_key(|dir| {
-            crate::lang::package_root(dir).map(std::path::Path::to_path_buf)
+            tilth_core::lang::package_root(dir).map(std::path::Path::to_path_buf)
         });
         if let Some(ref mr) = match_root {
             if mr == cp_root {

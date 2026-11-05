@@ -3,12 +3,13 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::cache::OutlineCache;
-use crate::error::TilthError;
-use crate::lang::detect_file_type;
-use crate::lang::outline::get_outline_entries;
 use crate::session::Session;
-use crate::types::{FileType, OutlineEntry, ViewMode};
+use crate::types::ViewMode;
+use tilth_core::cache::OutlineCache;
+use tilth_core::error::TilthError;
+use tilth_core::lang::detect_file_type;
+use tilth_core::lang::outline::get_outline_entries;
+use tilth_core::types::{FileType, OutlineEntry};
 
 use super::apply_budget;
 
@@ -160,7 +161,7 @@ pub(in crate::mcp) fn tool_read(
 
     // Append related-file hint for outlined code files (not section reads, not batch).
     if section.is_none() && crate::read::would_outline(&path) {
-        let related = crate::read::imports::resolve_related_files(&path);
+        let related = tilth_core::imports::resolve_related_files(&path);
         if !related.is_empty() {
             output.push_str("\n\n> Related: ");
             for (i, p) in related.iter().enumerate() {

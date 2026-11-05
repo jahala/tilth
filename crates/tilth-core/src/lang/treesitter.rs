@@ -64,7 +64,7 @@ pub(crate) fn is_type_reference(node: tree_sitter::Node) -> bool {
 /// preprocessor conditionals (an include guard wraps a whole header), C++
 /// `extern "C" { ... }` blocks and `template <...>` prefixes. The definitions
 /// inside count as if the wrapper were not there.
-pub(crate) const PASS_THROUGH_KINDS: &[&str] = &[
+pub const PASS_THROUGH_KINDS: &[&str] = &[
     "preproc_if",
     "preproc_ifdef",
     "preproc_elif",
@@ -76,7 +76,7 @@ pub(crate) const PASS_THROUGH_KINDS: &[&str] = &[
 
 /// Namespace nodes (C++, C#, PHP). A namespace is a definition with a name, but
 /// it does not nest its members the way a class does.
-pub(crate) const NAMESPACE_KINDS: &[&str] = &[
+pub const NAMESPACE_KINDS: &[&str] = &[
     "namespace_declaration",
     "namespace_definition",
     "file_scoped_namespace_declaration",
@@ -84,7 +84,8 @@ pub(crate) const NAMESPACE_KINDS: &[&str] = &[
 
 /// Whether `node` is one of `kinds`, or the `declaration_list` that holds the
 /// body of one (`namespace geo { ... }`, `extern "C" { ... }`).
-pub(crate) fn is_or_body_of(node: tree_sitter::Node, kinds: &[&str]) -> bool {
+#[must_use]
+pub fn is_or_body_of(node: tree_sitter::Node, kinds: &[&str]) -> bool {
     kinds.contains(&node.kind())
         || (node.kind() == "declaration_list"
             && node.parent().is_some_and(|p| kinds.contains(&p.kind())))
@@ -142,7 +143,8 @@ fn name_text(node: tree_sitter::Node, lines: &[&str]) -> String {
 /// declarator chains to the declared identifier, and handles export
 /// statements and JS/TS/C# variable declarations. A C/C++ type specifier
 /// without a body defines nothing, so it has no name.
-pub(crate) fn extract_definition_name(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
+#[must_use]
+pub fn extract_definition_name(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
     if is_type_reference(node) {
         return None;
     }
@@ -190,7 +192,7 @@ pub(crate) fn extract_definition_name(node: tree_sitter::Node, lines: &[&str]) -
 
 /// Controls how [`node_text_simple`] renders a node that spans multiple lines.
 #[derive(Clone, Copy)]
-pub(crate) enum NodeTextMode {
+pub enum NodeTextMode {
     /// Return the node's start line untruncated.
     Full,
     /// Truncate the node's start line to roughly 80 characters.
@@ -203,11 +205,8 @@ pub(crate) enum NodeTextMode {
 /// returns only the start line (start column to end-of-line) — never the full
 /// multi-line span; `mode` then decides whether that start line is returned in
 /// full or truncated.
-pub(crate) fn node_text_simple(
-    node: tree_sitter::Node,
-    lines: &[&str],
-    mode: NodeTextMode,
-) -> String {
+#[must_use]
+pub fn node_text_simple(node: tree_sitter::Node, lines: &[&str], mode: NodeTextMode) -> String {
     let row = node.start_position().row;
     let col_start = node.start_position().column;
     let end_row = node.end_position().row;
@@ -233,23 +232,23 @@ pub(crate) fn node_text_simple(
 
 /// Extract trait name from Rust `impl Trait for Type` node.
 /// Returns None for inherent impls (no trait).
-pub(crate) fn extract_impl_trait(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
+#[must_use]
+pub fn extract_impl_trait(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
     let trait_node = node.child_by_field_name("trait")?;
     Some(node_text_simple(trait_node, lines, NodeTextMode::Full))
 }
 
 /// Extract implementing type from Rust `impl ... for Type` node.
-pub(crate) fn extract_impl_type(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
+#[must_use]
+pub fn extract_impl_type(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
     let type_node = node.child_by_field_name("type")?;
     Some(node_text_simple(type_node, lines, NodeTextMode::Full))
 }
 
 /// Extract implemented interface names from TS/Java class declaration.
 /// Walks `implements_clause` (TS) and `super_interfaces` (Java) children.
-pub(crate) fn extract_implemented_interfaces(
-    node: tree_sitter::Node,
-    lines: &[&str],
-) -> Vec<String> {
+#[must_use]
+pub fn extract_implemented_interfaces(node: tree_sitter::Node, lines: &[&str]) -> Vec<String> {
     let mut interfaces = Vec::new();
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
@@ -358,7 +357,7 @@ static QUERY_CACHE: LazyLock<Mutex<HashMap<(usize, usize, usize), tree_sitter::Q
 ///
 /// `query_str` must be `'static` so its pointer address is stable across
 /// calls and can serve as part of the cache key.
-pub(crate) fn with_query<R>(
+pub fn with_query<R>(
     ts_lang: &tree_sitter::Language,
     query_str: &'static str,
     f: impl FnOnce(&tree_sitter::Query) -> R,

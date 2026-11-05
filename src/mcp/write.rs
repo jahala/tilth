@@ -138,7 +138,7 @@ mod tests {
         std::fs::write(&p, &content).unwrap();
 
         let stop = AtomicBool::new(false);
-        let cache = crate::cache::OutlineCache::new();
+        let cache = tilth_core::cache::OutlineCache::new();
         std::thread::scope(|s| {
             s.spawn(|| {
                 while !stop.load(Ordering::Relaxed) {

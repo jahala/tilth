@@ -59,7 +59,8 @@ pub(crate) const SPEC: LangSpec = LangSpec {
 /// Check if a tree-sitter node is an Elixir definition.
 /// In Elixir all definitions are `call` nodes whose `target` identifier
 /// is one of `defmodule`, `def`, `defp`, etc.
-pub(crate) fn is_elixir_definition(node: tree_sitter::Node, lines: &[&str]) -> bool {
+#[must_use]
+pub fn is_elixir_definition(node: tree_sitter::Node, lines: &[&str]) -> bool {
     if node.kind() != "call" {
         return false;
     }

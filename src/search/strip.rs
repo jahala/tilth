@@ -6,9 +6,9 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use crate::lang::detect_file_type;
-use crate::lang::spec::{spec, StripFamily};
-use crate::types::FileType;
+use tilth_core::lang::detect_file_type;
+use tilth_core::lang::spec::{spec, StripFamily};
+use tilth_core::types::FileType;
 
 /// Detect the stripping comment-syntax family for a file.
 ///

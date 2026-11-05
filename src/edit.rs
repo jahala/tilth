@@ -6,10 +6,10 @@ use std::sync::{Arc, LazyLock, Mutex};
 use dashmap::DashMap;
 use rayon::prelude::*;
 
-use crate::error::TilthError;
 use crate::format;
-use crate::index::bloom::BloomFilterCache;
 use crate::util::WriteOutcome;
+use tilth_core::error::TilthError;
+use tilth_core::index::bloom::BloomFilterCache;
 
 /// One write guard per file, keyed by [`normalize_path_key`].
 ///
@@ -560,7 +560,7 @@ fn render_applied(
                 output.push_str(&parse);
             }
             let abs_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-            let scope = crate::lang::package_root(&abs_path).map_or_else(
+            let scope = tilth_core::lang::package_root(&abs_path).map_or_else(
                 || std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
                 Path::to_path_buf,
             );

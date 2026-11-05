@@ -137,8 +137,9 @@ pub(crate) fn extract_go_receiver_name(
 /// grok must see: a grouped `const` block, a single `const`, a `var`, a struct
 /// `type` and a function. Shared by the Go tests in `lang::outline`,
 /// `search::symbol` and `search::grok` so they pin one source.
-#[cfg(test)]
-pub(crate) const GO_DECLARATIONS_FIXTURE: &str = "package main
+#[cfg(any(test, feature = "test-fixtures"))]
+#[doc(hidden)]
+pub const GO_DECLARATIONS_FIXTURE: &str = "package main
 
 const (
     StatusActive   = \"active\"

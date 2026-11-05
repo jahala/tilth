@@ -15,16 +15,12 @@
 )]
 
 pub(crate) mod budget;
-pub mod cache;
 pub(crate) mod classify;
 pub mod diff;
 pub(crate) mod edit;
 pub(crate) mod edit_parse_check;
-pub mod error;
 pub(crate) mod format;
-pub mod index;
 pub mod install;
-pub(crate) mod lang;
 pub mod map;
 pub mod mcp;
 pub mod overview;
@@ -44,7 +40,7 @@ pub mod __fuzz {
     use std::path::Path;
 
     pub use crate::read::outline::code::outline;
-    pub use crate::types::Lang;
+    pub use tilth_core::types::Lang;
 
     /// Wrapper: `strip_noise` is `pub(crate)`, so we re-export via a function
     /// rather than `pub use` (which Rust forbids for less-visible items).
@@ -62,9 +58,9 @@ pub mod __fuzz {
 
 use std::path::Path;
 
-use cache::OutlineCache;
 use classify::classify;
-use error::TilthError;
+use tilth_core::cache::OutlineCache;
+use tilth_core::TilthError;
 use types::QueryType;
 
 /// What a caller that refuses a file-valued scope can offer instead.
@@ -113,7 +109,7 @@ pub fn refuse_file_scope(raw: &Path, resolved: &Path, hint: FileScopeHint) -> Re
 /// Avoids scattered `Option<T>` + `unwrap()` throughout dispatch.
 struct ExpandedCtx {
     session: session::Session,
-    bloom: index::bloom::BloomFilterCache,
+    bloom: tilth_core::BloomFilterCache,
     expand: usize,
     /// Raises the search match cap (10 → 100). Driven by the explicit `--full`
     /// flag, NOT by `full = !is_tty`. Piped invocation must preserve the
@@ -216,7 +212,7 @@ pub fn run_callers(
     glob: Option<&str>,
     full: bool,
 ) -> Result<String, TilthError> {
-    let bloom = index::bloom::BloomFilterCache::new();
+    let bloom = tilth_core::BloomFilterCache::new();
     let expand = if expand > 0 { expand } else { 2 };
     let output =
         search::callers::search_callers_expanded(target, scope, &bloom, expand, None, glob, full)?;
@@ -232,8 +228,8 @@ pub fn run_deps(
     scope: &Path,
     budget_tokens: Option<u64>,
 ) -> Result<String, TilthError> {
-    let bloom = index::bloom::BloomFilterCache::new();
-    let result = search::deps::analyze_deps(path, scope, &bloom)?;
+    let bloom = tilth_core::BloomFilterCache::new();
+    let result = tilth_core::analyze_deps(path, scope, &bloom)?;
     let budget_usize = budget_tokens.map(|b| b as usize);
     Ok(search::deps::format_deps(&result, scope, budget_usize))
 }
@@ -243,7 +239,7 @@ pub fn run_deps(
 /// `target_spec` accepts a bare symbol name (`parse_unified_diff`), a path:line
 /// pair (`src/diff/parse.rs:7`), or a `Type::method` reference.
 pub fn run_grok(target_spec: &str, scope: &Path, full: bool) -> Result<String, TilthError> {
-    let bloom = index::bloom::BloomFilterCache::new();
+    let bloom = tilth_core::BloomFilterCache::new();
     let session = session::Session::default();
     let caps = if full {
         search::grok::GrokCaps::full()
@@ -293,7 +289,7 @@ fn run_inner(
         }
         if parts.len() >= 2 && parts.len() <= 5 && all_identifiers {
             let session = session::Session::new();
-            let bloom = index::bloom::BloomFilterCache::new();
+            let bloom = tilth_core::BloomFilterCache::new();
             let expand = if expand > 0 { expand } else { 2 };
             let output = search::search_multi_symbol_expanded(
                 &parts,
@@ -322,7 +318,7 @@ fn run_inner(
         QueryType::FilePath(path) => {
             let mut out = read::read_file(&path, section, full, cache, false)?;
             if section.is_none() && !full && read::would_outline(&path) {
-                let related = read::imports::resolve_related_files(&path);
+                let related = tilth_core::imports::resolve_related_files(&path);
                 if !related.is_empty() {
                     let hints: Vec<String> = related
                         .iter()
@@ -339,7 +335,7 @@ fn run_inner(
         _ if use_expanded => {
             let ctx = ExpandedCtx {
                 session: session::Session::new(),
-                bloom: index::bloom::BloomFilterCache::new(),
+                bloom: tilth_core::BloomFilterCache::new(),
                 expand,
                 full_search: cli_full,
                 budget: budget_tokens,
@@ -480,11 +476,11 @@ fn run_query_basic(
 fn single_query_search(
     text: &str,
     scope: &Path,
-    cache: &cache::OutlineCache,
+    cache: &OutlineCache,
     prefer_definitions: bool,
     glob: Option<&str>,
     full_search: bool,
-) -> Result<String, error::TilthError> {
+) -> Result<String, TilthError> {
     let sym_result = search::search_symbol_raw(text, scope, glob, full_search)?;
     let accept_sym = if prefer_definitions {
         sym_result.definitions > 0
@@ -506,7 +502,7 @@ fn single_query_search(
         return search::format_raw_result(&sym_result, cache);
     }
 
-    Err(error::TilthError::NotFound {
+    Err(TilthError::NotFound {
         path: scope.join(text),
         suggestion: read::suggest_similar_file(scope, text),
     })
@@ -516,10 +512,10 @@ fn single_query_search(
 fn multi_word_concept_search(
     text: &str,
     scope: &Path,
-    cache: &cache::OutlineCache,
+    cache: &OutlineCache,
     glob: Option<&str>,
     full_search: bool,
-) -> Result<String, error::TilthError> {
+) -> Result<String, TilthError> {
     // Try exact phrase match first
     let mut content_result = search::search_content_raw(text, scope, glob, full_search)?;
     content_result.query = text.to_string();
@@ -553,7 +549,7 @@ fn multi_word_concept_search(
     }
 
     let first_word = words.first().copied().unwrap_or(text);
-    Err(error::TilthError::NotFound {
+    Err(TilthError::NotFound {
         path: scope.join(text),
         suggestion: read::suggest_similar_file(scope, first_word),
     })

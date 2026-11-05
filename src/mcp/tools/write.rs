@@ -16,8 +16,8 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::index::bloom::BloomFilterCache;
 use crate::session::Session;
+use tilth_core::index::bloom::BloomFilterCache;
 
 /// Parse one `files[]` entry into a hash-mode edit task. Parse errors are
 /// deferred onto the task so a malformed entry surfaces as a per-file failure
@@ -390,7 +390,7 @@ pub(in crate::mcp) fn tool_write(
                         direct_results.push(format!(
                             "## {}\nerror: {}",
                             path.display(),
-                            crate::error::TilthError::AlreadyExists { path: path.clone() }
+                            tilth_core::error::TilthError::AlreadyExists { path: path.clone() }
                         ));
                     }
                     Err(e) => direct_results.push(format!("## {}\nerror: {e}", path.display())),

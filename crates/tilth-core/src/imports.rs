@@ -11,6 +11,7 @@ const MAX_SUGGESTIONS: usize = 8;
 
 /// Extract import sources from a code file and resolve them to existing local file paths.
 /// Returns empty Vec for non-code files, files with no imports, or when all imports are external.
+#[must_use]
 pub fn resolve_related_files(file_path: &Path) -> Vec<PathBuf> {
     let Ok(content) = fs::read_to_string(file_path) else {
         return Vec::new();
@@ -19,6 +20,7 @@ pub fn resolve_related_files(file_path: &Path) -> Vec<PathBuf> {
 }
 
 /// Same as `resolve_related_files` but takes pre-read content to avoid a redundant file read.
+#[must_use]
 pub fn resolve_related_files_with_content(file_path: &Path, content: &str) -> Vec<PathBuf> {
     let FileType::Code(lang) = detect_file_type(file_path) else {
         return Vec::new();
@@ -49,7 +51,8 @@ pub fn resolve_related_files_with_content(file_path: &Path, content: &str) -> Ve
     results
 }
 
-pub(crate) fn is_import_line(line: &str, lang: Lang) -> bool {
+#[must_use]
+pub fn is_import_line(line: &str, lang: Lang) -> bool {
     let trimmed = line.trim_start();
     match lang {
         Lang::Rust => trimmed.starts_with("use "),
@@ -73,7 +76,8 @@ pub(crate) fn is_import_line(line: &str, lang: Lang) -> bool {
     }
 }
 
-pub(crate) fn is_external(source: &str, lang: Lang) -> bool {
+#[must_use]
+pub fn is_external(source: &str, lang: Lang) -> bool {
     match lang {
         Lang::Rust => {
             !(source.starts_with("crate::")

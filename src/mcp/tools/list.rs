@@ -59,7 +59,7 @@ pub(in crate::mcp) fn tool_list(args: &Value) -> Result<String, String> {
     // by `depth` (ignore's max_depth: root=0, direct children=1 — matches
     // rel.components().count() for a top-level file, so depth:1 keeps it),
     // and collect every file matching any pattern into one token-rolled-up tree.
-    let mut builder = crate::search::base_walk_builder(&scope);
+    let mut builder = tilth_core::search::walk::base_walk_builder(&scope);
     if let Some(d) = depth {
         builder.max_depth(Some(d));
     }

@@ -10,10 +10,10 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
-use crate::lang::detect_file_type;
-use crate::read::imports::is_import_line;
-use crate::search::SKIP_DIRS;
-use crate::types::{FileType, Lang};
+use tilth_core::imports::is_import_line;
+use tilth_core::lang::detect_file_type;
+use tilth_core::search::walk::SKIP_DIRS;
+use tilth_core::types::{FileType, Lang};
 
 /// Compute a project fingerprint for MCP initialization.
 /// Must be fast (<250ms) — runs synchronously in the initialize handler.
@@ -236,7 +236,7 @@ fn common_dir_prefix(mods: &[(String, usize)]) -> String {
 // ---------------------------------------------------------------------------
 
 fn lang_display_name(lang: Lang) -> &'static str {
-    crate::lang::spec::spec(lang).display
+    tilth_core::lang::spec::spec(lang).display
 }
 
 // ---------------------------------------------------------------------------
@@ -717,7 +717,7 @@ fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opti
         };
 
         // Resolve imports to actual file paths using the proven import resolver
-        let resolved = crate::read::imports::resolve_related_files_with_content(&full, &content);
+        let resolved = tilth_core::imports::resolve_related_files_with_content(&full, &content);
         for target_path in resolved {
             *path_counts.entry(target_path).or_insert(0) += 1;
         }
@@ -725,8 +725,8 @@ fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opti
         // Collect import source strings for symbol extraction
         for line in content.lines() {
             if is_import_line(line, lang) {
-                let source = crate::lang::outline::extract_import_source(line, Some(lang));
-                if !source.is_empty() && !crate::read::imports::is_external(&source, lang) {
+                let source = tilth_core::lang::outline::extract_import_source(line, Some(lang));
+                if !source.is_empty() && !tilth_core::imports::is_external(&source, lang) {
                     all_import_sources.push(source);
                 }
             }
@@ -771,7 +771,7 @@ fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opti
             let mut symbol_counts: HashMap<String, usize> = HashMap::new();
             for source in &all_import_sources {
                 // Match imports that reference this module
-                // e.g., for module "types": "crate::types::OutlineEntry" matches
+                // e.g., for module "types": "tilth_core::types::OutlineEntry" matches
                 let segments: Vec<&str> = source.split("::").collect();
                 if let Some(mod_pos) = segments.iter().position(|s| *s == module_name) {
                     // Everything after the module name is a symbol path

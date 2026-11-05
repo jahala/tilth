@@ -3,7 +3,7 @@
 /// so heading hierarchy + section spans drop out of the AST instead of
 /// requiring a hand-rolled fence-aware ATX scan. Fenced code blocks are
 /// `fenced_code_block` nodes and never produce false-positive headings.
-use crate::lang::outline::{heading_level, heading_text, parse_markdown};
+use tilth_core::lang::outline::{heading_level, heading_text, parse_markdown};
 
 pub fn outline(buf: &[u8], max_lines: usize) -> String {
     let Ok(content) = std::str::from_utf8(buf) else {
@@ -76,7 +76,7 @@ fn emit_section_heading(section: tree_sitter::Node, lines: &[&str], entries: &mu
         let indent = "  ".repeat((level as usize).saturating_sub(1));
         let hashes = "#".repeat(level as usize);
         let display = if text.len() > 80 {
-            format!("{}...", crate::types::truncate_str(&text, 77))
+            format!("{}...", tilth_core::types::truncate_str(&text, 77))
         } else {
             text
         };

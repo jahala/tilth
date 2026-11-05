@@ -16,7 +16,7 @@ Only the latest minor release receives security updates. Older versions don't.
 
 tilth runs:
 
-- **Unit and integration tests** on every push (`cargo test`).
+- **Unit and integration tests** on every push (`cargo test --workspace`).
 - **CodeQL** static analysis on Rust, Python, and JavaScript on every push.
 - **OpenSSF Scorecard** weekly, results uploaded to the Code scanning view.
 - **cargo-fuzz** nightly across three input surfaces — `outline` (tree-sitter outline rendering across 18 languages), `strip` (comment / debug-log stripping), and `diff_parse` (unified diff parser). See `.github/workflows/fuzz.yml`. Crash artifacts land in the workflow run on failure; corpus is cached across runs.

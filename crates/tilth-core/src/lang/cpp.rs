@@ -43,8 +43,9 @@ pub(crate) const SPEC: LangSpec = LangSpec {
 /// and 8), the namespace-level prototype (line 14) and the forward
 /// `class Forward;` (line 12) must not count as definitions. Shared by the
 /// C++ tests in `lang::outline`, `search::symbol` and `search::scope`.
-#[cfg(test)]
-pub(crate) const CPP_DEFINITIONS_FIXTURE: &str = "int &ref(int &x) { return x; }
+#[cfg(any(test, feature = "test-fixtures"))]
+#[doc(hidden)]
+pub const CPP_DEFINITIONS_FIXTURE: &str = "int &ref(int &x) { return x; }
 class Shape {
  public:
   Shape();

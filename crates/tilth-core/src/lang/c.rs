@@ -44,8 +44,9 @@ pub(crate) const SPEC: LangSpec = LangSpec {
 /// `struct point` used as a return type (line 17). The include guard wraps the
 /// type definitions, as it does in a header. Shared by the C tests in
 /// `lang::outline`, `search::symbol` and `search::scope`.
-#[cfg(test)]
-pub(crate) const C_DEFINITIONS_FIXTURE: &str = "#ifndef SHAPES_H
+#[cfg(any(test, feature = "test-fixtures"))]
+#[doc(hidden)]
+pub const C_DEFINITIONS_FIXTURE: &str = "#ifndef SHAPES_H
 #define SHAPES_H
 struct point;
 struct point { int x; int y; };
