@@ -45,22 +45,113 @@ pub(crate) const DEFINITION_KINDS: &[&str] = &[
     "export_statement",
 ];
 
+/// C and C++ type specifiers. With a body they define a type; without one
+/// (`struct point *p`, `class Forward;`) they name a type defined elsewhere.
+const C_TYPE_SPECIFIERS: &[&str] = &[
+    "class_specifier",
+    "struct_specifier",
+    "union_specifier",
+    "enum_specifier",
+];
+
+/// Whether `node` is a C/C++ type specifier that names an existing type rather
+/// than defining one: `struct point` with no `{ ... }` body.
+pub(crate) fn is_type_reference(node: tree_sitter::Node) -> bool {
+    C_TYPE_SPECIFIERS.contains(&node.kind()) && node.child_by_field_name("body").is_none()
+}
+
+/// Nodes that group definitions without adding a scope of their own: C
+/// preprocessor conditionals (an include guard wraps a whole header), C++
+/// `extern "C" { ... }` blocks and `template <...>` prefixes. The definitions
+/// inside count as if the wrapper were not there.
+pub(crate) const PASS_THROUGH_KINDS: &[&str] = &[
+    "preproc_if",
+    "preproc_ifdef",
+    "preproc_elif",
+    "preproc_elifdef",
+    "preproc_else",
+    "linkage_specification",
+    "template_declaration",
+];
+
+/// Namespace nodes (C++, C#, PHP). A namespace is a definition with a name, but
+/// it does not nest its members the way a class does.
+pub(crate) const NAMESPACE_KINDS: &[&str] = &[
+    "namespace_declaration",
+    "namespace_definition",
+    "file_scoped_namespace_declaration",
+];
+
+/// Whether `node` is one of `kinds`, or the `declaration_list` that holds the
+/// body of one (`namespace geo { ... }`, `extern "C" { ... }`).
+pub(crate) fn is_or_body_of(node: tree_sitter::Node, kinds: &[&str]) -> bool {
+    kinds.contains(&node.kind())
+        || (node.kind() == "declaration_list"
+            && node.parent().is_some_and(|p| kinds.contains(&p.kind())))
+}
+
+/// Follow a declarator chain down to the node that holds the declared name.
+///
+/// A C/C++ declaration keeps its name at the bottom of a chain of declarators:
+/// `int *make(void)` is a pointer declarator around a function declarator
+/// around `make`. Reference and parenthesised declarators hold their inner
+/// declarator as an unnamed child. In C++ the name can also sit behind a scope
+/// (`Shape::sides`) or template arguments (`biggest<int>`); the declared name
+/// is the last segment. JS, TS and Java `variable_declarator`s keep theirs in
+/// a `name` field.
+fn declared_name(mut node: tree_sitter::Node) -> tree_sitter::Node {
+    loop {
+        let kind = node.kind();
+        let inner = if kind == "qualified_identifier" || kind == "template_function" {
+            node.child_by_field_name("name")
+        } else if kind.ends_with("declarator") {
+            node.child_by_field_name("declarator")
+                .or_else(|| node.child_by_field_name("name"))
+                .or_else(|| node.named_child(0))
+        } else {
+            None
+        };
+        match inner {
+            Some(next) => node = next,
+            None => return node,
+        }
+    }
+}
+
+/// The text of a declared-name node. A C++ conversion operator
+/// (`operator bool() const`) carries its parameter list as a declarator of its
+/// own; its name is the text before that declarator.
+fn name_text(node: tree_sitter::Node, lines: &[&str]) -> String {
+    if node.kind() == "operator_cast" {
+        if let Some(params) = node.child_by_field_name("declarator") {
+            let start = node.start_position();
+            let end = params.start_position();
+            if start.row == end.row && start.row < lines.len() {
+                if let Some(text) = lines[start.row].get(start.column..end.column) {
+                    return text.trim_end().to_string();
+                }
+            }
+        }
+    }
+    node_text_simple(node, lines, NodeTextMode::Full)
+}
+
 /// Extract the name defined by a tree-sitter definition node.
 ///
-/// Walks standard field names (`name`, `identifier`, `declarator`) and handles
-/// nested declarators and export statements.
+/// Walks standard field names (`name`, `identifier`, `declarator`), follows
+/// declarator chains to the declared identifier, and handles export
+/// statements and JS/TS/C# variable declarations. A C/C++ type specifier
+/// without a body defines nothing, so it has no name.
 pub(crate) fn extract_definition_name(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
+    if is_type_reference(node) {
+        return None;
+    }
+
     // Try standard field names
     for field in &["name", "identifier", "declarator"] {
         if let Some(child) = node.child_by_field_name(field) {
-            let text = node_text_simple(child, lines, NodeTextMode::Full);
+            let text = name_text(declared_name(child), lines);
             if !text.is_empty() {
-                // For variable_declarator, get the identifier inside
-                if child.kind().contains("declarator") {
-                    if let Some(id) = child.child_by_field_name("name") {
-                        return Some(node_text_simple(id, lines, NodeTextMode::Full));
-                    }
-                }
                 return Some(text);
             }
         }
@@ -235,7 +326,13 @@ pub(crate) fn definition_weight(kind: &str) -> u16 {
         | "type_declaration"
         | "type_spec"
         | "type_alias"
-        | "decorated_definition" => 100,
+        | "decorated_definition"
+        | "class_specifier"
+        | "struct_specifier"
+        | "union_specifier"
+        | "enum_specifier"
+        | "type_definition"
+        | "alias_declaration" => 100,
         "impl_item" | "object_declaration" => 90,
         "const_item" | "const_declaration" | "const_spec" | "static_item" => 80,
         "mod_item" | "namespace_definition" | "property_declaration" => 70,
@@ -329,6 +426,17 @@ mod tests {
         assert_eq!(definition_weight("interface_declaration"), 100);
         assert_eq!(definition_weight("enum_item"), 100);
         assert_eq!(definition_weight("decorated_definition"), 100);
+        // C/C++ types rank with the other languages' types.
+        for kind in [
+            "class_specifier",
+            "struct_specifier",
+            "union_specifier",
+            "enum_specifier",
+            "type_definition",
+            "alias_declaration",
+        ] {
+            assert_eq!(definition_weight(kind), 100, "{kind}");
+        }
         // Go specs rank with their counterparts: types, constants, variables.
         assert_eq!(definition_weight("type_spec"), 100);
         assert_eq!(definition_weight("type_alias"), 100);
@@ -440,5 +548,74 @@ mod tests {
         let lines: Vec<&str> = src.lines().collect();
         let node = find_by_kind(tree.root_node(), "impl_item");
         assert_eq!(extract_definition_name(node, &lines), None);
+    }
+
+    #[test]
+    fn extract_definition_name_follows_c_family_declarators_to_the_name() {
+        // A C/C++ function's name sits at the bottom of its declarator chain:
+        // inside a function declarator, wrapped by pointer, reference or
+        // parenthesised declarators, and in C++ behind a scope or template
+        // arguments. The defined name is that bottom identifier, never the
+        // declarator text with its parameter list.
+        let cases = [
+            (Lang::C, "int add(int a, int b) { return a + b; }\n", "add"),
+            (Lang::C, "int *make(void) { return 0; }\n", "make"),
+            (Lang::C, "int (*pick(void))(int) { return 0; }\n", "pick"),
+            (Lang::Cpp, "int &ref(int &x) { return x; }\n", "ref"),
+            (Lang::Cpp, "int Shape::sides() { return 4; }\n", "sides"),
+            (Lang::Cpp, "void a::b::deep() {}\n", "deep"),
+            (Lang::Cpp, "Shape::~Shape() {}\n", "~Shape"),
+            (
+                Lang::Cpp,
+                "bool operator==(int a, int b) { return true; }\n",
+                "operator==",
+            ),
+            (
+                Lang::Cpp,
+                "Shape::operator bool() const { return true; }\n",
+                "operator bool",
+            ),
+            (
+                Lang::Cpp,
+                "template <> int biggest<int>(int a) { return a; }\n",
+                "biggest",
+            ),
+        ];
+        for (lang, src, expected) in cases {
+            let tree = parse(src, lang);
+            let lines: Vec<&str> = src.lines().collect();
+            let node = find_by_kind(tree.root_node(), "function_definition");
+            assert_eq!(
+                extract_definition_name(node, &lines).as_deref(),
+                Some(expected),
+                "{src}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_definition_name_skips_c_type_references() {
+        // `struct point { ... }` defines `point`; a bare `struct point` names
+        // an existing type and defines nothing. A typedef defines the name in
+        // its declarator, even behind a function-pointer declarator.
+        let src = "struct point { int x; };\nstruct point *p;\ntypedef int (*cmp_fn)(int);\n";
+        let tree = parse(src, Lang::C);
+        let lines: Vec<&str> = src.lines().collect();
+        let root = tree.root_node();
+        let definition = root.named_child(0).expect("struct definition");
+        let reference = root
+            .named_child(1)
+            .and_then(|d| d.child_by_field_name("type"))
+            .expect("struct reference");
+        let typedef = root.named_child(2).expect("typedef");
+        assert_eq!(
+            extract_definition_name(definition, &lines).as_deref(),
+            Some("point")
+        );
+        assert_eq!(extract_definition_name(reference, &lines), None);
+        assert_eq!(
+            extract_definition_name(typedef, &lines).as_deref(),
+            Some("cmp_fn")
+        );
     }
 }

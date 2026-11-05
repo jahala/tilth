@@ -16,6 +16,9 @@ use crate::lang::treesitter::{
 const TYPE_KINDS: &[&str] = &[
     "class_declaration",
     "class_definition",
+    "class_specifier",
+    "struct_specifier",
+    "union_specifier",
     "struct_item",
     "impl_item",
     "interface_declaration",
@@ -360,5 +363,34 @@ mod tests {
         let scope = enclosing_definition_at(&p, 4, &cache).unwrap();
         assert_eq!(scope.kind, "function");
         assert_eq!(scope.name, "bar");
+    }
+
+    #[test]
+    fn enclosing_at_c_function_is_its_bare_name() {
+        // Line 12 sits in the body of `int add(int a, int b)`.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = write(tmp.path(), "a.c", crate::lang::c::C_DEFINITIONS_FIXTURE);
+        let cache = OutlineCache::new();
+        let scope = enclosing_definition_at(&p, 12, &cache).unwrap();
+        assert_eq!(scope.kind, "function");
+        assert_eq!(scope.name, "add");
+    }
+
+    #[test]
+    fn enclosing_at_cpp_method_qualifies_with_class() {
+        // A method body inside a class, and inside a struct in a namespace,
+        // is qualified with its type, the same way a TypeScript method is.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = write(
+            tmp.path(),
+            "a.cpp",
+            "class Shape {\n  int area() {\n    return 0;\n  }\n};\nnamespace geo {\nstruct Box {\n  int volume() {\n    return 1;\n  }\n};\n}\n",
+        );
+        let cache = OutlineCache::new();
+        for (line, name) in [(3, "Shape.area"), (9, "Box.volume")] {
+            let scope = enclosing_definition_at(&p, line, &cache).unwrap();
+            assert_eq!(scope.kind, "function", "line {line}");
+            assert_eq!(scope.name, name, "line {line}");
+        }
     }
 }
