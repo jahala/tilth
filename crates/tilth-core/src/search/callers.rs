@@ -245,3 +245,40 @@ fn find_enclosing_function(
         None => ("<top-level>".to_string(), None),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bloom pre-filter must never hide a file that holds a call site. A
+    /// quote inside a triple-quoted string, or an apostrophe in a `#` comment,
+    /// once made the scanner read the rest of the file as a string, so the
+    /// names after it never reached the filter and their call sites vanished.
+    #[test]
+    fn call_sites_after_a_triple_quoted_string_or_hash_comment_are_found() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lib.py"), "def helper_after():\n    pass\n").unwrap();
+        std::fs::write(
+            dir.path().join("uses_docstring.py"),
+            "FIXTURE = \"\"\"\n{\"prompt\": \"count ripgrep's lines\"}\n\"\"\"\n\n\
+             def docstring_caller():\n    helper_after()\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("uses_comment.py"),
+            "# don't call this twice\ndef comment_caller():\n    helper_after()\n",
+        )
+        .unwrap();
+
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let targets: HashSet<String> = std::iter::once("helper_after".to_string()).collect();
+        let found =
+            find_callers_batch(&targets, dir.path(), &bloom, None, BATCH_EARLY_QUIT).unwrap();
+        let mut callers: Vec<&str> = found
+            .iter()
+            .map(|(_, m)| m.calling_function.as_str())
+            .collect();
+        callers.sort_unstable();
+        assert_eq!(callers, ["comment_caller", "docstring_caller"]);
+    }
+}
