@@ -261,26 +261,6 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                 }
             }
         }),
-        serde_json::json!({
-            "name": "tilth_config",
-            "annotations": { "readOnlyHint": false, "idempotentHint": true },
-            "description": "Read or update MCP runtime configuration. Gitignore handling persists for this server process and applies to search, list, map, callers, and other filesystem walks. .tilthignore and built-in junk-directory exclusions always remain active.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["get", "set", "reset"],
-                        "default": "get",
-                        "description": "get reports effective configuration; set applies supplied values; reset returns to startup environment/default behavior."
-                    },
-                    "respect_gitignore": {
-                        "type": "boolean",
-                        "description": "For action=set, enable or disable .gitignore, .ignore, and Git exclude rules."
-                    }
-                }
-            }
-        }),
     ];
 
     if edit_mode {
@@ -380,7 +360,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         if name == "tilth_search" || name == "tilth_list" {
             tool["inputSchema"]["properties"]["gitignore"] = serde_json::json!({
                 "type": "boolean",
-                "description": "For this call, honor .gitignore, .ignore, and Git exclude rules when true; bypass them when false. Omit to use the current server setting (enabled by default)."
+                "description": "For this call, honor .gitignore, .ignore, and Git exclude rules when true; bypass them when false. Omit to use the startup setting: off unless the server runs with TILTH_RESPECT_GITIGNORE=1. .tilthignore is always honored."
             });
         }
     }
@@ -500,19 +480,26 @@ mod tests {
         }
     }
 
+    /// Only the two tools that walk on the agent's behalf carry the per-call
+    /// `gitignore` flag, so other schemas pay nothing for it. Its description
+    /// names the startup setting, which is the only thing that sets the default.
     #[test]
-    fn tilth_config_exposes_gitignore_runtime_setting() {
+    fn gitignore_param_only_on_search_and_list() {
         for edit_mode in [false, true] {
-            let defs = tool_definitions(edit_mode);
-            let config = defs
-                .iter()
-                .find(|tool| tool["name"] == "tilth_config")
-                .expect("tilth_config must be advertised in every MCP mode");
-            assert_eq!(
-                config["inputSchema"]["properties"]["respect_gitignore"]["type"],
-                "boolean"
-            );
-            assert_eq!(config["annotations"]["readOnlyHint"], false);
+            for tool in tool_definitions(edit_mode) {
+                let name = tool["name"].as_str().unwrap_or("");
+                let param = &tool["inputSchema"]["properties"]["gitignore"];
+                if name == "tilth_search" || name == "tilth_list" {
+                    assert_eq!(param["type"], "boolean", "{name} lacks gitignore");
+                    let desc = param["description"].as_str().unwrap_or("");
+                    assert!(
+                        desc.contains("TILTH_RESPECT_GITIGNORE"),
+                        "{name} gitignore description must name the startup setting: {desc}"
+                    );
+                } else {
+                    assert!(param.is_null(), "{name} must not carry gitignore");
+                }
+            }
         }
     }
 }

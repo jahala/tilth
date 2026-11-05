@@ -21,7 +21,6 @@ use std::collections::HashSet;
 use std::fmt::Write;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::SystemTime;
 
 use ignore::WalkBuilder;
@@ -81,11 +80,6 @@ const EXPAND_FULL_FILE_THRESHOLD: u64 = 800;
 /// section)" so the user knows to expand for the rest.
 const MARKDOWN_PREVIEW_MAX_LINES: usize = 40;
 
-const GITIGNORE_OVERRIDE_UNSET: u8 = 0;
-const GITIGNORE_OVERRIDE_DISABLED: u8 = 1;
-const GITIGNORE_OVERRIDE_ENABLED: u8 = 2;
-static GITIGNORE_OVERRIDE: AtomicU8 = AtomicU8::new(GITIGNORE_OVERRIDE_UNSET);
-
 thread_local! {
     static CALL_GITIGNORE_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
@@ -115,25 +109,13 @@ fn gitignore_from_env() -> Option<bool> {
     })
 }
 
-pub(crate) fn gitignore_config() -> (bool, &'static str) {
-    if let Some(value) = CALL_GITIGNORE_OVERRIDE.with(std::cell::Cell::get) {
-        return (value, "call");
-    }
-
-    match GITIGNORE_OVERRIDE.load(Ordering::Relaxed) {
-        GITIGNORE_OVERRIDE_DISABLED => (false, "runtime"),
-        GITIGNORE_OVERRIDE_ENABLED => (true, "runtime"),
-        _ => gitignore_from_env().map_or((false, "default"), |enabled| (enabled, "environment")),
-    }
-}
-
-pub(crate) fn set_gitignore_config(value: Option<bool>) {
-    let value = match value {
-        Some(false) => GITIGNORE_OVERRIDE_DISABLED,
-        Some(true) => GITIGNORE_OVERRIDE_ENABLED,
-        None => GITIGNORE_OVERRIDE_UNSET,
-    };
-    GITIGNORE_OVERRIDE.store(value, Ordering::Relaxed);
+/// Whether walks honor `.gitignore`, `.ignore` and Git exclude rules: the
+/// per-call MCP override when one is set, else `TILTH_RESPECT_GITIGNORE`
+/// (which `--respect-gitignore` sets), else off.
+pub(crate) fn respect_gitignore() -> bool {
+    call_gitignore_override()
+        .or_else(gitignore_from_env)
+        .unwrap_or(false)
 }
 
 /// Shared walker policy: searches files except known junk directories and
@@ -146,7 +128,7 @@ pub(crate) fn set_gitignore_config(value: Option<bool>) {
 /// walker (`crate::map::generate`), which each apply their own final
 /// `.max_depth()`/`.threads()` and `.build()`/`.build_parallel()`.
 pub(crate) fn base_walk_builder(scope: &Path) -> WalkBuilder {
-    base_walk_builder_with_gitignore(scope, gitignore_config().0)
+    base_walk_builder_with_gitignore(scope, respect_gitignore())
 }
 
 fn base_walk_builder_with_gitignore(scope: &Path, respect_gitignore: bool) -> WalkBuilder {
@@ -187,7 +169,7 @@ pub(crate) fn walker(scope: &Path, glob: Option<&str>) -> Result<ignore::WalkPar
             std::thread::available_parallelism().map_or(4, |n| (n.get() / 2).clamp(2, 6))
         });
 
-    let respect_gitignore = gitignore_config().0;
+    let respect_gitignore = respect_gitignore();
     let mut builder = base_walk_builder_with_gitignore(scope, respect_gitignore);
     builder.threads(threads);
 
