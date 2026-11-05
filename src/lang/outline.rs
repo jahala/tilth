@@ -1,4 +1,7 @@
-use crate::lang::treesitter::{node_text_simple, NodeTextMode};
+use crate::lang::treesitter::{
+    extract_definition_name, is_or_body_of, is_type_reference, node_text_simple, NodeTextMode,
+    NAMESPACE_KINDS, PASS_THROUGH_KINDS,
+};
 use crate::types::{Lang, OutlineEntry, OutlineKind};
 
 /// Get the tree-sitter Language for a given Lang variant.
@@ -90,12 +93,30 @@ pub(crate) fn walk_top_level(
                 continue;
             }
         }
-        if let Some(entry) = node_to_entry(child, lines, lang, 0) {
-            entries.push(entry);
-        }
+        push_entries(child, lines, lang, 0, &mut entries);
     }
 
     entries
+}
+
+/// Push the outline entry for `node`. A pass-through wrapper (`#ifdef`,
+/// `extern "C" { ... }`, `template <...>`) has no entry of its own: the
+/// entries of what it wraps take its place.
+fn push_entries(
+    node: tree_sitter::Node,
+    lines: &[&str],
+    lang: Lang,
+    depth: usize,
+    out: &mut Vec<OutlineEntry>,
+) {
+    if is_or_body_of(node, PASS_THROUGH_KINDS) {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            push_entries(child, lines, lang, depth, out);
+        }
+    } else if let Some(entry) = node_to_entry(node, lines, lang, depth) {
+        out.push(entry);
+    }
 }
 
 /// Convert a tree-sitter node to an `OutlineEntry` based on its kind.
@@ -120,16 +141,14 @@ fn node_to_entry(
         | "init_declaration"
         | "deinit_declaration"
         | "protocol_function_declaration" => {
-            let name = find_child_text(node, "name", lines)
-                .or_else(|| find_child_text(node, "identifier", lines))
-                .unwrap_or_else(|| {
-                    // Swift deinit has no name field — use the node kind as name
-                    if kind_str == "deinit_declaration" {
-                        "deinit".into()
-                    } else {
-                        "<anonymous>".into()
-                    }
-                });
+            let name = extract_definition_name(node, lines).unwrap_or_else(|| {
+                // Swift deinit has no name field — use the node kind as name
+                if kind_str == "deinit_declaration" {
+                    "deinit".into()
+                } else {
+                    "<anonymous>".into()
+                }
+            });
             let sig = extract_signature(node, lines);
             (OutlineKind::Function, name, Some(sig))
         }
@@ -146,6 +165,21 @@ fn node_to_entry(
             (OutlineKind::Struct, name, None)
         }
 
+        // C/C++ types. Only a specifier with a body defines one; a bare
+        // `struct point` or `class Forward;` names a type defined elsewhere.
+        "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier" => {
+            if is_type_reference(node) {
+                return None;
+            }
+            let name = extract_definition_name(node, lines).unwrap_or_else(|| "<anonymous>".into());
+            let kind = match kind_str {
+                "class_specifier" => OutlineKind::Class,
+                "enum_specifier" => OutlineKind::Enum,
+                _ => OutlineKind::Struct,
+            };
+            (kind, name, None)
+        }
+
         // Interfaces & traits
         "interface_declaration"
         | "type_alias_declaration"
@@ -156,8 +190,9 @@ fn node_to_entry(
             let name = find_child_text(node, "name", lines).unwrap_or_else(|| "<anonymous>".into());
             (OutlineKind::Interface, name, None)
         }
-        "type_item" | "type_definition" | "typealias_declaration" => {
-            let name = find_child_text(node, "name", lines).unwrap_or_else(|| "<anonymous>".into());
+        "type_item" | "type_definition" | "typealias_declaration" | "alias_declaration" => {
+            // A C `typedef` names its type in a declarator, not a `name` field.
+            let name = extract_definition_name(node, lines).unwrap_or_else(|| "<anonymous>".into());
             (OutlineKind::TypeAlias, name, None)
         }
 
@@ -294,10 +329,7 @@ fn node_to_entry(
     };
 
     // Collect children for classes, impls, modules, traits/interfaces
-    let is_namespace = matches!(
-        kind_str,
-        "namespace_declaration" | "namespace_definition" | "file_scoped_namespace_declaration"
-    );
+    let is_namespace = NAMESPACE_KINDS.contains(&kind_str);
     let children = if matches!(
         kind,
         OutlineKind::Class | OutlineKind::Struct | OutlineKind::Module | OutlineKind::Interface
@@ -335,19 +367,21 @@ fn collect_children(
     let mut children = Vec::new();
     let mut cursor = node.walk();
 
-    // Look for a body node first (C# uses `declaration_list` instead of `*_body`/`*_block`)
+    // Look for a body node first (C# uses `declaration_list` instead of
+    // `*_body`/`*_block`, C/C++ classes and structs a `field_declaration_list`)
     let body = node.children(&mut cursor).find(|c| {
         let k = c.kind();
-        k.contains("body") || k.contains("block") || k == "declaration_list"
+        k.contains("body")
+            || k.contains("block")
+            || k == "declaration_list"
+            || k == "field_declaration_list"
     });
 
     let parent = body.unwrap_or(node);
     let mut cursor2 = parent.walk();
 
     for child in parent.children(&mut cursor2) {
-        if let Some(entry) = node_to_entry(child, lines, lang, depth) {
-            children.push(entry);
-        }
+        push_entries(child, lines, lang, depth, &mut children);
     }
 
     children
@@ -1434,5 +1468,103 @@ mod doc_comment_tests {
         assert!(doc.starts_with("Adds two numbers."), "got: {doc:?}");
         assert!(!doc.contains('*'), "delimiters must be gone: {doc:?}");
         assert!(!doc.contains('\n'), "must be one line: {doc:?}");
+    }
+}
+
+#[cfg(test)]
+mod c_family_outline_tests {
+    use super::get_outline_entries;
+    use crate::lang::c::C_DEFINITIONS_FIXTURE;
+    use crate::lang::cpp::CPP_DEFINITIONS_FIXTURE;
+    use crate::types::{Lang, OutlineEntry, OutlineKind};
+
+    /// `(name, kind, start_line, end_line, children)` for an entry tree.
+    #[derive(Debug, PartialEq)]
+    struct Node(String, OutlineKind, u32, u32, Vec<Node>);
+
+    fn tree(entries: Vec<OutlineEntry>) -> Vec<Node> {
+        entries
+            .into_iter()
+            .map(|e| Node(e.name, e.kind, e.start_line, e.end_line, tree(e.children)))
+            .collect()
+    }
+
+    fn leaf(name: &str, kind: OutlineKind, start: u32, end: u32) -> Node {
+        Node(name.to_string(), kind, start, end, Vec::new())
+    }
+
+    #[test]
+    fn c_outline_names_functions_and_types() {
+        // Functions carry their bare name whatever wraps it, the include
+        // guard does not hide the types inside it, and the forward
+        // `struct point;` and the prototype are not entries.
+        use OutlineKind::{Enum, Function, Struct, TypeAlias};
+        let expected = vec![
+            leaf("point", Struct, 4, 4),
+            leaf("number", Struct, 5, 5),
+            leaf("color", Enum, 6, 6),
+            leaf("point_t", TypeAlias, 7, 7),
+            leaf("compare_fn", TypeAlias, 8, 8),
+            leaf("add", Function, 11, 13),
+            leaf("make", Function, 14, 14),
+            leaf("label", Function, 15, 15),
+            leaf("pick", Function, 16, 16),
+            leaf("origin", Function, 17, 17),
+            leaf("main", Function, 18, 18),
+        ];
+        assert_eq!(
+            tree(get_outline_entries(C_DEFINITIONS_FIXTURE, Lang::C)),
+            expected
+        );
+    }
+
+    #[test]
+    fn cpp_outline_names_methods_namespaces_and_templates() {
+        // Classes list their in-class method definitions, a namespace lists
+        // what it holds, and templates and `extern "C"` blocks show the
+        // definition they wrap. Declarations without a body are not entries.
+        use OutlineKind::{Class, Enum, Function, Module, Struct, TypeAlias};
+        let expected = vec![
+            leaf("ref", Function, 1, 1),
+            Node(
+                "Shape".into(),
+                Class,
+                2,
+                9,
+                vec![
+                    leaf("~Shape", Function, 5, 5),
+                    leaf("area", Function, 6, 6),
+                    leaf("operator==", Function, 7, 7),
+                ],
+            ),
+            leaf("Shape", Function, 10, 10),
+            leaf("sides", Function, 11, 11),
+            Node(
+                "geo".into(),
+                Module,
+                13,
+                20,
+                vec![
+                    leaf("detail", Module, 14, 14),
+                    leaf("helper", Function, 15, 15),
+                    leaf("biggest", Function, 16, 16),
+                    Node(
+                        "Box".into(),
+                        Struct,
+                        17,
+                        19,
+                        vec![leaf("volume", Function, 18, 18)],
+                    ),
+                ],
+            ),
+            leaf("biggest", Function, 21, 21),
+            leaf("c_entry", Function, 22, 22),
+            leaf("Size", TypeAlias, 23, 23),
+            leaf("Mode", Enum, 24, 24),
+        ];
+        assert_eq!(
+            tree(get_outline_entries(CPP_DEFINITIONS_FIXTURE, Lang::Cpp)),
+            expected
+        );
     }
 }

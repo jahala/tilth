@@ -9,7 +9,7 @@ use crate::lang::elixir::is_elixir_definition;
 use crate::lang::spec::{spec, DefinitionOps, DEFAULT_DEFS, DEFAULT_DEF_KINDS};
 use crate::lang::treesitter::{
     extract_definition_name, extract_impl_trait, extract_impl_type, extract_implemented_interfaces,
-    node_text_simple, NodeTextMode,
+    is_or_body_of, node_text_simple, NodeTextMode, NAMESPACE_KINDS, PASS_THROUGH_KINDS,
 };
 
 use crate::error::TilthError;
@@ -475,7 +475,17 @@ fn walk_for_definitions(
         }
     }
 
-    // Recurse into children (for nested definitions, class bodies, impl blocks, etc.)
+    // Recurse into children (for nested definitions, class bodies, impl blocks,
+    // etc.). Namespaces and pass-through wrappers (`#ifdef`, `extern "C"`,
+    // `template <...>`) add no nesting, so they do not count toward the depth
+    // limit: a method in a class in a namespace is found like one in a
+    // top-level class.
+    let child_depth =
+        if is_or_body_of(node, NAMESPACE_KINDS) || is_or_body_of(node, PASS_THROUGH_KINDS) {
+            depth
+        } else {
+            depth + 1
+        };
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         walk_for_definitions(
@@ -487,7 +497,7 @@ fn walk_for_definitions(
             mtime,
             defs,
             lang,
-            depth + 1,
+            child_depth,
         );
     }
 }
@@ -495,9 +505,13 @@ fn walk_for_definitions(
 /// Whether definition `node` binds the name `query`. Most definitions bind
 /// one name, which `extract_name` returns. A Go `const` or `var` spec can bind
 /// several (`var a, b int`), each a named child under the `name` field, so
-/// the later names are checked too.
+/// the later names are checked too. A node `extract_name` gives no name binds
+/// nothing: a C `struct point` without a body names a type, it defines none.
 fn defines_name(node: tree_sitter::Node, lines: &[&str], query: &str, ops: &DefinitionOps) -> bool {
-    if (ops.extract_name)(node, lines).is_some_and(|name| name == query) {
+    let Some(first) = (ops.extract_name)(node, lines) else {
+        return false;
+    };
+    if first == query {
         return true;
     }
     let mut cursor = node.walk();
@@ -1515,5 +1529,135 @@ func run() {
             );
         }
         assert_eq!(go_find(code, "run").len(), 1, "run is a definition");
+    }
+
+    /// Search `fixture`, written to `file`, for `query` end to end and return
+    /// the line of every definition found, sorted. Fails if a definition's
+    /// `def_name` is not the bare query.
+    fn definition_lines(file: &str, fixture: &str, query: &str) -> Vec<u32> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(file), fixture).expect("write fixture");
+        let result = search(query, dir.path(), None, None, false).expect("search");
+        let mut lines: Vec<u32> = result
+            .matches
+            .iter()
+            .filter(|m| m.is_definition)
+            .inspect(|m| assert_eq!(m.def_name.as_deref(), Some(query), "{query} def_name"))
+            .map(|m| m.line)
+            .collect();
+        lines.sort_unstable();
+        lines
+    }
+
+    #[test]
+    fn c_definitions_are_found_by_their_bare_name() {
+        // Each function is a definition on its own line, whatever wraps the
+        // name: a plain, pointer, or function-pointer return type. The
+        // prototype of `add` (line 9) is not a definition, nor is the forward
+        // `struct point;` (line 3) or the bodiless `struct point` return type
+        // of `origin` (line 17).
+        let fixture = crate::lang::c::C_DEFINITIONS_FIXTURE;
+        for (query, expected) in [
+            ("add", vec![11]),
+            ("make", vec![14]),
+            ("label", vec![15]),
+            ("pick", vec![16]),
+            ("origin", vec![17]),
+            ("main", vec![18]),
+            ("point", vec![4]),
+            ("number", vec![5]),
+            ("color", vec![6]),
+            ("point_t", vec![7]),
+            ("compare_fn", vec![8]),
+        ] {
+            assert_eq!(
+                definition_lines("shapes.c", fixture, query),
+                expected,
+                "{query}: definition lines"
+            );
+        }
+    }
+
+    #[test]
+    fn c_function_definition_spans_its_body() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("shapes.c"),
+            crate::lang::c::C_DEFINITIONS_FIXTURE,
+        )
+        .expect("write fixture");
+        let result = search("add", dir.path(), None, None, false).expect("search");
+        let def = result
+            .matches
+            .iter()
+            .find(|m| m.is_definition)
+            .expect("add has a definition");
+        assert_eq!(def.def_range, Some((11, 13)));
+        assert_eq!(
+            def.def_weight, 100,
+            "a function ranks as a primary definition"
+        );
+    }
+
+    #[test]
+    fn cpp_definitions_are_found_by_their_bare_name() {
+        // In-class methods, out-of-class `Type::name` definitions, functions
+        // in nested namespaces, templates and their specialisations, and
+        // `extern "C"` functions are definitions under their bare name.
+        // In-class declarations (lines 4, 8), the namespace-level prototype
+        // (line 14) and the forward `class Forward;` (line 12) are not. A
+        // constructor defines its class's name too (line 10).
+        let fixture = crate::lang::cpp::CPP_DEFINITIONS_FIXTURE;
+        for (query, expected) in [
+            ("ref", vec![1]),
+            ("Shape", vec![2, 10]),
+            ("area", vec![6]),
+            ("sides", vec![11]),
+            ("Forward", vec![]),
+            ("geo", vec![13]),
+            ("helper", vec![15]),
+            ("biggest", vec![16, 21]),
+            ("Box", vec![17]),
+            ("volume", vec![18]),
+            ("c_entry", vec![22]),
+            ("Size", vec![23]),
+            ("Mode", vec![24]),
+        ] {
+            assert_eq!(
+                definition_lines("shapes.cpp", fixture, query),
+                expected,
+                "{query}: definition lines"
+            );
+        }
+    }
+
+    #[test]
+    fn cpp_destructor_and_operator_definitions_keep_their_spelling() {
+        // `~Shape` and `operator==` are not words the usage regex can match, so
+        // check the definition walker directly.
+        let code = crate::lang::cpp::CPP_DEFINITIONS_FIXTURE;
+        let ts_lang = crate::lang::outline::outline_language(crate::types::Lang::Cpp).unwrap();
+        for (name, line) in [("~Shape", 5), ("operator==", 7)] {
+            let defs = find_defs_treesitter(
+                std::path::Path::new("shapes.cpp"),
+                name,
+                &ts_lang,
+                Some(crate::types::Lang::Cpp),
+                code,
+                code.lines().count() as u32,
+                SystemTime::now(),
+            );
+            let lines: Vec<u32> = defs.iter().map(|m| m.line).collect();
+            assert_eq!(lines, vec![line], "{name}: definition lines");
+        }
+    }
+
+    #[test]
+    fn csharp_method_in_namespaced_class_is_a_definition() {
+        // A namespace adds no nesting of its own, so a method in a class in a
+        // namespace is found like a method in a top-level class.
+        let code = "namespace App {\n  public class Svc {\n    public void Run() {}\n  }\n}\n";
+        assert_eq!(definition_lines("Svc.cs", code, "Svc"), vec![2]);
+        assert_eq!(definition_lines("Svc.cs", code, "Run"), vec![3]);
     }
 }
