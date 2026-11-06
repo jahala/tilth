@@ -692,7 +692,7 @@ fn test_style(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opt
 // ---------------------------------------------------------------------------
 
 fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Option<String> {
-    let lang = primary_lang?; // require a detected language
+    primary_lang?; // require a detected language
     let start = Instant::now();
 
     // Sort by size (smallest first) and take first 100
@@ -715,15 +715,20 @@ fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opti
             continue;
         };
 
+        // Each file is read in its own language, as the resolver always did.
+        let FileType::Code(file_lang) = detect_file_type(&full) else {
+            continue;
+        };
+
         // Resolve imports to actual file paths using the proven import resolver
-        let resolved = tilth_core::imports::resolve_related_files_with_content(&full, &content);
-        for target_path in resolved {
+        let imports = tilth_core::extract_imports(&content, file_lang);
+        for target_path in tilth_core::imports::resolve_imports(&full, file_lang, &imports) {
             *path_counts.entry(target_path).or_insert(0) += 1;
         }
 
         // Collect import source strings for symbol extraction
-        for import in tilth_core::extract_imports(&content, lang) {
-            if !tilth_core::imports::is_external(&import.source, lang) {
+        for import in imports {
+            if !tilth_core::imports::is_external(&import.source, file_lang) {
                 all_import_sources.push(import.source);
             }
         }

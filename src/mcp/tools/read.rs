@@ -161,7 +161,7 @@ pub(in crate::mcp) fn tool_read(
 
     // Append related-file hint for outlined code files (not section reads, not batch).
     if section.is_none() && crate::read::would_outline(&path) {
-        let related = tilth_core::imports::resolve_related_files(&path);
+        let related = tilth_core::imports::resolve_related_files(&path, cache);
         if !related.is_empty() {
             output.push_str("\n\n> Related: ");
             for (i, p) in related.iter().enumerate() {

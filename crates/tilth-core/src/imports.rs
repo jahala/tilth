@@ -1,18 +1,30 @@
-//! Resolve import statements to local file paths.
-//! Used by the MCP layer to hint related files after an outlined read.
+//! Imports as data, one per module a statement names, and their resolution
+//! to local file paths (the MCP layer's related-file hint, deps, callees).
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
+
+use streaming_iterator::StreamingIterator;
 
 use crate::lang::detect_file_type;
 use crate::types::{FileType, Lang};
 
 const MAX_SUGGESTIONS: usize = 8;
 
-/// Extract import sources from a code file and resolve them to existing local file paths.
-/// Returns empty Vec for non-code files, files with no imports, or when all imports are external.
+/// The local files a code file's imports resolve to, read through `cache`'s
+/// parsed tree so an outlined read does not parse the file a second time.
+/// Returns empty for non-code files, files with no imports, or when all
+/// imports are external.
 #[must_use]
-pub fn resolve_related_files(file_path: &Path) -> Vec<PathBuf> {
+pub fn resolve_related_files(file_path: &Path, cache: &crate::cache::OutlineCache) -> Vec<PathBuf> {
+    if let Some(parsed) = cache.get_or_parse(file_path) {
+        let imports = imports_in_tree(parsed.tree.root_node(), &parsed.content, parsed.lang);
+        return resolve_imports(file_path, parsed.lang, &imports);
+    }
+    // The cache holds no tree for this file (no grammar, or over its size
+    // cap): read it and parse here.
     let Ok(content) = fs::read_to_string(file_path) else {
         return Vec::new();
     };
@@ -25,13 +37,20 @@ pub fn resolve_related_files_with_content(file_path: &Path, content: &str) -> Ve
     let FileType::Code(lang) = detect_file_type(file_path) else {
         return Vec::new();
     };
+    resolve_imports(file_path, lang, &extract_imports(content, lang))
+}
 
+/// Resolve the local imports of the file at `file_path` to existing files,
+/// first come first served, at most `MAX_SUGGESTIONS`. For a caller that
+/// already holds the file's imports.
+#[must_use]
+pub fn resolve_imports(file_path: &Path, lang: Lang, imports: &[Import]) -> Vec<PathBuf> {
     let Some(dir) = file_path.parent() else {
         return Vec::new();
     };
 
     let mut results = Vec::new();
-    for import in extract_imports(content, lang) {
+    for import in imports {
         if results.len() >= MAX_SUGGESTIONS {
             break;
         }
@@ -102,39 +121,73 @@ pub fn imports_in_tree(root: tree_sitter::Node, content: &str, lang: Lang) -> Ve
     if !reads_statements_from_tree(lang) {
         return line_imports(content, lang);
     }
+    let Some(query) = statement_query(lang) else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
-    let mut cursor = root.walk();
-    loop {
-        let node = cursor.node();
-        let modules = statement_modules(node, content, lang);
-        let is_statement = modules.is_some();
-        for (source, line) in modules.into_iter().flatten() {
-            if source.is_empty() {
-                continue;
-            }
-            out.push(Import {
-                source,
-                line,
-                start_line: line_of(node),
-                end_line: last_line_of(node),
-            });
-        }
-        // A statement's own subtree holds no further statements.
-        if !is_statement && cursor.goto_first_child() {
-            continue;
-        }
-        loop {
-            if cursor.node() == root {
-                return out;
-            }
-            if cursor.goto_next_sibling() {
-                break;
-            }
-            if !cursor.goto_parent() {
-                return out;
+    let mut cursor = tree_sitter::QueryCursor::new();
+    // These grammars allow imports only at the top of a file, so the match
+    // need not look below the root's children.
+    if matches!(
+        lang,
+        Lang::Go | Lang::TypeScript | Lang::Tsx | Lang::JavaScript | Lang::Java | Lang::Kotlin
+    ) {
+        cursor.set_max_start_depth(Some(1));
+    }
+    let mut matches = cursor.matches(query, root, content.as_bytes());
+    while let Some(found) = matches.next() {
+        for capture in found.captures() {
+            let node = capture.node;
+            for (source, line) in statement_modules(node, content, lang).into_iter().flatten() {
+                if source.is_empty() {
+                    continue;
+                }
+                out.push(Import {
+                    source,
+                    line,
+                    start_line: line_of(node),
+                    end_line: last_line_of(node),
+                });
             }
         }
     }
+    out
+}
+
+/// The query matching the node kinds that can be an import statement in
+/// `lang`, compiled on first use and kept for the life of the process.
+/// Matching runs inside tree-sitter, which is faster than stepping a cursor
+/// over every node from Rust. `statement_modules` then reads each candidate,
+/// and drops the Elixir calls that are not imports. Each language compiles
+/// only when a file of it is read, since compiling costs a few milliseconds.
+fn statement_query(lang: Lang) -> Option<&'static tree_sitter::Query> {
+    static COMPILED: LazyLock<Mutex<HashMap<Lang, &'static tree_sitter::Query>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    let pattern = match lang {
+        Lang::Go | Lang::Scala | Lang::Java => "(import_declaration) @statement",
+        Lang::Rust => "(use_declaration) @statement",
+        Lang::Python => {
+            "[(import_statement) (import_from_statement) (future_import_statement)] @statement"
+        }
+        Lang::TypeScript | Lang::Tsx | Lang::JavaScript => "(import_statement) @statement",
+        Lang::Elixir => "(call target: (identifier)) @statement",
+        Lang::Kotlin => "(import) @statement",
+        _ => return None,
+    };
+    let mut compiled = COMPILED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(&query) = compiled.get(&lang) {
+        return Some(query);
+    }
+    let language = crate::lang::outline::outline_language(lang)?;
+    // One query per language at most, so leaking it to get a `'static`
+    // borrow is bounded, and matching then runs without the lock.
+    let query: &'static tree_sitter::Query =
+        Box::leak(Box::new(tree_sitter::Query::new(&language, pattern).ok()?));
+    compiled.insert(lang, query);
+    Some(query)
 }
 
 /// Languages whose import statements are read from the syntax tree: one
@@ -662,6 +715,25 @@ fn resolve_bash(dir: &Path, source: &str) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn every_tree_read_language_has_a_compiled_statement_query() {
+        for lang in [
+            Lang::Go,
+            Lang::Rust,
+            Lang::Python,
+            Lang::TypeScript,
+            Lang::Tsx,
+            Lang::JavaScript,
+            Lang::Scala,
+            Lang::Elixir,
+            Lang::Java,
+            Lang::Kotlin,
+        ] {
+            assert!(reads_statements_from_tree(lang), "{lang:?}");
+            assert!(statement_query(lang).is_some(), "{lang:?}");
+        }
+    }
 
     fn sources(content: &str, lang: Lang) -> Vec<String> {
         extract_imports(content, lang)
