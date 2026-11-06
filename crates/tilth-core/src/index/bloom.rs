@@ -78,6 +78,13 @@ fn code_lang(path: &Path) -> Option<Lang> {
     }
 }
 
+/// The seed of every filter. fastbloom draws a random seed per filter by
+/// default, which makes false positives, and so which files a batch search
+/// reads, differ between runs over the same tree. A fixed seed makes a
+/// filter's answers a function of the content alone. The value spells
+/// `tilth_bloom_seed` in ASCII.
+const FILTER_SEED: u128 = 0x7469_6c74_685f_626c_6f6f_6d5f_7365_6564;
+
 /// Build a Bloom filter from file content by extracting all identifiers.
 fn build_filter(content: &str, lang: Option<Lang>) -> BloomFilter {
     let idents: Vec<&str> = extract_identifiers(content, lang).collect();
@@ -85,7 +92,9 @@ fn build_filter(content: &str, lang: Option<Lang>) -> BloomFilter {
     // the filter, so the achieved FPR is well below the 0.01 target in practice.
     let expected = idents.len().max(1);
 
-    let mut filter = BloomFilter::with_false_pos(0.01).expected_items(expected);
+    let mut filter = BloomFilter::with_false_pos(0.01)
+        .seed(&FILTER_SEED)
+        .expected_items(expected);
     for ident in idents {
         filter.insert(ident);
     }
@@ -107,6 +116,9 @@ fn build_filter(content: &str, lang: Option<Lang>) -> BloomFilter {
 /// `lang` gates language-specific lexing: the Rust lifetime heuristic only
 /// applies when `lang` is `Some(Lang::Rust)`. For every other language a `'`
 /// opens a single-quoted string, matching their actual syntax.
+/// Triple-quoted strings and `#` line comments are read as such only in the
+/// languages that have them; read quote by quote, a quote or an apostrophe
+/// inside one would swallow the identifiers that follow it.
 fn extract_identifiers(content: &str, lang: Option<Lang>) -> impl Iterator<Item = &str> {
     IdentifierIter::new(content, lang)
 }
@@ -122,7 +134,9 @@ enum ScanState {
     StringSingle,
     /// Inside a backtick string (JS template literals, Go raw strings).
     StringBacktick,
-    /// Inside a line comment (// ...).
+    /// Inside a triple-quoted string, closed by three of the given quote byte.
+    StringTriple(u8),
+    /// Inside a line comment (`// ...`, or `# ...` where the language has it).
     LineComment,
     /// Inside a block comment (/* ... */).
     BlockComment,
@@ -134,6 +148,8 @@ struct IdentifierIter<'a> {
     pos: usize,
     state: ScanState,
     lang: Option<Lang>,
+    triple_quotes: bool,
+    hash_comments: bool,
 }
 
 impl<'a> IdentifierIter<'a> {
@@ -144,6 +160,8 @@ impl<'a> IdentifierIter<'a> {
             pos: 0,
             state: ScanState::Code,
             lang,
+            triple_quotes: lang.is_some_and(Lang::has_triple_quoted_strings),
+            hash_comments: lang.is_some_and(Lang::has_hash_comments),
         }
     }
 }
@@ -161,6 +179,37 @@ impl<'a> Iterator for IdentifierIter<'a> {
 
             match self.state {
                 ScanState::Code => {
+                    // A triple-quoted string first: read quote by quote, `"""` is
+                    // an empty string and then an open one, and the first quote
+                    // inside flips code and string for the rest of the file.
+                    if self.triple_quotes
+                        && (b == b'"' || b == b'\'')
+                        && bytes[i..].starts_with(&[b, b, b])
+                    {
+                        self.state = ScanState::StringTriple(b);
+                        self.pos += 3;
+                        continue;
+                    }
+
+                    // A `#` opens a line comment where the language says so,
+                    // also straight after code (`call()# it's`). It is code
+                    // inside a word (`a#b`), in a shell expansion (`${#name}`,
+                    // `$#`), as a character literal (`?#`), escaped (`\#`) and
+                    // before `[` (an attribute). Misreading code as a comment
+                    // loses one line; misreading a comment as code can lose
+                    // the rest of the file, so the rule leans to comment.
+                    if b == b'#'
+                        && self.hash_comments
+                        && (i == 0
+                            || !(is_ident_continue(bytes[i - 1])
+                                || matches!(bytes[i - 1], b'$' | b'{' | b'?' | b'\\')))
+                        && !(i + 1 < len && bytes[i + 1] == b'[')
+                    {
+                        self.state = ScanState::LineComment;
+                        self.pos += 1;
+                        continue;
+                    }
+
                     // Check for start of string literals
                     if b == b'"' {
                         self.state = ScanState::StringDouble;
@@ -253,6 +302,17 @@ impl<'a> Iterator for IdentifierIter<'a> {
                     } else if b == b'`' {
                         self.state = ScanState::Code;
                         self.pos += 1;
+                    } else {
+                        self.pos += 1;
+                    }
+                }
+
+                ScanState::StringTriple(quote) => {
+                    if b == b'\\' && i + 1 < len {
+                        self.pos += 2; // skip escaped character
+                    } else if bytes[i..].starts_with(&[quote, quote, quote]) {
+                        self.state = ScanState::Code;
+                        self.pos += 3;
                     } else {
                         self.pos += 1;
                     }
@@ -594,9 +654,19 @@ mod tests {
     fn hash_inside_a_word_is_not_a_comment() {
         // Shell `${#name}` and `$#` are code. Only a `#` that starts a word opens a
         // comment, so nothing after such a `#` is lost.
-        let src = "count=${#items}; next_step\n";
+        let src = "count=${#items}; n=$#; url=a#b next_step\n";
         let idents: Vec<&str> = extract_identifiers(src, Some(Lang::Bash)).collect();
         assert!(idents.contains(&"next_step"), "got {idents:?}");
+    }
+
+    #[test]
+    fn hash_comment_straight_after_code_is_a_comment() {
+        // No space before the `#`: still a comment in Python, so its apostrophe
+        // must not open a string that swallows the next definition.
+        let src = "setup()# don't call this twice\ndef after_the_comment():\n    pass\n";
+        let idents: Vec<&str> = extract_identifiers(src, Some(Lang::Python)).collect();
+        assert!(idents.contains(&"after_the_comment"), "got {idents:?}");
+        assert!(!idents.contains(&"twice"), "got {idents:?}");
     }
 
     #[test]
