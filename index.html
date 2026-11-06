@@ -24,8 +24,8 @@
     --pp-healthy:#46913C; --pp-caution:#B0741C; --pp-error:#BC4126; --pp-info:#3F7186; --pp-muted:#9A8C72;
     /* product blooms */
     --pp-mull:#76D4FF; --pp-glean:#0096B3; --pp-cultivate:#09636B; --pp-graft:#FEAA68; --pp-petals:#CC6A37;
-    --pp-tend:#98D98D; --pp-pleach:#779C46; --pp-umbel:#545E05; --pp-tilth:#F7D4B7; --pp-mycelium:#C9A18D; --pp-weeder:#A37A6E; --pp-well:#4D5972;
-    --pp-coldframe:#4E5A48;
+    --pp-tend:#98D98D; --pp-pleach:#779C46; --pp-umbel:#545E05; --pp-tilth:#F7D4B7; --pp-mycelium:#C9A18D; --pp-weeder:#A37A6E; --pp-well:#4D5972; --pp-hedge:#C9C7E7; --pp-pollen:#BD59D2; --pp-copeca:#219282;
+    --pp-coldframe:#8882A1;
     /* soil-night terminal (fixed in both themes) */
     --pp-term-bg:#1C1610; --pp-term-surface:#262019; --pp-term-border:#403628;
     --pp-term-green:#84C56A; --pp-term-sun:#F2A93B; --pp-term-text:#F3ECD9;
@@ -60,7 +60,7 @@
     --pp-primary:#84C56A; --pp-accent:#F2A93B; --pp-leaf:#9FD08A;
     --pp-text:#F3ECD9; --pp-text-soft:#C9BBA0;
     --pp-bg:#1C1610; --pp-bg-band:#211A12; --pp-surface:#262019; --pp-border:#403628;
-    --pp-cultivate:#1E6F77; --pp-umbel:#5F6A18; --pp-well:#58647E; --pp-coldframe:#5A6853;
+    --pp-cultivate:#1E6F77; --pp-umbel:#5F6A18; --pp-well:#58647E;
     --pp-weeder-word:#A37A6E;
     --pp-shadow-rest:0 1px 0 #403628, 0 12px 40px -16px rgba(8,6,4,0.6);
     --pp-shadow-lift:0 2px 4px rgba(8,6,4,0.3), 0 14px 32px rgba(8,6,4,0.45);
@@ -617,11 +617,14 @@
           <span style="--bloom:var(--pp-tend)"><span class="gf-dot"></span>tend</span>
           <a href="https://jahala.github.io/pleach/" style="--bloom:var(--pp-pleach)"><span class="gf-dot"></span>pleach</a>
           <a href="https://jahala.github.io/umbel/" style="--bloom:var(--pp-umbel)"><span class="gf-dot"></span>umbel</a>
+          <span style="--bloom:var(--pp-pollen)"><span class="gf-dot"></span>pollen</span>
           <a href="#top" style="--bloom:var(--pp-tilth)" class="is-current" aria-current="page"><span class="gf-dot"></span>tilth</a>
           <a href="https://jahala.github.io/mycelium/" style="--bloom:var(--pp-mycelium)"><span class="gf-dot"></span>mycelium</a>
           <a href="https://jahala.github.io/weeder/" style="--bloom:var(--pp-weeder)"><span class="gf-dot"></span>weeder</a>
-          <a href="https://jahala.github.io/well/" style="--bloom:var(--pp-well)"><span class="gf-dot"></span>well</a>
+          <a href="https://jahala.github.io/copeca/" style="--bloom:var(--pp-copeca)"><span class="gf-dot"></span>copeca</a>
+          <span style="--bloom:var(--pp-hedge)"><span class="gf-dot"></span>hedge</span>
           <a href="https://jahala.github.io/coldframe/" style="--bloom:var(--pp-coldframe)"><span class="gf-dot"></span>coldframe</a>
+          <a href="https://jahala.github.io/well/" style="--bloom:var(--pp-well)"><span class="gf-dot"></span>well</a>
         </nav>
         <p class="gf-soft">small, sharp tools for building with agents.</p>
       </div>
@@ -634,7 +637,7 @@
 
     </div>
     <div class="gf-bottom">
-      <span>© 2026 · a plotplot garden tool · MIT</span>
+      <span>© 2026 · a plotplot garden tool · MIT · counted without cookies, in the EU</span>
       <span>the structure under the surface.</span>
     </div>
   </div>
@@ -713,6 +716,24 @@
     if(rear>W+30){phase='away';tp=0;wait=3000+Math.random()*4000;}
     requestAnimationFrame(frame);}
   requestAnimationFrame(frame);
+})();
+</script>
+<script>
+/* one cookieless page view for the plotplot garden, counted by cfanalytics in the EU.
+   no cookies, no storage, no library; nothing is sent under Do Not Track or Global Privacy Control. */
+(function(){
+  if (navigator.doNotTrack === '1' || navigator.globalPrivacyControl === true) return;
+  var t = 'cfa_pk_giKW9ROJWXTBF4bKru_LnnDspyoLj2M3Ceq5OK1fsGA', r = document.referrer, d = '$direct';
+  try { if (r) d = new URL(r).host; } catch (e) {}
+  var now = new Date().toISOString();
+  var p = { token: t, distinct_id: '$posthog_cookieless', $cookieless_mode: true, $lib: 'web',
+    $current_url: location.href, $host: location.host, $pathname: location.pathname, title: document.title,
+    $referrer: r || '$direct', $referring_domain: d, $raw_user_agent: navigator.userAgent.slice(0, 1000),
+    $timezone: Intl.DateTimeFormat().resolvedOptions().timeZone, $browser_language: navigator.language,
+    $screen_width: screen.width, $screen_height: screen.height, $viewport_width: innerWidth, $viewport_height: innerHeight };
+  fetch('https://e.plotplot.ai/i/v0/e/', { method: 'POST', keepalive: true,
+    body: JSON.stringify({ api_key: t, batch: [{ event: '$pageview', properties: p, timestamp: now }], sent_at: now }) })
+    .catch(function(){});
 })();
 </script>
 </body>
