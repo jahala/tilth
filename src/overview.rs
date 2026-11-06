@@ -10,7 +10,6 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
-use tilth_core::imports::is_import_line;
 use tilth_core::lang::detect_file_type;
 use tilth_core::search::walk::SKIP_DIRS;
 use tilth_core::types::{FileType, Lang};
@@ -704,7 +703,7 @@ fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opti
     // Use resolve_related_files to get real file paths for imports.
     // Count how many files import each target path.
     let mut path_counts: HashMap<std::path::PathBuf, usize> = HashMap::new();
-    // Also collect all import source lines for symbol extraction later
+    // Also collect every local import source for symbol extraction later
     let mut all_import_sources: Vec<String> = Vec::new();
 
     for (rel_path, _) in &files {
@@ -723,12 +722,9 @@ fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opti
         }
 
         // Collect import source strings for symbol extraction
-        for line in content.lines() {
-            if is_import_line(line, lang) {
-                let source = tilth_core::lang::outline::extract_import_source(line, Some(lang));
-                if !source.is_empty() && !tilth_core::imports::is_external(&source, lang) {
-                    all_import_sources.push(source);
-                }
+        for import in tilth_core::extract_imports(&content, lang) {
+            if !tilth_core::imports::is_external(&import.source, lang) {
+                all_import_sources.push(import.source);
             }
         }
     }
@@ -834,6 +830,31 @@ mod tests {
         assert!(
             estimated_tokens < 300,
             "fingerprint should be <300 tokens, got {estimated_tokens}"
+        );
+    }
+
+    /// A file imported only through `use` groups is still hot, and the
+    /// symbol named most inside the groups is the one shown. Read as one
+    /// source per line, each group was `crate` and named no file.
+    #[test]
+    fn hot_files_count_imports_inside_use_groups() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("types.rs"), "pub struct Outline;\n").unwrap();
+        fs::write(src.join("other.rs"), "").unwrap();
+        for user in ["a.rs", "b.rs"] {
+            fs::write(
+                src.join(user),
+                "use crate::{other, types::Outline};\nfn f(_: Outline) {}\n",
+            )
+            .unwrap();
+        }
+        let walk = walk_files(tmp.path());
+        let hot = hot_files(tmp.path(), &walk, Some(Lang::Rust));
+        assert_eq!(
+            hot.as_deref(),
+            Some("src/other.rs ×2, src/types.rs(Outline) ×2")
         );
     }
 

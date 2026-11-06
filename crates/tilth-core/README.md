@@ -20,8 +20,10 @@ are shared with the `tilth` binary and carry no stability promise.
 | `is_test_file(&Path) -> bool` | Test files by path: `.test.`, `.spec.`, `__tests__/`. |
 | `test_entries(&str, Lang) -> Vec<TestEntry>` | `describe`/`it`/`test` structure as data, with lines and depth. |
 | `TestEntry`, `TestKind` | One suite or case. |
-| `is_import_line(&str, Lang) -> bool` | Whether a line is an import statement. |
-| `extract_import_source(&str, Option<Lang>) -> String` | The module an import names. |
+| `extract_imports(&str, Lang) -> Vec<Import>` | Every module a file imports, one `Import` per module: a Go import block, a Rust `use` group and Python's `import os, json` each give one per module named. |
+| `Import` | One module: its `source`, the `line` that names it, and its statement's `start_line` and `end_line`. |
+| `is_import_line(&str, Lang) -> bool` | Whether a line starts an import statement. |
+| `extract_import_source(&str, Option<Lang>) -> String` | The source an import statement's text names, read as one source. |
 | `is_external(&str, Lang) -> bool` | Whether that module lies outside the project. |
 | `resolve_related_files_with_content(&Path, &str) -> Vec<PathBuf>` | The local files a file's imports resolve to. |
 | `find_callers_batch(&HashSet<String>, &Path, &BloomFilterCache, Option<&str>, usize)` | Call sites of a set of symbols across a directory. |

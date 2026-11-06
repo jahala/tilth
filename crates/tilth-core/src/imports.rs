@@ -31,24 +31,388 @@ pub fn resolve_related_files_with_content(file_path: &Path, content: &str) -> Ve
     };
 
     let mut results = Vec::new();
-    for line in content.lines() {
+    for import in extract_imports(content, lang) {
         if results.len() >= MAX_SUGGESTIONS {
             break;
         }
-        if !is_import_line(line, lang) {
+        if is_external(&import.source, lang) {
             continue;
         }
-        let source = crate::lang::outline::extract_import_source(line, Some(lang));
-        if source.is_empty() || is_external(&source, lang) {
-            continue;
-        }
-        if let Some(path) = resolve(dir, &source, lang) {
+        if let Some(path) = resolve(dir, &import.source, lang) {
             if !results.contains(&path) {
                 results.push(path);
             }
         }
     }
     results
+}
+
+/// One module an import statement names.
+///
+/// A statement can name several modules: a Go `import ( … )` block, a Rust
+/// `use a::{b, c}` group, Python's `import os, json`, a Scala
+/// `import a.{b, c}`, an Elixir `alias A.{B, C}`. Each module is its own
+/// `Import`, on the line that names it, and carries the lines of the
+/// statement it sits in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Import {
+    /// The module as the file spells it, without an alias: `example.com/m/core`,
+    /// `crate::seams::git`, `json`, `./core`, `"util.h"`. `is_external` reads it.
+    pub source: String,
+    /// The 1-based line on which the statement names this module.
+    pub line: u32,
+    /// The 1-based first line of the statement.
+    pub start_line: u32,
+    /// The 1-based last line of the statement, inclusive.
+    pub end_line: u32,
+}
+
+/// Every module `content` imports, one [`Import`] per module, in source order.
+///
+/// Where one statement can name several modules or span several lines (Go,
+/// Rust, Python, JavaScript, TypeScript, Scala, Elixir), statements come from
+/// the syntax tree, so an import-shaped line inside a string is not one.
+/// Where one line is one statement naming one module (Java, Kotlin, C, C++,
+/// Bash), each line `is_import_line` accepts gives one import, its source read
+/// by `extract_import_source`. A statement that does not spell its module
+/// out, such as a shell `source "$dir/lib.sh"`, gives none. Languages without
+/// imports tilth reads give none.
+#[must_use]
+pub fn extract_imports(content: &str, lang: Lang) -> Vec<Import> {
+    if !reads_statements_from_tree(lang) {
+        return line_imports(content, lang);
+    }
+    let Some(language) = crate::lang::outline::outline_language(lang) else {
+        return Vec::new();
+    };
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&language).is_err() {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(content, None) else {
+        return Vec::new();
+    };
+    imports_in_tree(tree.root_node(), content, lang)
+}
+
+/// [`extract_imports`] over a tree the caller has already parsed from
+/// `content` with `lang`'s grammar, so a caller that has one parses once.
+#[must_use]
+pub fn imports_in_tree(root: tree_sitter::Node, content: &str, lang: Lang) -> Vec<Import> {
+    if !reads_statements_from_tree(lang) {
+        return line_imports(content, lang);
+    }
+    let mut out = Vec::new();
+    let mut cursor = root.walk();
+    loop {
+        let node = cursor.node();
+        let modules = statement_modules(node, content, lang);
+        let is_statement = modules.is_some();
+        for (source, line) in modules.into_iter().flatten() {
+            if source.is_empty() {
+                continue;
+            }
+            out.push(Import {
+                source,
+                line,
+                start_line: line_of(node),
+                end_line: last_line_of(node),
+            });
+        }
+        // A statement's own subtree holds no further statements.
+        if !is_statement && cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.node() == root {
+                return out;
+            }
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                return out;
+            }
+        }
+    }
+}
+
+/// Languages where one statement can name several modules or span several
+/// lines, so statements are read from the syntax tree.
+fn reads_statements_from_tree(lang: Lang) -> bool {
+    matches!(
+        lang,
+        Lang::Go
+            | Lang::Rust
+            | Lang::Python
+            | Lang::TypeScript
+            | Lang::Tsx
+            | Lang::JavaScript
+            | Lang::Scala
+            | Lang::Elixir
+    )
+}
+
+/// One import per line `is_import_line` accepts.
+fn line_imports(content: &str, lang: Lang) -> Vec<Import> {
+    let mut out = Vec::new();
+    for (index, line) in content.lines().enumerate() {
+        if !is_import_line(line, lang) {
+            continue;
+        }
+        let source = crate::lang::outline::extract_import_source(line, Some(lang));
+        if source.is_empty() {
+            continue;
+        }
+        let line = index as u32 + 1;
+        out.push(Import {
+            source,
+            line,
+            start_line: line,
+            end_line: line,
+        });
+    }
+    out
+}
+
+/// The modules an import statement names, each with the line it is named on.
+/// `None` when `node` is not an import statement.
+fn statement_modules(node: tree_sitter::Node, src: &str, lang: Lang) -> Option<Vec<(String, u32)>> {
+    let mut out = Vec::new();
+    match (lang, node.kind()) {
+        (Lang::Go, "import_declaration") => go_specs(node, src, &mut out),
+        (Lang::Rust, "use_declaration") => {
+            if let Some(tree) = node.child_by_field_name("argument") {
+                rust_use_tree(tree, "", src, &mut out);
+            }
+        }
+        (Lang::Python, "import_statement") => {
+            let mut cursor = node.walk();
+            for name in node.children_by_field_name("name", &mut cursor) {
+                // `import a.b as c` names `a.b`.
+                let module = name.child_by_field_name("name").unwrap_or(name);
+                out.push((compact(module, src), line_of(module)));
+            }
+        }
+        (Lang::Python, "import_from_statement") => {
+            if let Some(module) = node.child_by_field_name("module_name") {
+                out.push((compact(module, src), line_of(module)));
+            }
+        }
+        (Lang::Python, "future_import_statement") => {
+            out.push(("__future__".to_string(), line_of(node)));
+        }
+        (Lang::TypeScript | Lang::Tsx | Lang::JavaScript, "import_statement") => {
+            // `import x from "m"` and `import "m"` carry the source on the
+            // statement; `import x = require("m")` on its require clause.
+            let source = node.child_by_field_name("source").or_else(|| {
+                let mut cursor = node.walk();
+                let clause = node
+                    .children(&mut cursor)
+                    .find(|c| c.kind() == "import_require_clause");
+                clause.and_then(|c| c.child_by_field_name("source"))
+            });
+            if let Some(source) = source {
+                out.push((unquote(source, src), line_of(source)));
+            }
+        }
+        (Lang::Scala, "import_declaration") => scala_paths(node, src, &mut out),
+        (Lang::Elixir, "call") => elixir_directive(node, src, &mut out)?,
+        _ => return None,
+    }
+    Some(out)
+}
+
+/// Go: `import "m"` and `import ( "a"; x "b" )`, one module per spec.
+fn go_specs(node: tree_sitter::Node, src: &str, out: &mut Vec<(String, u32)>) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "import_spec" => {
+                if let Some(path) = child.child_by_field_name("path") {
+                    out.push((unquote(path, src), line_of(path)));
+                }
+            }
+            "import_spec_list" => go_specs(child, src, out),
+            _ => {}
+        }
+    }
+}
+
+/// Rust: expand a use tree into one path per leaf. `crate::{core, seams::git}`
+/// gives `crate::core` and `crate::seams::git`; `foo::{self, bar as baz}`
+/// gives `foo` and `foo::bar`; a glob keeps its `*`.
+fn rust_use_tree(node: tree_sitter::Node, prefix: &str, src: &str, out: &mut Vec<(String, u32)>) {
+    match node.kind() {
+        "scoped_use_list" => {
+            let path = node
+                .child_by_field_name("path")
+                .map(|p| compact(p, src))
+                .unwrap_or_default();
+            if let Some(list) = node.child_by_field_name("list") {
+                rust_use_tree(list, &join_path(prefix, &path, "::"), src, out);
+            }
+        }
+        "use_list" => {
+            let mut cursor = node.walk();
+            for member in node.named_children(&mut cursor) {
+                rust_use_tree(member, prefix, src, out);
+            }
+        }
+        "use_as_clause" => {
+            if let Some(path) = node.child_by_field_name("path") {
+                out.push((join_path(prefix, &compact(path, src), "::"), line_of(node)));
+            }
+        }
+        "self" if !prefix.is_empty() => out.push((prefix.to_string(), line_of(node))),
+        kind if kind.ends_with("comment") => {}
+        _ => out.push((join_path(prefix, &compact(node, src), "::"), line_of(node))),
+    }
+}
+
+/// Scala: `import a.b, c.d` gives two paths; `import a.{b, c => d}` gives
+/// `a.b` and `a.c`; a wildcard keeps its `_`.
+fn scala_paths(node: tree_sitter::Node, src: &str, out: &mut Vec<(String, u32)>) {
+    /// Close the path read so far; a path that ended in selectors or a
+    /// wildcard has already given its imports.
+    fn flush(path: &mut String, line: u32, selected: &mut bool, out: &mut Vec<(String, u32)>) {
+        let stem = path.trim_end_matches('.');
+        if !*selected && !stem.is_empty() {
+            out.push((stem.to_string(), line));
+        }
+        path.clear();
+        *selected = false;
+    }
+
+    let mut path = String::new();
+    let mut path_line = line_of(node);
+    let mut selected = false;
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "import" => {}
+            "," => flush(&mut path, path_line, &mut selected, out),
+            "namespace_selectors" => {
+                let stem = path.trim_end_matches('.').to_string();
+                let mut members = child.walk();
+                for member in child.named_children(&mut members) {
+                    if member.kind().ends_with("comment") {
+                        continue;
+                    }
+                    let name = if member.kind() == "namespace_wildcard" {
+                        "_".to_string()
+                    } else {
+                        compact(member.child_by_field_name("name").unwrap_or(member), src)
+                    };
+                    out.push((join_path(&stem, &name, "."), line_of(member)));
+                }
+                selected = true;
+            }
+            "namespace_wildcard" => {
+                out.push((
+                    join_path(path.trim_end_matches('.'), "_", "."),
+                    line_of(child),
+                ));
+                selected = true;
+            }
+            kind if kind.ends_with("comment") => {}
+            _ => {
+                if path.is_empty() {
+                    path_line = line_of(child);
+                }
+                path.push_str(&compact(child, src));
+            }
+        }
+    }
+    flush(&mut path, path_line, &mut selected, out);
+}
+
+/// Elixir: `alias`, `import`, `use` and `require` name the module in their
+/// first argument; `alias A.{B, C}` names `A.B` and `A.C`. `None` when the
+/// call is none of the four.
+fn elixir_directive(
+    node: tree_sitter::Node,
+    src: &str,
+    out: &mut Vec<(String, u32)>,
+) -> Option<()> {
+    let target = node.child_by_field_name("target")?;
+    if target.kind() != "identifier"
+        || !matches!(text(target, src), "alias" | "import" | "use" | "require")
+    {
+        return None;
+    }
+    let mut cursor = node.walk();
+    let arguments = node
+        .children(&mut cursor)
+        .find(|c| c.kind() == "arguments")?;
+    let mut args = arguments.walk();
+    let Some(first) = arguments
+        .named_children(&mut args)
+        .find(|c| !c.kind().ends_with("comment"))
+    else {
+        return Some(());
+    };
+    let group = (first.kind() == "dot")
+        .then(|| first.child_by_field_name("right"))
+        .flatten()
+        .filter(|right| right.kind() == "tuple");
+    match (group, first.child_by_field_name("left")) {
+        (Some(tuple), Some(left)) => {
+            let stem = compact(left, src);
+            let mut members = tuple.walk();
+            for member in tuple.named_children(&mut members) {
+                if !member.kind().ends_with("comment") {
+                    out.push((
+                        join_path(&stem, &compact(member, src), "."),
+                        line_of(member),
+                    ));
+                }
+            }
+        }
+        _ => out.push((compact(first, src), line_of(first))),
+    }
+    Some(())
+}
+
+fn text<'a>(node: tree_sitter::Node, src: &'a str) -> &'a str {
+    &src[node.byte_range()]
+}
+
+/// A path's text with the whitespace a formatter may put inside it removed.
+fn compact(node: tree_sitter::Node, src: &str) -> String {
+    text(node, src).split_whitespace().collect()
+}
+
+/// A string literal's content.
+fn unquote(node: tree_sitter::Node, src: &str) -> String {
+    text(node, src)
+        .trim_matches(|c| c == '"' || c == '\'' || c == '`')
+        .to_string()
+}
+
+fn join_path(prefix: &str, rest: &str, separator: &str) -> String {
+    if prefix.is_empty() {
+        rest.to_string()
+    } else if rest.is_empty() {
+        prefix.to_string()
+    } else {
+        format!("{prefix}{separator}{rest}")
+    }
+}
+
+fn line_of(node: tree_sitter::Node) -> u32 {
+    node.start_position().row as u32 + 1
+}
+
+/// The last line a node covers; a node that ends at the start of a line
+/// (after its newline) ends on the line before.
+fn last_line_of(node: tree_sitter::Node) -> u32 {
+    let end = node.end_position();
+    if end.column == 0 && end.row > node.start_position().row {
+        end.row as u32
+    } else {
+        end.row as u32 + 1
+    }
 }
 
 #[must_use]
@@ -269,6 +633,36 @@ fn resolve_bash(dir: &Path, source: &str) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use std::fs;
+
+    fn sources(content: &str, lang: Lang) -> Vec<String> {
+        extract_imports(content, lang)
+            .into_iter()
+            .map(|i| i.source)
+            .collect()
+    }
+
+    #[test]
+    fn import_shaped_text_in_a_string_is_not_an_import() {
+        let python = "DOC = \"\"\"\nimport not_a_module\n\"\"\"\nimport real\n";
+        assert_eq!(sources(python, Lang::Python), ["real"]);
+    }
+
+    #[test]
+    fn rust_use_trees_expand_to_leaf_paths() {
+        let rust = "use foo::{self, bar as baz, *};\nuse x::*;\nfn f() {\n    use inner::q;\n}\n";
+        assert_eq!(
+            sources(rust, Lang::Rust),
+            ["foo", "foo::bar", "foo::*", "x::*", "inner::q"]
+        );
+    }
+
+    #[test]
+    fn line_languages_give_one_import_per_line() {
+        let java = "import a.b.C;\nimport a.*;\nclass X {}\n";
+        assert_eq!(sources(java, Lang::Java), ["a.b.C", "a.*"]);
+        let bash = "source ./lib.sh\nsource \"$DIR/x.sh\"\n";
+        assert_eq!(sources(bash, Lang::Bash), ["./lib.sh"]);
+    }
 
     /// A Rust `use` group names one module per member, and each one that is
     /// local resolves to its own file. Read off the line as one source, the

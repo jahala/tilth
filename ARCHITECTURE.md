@@ -47,7 +47,7 @@ crates/tilth-core/src/
 │                    InvalidQuery, IoError, ParseError, …)
 ├── cache.rs         OutlineCache: rendered outlines + parsed
 │                    tree_sitter::Tree, both keyed by (path, mtime)
-├── imports.rs       Import lines, import sources, related-file resolution
+├── imports.rs       Imports as data (one per module named), import lines, related-file resolution
 ├── test_structure.rs describe/it/test calls as TestEntry data
 │
 ├── search/          Cross-file queries

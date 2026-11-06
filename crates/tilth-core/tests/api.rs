@@ -1,16 +1,18 @@
 //! The public surface of `tilth-core`, exercised from outside the crate: a
 //! consumer with only this crate must be able to do all of it. Four inline
-//! language samples, a two-file callers case and a two-file deps case.
+//! language samples, per-module imports in Go, Rust, Python and TypeScript,
+//! a two-file callers case and a two-file deps case.
 
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
 use tilth_core::{
-    analyze_deps, detect_file_type, extract_import_source, find_callers_batch, get_outline_entries,
-    is_external, is_import_line, is_test_file, resolve_related_files_with_content, test_entries,
-    BloomFilterCache, CallerMatch, Dependent, DepsResult, FileType, Lang, LocalDep, OutlineEntry,
-    OutlineKind, TestEntry, TestKind, TilthError,
+    analyze_deps, detect_file_type, extract_import_source, extract_imports, find_callers_batch,
+    get_outline_entries, is_external, is_import_line, is_test_file,
+    resolve_related_files_with_content, test_entries, BloomFilterCache, CallerMatch, Dependent,
+    DepsResult, FileType, Import, Lang, LocalDep, OutlineEntry, OutlineKind, TestEntry, TestKind,
+    TilthError,
 };
 
 struct Sample {
@@ -144,6 +146,77 @@ fn import_lines_are_recognised_and_their_source_extracted() {
     }
     assert!(!is_external("./util", Lang::TypeScript));
     assert!(!is_external("crate::util", Lang::Rust));
+}
+
+/// `(source, line, start_line, end_line)` of each import, for a readable assert.
+fn imports_of(content: &str, lang: Lang) -> Vec<(String, u32, u32, u32)> {
+    extract_imports(content, lang)
+        .into_iter()
+        .map(|i: Import| (i.source, i.line, i.start_line, i.end_line))
+        .collect()
+}
+
+fn owned(expected: &[(&str, u32, u32, u32)]) -> Vec<(String, u32, u32, u32)> {
+    expected
+        .iter()
+        .map(|&(s, l, a, b)| (s.to_string(), l, a, b))
+        .collect()
+}
+
+/// A statement that names several modules gives one import per module,
+/// each on the line that names it, and each knows the statement it sits in.
+#[test]
+fn go_import_block_gives_one_import_per_spec() {
+    let go = "package m\n\nimport \"errors\"\n\nimport (\n\t\"fmt\"\n\tx \"example.com/m/core\"\n\t_ \"example.com/m/seams\"\n)\n";
+    assert_eq!(
+        imports_of(go, Lang::Go),
+        owned(&[
+            ("errors", 3, 3, 3),
+            ("fmt", 6, 5, 9),
+            ("example.com/m/core", 7, 5, 9),
+            ("example.com/m/seams", 8, 5, 9),
+        ])
+    );
+}
+
+#[test]
+fn rust_use_group_gives_one_import_per_member() {
+    let rust = "use crate::{core, seams::git};\nuse crate::{\n    read::{self, Outline},\n    error::Error as E,\n};\nuse std::fs;\n";
+    assert_eq!(
+        imports_of(rust, Lang::Rust),
+        owned(&[
+            ("crate::core", 1, 1, 1),
+            ("crate::seams::git", 1, 1, 1),
+            ("crate::read", 3, 2, 5),
+            ("crate::read::Outline", 3, 2, 5),
+            ("crate::error::Error", 4, 2, 5),
+            ("std::fs", 6, 6, 6),
+        ])
+    );
+}
+
+#[test]
+fn python_import_list_gives_one_import_per_module() {
+    let python = "import os, json\nimport a.b as c\nfrom pkg import (\n    one,\n    two,\n)\nfrom . import sibling\n";
+    assert_eq!(
+        imports_of(python, Lang::Python),
+        owned(&[
+            ("os", 1, 1, 1),
+            ("json", 1, 1, 1),
+            ("a.b", 2, 2, 2),
+            ("pkg", 3, 3, 6),
+            (".", 7, 7, 7),
+        ])
+    );
+}
+
+#[test]
+fn typescript_import_across_lines_names_its_module() {
+    let ts = "import {\n  a,\n  b,\n} from \"./core\";\nimport \"./side\";\n";
+    assert_eq!(
+        imports_of(ts, Lang::TypeScript),
+        owned(&[("./core", 4, 1, 4), ("./side", 5, 5, 5)])
+    );
 }
 
 #[test]

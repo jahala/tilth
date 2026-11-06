@@ -26,7 +26,7 @@ crates/tilth-core/src/
     bloom_walk.rs      Shared file-prefilter for relational queries (callers/callees/deps): size gate + bloom-filter pre-check before a full parse.
   index/
     bloom.rs           Bloom filter cache for fast "file contains symbol?" pre-check.
-  imports.rs           Import detection and resolution: is_import_line(), is_external(), resolve_related_files_with_content().
+  imports.rs           Imports as data, one Import per module a statement names: extract_imports(). Also is_import_line(), is_external(), resolve_related_files_with_content().
   test_structure.rs    describe/it/test structure of a test file as data: test_entries().
   cache.rs             OutlineCache — DashMap of path → (mtime, outline) and parsed trees. Shared across tools.
   types.rs             Shared types: Lang, FileType, OutlineEntry, OutlineKind.

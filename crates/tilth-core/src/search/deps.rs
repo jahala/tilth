@@ -7,9 +7,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::error::TilthError;
-use crate::imports::{is_external, is_import_line, resolve_related_files_with_content};
+use crate::imports::{extract_imports, is_external, resolve_related_files_with_content};
 use crate::lang::detect_file_type;
-use crate::lang::outline::{extract_import_source, get_outline_entries};
+use crate::lang::outline::get_outline_entries;
 use crate::search::callees::{extract_callee_names, resolve_callees};
 use crate::search::callers::find_callers_batch;
 use crate::types::{is_test_file, FileType, OutlineKind};
@@ -153,19 +153,13 @@ pub fn analyze_deps(
         .collect();
     uses_local.sort_by(|a, b| a.path.cmp(&b.path));
 
-    // External deps via line-level import parsing
+    // External deps: one per module the imports name
     let mut external_set: HashSet<String> = HashSet::new();
-    for line in content.lines() {
-        if !is_import_line(line, lang) {
-            continue;
-        }
-        let source = extract_import_source(line, Some(lang));
-        if source.is_empty() {
-            continue;
-        }
+    for import in extract_imports(&content, lang) {
+        let source = import.source;
         if is_external(&source, lang) && !is_stdlib(&source, lang) && is_valid_module_path(&source)
         {
-            external_set.insert(source.clone());
+            external_set.insert(source);
         }
     }
     let mut uses_external: Vec<String> = external_set.into_iter().collect();
@@ -283,7 +277,7 @@ fn is_stdlib(source: &str, lang: crate::types::Lang) -> bool {
 }
 
 /// Returns true if the string looks like a valid module/package path.
-/// Filters out garbage from string literals that pass `is_import_line`.
+/// Filters out what a line-read import yields that names no module.
 fn is_valid_module_path(source: &str) -> bool {
     // Must not contain spaces (real module paths don't)
     if source.contains(' ') {
@@ -343,7 +337,34 @@ mod tests {
         let content = "use serde::{Deserialize, de::Visitor};\nuse serde_json::Value as Json;\n";
         assert_eq!(
             externals_of("lib.rs", content),
-            ["serde::Deserialize", "serde::de::Visitor", "serde_json::Value"]
+            [
+                "serde::Deserialize",
+                "serde::de::Visitor",
+                "serde_json::Value"
+            ]
+        );
+    }
+
+    /// Scala's `import cats.{Functor, Monad}` names two modules. Read as one,
+    /// the source held a space and was dropped.
+    #[test]
+    fn scala_import_selectors_name_each_module() {
+        let content = "import cats.{Functor, Monad => M}\nimport akka.actor._\n";
+        assert_eq!(
+            externals_of("Main.scala", content),
+            ["akka.actor._", "cats.Functor", "cats.Monad"]
+        );
+    }
+
+    /// Elixir's `alias Foo.{Bar, Baz}` names two modules. Read as one, the
+    /// source was `Foo.{Bar`.
+    #[test]
+    fn elixir_alias_group_names_each_module() {
+        let content =
+            "defmodule M do\n  alias Foo.{Bar, Baz}\n  import Ecto.Query, only: [from: 2]\nend\n";
+        assert_eq!(
+            externals_of("m.ex", content),
+            ["Ecto.Query", "Foo.Bar", "Foo.Baz"]
         );
     }
 
