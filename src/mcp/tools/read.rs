@@ -3,12 +3,13 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::cache::OutlineCache;
-use crate::error::TilthError;
-use crate::lang::detect_file_type;
-use crate::lang::outline::get_outline_entries;
 use crate::session::Session;
-use crate::types::{FileType, OutlineEntry, ViewMode};
+use crate::types::ViewMode;
+use tilth_core::cache::OutlineCache;
+use tilth_core::error::TilthError;
+use tilth_core::lang::detect_file_type;
+use tilth_core::lang::outline::get_outline_entries;
+use tilth_core::types::{FileType, OutlineEntry, OutlineKind};
 
 use super::apply_budget;
 
@@ -160,7 +161,7 @@ pub(in crate::mcp) fn tool_read(
 
     // Append related-file hint for outlined code files (not section reads, not batch).
     if section.is_none() && crate::read::would_outline(&path) {
-        let related = crate::read::imports::resolve_related_files(&path);
+        let related = tilth_core::imports::resolve_related_files(&path, cache);
         if !related.is_empty() {
             output.push_str("\n\n> Related: ");
             for (i, p) in related.iter().enumerate() {
@@ -218,7 +219,14 @@ fn read_signature_file(path: &Path, cache: &OutlineCache) -> Result<(String, u32
 }
 
 fn render_signature_entries(entries: &[OutlineEntry], lines: &[&str], out: &mut String) {
+    let mut previous_start = None;
     for entry in entries {
+        // The specifiers of one export clause are entries on the same line;
+        // the line prints once.
+        if previous_start == Some(entry.start_line) && entry.kind == OutlineKind::Export {
+            continue;
+        }
+        previous_start = Some(entry.start_line);
         let idx = entry.start_line.saturating_sub(1) as usize;
         if let Some(line) = lines.get(idx) {
             let hash = crate::format::line_hash(line.as_bytes());
@@ -317,6 +325,26 @@ mod tests {
         assert!(
             !out.contains("body_marker"),
             "signature mode should omit function body: {out}"
+        );
+    }
+
+    /// An export clause is one outline entry per specifier; its line prints
+    /// once in signature mode.
+    #[test]
+    fn tool_read_signature_mode_prints_an_export_clause_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("barrel.ts");
+        std::fs::write(&path, "export { a, b as c } from \"./y\";\n").unwrap();
+        let args = serde_json::json!({
+            "path": path.to_str().unwrap(),
+            "mode": "signature",
+        });
+        let out =
+            tool_read(&args, &OutlineCache::new(), &Session::new(), false).expect("signature read");
+        assert_eq!(
+            out.lines().filter(|l| l.starts_with("1:")).count(),
+            1,
+            "{out}"
         );
     }
 

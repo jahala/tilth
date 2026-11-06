@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use super::{DiffLine, DiffLineKind, FileDiff, FileStatus, Hunk};
-use crate::lang::detection::is_generated_by_name;
+use tilth_core::lang::detection::is_generated_by_name;
 
 /// Parse `git diff --no-color` unified diff output into a list of `FileDiff`s.
 pub(crate) fn parse_unified_diff(raw: &str) -> Vec<FileDiff> {

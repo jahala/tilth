@@ -535,8 +535,8 @@ mod tests {
     use crate::diff::{
         ChangeType, Conflict, DiffLine, DiffLineKind, FileOverlay, MatchConfidence, SymbolChange,
     };
-    use crate::types::OutlineKind;
     use std::path::{Path, PathBuf};
+    use tilth_core::types::OutlineKind;
 
     fn make_overlay(path: &str, changes: Vec<SymbolChange>) -> FileOverlay {
         FileOverlay {

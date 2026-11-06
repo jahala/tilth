@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Range;
 
-use crate::lang::outline::outline_language;
-use crate::types::{Lang, OutlineEntry, OutlineKind};
+use tilth_core::lang::outline::outline_language;
+use tilth_core::types::{Lang, OutlineEntry, OutlineKind};
 
 use super::{ChangeType, DiffSymbol, MatchConfidence, SymbolChange, SymbolIdentity};
 
@@ -413,6 +413,7 @@ fn clone_entry_shallow(entry: &OutlineEntry) -> OutlineEntry {
         signature: entry.signature.clone(),
         children: Vec::new(),
         doc: entry.doc.clone(),
+        local_name: entry.local_name.clone(),
     }
 }
 
@@ -562,6 +563,7 @@ mod tests {
                 signature: sig.map(std::string::ToString::to_string),
                 children: Vec::new(),
                 doc: None,
+                local_name: None,
             },
             identity: SymbolIdentity {
                 kind,
@@ -989,7 +991,7 @@ mod tests {
     #[test]
     fn impl_block_parent_path() {
         let src = "impl Foo {\n    fn bar(&self) { 1 }\n}";
-        let entries = crate::lang::outline::get_outline_entries(src, Lang::Rust);
+        let entries = tilth_core::lang::outline::get_outline_entries(src, Lang::Rust);
         let symbols = build_diff_symbols(&entries, src, Lang::Rust);
         let bar = symbols
             .iter()
@@ -1006,7 +1008,7 @@ mod tests {
     #[test]
     fn build_diff_symbols_rust() {
         let src = "fn hello() -> i32 { 42 }\nstruct Point { x: f64, y: f64 }";
-        let entries = crate::lang::outline::get_outline_entries(src, Lang::Rust);
+        let entries = tilth_core::lang::outline::get_outline_entries(src, Lang::Rust);
         let symbols = build_diff_symbols(&entries, src, Lang::Rust);
         assert!(symbols.len() >= 2);
         let hello = symbols.iter().find(|s| s.identity.name == "hello");
@@ -1019,7 +1021,7 @@ mod tests {
     #[test]
     fn build_diff_symbols_impl_children() {
         let src = "impl MyStruct {\n    fn method_a(&self) { }\n    fn method_b(&self) { }\n}";
-        let entries = crate::lang::outline::get_outline_entries(src, Lang::Rust);
+        let entries = tilth_core::lang::outline::get_outline_entries(src, Lang::Rust);
         let symbols = build_diff_symbols(&entries, src, Lang::Rust);
         let methods: Vec<_> = symbols
             .iter()

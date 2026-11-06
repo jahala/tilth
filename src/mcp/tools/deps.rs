@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::index::bloom::BloomFilterCache;
+use tilth_core::index::bloom::BloomFilterCache;
 
 use super::resolve_scope;
 
@@ -26,8 +26,7 @@ pub(in crate::mcp) fn tool_deps(
         .and_then(serde_json::Value::as_u64)
         .map(|b| b as usize);
 
-    let deps_result =
-        crate::search::deps::analyze_deps(&path, &scope, bloom).map_err(|e| e.to_string())?;
+    let deps_result = tilth_core::analyze_deps(&path, &scope, bloom).map_err(|e| e.to_string())?;
     let mut output = scope_warning.unwrap_or_default();
     output.push_str(&crate::search::deps::format_deps(
         &deps_result,

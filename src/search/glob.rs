@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 
 use globset::Glob;
 
-use crate::error::TilthError;
 use crate::types::estimate_tokens;
+use tilth_core::error::TilthError;
 
 const MAX_FILES: usize = 20;
 
@@ -32,7 +32,7 @@ pub fn search(pattern: &str, scope: &Path) -> Result<GlobResult, TilthError> {
     let matched: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
     let extensions: std::sync::Mutex<HashSet<String>> = std::sync::Mutex::new(HashSet::new());
 
-    let walker = super::walker(scope, None)?;
+    let walker = tilth_core::search::walk::walker(scope, None)?;
 
     walker.run(|| {
         let matcher = &matcher;
@@ -137,7 +137,7 @@ fn is_binary_file(path: &Path) -> bool {
     if file.take(512).read_to_end(&mut head).is_err() {
         return false;
     }
-    crate::lang::detection::is_binary(&head)
+    tilth_core::lang::detection::is_binary(&head)
 }
 
 #[cfg(test)]

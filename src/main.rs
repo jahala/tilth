@@ -291,7 +291,7 @@ fn main() {
 
     // Map mode
     if cli.map {
-        let cache = tilth::cache::OutlineCache::new();
+        let cache = tilth_core::cache::OutlineCache::new();
         let scope =
             cli_scope(cli.scope, FileScopeHint::Directory).unwrap_or_else(|e| usage_exit(&e));
         let output = tilth::map::generate(&scope, 3, cli.budget, &cache);
@@ -307,7 +307,7 @@ fn main() {
         process::exit(3);
     };
 
-    let cache = tilth::cache::OutlineCache::new();
+    let cache = tilth_core::cache::OutlineCache::new();
     // --deps takes no --glob, so only the search modes can offer one.
     let hint = if cli.deps {
         FileScopeHint::Directory
@@ -424,7 +424,7 @@ fn usage_exit(msg: &str) -> ! {
 }
 
 fn emit_result(
-    result: Result<String, tilth::error::TilthError>,
+    result: Result<String, tilth_core::TilthError>,
     query: &str,
     json: bool,
     is_tty: bool,

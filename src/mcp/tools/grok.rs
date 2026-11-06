@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::index::bloom::BloomFilterCache;
 use crate::session::Session;
+use tilth_core::index::bloom::BloomFilterCache;
 
 use super::resolve_scope;
 

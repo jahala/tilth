@@ -1,4 +1,3 @@
-pub mod imports;
 pub mod outline;
 
 use std::fmt::Write;
@@ -7,12 +6,13 @@ use std::path::Path;
 
 use memmap2::Mmap;
 
-use crate::cache::OutlineCache;
-use crate::error::TilthError;
 use crate::format;
-use crate::lang::detect_file_type;
-use crate::lang::outline::{heading_level, heading_text, parse_markdown};
-use crate::types::{estimate_tokens, FileType, ViewMode};
+use crate::types::{estimate_tokens, ViewMode};
+use tilth_core::cache::OutlineCache;
+use tilth_core::error::TilthError;
+use tilth_core::lang::detect_file_type;
+use tilth_core::lang::outline::{heading_level, heading_text, parse_markdown};
+use tilth_core::types::FileType;
 
 pub(crate) const TOKEN_THRESHOLD: u64 = 6_000;
 /// Minimum compression ratio required to prefer the outline over full content.
@@ -91,7 +91,7 @@ pub fn read_file(
     })?;
     let buf = &mmap[..];
 
-    if crate::lang::detection::is_binary(buf) {
+    if tilth_core::lang::detection::is_binary(buf) {
         let mime = mime_from_ext(path);
         return Ok(format::binary_header(path, byte_len, mime));
     }
@@ -99,8 +99,8 @@ pub fn read_file(
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
     // Generated
-    if crate::lang::detection::is_generated_by_name(name)
-        || crate::lang::detection::is_generated_by_content(buf)
+    if tilth_core::lang::detection::is_generated_by_name(name)
+        || tilth_core::lang::detection::is_generated_by_content(buf)
     {
         let line_count = memchr::memchr_iter(b'\n', buf).count() as u32 + 1;
         return Ok(format::file_header(
@@ -112,9 +112,9 @@ pub fn read_file(
     }
 
     // Minified — filename convention or, for big files, newline-density heuristic.
-    if crate::lang::detection::is_minified_by_name(name)
-        || (byte_len >= crate::lang::detection::MINIFIED_CHECK_THRESHOLD
-            && crate::lang::detection::is_minified_by_content(buf))
+    if tilth_core::lang::detection::is_minified_by_name(name)
+        || (byte_len >= tilth_core::lang::detection::MINIFIED_CHECK_THRESHOLD
+            && tilth_core::lang::detection::is_minified_by_content(buf))
     {
         let line_count = memchr::memchr_iter(b'\n', buf).count() as u32 + 1;
         return Ok(format::file_header(

@@ -19,7 +19,7 @@ pub fn facet_matches(matches: Vec<Match>, _scope: &Path) -> FacetedResult {
         .iter()
         .find(|m| m.is_definition)
         .and_then(|m| m.path.parent())
-        .and_then(crate::lang::package_root)
+        .and_then(tilth_core::lang::package_root)
         .map(std::path::Path::to_path_buf);
 
     let mut definitions = Vec::new();
@@ -84,6 +84,6 @@ fn is_same_package(path: &Path, primary_pkg: Option<&PathBuf>) -> bool {
     };
 
     path.parent()
-        .and_then(crate::lang::package_root)
+        .and_then(tilth_core::lang::package_root)
         .is_some_and(|p| p == pkg_root.as_path())
 }

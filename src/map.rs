@@ -2,11 +2,12 @@ use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
-use crate::cache::OutlineCache;
-use crate::lang::detect_file_type;
 use crate::read::outline;
-use crate::search::base_walk_builder;
-use crate::types::{estimate_tokens, FileType};
+use crate::types::estimate_tokens;
+use tilth_core::cache::OutlineCache;
+use tilth_core::lang::detect_file_type;
+use tilth_core::search::walk::base_walk_builder;
+use tilth_core::types::FileType;
 
 /// Generate a structural codebase map.
 /// Code files show symbol names from outline cache.
@@ -218,7 +219,7 @@ fn format_tree(
                 } else {
                     let syms = symbols.join(", ");
                     let truncated = if syms.len() > 80 {
-                        format!("{}...", crate::types::truncate_str(&syms, 77))
+                        format!("{}...", tilth_core::types::truncate_str(&syms, 77))
                     } else {
                         syms
                     };

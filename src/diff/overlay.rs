@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::lang::detect_file_type;
-use crate::lang::outline::get_outline_entries;
-use crate::types::{FileType, OutlineEntry, OutlineKind};
+use tilth_core::lang::detect_file_type;
+use tilth_core::lang::outline::get_outline_entries;
+use tilth_core::types::{FileType, OutlineEntry, OutlineKind};
 
 use super::matching::{build_diff_symbols, match_symbols};
 use super::{

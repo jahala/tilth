@@ -3,9 +3,9 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::cache::OutlineCache;
-use crate::index::bloom::BloomFilterCache;
 use crate::session::Session;
+use tilth_core::cache::OutlineCache;
+use tilth_core::index::bloom::BloomFilterCache;
 
 use super::{apply_budget, resolve_scope};
 
@@ -132,9 +132,9 @@ pub(in crate::mcp) fn tool_search(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::OutlineCache;
-    use crate::index::bloom::BloomFilterCache;
     use crate::session::Session;
+    use tilth_core::cache::OutlineCache;
+    use tilth_core::index::bloom::BloomFilterCache;
 
     /// Regression: `kind=callers` with a comma query must search each target
     /// separately, not for a literal symbol named "alpha,beta". Before the

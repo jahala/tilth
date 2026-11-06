@@ -1,5 +1,6 @@
-use crate::lang::outline::{extract_import_source, outline_language, walk_top_level};
-use crate::types::{Lang, OutlineEntry, OutlineKind};
+use tilth_core::imports::{imports_in_tree, Import};
+use tilth_core::lang::outline::{extract_import_source, outline_language, walk_top_level};
+use tilth_core::types::{Lang, OutlineEntry, OutlineKind};
 
 /// Generate a code outline using tree-sitter. Walks top-level AST nodes,
 /// emitting signatures without bodies.
@@ -21,25 +22,38 @@ pub fn outline(content: &str, lang: Lang, max_lines: usize) -> String {
     let root = tree.root_node();
     let lines: Vec<&str> = content.lines().collect();
     let entries = walk_top_level(root, &lines, lang);
+    let imports = imports_in_tree(root, content, lang);
 
-    format_entries(&entries, &lines, max_lines, lang)
+    format_entries(&entries, &imports, max_lines, lang)
 }
 
 /// Format outline entries into the spec'd output format.
 fn format_entries(
     entries: &[OutlineEntry],
-    _lines: &[&str],
+    imports: &[Import],
     max_lines: usize,
     lang: Lang,
 ) -> String {
     let mut out = Vec::new();
-    let mut import_groups: Vec<&str> = Vec::new();
+    let mut import_groups: Vec<&OutlineEntry> = Vec::new();
     // Track the start line of the first import in the current group.
     let mut import_group_start: u32 = 1;
+    // The export clause last rendered: its specifiers' entries share it, and
+    // the clause renders once.
+    let mut last_clause: Option<(u32, u32, &str)> = None;
 
     for entry in entries {
         if out.len() >= max_lines {
             break;
+        }
+        if entry.kind == OutlineKind::Export {
+            if let Some(clause) = entry.signature.as_deref() {
+                let key = (entry.start_line, entry.end_line, clause);
+                if last_clause == Some(key) {
+                    continue;
+                }
+                last_clause = Some(key);
+            }
         }
 
         match entry.kind {
@@ -47,13 +61,18 @@ fn format_entries(
                 if import_groups.is_empty() {
                     import_group_start = entry.start_line;
                 }
-                import_groups.push(&entry.name);
+                import_groups.push(entry);
                 continue;
             }
             _ => {
                 // Flush any accumulated imports
                 if !import_groups.is_empty() {
-                    out.push(format_imports(&import_groups, import_group_start, lang));
+                    out.push(format_imports(
+                        &import_groups,
+                        imports,
+                        import_group_start,
+                        lang,
+                    ));
                     import_groups.clear();
                 }
             }
@@ -88,7 +107,12 @@ fn format_entries(
 
     // Flush trailing imports
     if !import_groups.is_empty() {
-        out.push(format_imports(&import_groups, import_group_start, lang));
+        out.push(format_imports(
+            &import_groups,
+            imports,
+            import_group_start,
+            lang,
+        ));
     }
 
     out.join("\n")
@@ -96,15 +120,37 @@ fn format_entries(
 
 /// Format a collapsed import summary grouped by source with counts.
 /// Spec format: `imports: react(4), express(2), @/lib(3)`
-fn format_imports(imports: &[&str], start: u32, lang: Lang) -> String {
-    let count = imports.len();
+///
+/// Each module a statement names counts once, so a Go block or a Rust group
+/// lists its members. A statement with no module in `imports` (PHP, C# and
+/// the other languages `extract_imports` does not read) counts once, by the
+/// source its own text names.
+fn format_imports(
+    statements: &[&OutlineEntry],
+    imports: &[Import],
+    start: u32,
+    lang: Lang,
+) -> String {
+    let mut named: Vec<String> = Vec::new();
+    for statement in statements {
+        let before = named.len();
+        named.extend(
+            imports
+                .iter()
+                .filter(|i| (statement.start_line..=statement.end_line).contains(&i.start_line))
+                .map(|i| i.source.clone()),
+        );
+        if named.len() == before {
+            named.push(extract_import_source(&statement.name, Some(lang)));
+        }
+    }
+    let count = named.len();
 
-    // Extract source modules and count occurrences
+    // Count occurrences of each source, in first-seen order
     let mut sources: Vec<String> = Vec::new();
     let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
-    for imp in imports {
-        let source = extract_import_source(imp, Some(lang));
+    for source in named {
         *seen.entry(source.clone()).or_insert(0) += 1;
         if !sources.contains(&source) {
             sources.push(source);
@@ -184,6 +230,12 @@ fn format_entry(entry: &OutlineEntry, indent: usize, lang: Lang) -> String {
         OutlineKind::TestCase => "test",
     };
 
+    // An export clause renders as written, once for all its specifiers.
+    if let (OutlineKind::Export, Some(clause)) = (entry.kind, &entry.signature) {
+        let rest = clause.strip_prefix("export ").unwrap_or(clause);
+        return format!("{prefix}{range:<12} export {rest}");
+    }
+
     let sig = match &entry.signature {
         Some(s) => format!("\n{prefix}           {s}"),
         None => String::new(),
@@ -192,7 +244,7 @@ fn format_entry(entry: &OutlineEntry, indent: usize, lang: Lang) -> String {
     let doc = match &entry.doc {
         Some(d) => {
             let truncated = if d.len() > 60 {
-                format!("{}...", crate::types::truncate_str(d, 57))
+                format!("{}...", tilth_core::types::truncate_str(d, 57))
             } else {
                 d.clone()
             };
@@ -254,6 +306,52 @@ type UserId = String
         assert!(outline.contains("def load"));
         assert!(outline.contains("def connect"));
         assert!(outline.contains("def create"));
+    }
+
+    /// The import summary names each module a statement imports. Read off
+    /// the statement's first line, a Go block was `(` and a Rust group
+    /// written across lines was its bare prefix.
+    #[test]
+    fn import_summary_names_each_module_of_a_statement() {
+        let go = "package m\n\nimport (\n\t\"fmt\"\n\tx \"example.com/m/core\"\n)\n\nfunc A() {}\n";
+        let outline_go = outline(go, Lang::Go, 1000);
+        assert!(
+            outline_go.contains("[3-]   imports: fmt, example.com/m/core\n"),
+            "{outline_go}"
+        );
+
+        let rust = "use std::{\n    fs,\n    io,\n};\nuse crate::a;\n\nfn f() {}\n";
+        let outline_rust = outline(rust, Lang::Rust, 1000);
+        assert!(
+            outline_rust.contains("[1-]   imports: std::fs, std::io, crate::a\n"),
+            "{outline_rust}"
+        );
+
+        let python = "import os, json\nimport a.b as c\n\ndef f():\n    pass\n";
+        let outline_python = outline(python, Lang::Python, 1000);
+        assert!(
+            outline_python.contains("[1-]   imports: os, json, a.b\n"),
+            "{outline_python}"
+        );
+    }
+
+    /// An export clause renders as one line, the clause as written. Read off
+    /// its first line, a clause written across lines was `export {`.
+    #[test]
+    fn export_clause_renders_once_as_written() {
+        let ts = "function readPlan() {}\nexport { readPlan as parsePlan, readNode };\nexport {\n  a,\n  b as c,\n} from \"./y\";\n";
+        for lang in [Lang::TypeScript, Lang::JavaScript] {
+            let rendered = outline(ts, lang, 1000);
+            let lines: Vec<&str> = rendered.lines().collect();
+            assert_eq!(
+                lines[2..],
+                [
+                    "[2]          export { readPlan as parsePlan, readNode };",
+                    "[3-6]        export { a, b as c, } from \"./y\";",
+                ],
+                "{lang:?}:\n{rendered}"
+            );
+        }
     }
 
     #[test]

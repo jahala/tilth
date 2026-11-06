@@ -7,7 +7,7 @@ pub mod test_file;
 
 use std::path::Path;
 
-use crate::types::FileType;
+use tilth_core::types::FileType;
 
 const OUTLINE_CAP: usize = 100; // max outline lines for huge files
 
@@ -22,7 +22,7 @@ pub fn generate(
     let max_lines = if capped { OUTLINE_CAP } else { usize::MAX };
 
     // Test files get special treatment regardless of language
-    if crate::types::is_test_file(path) {
+    if tilth_core::types::is_test_file(path) {
         if let FileType::Code(lang) = file_type {
             if let Some(outline) = test_file::outline(content, lang, max_lines) {
                 return with_omission_note(outline, max_lines);
@@ -113,7 +113,7 @@ mod tests {
             s
         });
         let path = std::path::Path::new("fake.rs");
-        let file_type = crate::types::FileType::Code(crate::types::Lang::Rust);
+        let file_type = tilth_core::types::FileType::Code(tilth_core::types::Lang::Rust);
         let result = super::generate(path, file_type, &src, src.as_bytes(), true);
         assert!(
             result.contains("outline truncated"),
@@ -131,7 +131,7 @@ mod tests {
             s
         });
         let path = std::path::Path::new("fake.rs");
-        let file_type = crate::types::FileType::Code(crate::types::Lang::Rust);
+        let file_type = tilth_core::types::FileType::Code(tilth_core::types::Lang::Rust);
         let result = super::generate(path, file_type, &src, src.as_bytes(), true);
         assert!(
             !result.contains("outline truncated"),

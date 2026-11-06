@@ -1,6 +1,5 @@
 mod alloc;
 pub mod blast;
-pub mod callees;
 pub mod callers;
 pub mod content;
 pub mod deps;
@@ -13,65 +12,21 @@ pub mod strip;
 pub mod symbol;
 pub mod truncate;
 
-mod bloom_walk;
-mod callee_query;
-pub mod scope;
-
 use std::collections::HashSet;
 use std::fmt::Write;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use ignore::WalkBuilder;
-
-use crate::cache::OutlineCache;
-use crate::error::TilthError;
 use crate::format;
 use crate::read;
 use crate::session::Session;
-use crate::types::{estimate_tokens, FileType, Match, SearchResult};
+use crate::types::{estimate_tokens, Match, SearchResult};
+use tilth_core::cache::OutlineCache;
+use tilth_core::error::TilthError;
+use tilth_core::types::FileType;
 
 use crate::format::rel;
-
-// Directories that are always skipped — build artifacts, dependencies, VCS internals.
-// Keep this list even when ignore files are disabled; it covers common
-// high-volume directories that are rarely useful search targets.
-pub(crate) const SKIP_DIRS: &[&str] = &[
-    ".git",
-    ".jj",
-    ".hg",
-    ".svn",
-    "node_modules",
-    "target",
-    "dist",
-    "build",
-    "__pycache__",
-    ".pycache",
-    "vendor",
-    ".next",
-    ".nuxt",
-    "coverage",
-    ".cache",
-    ".tox",
-    ".venv",
-    ".eggs",
-    ".mypy_cache",
-    ".ruff_cache",
-    ".pytest_cache",
-    ".turbo",
-    ".parcel-cache",
-    ".svelte-kit",
-    "out",
-    ".output",
-    ".vercel",
-    ".netlify",
-    ".gradle",
-    ".idea",
-    ".scala-build",
-    ".bloop",
-    ".metals",
-];
 
 const EXPAND_FULL_FILE_THRESHOLD: u64 = 800;
 
@@ -79,132 +34,6 @@ const EXPAND_FULL_FILE_THRESHOLD: u64 = 800;
 /// Long sections get a tail "… (N more lines — pass --expand to see the full
 /// section)" so the user knows to expand for the rest.
 const MARKDOWN_PREVIEW_MAX_LINES: usize = 40;
-
-thread_local! {
-    static CALL_GITIGNORE_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-}
-
-pub(crate) fn call_gitignore_override() -> Option<bool> {
-    CALL_GITIGNORE_OVERRIDE.with(std::cell::Cell::get)
-}
-
-pub(crate) fn with_gitignore_override<T>(value: Option<bool>, f: impl FnOnce() -> T) -> T {
-    struct Restore(Option<bool>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            CALL_GITIGNORE_OVERRIDE.with(|current| current.set(self.0));
-        }
-    }
-    let previous = CALL_GITIGNORE_OVERRIDE.with(|current| current.replace(value));
-    let _restore = Restore(previous);
-    f()
-}
-
-fn gitignore_from_env() -> Option<bool> {
-    std::env::var("TILTH_RESPECT_GITIGNORE").ok().map(|v| {
-        matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
-}
-
-/// Whether walks honor `.gitignore`, `.ignore` and Git exclude rules: the
-/// per-call MCP override when one is set, else `TILTH_RESPECT_GITIGNORE`
-/// (which `--respect-gitignore` sets), else off.
-pub(crate) fn respect_gitignore() -> bool {
-    call_gitignore_override()
-        .or_else(gitignore_from_env)
-        .unwrap_or(false)
-}
-
-/// Shared walker policy: searches files except known junk directories and
-/// `.tilthignore` entries. Gitignore-style files are opt-in.
-/// Parent `.tilthignore` files apply at every level above the scope.
-/// The scope itself is an explicit traversal root: `--scope src/tmp` searches
-/// that directory even if a parent `.gitignore` excludes `src/tmp/`; ignore
-/// rules still filter entries beneath the scope.
-/// Used by both the parallel search walker (`walker()`) and the sequential map
-/// walker (`crate::map::generate`), which each apply their own final
-/// `.max_depth()`/`.threads()` and `.build()`/`.build_parallel()`.
-pub(crate) fn base_walk_builder(scope: &Path) -> WalkBuilder {
-    base_walk_builder_with_gitignore(scope, respect_gitignore())
-}
-
-fn base_walk_builder_with_gitignore(scope: &Path, respect_gitignore: bool) -> WalkBuilder {
-    let mut builder = WalkBuilder::new(scope);
-    builder
-        .follow_links(true)
-        .same_file_system(true) // Stop at mount boundaries (NFS, external volumes).
-        .hidden(false)
-        .git_ignore(respect_gitignore)
-        .git_global(respect_gitignore)
-        .git_exclude(respect_gitignore)
-        .ignore(respect_gitignore)
-        .require_git(!respect_gitignore)
-        .parents(true)
-        .add_custom_ignore_filename(".tilthignore")
-        .filter_entry(include_entry);
-    builder
-}
-
-fn include_entry(entry: &ignore::DirEntry) -> bool {
-    if entry.file_type().is_some_and(|ft| ft.is_dir()) {
-        if let Some(name) = entry.file_name().to_str() {
-            return !SKIP_DIRS.contains(&name);
-        }
-    }
-    true
-}
-
-/// Build a parallel directory walker over `.tilthignore`-filtered files except
-/// known junk directories. Gitignore-style files are opt-in.
-/// When `glob` is Some, applies a file-pattern filter (whitelist or negation).
-/// With gitignore enabled, the glob cannot override ignore rules.
-pub(crate) fn walker(scope: &Path, glob: Option<&str>) -> Result<ignore::WalkParallel, TilthError> {
-    let threads = std::env::var("TILTH_THREADS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism().map_or(4, |n| (n.get() / 2).clamp(2, 6))
-        });
-
-    let respect_gitignore = respect_gitignore();
-    let mut builder = base_walk_builder_with_gitignore(scope, respect_gitignore);
-    builder.threads(threads);
-
-    if let Some(pattern) = glob {
-        if !pattern.is_empty() {
-            let mut overrides = ignore::overrides::OverrideBuilder::new(scope);
-            overrides
-                .add(pattern)
-                .map_err(|e| TilthError::InvalidQuery {
-                    query: pattern.to_string(),
-                    reason: format!("invalid glob: {e}"),
-                })?;
-            let overrides = overrides.build().map_err(|e| TilthError::InvalidQuery {
-                query: pattern.to_string(),
-                reason: format!("invalid glob: {e}"),
-            })?;
-            if respect_gitignore {
-                // A glob narrows the walk without whitelisting ignored entries.
-                builder.filter_entry(move |entry| {
-                    include_entry(entry)
-                        && !overrides
-                            .matched(
-                                entry.path(),
-                                entry.file_type().is_some_and(|ft| ft.is_dir()),
-                            )
-                            .is_ignore()
-                });
-            } else {
-                builder.overrides(overrides);
-            }
-        }
-    }
-
-    Ok(builder.build_parallel())
-}
 
 /// Parse `/pattern/` regex syntax. Returns (pattern, `is_regex`).
 fn parse_pattern(query: &str) -> (&str, bool) {
@@ -239,7 +68,7 @@ pub fn search_symbol(
     full: bool,
 ) -> Result<String, TilthError> {
     let result = symbol::search(query, scope, None, glob, full)?;
-    let bloom = crate::index::bloom::BloomFilterCache::new();
+    let bloom = tilth_core::index::bloom::BloomFilterCache::new();
     format_search_result(&result, cache, None, &bloom, 0, None)
 }
 
@@ -248,7 +77,7 @@ pub fn search_symbol_expanded(
     scope: &Path,
     cache: &OutlineCache,
     session: &Session,
-    bloom: &crate::index::bloom::BloomFilterCache,
+    bloom: &tilth_core::index::bloom::BloomFilterCache,
     expand: usize,
     context: Option<&Path>,
     glob: Option<&str>,
@@ -264,7 +93,7 @@ pub fn search_multi_symbol_expanded(
     scope: &Path,
     cache: &OutlineCache,
     session: &Session,
-    bloom: &crate::index::bloom::BloomFilterCache,
+    bloom: &tilth_core::index::bloom::BloomFilterCache,
     expand: usize,
     context: Option<&Path>,
     glob: Option<&str>,
@@ -329,7 +158,7 @@ pub fn search_content(
 ) -> Result<String, TilthError> {
     let (pattern, is_regex) = parse_pattern(query);
     let result = content::search(pattern, scope, is_regex, None, glob, full)?;
-    let bloom = crate::index::bloom::BloomFilterCache::new();
+    let bloom = tilth_core::index::bloom::BloomFilterCache::new();
     format_search_result(&result, cache, None, &bloom, 0, None)
 }
 
@@ -341,7 +170,7 @@ pub fn search_regex(
     full: bool,
 ) -> Result<String, TilthError> {
     let result = content::search(pattern, scope, true, None, glob, full)?;
-    let bloom = crate::index::bloom::BloomFilterCache::new();
+    let bloom = tilth_core::index::bloom::BloomFilterCache::new();
     format_search_result(&result, cache, None, &bloom, 0, None)
 }
 
@@ -358,7 +187,7 @@ pub fn search_content_expanded(
 ) -> Result<String, TilthError> {
     let (pattern, is_regex) = parse_pattern(query);
     let result = content::search(pattern, scope, is_regex, context, glob, full)?;
-    let bloom = crate::index::bloom::BloomFilterCache::new();
+    let bloom = tilth_core::index::bloom::BloomFilterCache::new();
     format_search_result(&result, cache, Some(session), &bloom, expand, budget)
 }
 
@@ -375,7 +204,7 @@ pub fn search_regex_expanded(
     budget: Option<u64>,
 ) -> Result<String, TilthError> {
     let result = content::search(pattern, scope, true, context, glob, full)?;
-    let bloom = crate::index::bloom::BloomFilterCache::new();
+    let bloom = tilth_core::index::bloom::BloomFilterCache::new();
     format_search_result(&result, cache, Some(session), &bloom, expand, budget)
 }
 
@@ -415,7 +244,7 @@ pub fn format_raw_result(
     result: &SearchResult,
     cache: &OutlineCache,
 ) -> Result<String, TilthError> {
-    let bloom = crate::index::bloom::BloomFilterCache::new();
+    let bloom = tilth_core::index::bloom::BloomFilterCache::new();
     format_search_result(result, cache, None, &bloom, 0, None)
 }
 
@@ -454,7 +283,7 @@ fn format_matches(
     scope: &Path,
     cache: &OutlineCache,
     session: Option<&Session>,
-    bloom: &crate::index::bloom::BloomFilterCache,
+    bloom: &tilth_core::index::bloom::BloomFilterCache,
     expand_remaining: &mut usize,
     expanded_files: &mut HashSet<PathBuf>,
     out: &mut String,
@@ -633,7 +462,7 @@ fn format_single_match(
     scope: &Path,
     cache: &OutlineCache,
     session: Option<&Session>,
-    bloom: &crate::index::bloom::BloomFilterCache,
+    bloom: &tilth_core::index::bloom::BloomFilterCache,
     expand_remaining: &mut usize,
     expanded_files: &mut HashSet<PathBuf>,
     multi_file: bool,
@@ -769,11 +598,11 @@ fn format_single_match(
                         }
                     }
 
-                    let file_type = crate::lang::detect_file_type(&m.path);
+                    let file_type = tilth_core::lang::detect_file_type(&m.path);
                     let mut skip_lines = strip::strip_noise(&content, &m.path, m.def_range);
 
                     if let Some((def_start, def_end)) = m.def_range {
-                        if let crate::types::FileType::Code(_) = file_type {
+                        if let tilth_core::types::FileType::Code(_) = file_type {
                             if let Some(keep) = truncate::select_diverse_lines(
                                 &content,
                                 def_start,
@@ -800,18 +629,22 @@ fn format_single_match(
                     out.push_str(&stripped_code);
 
                     if m.is_definition && m.def_range.is_some() {
-                        if let crate::types::FileType::Code(lang) = file_type {
-                            let callee_names =
-                                callees::extract_callee_names(&content, lang, m.def_range);
+                        if let tilth_core::types::FileType::Code(lang) = file_type {
+                            let callee_names = tilth_core::search::callees::extract_callee_names(
+                                &content,
+                                lang,
+                                m.def_range,
+                            );
                             if !callee_names.is_empty() {
-                                let mut nodes = callees::resolve_callees_transitive(
-                                    &callee_names,
-                                    &m.path,
-                                    &content,
-                                    bloom,
-                                    2,
-                                    15,
-                                );
+                                let mut nodes =
+                                    tilth_core::search::callees::resolve_callees_transitive(
+                                        &callee_names,
+                                        &m.path,
+                                        &content,
+                                        bloom,
+                                        2,
+                                        15,
+                                    );
 
                                 if let Some(ref name) = m.def_name {
                                     nodes.retain(|n| n.callee.name != *name);
@@ -855,7 +688,7 @@ fn format_single_match(
 
                             if let Some(def_range) = m.def_range {
                                 let entries =
-                                    crate::lang::outline::get_outline_entries(&content, lang);
+                                    tilth_core::lang::outline::get_outline_entries(&content, lang);
                                 if let Some(parent) = siblings::find_parent_entry(&entries, m.line)
                                 {
                                     let refs = siblings::extract_sibling_references(
@@ -1032,7 +865,7 @@ fn basename_file_outline(
 
     // Read file and generate outline
     let content = std::fs::read_to_string(&matched_path).ok()?;
-    let file_type = crate::lang::detect_file_type(&matched_path);
+    let file_type = tilth_core::lang::detect_file_type(&matched_path);
     let mtime = std::fs::metadata(&matched_path)
         .and_then(|m| m.modified())
         .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
@@ -1062,7 +895,7 @@ fn format_search_result(
     result: &SearchResult,
     cache: &OutlineCache,
     session: Option<&Session>,
-    bloom: &crate::index::bloom::BloomFilterCache,
+    bloom: &tilth_core::index::bloom::BloomFilterCache,
     expand: usize,
     budget: Option<u64>,
 ) -> Result<String, TilthError> {
@@ -1393,7 +1226,7 @@ fn flush_gap_marker(kept: &mut Vec<String>, consecutive_skipped: &mut u32) {
 
 /// Get cached outline string for a file. Returns None for non-code or huge files.
 fn get_outline_str(path: &std::path::Path, cache: &OutlineCache) -> Option<std::sync::Arc<str>> {
-    let file_type = crate::lang::detect_file_type(path);
+    let file_type = tilth_core::lang::detect_file_type(path);
     if !matches!(file_type, FileType::Code(_)) {
         return None;
     }
@@ -1461,9 +1294,9 @@ fn enclosing_scope_label(
     match_line: u32,
     cache: &OutlineCache,
 ) -> Option<String> {
-    match crate::lang::detect_file_type(path) {
+    match tilth_core::lang::detect_file_type(path) {
         FileType::Code(_) => {
-            let s = scope::enclosing_definition_at(path, match_line, cache)?;
+            let s = tilth_core::search::scope::enclosing_definition_at(path, match_line, cache)?;
             Some(format!("{} {}", s.kind, s.name))
         }
         FileType::Markdown => markdown_enclosing_scope(path, match_line),
@@ -1480,12 +1313,12 @@ fn markdown_enclosing_scope(path: &std::path::Path, match_line: u32) -> Option<S
         return None;
     }
     let content = std::fs::read_to_string(path).ok()?;
-    let tree = crate::lang::outline::parse_markdown(&content)?;
+    let tree = tilth_core::lang::outline::parse_markdown(&content)?;
     let lines: Vec<&str> = content.lines().collect();
     let mut best: Option<(tree_sitter::Node, u32)> = None;
     walk_md_for_enclosing(tree.root_node(), match_line, &mut best);
     let (heading, _) = best?;
-    let text = crate::lang::outline::heading_text(heading, &lines);
+    let text = tilth_core::lang::outline::heading_text(heading, &lines);
     if text.is_empty() {
         return None;
     }
@@ -1596,272 +1429,6 @@ fn format_glob_result(result: &glob::GlobResult, scope: &Path) -> Result<String,
 mod tests {
     use super::*;
     use std::collections::HashSet;
-    use std::sync::Mutex;
-
-    /// Collect all file paths from a walker into a sorted Vec.
-    fn walk_paths(scope: &Path, glob: Option<&str>) -> Vec<PathBuf> {
-        let w = walker(scope, glob).expect("walker failed");
-        collect_walk_paths(w)
-    }
-
-    fn walk_paths_with_gitignore(scope: &Path, respect_gitignore: bool) -> Vec<PathBuf> {
-        let w = base_walk_builder_with_gitignore(scope, respect_gitignore).build_parallel();
-        collect_walk_paths(w)
-    }
-
-    fn collect_walk_paths(w: ignore::WalkParallel) -> Vec<PathBuf> {
-        let paths: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
-        w.run(|| {
-            let paths = &paths;
-            Box::new(move |entry| {
-                if let Ok(e) = entry {
-                    if e.file_type().is_some_and(|ft| ft.is_file()) {
-                        paths.lock().unwrap().push(e.into_path());
-                    }
-                }
-                ignore::WalkState::Continue
-            })
-        });
-        let mut v = paths.into_inner().unwrap();
-        v.sort();
-        v
-    }
-
-    fn extensions(paths: &[PathBuf]) -> HashSet<String> {
-        paths
-            .iter()
-            .filter_map(|p| p.extension())
-            .map(|e| e.to_string_lossy().to_string())
-            .collect()
-    }
-
-    // ── walker unit tests ──
-
-    #[test]
-    fn walker_none_returns_all_file_types() {
-        let scope = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let all = walk_paths(&scope, None);
-        let exts = extensions(&all);
-        assert!(exts.contains("rs"), "expected .rs files, got {exts:?}");
-        assert_ne!(all.len(), 0, "no files walked under {}", scope.display());
-    }
-
-    #[test]
-    fn walker_gitignore_setting_controls_ignored_files() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir(tmp.path().join(".git")).unwrap();
-        std::fs::create_dir(tmp.path().join("ignored")).unwrap();
-        std::fs::write(tmp.path().join(".gitignore"), "ignored/\n").unwrap();
-        std::fs::write(tmp.path().join("visible.rs"), "fn visible() {}\n").unwrap();
-        std::fs::write(
-            tmp.path().join("ignored").join("hidden.rs"),
-            "fn hidden() {}\n",
-        )
-        .unwrap();
-
-        for enabled in [false, true] {
-            let rels: HashSet<String> = walk_paths_with_gitignore(tmp.path(), enabled)
-                .iter()
-                .filter_map(|p| p.strip_prefix(tmp.path()).ok())
-                .map(|p| p.to_string_lossy().to_string())
-                .collect();
-            assert!(
-                rels.contains("visible.rs"),
-                "visible file missing: {rels:?}"
-            );
-            assert_eq!(
-                rels.contains("ignored/hidden.rs"),
-                !enabled,
-                "unexpected gitignore behavior with enabled={enabled}: {rels:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn walker_respects_tilthignore_by_default() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir(tmp.path().join("ignored")).unwrap();
-        std::fs::write(tmp.path().join(".tilthignore"), "ignored/\n").unwrap();
-        std::fs::write(tmp.path().join("visible.rs"), "fn visible() {}\n").unwrap();
-        std::fs::write(
-            tmp.path().join("ignored").join("hidden.rs"),
-            "fn hidden() {}\n",
-        )
-        .unwrap();
-
-        let paths = walk_paths_with_gitignore(tmp.path(), false);
-        let rels: HashSet<String> = paths
-            .iter()
-            .filter_map(|p| p.strip_prefix(tmp.path()).ok())
-            .map(|p| p.to_string_lossy().to_string())
-            .collect();
-
-        assert!(
-            rels.contains("visible.rs"),
-            "non-ignored file should be walked: {rels:?}"
-        );
-        assert!(
-            !rels.contains("ignored/hidden.rs"),
-            ".tilthignore file should not be walked: {rels:?}"
-        );
-    }
-
-    #[test]
-    fn walker_respects_parent_tilthignore_by_default() {
-        let tmp = tempfile::tempdir().unwrap();
-        let src = tmp.path().join("src");
-        let ignored = src.join("ignored");
-        std::fs::create_dir_all(&ignored).unwrap();
-        std::fs::write(tmp.path().join(".tilthignore"), "src/ignored/\n").unwrap();
-        std::fs::write(src.join("visible.rs"), "fn visible() {}\n").unwrap();
-        std::fs::write(ignored.join("hidden.rs"), "fn hidden() {}\n").unwrap();
-
-        let paths = walk_paths_with_gitignore(&src, false);
-        let rels: HashSet<String> = paths
-            .iter()
-            .filter_map(|p| p.strip_prefix(&src).ok())
-            .map(|p| p.to_string_lossy().to_string())
-            .collect();
-
-        assert!(
-            rels.contains("visible.rs"),
-            "non-ignored file should be walked: {rels:?}"
-        );
-        assert!(
-            !rels.contains("ignored/hidden.rs"),
-            "parent .tilthignore file should not be walked: {rels:?}"
-        );
-    }
-
-    #[test]
-    fn walker_skips_vcs_internal_dirs() {
-        // `.jj`/`.hg`/`.svn` are VCS internals like `.git` — never source.
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("real.rs"), "fn main() {}").unwrap();
-        for vcs in [".jj", ".hg", ".svn"] {
-            let dir = tmp.path().join(vcs);
-            std::fs::create_dir(&dir).unwrap();
-            std::fs::write(dir.join("store.rs"), "fn buried() {}").unwrap();
-        }
-
-        let names: Vec<String> = walk_paths(tmp.path(), None)
-            .iter()
-            .filter_map(|p| Some(p.file_name()?.to_str()?.to_string()))
-            .collect();
-        assert!(
-            names.contains(&"real.rs".to_string()),
-            "source file must be found: {names:?}"
-        );
-        assert!(
-            !names.contains(&"store.rs".to_string()),
-            "VCS-internal file leaked through the walker: {names:?}"
-        );
-    }
-
-    #[test]
-    fn walker_whitelist_filters_to_matching_extension() {
-        let scope = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let filtered = walk_paths(&scope, Some("*.rs"));
-        assert!(!filtered.is_empty(), "whitelist should find .rs files");
-        for p in &filtered {
-            assert_eq!(
-                p.extension().and_then(|e| e.to_str()),
-                Some("rs"),
-                "non-.rs file leaked through whitelist: {}",
-                p.display()
-            );
-        }
-    }
-
-    #[test]
-    fn walker_negation_excludes_matching_extension() {
-        let scope = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let without_rs = walk_paths(&scope, Some("!*.rs"));
-        for p in &without_rs {
-            assert_ne!(
-                p.extension().and_then(|e| e.to_str()),
-                Some("rs"),
-                ".rs file leaked through negation: {}",
-                p.display()
-            );
-        }
-    }
-
-    #[test]
-    fn walker_empty_string_equals_none() {
-        let scope = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let all = walk_paths(&scope, None);
-        let empty = walk_paths(&scope, Some(""));
-        assert_eq!(all.len(), empty.len(), "empty glob should behave like None");
-    }
-
-    #[test]
-    fn walker_invalid_glob_returns_error() {
-        let scope = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let result = walker(&scope, Some("[unclosed"));
-        match result {
-            Err(TilthError::InvalidQuery { query, reason }) => {
-                assert_eq!(query, "[unclosed");
-                assert!(
-                    reason.contains("invalid glob"),
-                    "reason should mention 'invalid glob': {reason}"
-                );
-            }
-            Err(other) => panic!("expected InvalidQuery, got {other}"),
-            Ok(_) => panic!("expected Err for invalid glob, got Ok"),
-        }
-    }
-
-    #[test]
-    fn walker_brace_expansion_matches_multiple_extensions() {
-        let scope = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let filtered = walk_paths(scope, Some("*.{rs,toml}"));
-        let exts = extensions(&filtered);
-        assert!(
-            exts.contains("rs"),
-            "brace expansion should include .rs: {exts:?}"
-        );
-        assert!(
-            exts.contains("toml"),
-            "brace expansion should include .toml: {exts:?}"
-        );
-        for ext in &exts {
-            assert!(
-                ext == "rs" || ext == "toml",
-                "unexpected extension leaked: {ext}"
-            );
-        }
-    }
-
-    #[test]
-    fn walker_whitelist_fewer_than_unfiltered() {
-        // Use project root (not src/) — project root has .toml, .md, .lock etc.
-        // alongside .rs files, so *.rs is guaranteed to be a strict subset.
-        let scope = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let all = walk_paths(scope, None);
-        let rs_only = walk_paths(scope, Some("*.rs"));
-        assert!(
-            rs_only.len() < all.len(),
-            "whitelist ({}) should find fewer files than unfiltered ({})",
-            rs_only.len(),
-            all.len()
-        );
-    }
-
-    #[test]
-    fn walker_path_pattern_restricts_directory() {
-        let scope = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let filtered = walk_paths(scope, Some("src/**/*.rs"));
-        assert!(!filtered.is_empty(), "path pattern should find files");
-        let src_dir = scope.join("src");
-        for p in &filtered {
-            assert!(
-                p.starts_with(&src_dir),
-                "file outside src/ leaked: {}",
-                p.display()
-            );
-        }
-    }
 
     // ── end-to-end through search functions ──
 
@@ -1917,23 +1484,23 @@ mod tests {
     #[test]
     fn callers_search_glob_restricts_results() {
         let scope = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let bloom = tilth_core::index::bloom::BloomFilterCache::new();
         let single: std::collections::HashSet<String> =
             std::iter::once("walker".to_string()).collect();
-        let rs_callers = callers::find_callers_batch(
+        let rs_callers = tilth_core::find_callers_batch(
             &single,
             &scope,
             &bloom,
             Some("*.rs"),
-            callers::BATCH_EARLY_QUIT,
+            tilth_core::search::callers::BATCH_EARLY_QUIT,
         )
         .expect("callers failed");
-        let toml_callers = callers::find_callers_batch(
+        let toml_callers = tilth_core::find_callers_batch(
             &single,
             &scope,
             &bloom,
             Some("*.toml"),
-            callers::BATCH_EARLY_QUIT,
+            tilth_core::search::callers::BATCH_EARLY_QUIT,
         )
         .expect("callers toml failed");
 
@@ -1953,81 +1520,6 @@ mod tests {
                 c.path.display()
             );
         }
-    }
-
-    #[test]
-    fn walker_follows_symlinked_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let real_dir = tmp.path().join("real");
-        std::fs::create_dir(&real_dir).unwrap();
-        std::fs::write(real_dir.join("hello.rs"), "fn main() {}").unwrap();
-
-        let link_dir = tmp.path().join("linked");
-        std::fs::create_dir(&link_dir).unwrap();
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(real_dir.join("hello.rs"), link_dir.join("hello.rs")).unwrap();
-        #[cfg(windows)]
-        std::os::windows::fs::symlink_file(real_dir.join("hello.rs"), link_dir.join("hello.rs"))
-            .unwrap();
-
-        let paths = walk_paths(tmp.path(), None);
-        let names: Vec<&str> = paths
-            .iter()
-            .filter_map(|p| p.file_name()?.to_str())
-            .collect();
-        // Should find hello.rs twice: once in real/, once via the symlink in linked/
-        assert_eq!(
-            names.iter().filter(|n| **n == "hello.rs").count(),
-            2,
-            "expected hello.rs from both real and symlinked dirs, got: {names:?}"
-        );
-    }
-
-    #[test]
-    fn walker_follows_symlinked_directory() {
-        let tmp = tempfile::tempdir().unwrap();
-        let real_dir = tmp.path().join("real_pkg");
-        std::fs::create_dir(&real_dir).unwrap();
-        std::fs::write(real_dir.join("lib.rs"), "pub fn add() {}").unwrap();
-        std::fs::write(real_dir.join("util.rs"), "pub fn helper() {}").unwrap();
-
-        // Symlink the entire directory
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&real_dir, tmp.path().join("deps_link")).unwrap();
-        #[cfg(windows)]
-        std::os::windows::fs::symlink_dir(&real_dir, tmp.path().join("deps_link")).unwrap();
-
-        let paths = walk_paths(tmp.path(), None);
-        let link_files: Vec<_> = paths
-            .iter()
-            .filter(|p| p.starts_with(tmp.path().join("deps_link")))
-            .collect();
-        assert_eq!(
-            link_files.len(),
-            2,
-            "expected 2 files via symlinked directory, got: {link_files:?}"
-        );
-    }
-
-    #[test]
-    fn walker_survives_symlink_cycle() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("real.rs"), "fn main() {}").unwrap();
-
-        // Create a symlink cycle: loop -> .
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(tmp.path(), tmp.path().join("loop")).unwrap();
-
-        // Should complete without hanging — ignore crate detects the cycle via inode tracking
-        let paths = walk_paths(tmp.path(), None);
-        let names: Vec<&str> = paths
-            .iter()
-            .filter_map(|p| p.file_name()?.to_str())
-            .collect();
-        assert!(
-            names.contains(&"real.rs"),
-            "should find real.rs despite cycle: {names:?}"
-        );
     }
 
     #[test]
@@ -2196,7 +1688,7 @@ mod tests {
             impl_target: None,
         };
         let cache = OutlineCache::new();
-        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let bloom = tilth_core::index::bloom::BloomFilterCache::new();
         let mut expand_remaining = 0usize;
         let mut expanded_files: HashSet<PathBuf> = HashSet::new();
         let mut out = String::new();
@@ -2247,7 +1739,7 @@ mod tests {
             impl_target: None,
         };
         let cache = OutlineCache::new();
-        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let bloom = tilth_core::index::bloom::BloomFilterCache::new();
         let mut expand_remaining = 1usize;
         let mut expanded_files: HashSet<PathBuf> = HashSet::new();
         let mut out = String::new();
@@ -2367,7 +1859,7 @@ mod tests {
             impl_target: None,
         };
         let cache = OutlineCache::new();
-        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let bloom = tilth_core::index::bloom::BloomFilterCache::new();
         let mut expand_remaining = 0usize;
         let mut expanded_files: HashSet<PathBuf> = HashSet::new();
         let mut out = String::new();
@@ -2425,7 +1917,7 @@ mod tests {
             impl_target: None,
         };
         let cache = OutlineCache::new();
-        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let bloom = tilth_core::index::bloom::BloomFilterCache::new();
         let mut expand_remaining = 0usize;
         let mut expanded_files: HashSet<PathBuf> = HashSet::new();
         let mut out = String::new();
@@ -2497,7 +1989,7 @@ mod tests {
             impl_target: None,
         };
         let cache = OutlineCache::new();
-        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let bloom = tilth_core::index::bloom::BloomFilterCache::new();
         // Non-zero expand budget — should NOT change the cap behavior.
         let mut expand_remaining = 5usize;
         let mut expanded_files: HashSet<PathBuf> = HashSet::new();
@@ -2598,8 +2090,8 @@ mod tests {
     // Each push must cover non-empty, non-overlapping ranges that index into `out`.
     #[test]
     fn format_matches_segments_record_correct_byte_ranges() {
-        use crate::index::bloom::BloomFilterCache;
         use crate::types::Match;
+        use tilth_core::index::bloom::BloomFilterCache;
 
         let tmp = tempfile::tempdir().unwrap();
         let p = tmp.path().join("a.rs");
@@ -2694,7 +2186,7 @@ mod tests {
 
         let cache = OutlineCache::new();
         let session = Session::new();
-        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let bloom = tilth_core::index::bloom::BloomFilterCache::new();
 
         let out = search_symbol_expanded(
             "budget_probe_target",
@@ -2747,7 +2239,7 @@ mod tests {
 
         let cache = OutlineCache::new();
         let session = Session::new();
-        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let bloom = tilth_core::index::bloom::BloomFilterCache::new();
 
         let with_none = search_symbol_expanded(
             "budget_probe_target",
@@ -2841,7 +2333,7 @@ mod tests {
 
         let cache = OutlineCache::new();
         let session = Session::new();
-        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let bloom = tilth_core::index::bloom::BloomFilterCache::new();
         let single = search_symbol_expanded(
             "alpha_target",
             tmp.path(),

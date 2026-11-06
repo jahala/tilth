@@ -10,10 +10,9 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
-use crate::lang::detect_file_type;
-use crate::read::imports::is_import_line;
-use crate::search::SKIP_DIRS;
-use crate::types::{FileType, Lang};
+use tilth_core::lang::detect_file_type;
+use tilth_core::search::walk::SKIP_DIRS;
+use tilth_core::types::{FileType, Lang};
 
 /// Compute a project fingerprint for MCP initialization.
 /// Must be fast (<250ms) — runs synchronously in the initialize handler.
@@ -236,7 +235,7 @@ fn common_dir_prefix(mods: &[(String, usize)]) -> String {
 // ---------------------------------------------------------------------------
 
 fn lang_display_name(lang: Lang) -> &'static str {
-    crate::lang::spec::spec(lang).display
+    tilth_core::lang::spec::spec(lang).display
 }
 
 // ---------------------------------------------------------------------------
@@ -693,7 +692,7 @@ fn test_style(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opt
 // ---------------------------------------------------------------------------
 
 fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Option<String> {
-    let lang = primary_lang?; // require a detected language
+    primary_lang?; // require a detected language
     let start = Instant::now();
 
     // Sort by size (smallest first) and take first 100
@@ -704,7 +703,7 @@ fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opti
     // Use resolve_related_files to get real file paths for imports.
     // Count how many files import each target path.
     let mut path_counts: HashMap<std::path::PathBuf, usize> = HashMap::new();
-    // Also collect all import source lines for symbol extraction later
+    // Also collect every local import source for symbol extraction later
     let mut all_import_sources: Vec<String> = Vec::new();
 
     for (rel_path, _) in &files {
@@ -716,19 +715,21 @@ fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opti
             continue;
         };
 
+        // Each file is read in its own language, as the resolver always did.
+        let FileType::Code(file_lang) = detect_file_type(&full) else {
+            continue;
+        };
+
         // Resolve imports to actual file paths using the proven import resolver
-        let resolved = crate::read::imports::resolve_related_files_with_content(&full, &content);
-        for target_path in resolved {
+        let imports = tilth_core::extract_imports(&content, file_lang);
+        for target_path in tilth_core::imports::resolve_imports(&full, file_lang, &imports) {
             *path_counts.entry(target_path).or_insert(0) += 1;
         }
 
         // Collect import source strings for symbol extraction
-        for line in content.lines() {
-            if is_import_line(line, lang) {
-                let source = crate::lang::outline::extract_import_source(line, Some(lang));
-                if !source.is_empty() && !crate::read::imports::is_external(&source, lang) {
-                    all_import_sources.push(source);
-                }
+        for import in imports {
+            if !tilth_core::imports::is_external(&import.source, file_lang) {
+                all_import_sources.push(import.source);
             }
         }
     }
@@ -771,7 +772,7 @@ fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opti
             let mut symbol_counts: HashMap<String, usize> = HashMap::new();
             for source in &all_import_sources {
                 // Match imports that reference this module
-                // e.g., for module "types": "crate::types::OutlineEntry" matches
+                // e.g., for module "types": "tilth_core::types::OutlineEntry" matches
                 let segments: Vec<&str> = source.split("::").collect();
                 if let Some(mod_pos) = segments.iter().position(|s| *s == module_name) {
                     // Everything after the module name is a symbol path
@@ -834,6 +835,31 @@ mod tests {
         assert!(
             estimated_tokens < 300,
             "fingerprint should be <300 tokens, got {estimated_tokens}"
+        );
+    }
+
+    /// A file imported only through `use` groups is still hot, and the
+    /// symbol named most inside the groups is the one shown. Read as one
+    /// source per line, each group was `crate` and named no file.
+    #[test]
+    fn hot_files_count_imports_inside_use_groups() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("types.rs"), "pub struct Outline;\n").unwrap();
+        fs::write(src.join("other.rs"), "").unwrap();
+        for user in ["a.rs", "b.rs"] {
+            fs::write(
+                src.join(user),
+                "use crate::{other, types::Outline};\nfn f(_: Outline) {}\n",
+            )
+            .unwrap();
+        }
+        let walk = walk_files(tmp.path());
+        let hot = hot_files(tmp.path(), &walk, Some(Lang::Rust));
+        assert_eq!(
+            hot.as_deref(),
+            Some("src/other.rs ×2, src/types.rs(Outline) ×2")
         );
     }
 

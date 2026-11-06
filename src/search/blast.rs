@@ -3,10 +3,10 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use crate::edit::Edit;
-use crate::lang::detect_file_type;
-use crate::lang::outline::get_outline_entries;
-use crate::search::callers::{find_callers_batch, CallerMatch};
-use crate::types::{is_test_file, FileType, OutlineEntry, OutlineKind};
+use tilth_core::lang::detect_file_type;
+use tilth_core::lang::outline::get_outline_entries;
+use tilth_core::search::callers::{find_callers_batch, CallerMatch};
+use tilth_core::types::{is_test_file, FileType, OutlineEntry, OutlineKind};
 
 pub(crate) struct TouchedSymbol {
     name: String,
@@ -66,7 +66,7 @@ pub(crate) fn blast_radius(
     path: &Path,
     edits: &[Edit],
     scope: &Path,
-    bloom: &crate::index::bloom::BloomFilterCache,
+    bloom: &tilth_core::index::bloom::BloomFilterCache,
 ) -> Option<String> {
     let content = std::fs::read_to_string(path).ok()?;
 
@@ -87,7 +87,7 @@ pub(crate) fn blast_radius(
         scope,
         bloom,
         None,
-        crate::search::callers::BATCH_EARLY_QUIT,
+        tilth_core::search::callers::BATCH_EARLY_QUIT,
     )
     .ok()?;
 
@@ -187,7 +187,7 @@ fn format_blast_radius(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::OutlineKind;
+    use tilth_core::types::OutlineKind;
 
     fn make_edit(start: usize, end: usize) -> Edit {
         Edit {
@@ -208,6 +208,7 @@ mod tests {
             signature: None,
             children: Vec::new(),
             doc: None,
+            local_name: None,
         }
     }
 
@@ -220,6 +221,7 @@ mod tests {
             signature: None,
             children: Vec::new(),
             doc: None,
+            local_name: None,
         }
     }
 

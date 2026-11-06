@@ -13,9 +13,9 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::lang::detect_file_type;
-use crate::lang::outline::outline_language;
-use crate::types::FileType;
+use tilth_core::lang::detect_file_type;
+use tilth_core::lang::outline::outline_language;
+use tilth_core::types::FileType;
 
 /// Maximum number of new errors listed before truncating to a count summary.
 const MAX_LISTED: usize = 10;

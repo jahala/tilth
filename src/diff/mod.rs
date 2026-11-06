@@ -9,7 +9,7 @@ use std::process::Command;
 
 use rayon::prelude::*;
 
-use crate::types::OutlineKind;
+use tilth_core::types::OutlineKind;
 
 #[derive(Debug)]
 pub enum DiffSource {
@@ -63,7 +63,7 @@ pub enum DiffLineKind {
 
 #[derive(Debug)]
 pub struct DiffSymbol {
-    pub entry: crate::types::OutlineEntry,
+    pub entry: tilth_core::types::OutlineEntry,
     pub identity: SymbolIdentity,
     pub content_hash: u64,
     pub structural_hash: u64,
@@ -449,14 +449,14 @@ fn compute_blast(overlays: &[FileOverlay], repo: Option<&Path>) -> Vec<String> {
         Some(r) => r.to_path_buf(),
         None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
     };
-    let bloom = crate::index::bloom::BloomFilterCache::new();
+    let bloom = tilth_core::index::bloom::BloomFilterCache::new();
 
-    match crate::search::callers::find_callers_batch(
+    match tilth_core::find_callers_batch(
         &sig_changed,
         &scope,
         &bloom,
         None,
-        crate::search::callers::BATCH_EARLY_QUIT,
+        tilth_core::search::callers::BATCH_EARLY_QUIT,
     ) {
         Ok(matches) => {
             let mut counts: std::collections::HashMap<String, usize> =
