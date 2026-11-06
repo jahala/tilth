@@ -69,12 +69,12 @@ pub struct Import {
 
 /// Every module `content` imports, one [`Import`] per module, in source order.
 ///
-/// Where one statement can name several modules or span several lines (Go,
-/// Rust, Python, JavaScript, TypeScript, Scala, Elixir), statements come from
-/// the syntax tree, so an import-shaped line inside a string is not one.
-/// Where one line is one statement naming one module (Java, Kotlin, C, C++,
-/// Bash), each line `is_import_line` accepts gives one import, its source read
-/// by `extract_import_source`. A statement that does not spell its module
+/// In Go, Rust, Python, JavaScript, TypeScript, Scala, Elixir, Java and
+/// Kotlin, statements come from the syntax tree, so an import-shaped line
+/// inside a string is not one and an alias is not part of a source. In C,
+/// C++ and Bash, where an import is one line naming one file, each line
+/// `is_import_line` accepts gives one import, its source read by
+/// `extract_import_source`. A statement that does not spell its module
 /// out, such as a shell `source "$dir/lib.sh"`, gives none. Languages without
 /// imports tilth reads give none.
 #[must_use]
@@ -137,8 +137,9 @@ pub fn imports_in_tree(root: tree_sitter::Node, content: &str, lang: Lang) -> Ve
     }
 }
 
-/// Languages where one statement can name several modules or span several
-/// lines, so statements are read from the syntax tree.
+/// Languages whose import statements are read from the syntax tree: one
+/// statement can name several modules, span lines, or carry an alias or
+/// modifier that is not part of the module.
 fn reads_statements_from_tree(lang: Lang) -> bool {
     matches!(
         lang,
@@ -150,6 +151,8 @@ fn reads_statements_from_tree(lang: Lang) -> bool {
             | Lang::JavaScript
             | Lang::Scala
             | Lang::Elixir
+            | Lang::Java
+            | Lang::Kotlin
     )
 }
 
@@ -217,6 +220,9 @@ fn statement_modules(node: tree_sitter::Node, src: &str, lang: Lang) -> Option<V
             }
         }
         (Lang::Scala, "import_declaration") => scala_paths(node, src, &mut out),
+        (Lang::Java, "import_declaration") | (Lang::Kotlin, "import") => {
+            dotted_import(node, src, &mut out);
+        }
         (Lang::Elixir, "call") => elixir_directive(node, src, &mut out)?,
         _ => return None,
     }
@@ -325,6 +331,29 @@ fn scala_paths(node: tree_sitter::Node, src: &str, out: &mut Vec<(String, u32)>)
         }
     }
     flush(&mut path, path_line, &mut selected, out);
+}
+
+/// Java and Kotlin: one dotted path per statement, a wildcard kept as `.*`.
+/// `static` and an `as` alias are not part of the module.
+fn dotted_import(node: tree_sitter::Node, src: &str, out: &mut Vec<(String, u32)>) {
+    let mut cursor = node.walk();
+    let children: Vec<tree_sitter::Node> = node.children(&mut cursor).collect();
+    let Some(path) = children.iter().find(|c| {
+        matches!(
+            c.kind(),
+            "scoped_identifier" | "qualified_identifier" | "identifier"
+        )
+    }) else {
+        return;
+    };
+    let mut source = compact(*path, src);
+    if children
+        .iter()
+        .any(|c| matches!(c.kind(), "asterisk" | "*"))
+    {
+        source.push_str(".*");
+    }
+    out.push((source, line_of(*path)));
 }
 
 /// Elixir: `alias`, `import`, `use` and `require` name the module in their
@@ -658,10 +687,20 @@ mod tests {
 
     #[test]
     fn line_languages_give_one_import_per_line() {
-        let java = "import a.b.C;\nimport a.*;\nclass X {}\n";
-        assert_eq!(sources(java, Lang::Java), ["a.b.C", "a.*"]);
         let bash = "source ./lib.sh\nsource \"$DIR/x.sh\"\n";
         assert_eq!(sources(bash, Lang::Bash), ["./lib.sh"]);
+        let c = "#include \"util.h\"\n#include <stdio.h>\n";
+        assert_eq!(sources(c, Lang::C), ["\"util.h\"", "<stdio.h>"]);
+    }
+
+    /// Java's `static` and Kotlin's `as` are not part of the module. Read off
+    /// the line, the source was `static a.b.D.e` or `a.b.D as E`.
+    #[test]
+    fn java_and_kotlin_imports_name_the_module_alone() {
+        let java = "import a.b.C;\nimport static a.b.D.e;\nimport a.*;\nclass X {}\n";
+        assert_eq!(sources(java, Lang::Java), ["a.b.C", "a.b.D.e", "a.*"]);
+        let kotlin = "import a.b.C\nimport a.b.*\nimport a.b.D as E\n";
+        assert_eq!(sources(kotlin, Lang::Kotlin), ["a.b.C", "a.b.*", "a.b.D"]);
     }
 
     /// A Rust `use` group names one module per member, and each one that is
