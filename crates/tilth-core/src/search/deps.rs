@@ -300,6 +300,53 @@ fn is_valid_module_path(source: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// The external modules `analyze_deps` reports for one file.
+    fn externals_of(file: &str, content: &str) -> Vec<String> {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(file);
+        fs::write(&path, content).unwrap();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        analyze_deps(&path, tmp.path(), &bloom)
+            .unwrap()
+            .uses_external
+    }
+
+    /// Each spec of a Go import block is its own module. Read line by line,
+    /// the block's first line was `import (` and the specs were not imports
+    /// at all, so a file importing only through a block used nothing.
+    #[test]
+    fn go_import_block_names_each_module() {
+        let content = "package m\n\nimport (\n\t\"fmt\"\n\tx \"example.com/m/core\"\n\t_ \"example.com/m/seams\"\n)\n";
+        assert_eq!(
+            externals_of("main.go", content),
+            ["example.com/m/core", "example.com/m/seams"]
+        );
+    }
+
+    /// `import requests, numpy` names two modules. Read as one, the source
+    /// was `requests, numpy`, which is no module path, so both were dropped,
+    /// and so was the aliased `yaml as y`.
+    #[test]
+    fn python_import_list_names_each_module() {
+        let content = "import requests, numpy\nimport yaml as y\n";
+        assert_eq!(
+            externals_of("main.py", content),
+            ["numpy", "requests", "yaml"]
+        );
+    }
+
+    /// A Rust `use` group names one module per member. Read as one, the
+    /// source was `serde` and the members were gone; an alias kept its
+    /// `as` clause and was then dropped as not a module path.
+    #[test]
+    fn rust_use_group_names_each_member() {
+        let content = "use serde::{Deserialize, de::Visitor};\nuse serde_json::Value as Json;\n";
+        assert_eq!(
+            externals_of("lib.rs", content),
+            ["serde::Deserialize", "serde::de::Visitor", "serde_json::Value"]
+        );
+    }
+
     #[test]
     fn go_stdlib_fmt_is_stdlib() {
         assert!(is_stdlib("fmt", crate::types::Lang::Go));

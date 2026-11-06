@@ -270,6 +270,32 @@ mod tests {
     use super::*;
     use std::fs;
 
+    /// A Rust `use` group names one module per member, and each one that is
+    /// local resolves to its own file. Read off the line as one source, the
+    /// group was `crate` and resolved to nothing.
+    #[test]
+    fn rust_use_group_resolves_every_member() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(src.join("seams")).unwrap();
+        fs::write(src.join("core.rs"), "").unwrap();
+        fs::write(src.join("seams/git.rs"), "").unwrap();
+        let content = "use crate::{core, seams::git};\nuse std::fs;\n";
+        let related = resolve_related_files_with_content(&src.join("main.rs"), content);
+        assert_eq!(related, [src.join("core.rs"), src.join("seams/git.rs")]);
+    }
+
+    /// An import written across several lines names its module on the last
+    /// one. Read off the first line alone, the source was `{`.
+    #[test]
+    fn multi_line_js_import_resolves() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("util.ts"), "").unwrap();
+        let content = "import {\n  first,\n  second,\n} from \"./util\";\n";
+        let related = resolve_related_files_with_content(&tmp.path().join("main.ts"), content);
+        assert_eq!(related, [tmp.path().join("util.ts")]);
+    }
+
     #[test]
     fn normalize_collapses_dot_and_parent_components() {
         let p = Path::new("temporal/workflows/../utils/activityProxies.ts");
