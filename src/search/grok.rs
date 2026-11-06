@@ -982,6 +982,7 @@ mod tests {
             signature: None,
             children: Vec::new(),
             doc: None,
+            local_name: None,
         }
     }
 

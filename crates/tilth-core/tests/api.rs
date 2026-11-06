@@ -219,6 +219,38 @@ fn typescript_import_across_lines_names_its_module() {
     );
 }
 
+/// `(name, local_name, start_line, end_line)` of each export entry.
+fn exports_of(content: &str, lang: Lang) -> Vec<(String, Option<String>, u32, u32)> {
+    get_outline_entries(content, lang)
+        .into_iter()
+        .filter(|e| e.kind == OutlineKind::Export)
+        .map(|e| (e.name, e.local_name, e.start_line, e.end_line))
+        .collect()
+}
+
+/// An export clause gives one export per specifier, named as it is
+/// exported, with the local name where the two differ, on the clause's own
+/// lines; a re-export clause the same.
+#[test]
+fn export_clause_gives_one_export_per_specifier() {
+    let source = "function readPlan() {}\nfunction readNode() {}\nexport { readPlan as parsePlan, readNode };\nexport { x as y, z } from \"./y\";\nexport {\n  a,\n  b as c,\n};\n";
+    let some = |s: &str| Some(s.to_string());
+    for lang in [Lang::TypeScript, Lang::JavaScript] {
+        assert_eq!(
+            exports_of(source, lang),
+            [
+                ("parsePlan".to_string(), some("readPlan"), 3, 3),
+                ("readNode".to_string(), None, 3, 3),
+                ("y".to_string(), some("x"), 4, 4),
+                ("z".to_string(), None, 4, 4),
+                ("a".to_string(), None, 5, 8),
+                ("c".to_string(), some("b"), 5, 8),
+            ],
+            "{lang:?}"
+        );
+    }
+}
+
 #[test]
 fn related_files_resolve_a_relative_typescript_import() {
     let dir = tempfile::tempdir().unwrap();

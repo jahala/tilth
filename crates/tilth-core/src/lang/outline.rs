@@ -93,6 +93,12 @@ pub fn walk_top_level(root: tree_sitter::Node, lines: &[&str], lang: Lang) -> Ve
                 continue;
             }
         }
+        if matches!(lang, Lang::TypeScript | Lang::Tsx | Lang::JavaScript) {
+            if let Some(specifiers) = export_clause_entries(child, lines) {
+                entries.extend(specifiers);
+                continue;
+            }
+        }
         push_entries(child, lines, lang, 0, &mut entries);
     }
 
@@ -354,6 +360,7 @@ fn node_to_entry(
         signature,
         children,
         doc,
+        local_name: None,
     })
 }
 
@@ -560,6 +567,88 @@ fn clean_comment_text(text: &str) -> String {
 /// every spec becomes its own entry with its own line range. `type` and
 /// `const` groups hold their specs directly; `var` groups wrap them in a
 /// `var_spec_list`. Returns `None` for any other node.
+/// One `Export` entry per specifier of an export clause:
+/// `export { readPlan as parsePlan, readNode }` and the re-export
+/// `export { x } from "./y"`. Each is named as it is exported, carries the
+/// name it refers to in `local_name` where the two differ, and spans the
+/// clause's own lines. Its `signature` is the clause as written, on one
+/// line, which is how the outline renders the clause. `None` for any other
+/// node, including `export * from`, exports of a declaration and `export {}`.
+fn export_clause_entries(node: tree_sitter::Node, lines: &[&str]) -> Option<Vec<OutlineEntry>> {
+    if node.kind() != "export_statement" || node.child_by_field_name("declaration").is_some() {
+        return None;
+    }
+    let mut cursor = node.walk();
+    let clause = node
+        .named_children(&mut cursor)
+        .find(|c| c.kind() == "export_clause")?;
+
+    let start_line = node.start_position().row as u32 + 1;
+    let end_line = node.end_position().row as u32 + 1;
+    let signature = statement_on_one_line(node, lines);
+    let doc = extract_doc(node, lines);
+
+    let mut entries = Vec::new();
+    let mut cursor = clause.walk();
+    for specifier in clause.named_children(&mut cursor) {
+        if specifier.kind() != "export_specifier" {
+            continue;
+        }
+        let Some(local) = specifier.child_by_field_name("name") else {
+            continue;
+        };
+        let local = node_text(local, lines);
+        let exported = specifier
+            .child_by_field_name("alias")
+            .map(|alias| node_text(alias, lines));
+        let (name, local_name) = match exported {
+            Some(exported) if exported != local => (exported, Some(local)),
+            _ => (local, None),
+        };
+        entries.push(OutlineEntry {
+            kind: OutlineKind::Export,
+            name,
+            start_line,
+            end_line,
+            signature: Some(signature.clone()),
+            children: Vec::new(),
+            doc: doc.clone(),
+            local_name,
+        });
+    }
+    // `export {}` names nothing; it stays one entry, as written.
+    (!entries.is_empty()).then_some(entries)
+}
+
+/// A node's full text with each line trimmed and the lines joined by one
+/// space, so a statement written across lines reads as one.
+fn statement_on_one_line(node: tree_sitter::Node, lines: &[&str]) -> String {
+    let (start, end) = (node.start_position(), node.end_position());
+    let rows = lines
+        .iter()
+        .enumerate()
+        .skip(start.row)
+        .take(end.row.saturating_sub(start.row) + 1);
+    let mut parts = Vec::new();
+    for (row, line) in rows {
+        let from = if row == start.row {
+            start.column.min(line.len())
+        } else {
+            0
+        };
+        let to = if row == end.row {
+            end.column.min(line.len())
+        } else {
+            line.len()
+        };
+        let part = line.get(from..to).unwrap_or("").trim();
+        if !part.is_empty() {
+            parts.push(part);
+        }
+    }
+    parts.join(" ")
+}
+
 fn go_declaration_entries(node: tree_sitter::Node, lines: &[&str]) -> Option<Vec<OutlineEntry>> {
     let container = match node.kind() {
         "type_declaration" | "const_declaration" => node,
@@ -616,6 +705,7 @@ fn go_declaration_entries(node: tree_sitter::Node, lines: &[&str]) -> Option<Vec
             signature: None,
             children: Vec::new(),
             doc,
+            local_name: None,
         });
     }
 
@@ -714,6 +804,7 @@ fn elixir_call_to_entry(
         signature,
         children,
         doc,
+        local_name: None,
     })
 }
 
@@ -739,6 +830,7 @@ fn elixir_attr_to_entry(node: tree_sitter::Node, lines: &[&str]) -> Option<Outli
                 signature: Some(sig),
                 children: Vec::new(),
                 doc: None,
+                local_name: None,
             })
         }
         "callback" | "macrocallback" => {
@@ -752,6 +844,7 @@ fn elixir_attr_to_entry(node: tree_sitter::Node, lines: &[&str]) -> Option<Outli
                 signature: Some(sig),
                 children: Vec::new(),
                 doc: None,
+                local_name: None,
             })
         }
         _ => None,

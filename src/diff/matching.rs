@@ -413,6 +413,7 @@ fn clone_entry_shallow(entry: &OutlineEntry) -> OutlineEntry {
         signature: entry.signature.clone(),
         children: Vec::new(),
         doc: entry.doc.clone(),
+        local_name: entry.local_name.clone(),
     }
 }
 
@@ -562,6 +563,7 @@ mod tests {
                 signature: sig.map(std::string::ToString::to_string),
                 children: Vec::new(),
                 doc: None,
+                local_name: None,
             },
             identity: SymbolIdentity {
                 kind,

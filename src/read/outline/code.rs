@@ -38,10 +38,22 @@ fn format_entries(
     let mut import_groups: Vec<&OutlineEntry> = Vec::new();
     // Track the start line of the first import in the current group.
     let mut import_group_start: u32 = 1;
+    // The export clause last rendered: its specifiers' entries share it, and
+    // the clause renders once.
+    let mut last_clause: Option<(u32, u32, &str)> = None;
 
     for entry in entries {
         if out.len() >= max_lines {
             break;
+        }
+        if entry.kind == OutlineKind::Export {
+            if let Some(clause) = entry.signature.as_deref() {
+                let key = (entry.start_line, entry.end_line, clause);
+                if last_clause == Some(key) {
+                    continue;
+                }
+                last_clause = Some(key);
+            }
         }
 
         match entry.kind {
@@ -218,6 +230,12 @@ fn format_entry(entry: &OutlineEntry, indent: usize, lang: Lang) -> String {
         OutlineKind::TestCase => "test",
     };
 
+    // An export clause renders as written, once for all its specifiers.
+    if let (OutlineKind::Export, Some(clause)) = (entry.kind, &entry.signature) {
+        let rest = clause.strip_prefix("export ").unwrap_or(clause);
+        return format!("{prefix}{range:<12} export {rest}");
+    }
+
     let sig = match &entry.signature {
         Some(s) => format!("\n{prefix}           {s}"),
         None => String::new(),
@@ -315,6 +333,25 @@ type UserId = String
             outline_python.contains("[1-]   imports: os, json, a.b\n"),
             "{outline_python}"
         );
+    }
+
+    /// An export clause renders as one line, the clause as written. Read off
+    /// its first line, a clause written across lines was `export {`.
+    #[test]
+    fn export_clause_renders_once_as_written() {
+        let ts = "function readPlan() {}\nexport { readPlan as parsePlan, readNode };\nexport {\n  a,\n  b as c,\n} from \"./y\";\n";
+        for lang in [Lang::TypeScript, Lang::JavaScript] {
+            let rendered = outline(ts, lang, 1000);
+            let lines: Vec<&str> = rendered.lines().collect();
+            assert_eq!(
+                lines[2..],
+                [
+                    "[2]          export { readPlan as parsePlan, readNode };",
+                    "[3-6]        export { a, b as c, } from \"./y\";",
+                ],
+                "{lang:?}:\n{rendered}"
+            );
+        }
     }
 
     #[test]

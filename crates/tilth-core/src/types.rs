@@ -71,6 +71,11 @@ pub struct OutlineEntry {
     pub signature: Option<String>,
     pub children: Vec<OutlineEntry>,
     pub doc: Option<String>,
+    /// For an entry exported under another name (`export { readPlan as
+    /// parsePlan }`, whose `name` is `parsePlan`), the name it refers to:
+    /// `readPlan`. `None` where the two are the same, and for every other
+    /// kind of entry.
+    pub local_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

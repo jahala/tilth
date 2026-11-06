@@ -207,6 +207,7 @@ mod tests {
             signature: sig.map(str::to_string),
             children: Vec::new(),
             doc: None,
+            local_name: None,
         }
     }
 
@@ -219,6 +220,7 @@ mod tests {
             signature: None,
             children,
             doc: None,
+            local_name: None,
         }
     }
 

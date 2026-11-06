@@ -208,6 +208,7 @@ mod tests {
             signature: None,
             children: Vec::new(),
             doc: None,
+            local_name: None,
         }
     }
 
@@ -220,6 +221,7 @@ mod tests {
             signature: None,
             children: Vec::new(),
             doc: None,
+            local_name: None,
         }
     }
 
