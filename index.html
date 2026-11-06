@@ -723,7 +723,7 @@
    no cookies, no storage, no library; nothing is sent under Do Not Track or Global Privacy Control. */
 (function(){
   if (navigator.doNotTrack === '1' || navigator.globalPrivacyControl === true) return;
-  var t = 'cfa_pk_giKW9ROJWXTBF4bKru_LnnDspyoLj2M3Ceq5OK1fsGA', r = document.referrer, d = '$direct';
+  var t = 'cfa_pk_SXCFSwTUhk7-ubsvvL3iJS3ZPCDSF4WBH2GwQZxiUdk', r = document.referrer, d = '$direct';
   try { if (r) d = new URL(r).host; } catch (e) {}
   var now = new Date().toISOString();
   var p = { token: t, distinct_id: '$posthog_cookieless', $cookieless_mode: true, $lib: 'web',
