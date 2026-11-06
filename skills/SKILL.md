@@ -1,11 +1,11 @@
 ---
 name: tilth
-description: Use the `tilth` CLI for code reading, outlining, search, callers, blast-radius deps, and structural diffs. Activate when the user asks to explore a repo, find a symbol, trace callers, read a file, view a diff, or analyze impact. Prefer `tilth` over `grep`/`cat`/`find`/`ls` — one invocation returns AST-aware outlines, definitions, callees, and usages.
+description: Use when exploring a codebase, finding where a symbol is defined or used, tracing its callers or callees, reading a source file as an outline, checking what depends on a file before changing it, or reviewing a diff by function. Covers 17 languages.
 ---
 
 # tilth — code intelligence CLI
 
-Tree-sitter + ripgrep + smart file reading in one binary. Replaces `grep`, `cat`, `find`, `ls` with AST-aware equivalents across 14 languages (Rust, TS/TSX, JS, Python, Go, Java, Scala, C, C++, Ruby, PHP, C#, Swift, Elixir).
+Tree-sitter + ripgrep + smart file reading in one binary. Replaces `grep`, `cat`, `find`, `ls` with AST-aware equivalents across 17 languages (Rust, TypeScript, TSX, JavaScript, Python, Go, Java, Scala, C, C++, Ruby, PHP, C#, Swift, Kotlin, Elixir, Bash).
 
 Run via Bash: `tilth <args>`. Search before reading — `tilth <symbol> --scope .` returns definitions, usages, and callee footers in one call.
 
@@ -24,6 +24,18 @@ tilth <path> --full               # force full content (file paths)
 Outline format: `[<start>-<end>]  <symbol>`. Full/section format: `<line> │ <content>`. Binary files print `[skipped]`; lockfiles, minified bundles, generated code print `[generated]`.
 
 ## Search
+
+The shape of the query picks the mode:
+
+| Query | Mode | Example |
+|---|---|---|
+| One identifier | Symbol search: definitions, then usages | `tilth WeekService` |
+| Several words | Literal text search | `tilth "study start date"` |
+| Contains `*` | File listing | `tilth "*.swift"` |
+| `/pattern/` or `/pattern/flags` | Regex search | `tilth "/week/i"` |
+| An existing file path | Read the file | `tilth src/main.rs` |
+
+Symbol search matches the identifier exactly, including case.
 
 ```bash
 tilth <symbol> --scope <dir>                # definitions + usages
@@ -86,6 +98,32 @@ tilth diff --expand 3             # inline source for top 3 changed symbols
 ```
 
 Function-level change detection — `[+]` added, `[-]` removed, `[~]` modified, `[~:sig]` signature changed. Replaces `git diff` for symbol-level review.
+
+## Over MCP
+
+When tilth runs as an MCP server (`tilth --mcp`), the tools are `tilth_search`, `tilth_read`, `tilth_list`, `tilth_deps`, `tilth_grok`, `tilth_diff`, and `tilth_write` in edit mode. Each tool's description carries its parameters. The rules below are the ones that are easy to get wrong.
+
+Paths and scope:
+
+- The server cannot see your shell's working directory. Pass absolute paths, or set `root` to the absolute project root whenever a `path` or `scope` is relative.
+- `scope` is an existing directory, never a file. To search one file, set `scope` to its directory and `glob` to its name, or call `tilth_read` if you already know the file.
+- Omitting `scope` searches `root` when it is set, and otherwise the directory the server was started in. In a worktree, set `root` so the search runs in the right checkout.
+- `context` names the file you are working on. It boosts nearby results and does not narrow the search.
+
+Search:
+
+- `kind: "symbol"` (the default) for identifiers, `"content"` for literal text such as error messages or config keys, `"regex"` only when you need a pattern, and `"callers"` for call sites.
+- Do not mix kinds in one query. Search a class name as a symbol and `__all__` as content, in two calls.
+- Comma-separated queries are for up to five symbol names in one symbol search.
+- `glob` narrows by file: `"**/*.py"`, `"models.py"`, or `"!**/*_test.py"` to exclude.
+- Use `tilth_list` only to list files when there is no symbol or text to search for.
+- Do not re-read source already shown in an expanded search result.
+
+Other tools:
+
+- `tilth_grok` when the task is to understand one symbol: it returns its definition, callers, callees, siblings and tests together.
+- `tilth_deps` before changing a signature, renaming or removing an export, or changing behaviour that callers rely on.
+- `tilth_write` replaces the host's Edit and Write tools. Group writes to several files into one call. `mode: "hash"` takes `edits`, each with a `start` anchor from `tilth_read`, an optional `end`, and `content`. `"overwrite"` and `"append"` take `content`. A multi-file call can partly succeed, so read each file's result.
 
 ## Budget
 
