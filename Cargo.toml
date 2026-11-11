@@ -33,6 +33,7 @@ streaming-iterator = "0.1"
 # Search (ripgrep internals)
 grep-regex = "0.1"
 grep-searcher = "0.1"
+grep-matcher = "0.1"
 ignore = "0.4"
 globset = "0.4"
 

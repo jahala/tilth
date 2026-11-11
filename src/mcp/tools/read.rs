@@ -67,10 +67,12 @@ pub(in crate::mcp) fn tool_read(
             .unwrap_or(60);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(batch_timeout);
 
+        // Every file is read at its own size first. Only when the batch is
+        // over the budget do the biggest files shrink, each to a fair share
+        // (`fair_share`), so small files stay whole.
         let mut results = Vec::with_capacity(paths_arr.len());
-        // Each file gets an equal share of what the files before it left,
-        // so a big first file cannot use up the budget of the rest.
-        let mut used = 0u64;
+        // The files whose view a budget can shrink, by index in `results`.
+        let mut fitted: Vec<(usize, PathBuf)> = Vec::new();
         for (i, p) in paths_arr.iter().enumerate() {
             // Check deadline before each file
             if std::time::Instant::now() > deadline {
@@ -91,16 +93,43 @@ pub(in crate::mcp) fn tool_read(
             } else if force_stripped {
                 read_stripped_file(&path, cache).map(|(body, _, _)| body)
             } else {
-                let left = (paths_arr.len() - i) as u64;
-                let share = read_budget.saturating_sub(used) / left;
-                crate::read::read_file(&path, None, force_full, cache, edit_mode, Some(share))
+                let read = crate::read::read_file(
+                    &path,
+                    None,
+                    force_full,
+                    cache,
+                    edit_mode,
+                    Some(read_budget),
+                );
+                if read.is_ok() {
+                    fitted.push((results.len(), path.clone()));
+                }
+                read
             };
-            let output = match read {
+            results.push(match read {
                 Ok(output) => output,
                 Err(e) => format!("# {} — error: {}", path.display(), e),
-            };
-            used += crate::types::estimate_tokens(output.len() as u64 + 2);
-            results.push(output);
+            });
+        }
+        // Each file's cost in the joined batch, its separator included.
+        let cost = |view: &str| crate::types::estimate_tokens(view.len() as u64 + 2);
+        let sizes: Vec<u64> = results.iter().map(|r| cost(r)).collect();
+        if let Some(share) = fair_share(&sizes, read_budget) {
+            for (i, path) in fitted {
+                if sizes[i] > share {
+                    if let Ok(view) = crate::read::read_file(
+                        &path,
+                        None,
+                        force_full,
+                        cache,
+                        edit_mode,
+                        // One token of the share is the separator's.
+                        Some(share.saturating_sub(1)),
+                    ) {
+                        results[i] = view;
+                    }
+                }
+            }
         }
         let combined = results.join("\n\n");
         return Ok(apply_budget(&combined, budget));
@@ -315,6 +344,27 @@ fn read_stripped_file(path: &Path, cache: &OutlineCache) -> Result<(String, u32,
         total_lines,
         stripped,
     ))
+}
+
+/// The most each file of a batch may take so the batch fits in `budget`,
+/// when its files' `sizes` add up to more: files under the share keep their
+/// size, and what they leave is split evenly between the bigger ones.
+/// `None` when the batch fits as it is.
+fn fair_share(sizes: &[u64], budget: u64) -> Option<u64> {
+    if sizes.iter().sum::<u64>() <= budget {
+        return None;
+    }
+    let mut sorted = sizes.to_vec();
+    sorted.sort_unstable();
+    let mut left = budget;
+    for (k, &size) in sorted.iter().enumerate() {
+        let share = left / (sorted.len() - k) as u64;
+        if size > share {
+            return Some(share);
+        }
+        left -= size;
+    }
+    None
 }
 
 #[cfg(test)]
@@ -762,6 +812,63 @@ mod tests {
             "{}",
             tail(&out)
         );
+        assert!(!out.contains("... truncated"), "{}", tail(&out));
+    }
+
+    /// Each file in a batch got an equal share of the budget up front, so a
+    /// 5k-token file next to nine small ones came back outlined although
+    /// the whole batch is about 6k tokens. A batch that fits keeps every
+    /// file as a lone read shows it.
+    #[test]
+    fn tool_read_batch_keeps_files_whole_when_the_batch_fits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut big = String::new();
+        for i in 0..240 {
+            let _ = writeln!(
+                big,
+                "export function handler{i:03}(request, response) {{ return response.send(request.body); }}"
+            );
+        }
+        std::fs::write(dir.path().join("big.js"), &big).unwrap();
+        let big_tokens = crate::types::estimate_tokens(big.len() as u64);
+        assert!((4_500..6_000).contains(&big_tokens), "{big_tokens} tokens");
+        let mut paths = vec![dir.path().join("big.js")];
+        for i in 0..9 {
+            let path = dir.path().join(format!("small{i}.js"));
+            std::fs::write(&path, format!("export const value{i} = {i};\n").repeat(20)).unwrap();
+            paths.push(path);
+        }
+        let names: Vec<&str> = paths.iter().map(|p| p.to_str().unwrap()).collect();
+        let out = read_args(&serde_json::json!({ "paths": names }));
+        for path in &names {
+            let alone = read_args(&serde_json::json!({ "path": path }));
+            assert!(out.contains(&alone), "{path} changed in the batch:\n{}", tail(&out));
+        }
+    }
+
+    #[test]
+    fn fair_share_caps_only_the_files_over_it() {
+        assert_eq!(fair_share(&[5_000, 100, 100], 24_000), None);
+        assert_eq!(fair_share(&[30_000, 100], 24_000), Some(23_900));
+        assert_eq!(fair_share(&[20_000, 100, 20_000], 24_000), Some(11_950));
+    }
+
+    /// Over the budget, the biggest files shrink first and the small ones
+    /// stay whole.
+    #[test]
+    fn tool_read_batch_over_the_budget_shrinks_the_biggest_file_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = write_dense_js(dir.path(), "a.js");
+        let small = dir.path().join("small.js");
+        std::fs::write(&small, "export const answer = 42;\n").unwrap();
+        let out = read_args(&serde_json::json!({
+            "paths": [a.to_str().unwrap(), small.to_str().unwrap()],
+        }));
+        let alone = read_args(&serde_json::json!({ "path": small.to_str().unwrap() }));
+        assert!(out.contains(&alone), "{}", tail(&out));
+        assert_eq!(out.matches("> outline cut to fit the budget").count(), 1, "{}", tail(&out));
+        let tokens = crate::types::estimate_tokens(out.len() as u64);
+        assert!(tokens <= crate::budget::DEFAULT_BUDGET, "{tokens} tokens");
         assert!(!out.contains("... truncated"), "{}", tail(&out));
     }
 

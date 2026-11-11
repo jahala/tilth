@@ -57,6 +57,12 @@ fn search_capped(
         reason: e.to_string(),
     })?;
 
+    let check = if is_regex {
+        super::size_check_matcher(pattern)
+    } else {
+        super::size_check_matcher(&regex_syntax::escape(pattern))
+    };
+
     let matches: Mutex<Vec<Match>> = Mutex::new(Vec::new());
     let skipped_large: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
     // Relaxed is correct: walker.run() joins all threads before we read the final value.
@@ -69,6 +75,7 @@ fn search_capped(
 
     walker.run(|| {
         let matcher = &matcher;
+        let check = check.as_ref();
         let matches = &matches;
         let skipped_large = &skipped_large;
         let total_found = &total_found;
@@ -97,7 +104,7 @@ fn search_capped(
             let file_size = match std::fs::metadata(path) {
                 Ok(meta) => {
                     if meta.len() > tilth_core::source::MAX_FILE_SIZE {
-                        if super::oversized_holds(path, matcher) {
+                        if check.is_some_and(|c| super::oversized_holds(path, c)) {
                             super::record(skipped_large, path);
                         }
                         return ignore::WalkState::Continue;

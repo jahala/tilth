@@ -91,37 +91,33 @@ fn parse_pattern(query: &str) -> (&str, bool) {
     }
 }
 
-/// Does a file over the size limit contain what the search looks for? The
-/// walkers skip such a file without parsing it, and this check is what lets
-/// the result name it instead of leaving it out in silence. It streams the
-/// file, so a multi-gigabyte file costs a fixed buffer, and a binary one
-/// stops at its first NUL byte.
-pub(crate) fn oversized_holds(path: &Path, matcher: &grep_regex::RegexMatcher) -> bool {
-    std::fs::File::open(path).is_ok_and(|file| stream_holds(file, matcher))
+/// Does a file over the size limit hold a match of `check`? The walkers
+/// skip such a file without parsing it, and this check is what lets the
+/// result name it instead of leaving it out in silence. `check` is built
+/// with [`size_check_matcher`], so it matches within a line as the line
+/// search does. A match longer than `REGEX_OVERLAP` that runs across a
+/// 1 MiB chunk's cut is not seen.
+pub(crate) fn oversized_holds(path: &Path, check: &grep_regex::RegexMatcher) -> bool {
+    use grep_matcher::Matcher as _;
+    tilth_core::source::holds(path, REGEX_OVERLAP, |window, from| {
+        let found = check.find_at(window, from).ok().flatten()?;
+        Some((found.start(), found.end()))
+    })
 }
 
-/// The longest line the size check holds in memory. A file with a longer
-/// line (a minified bundle) is not checked past it.
-const MAX_CHECKED_LINE: usize = 1 << 20;
+/// The longest regex match the size check finds across a chunk's cut.
+const REGEX_OVERLAP: usize = 64 << 10;
 
-/// Does `matcher` match in `reader`? Reads it as a stream in a fixed
-/// buffer and stops at the first match, at the first NUL byte (a binary
-/// file, which search never reads) or at a line over `MAX_CHECKED_LINE`.
-fn stream_holds(reader: impl std::io::Read, matcher: &grep_regex::RegexMatcher) -> bool {
-    let mut hit = false;
-    let mut searcher = grep_searcher::SearcherBuilder::new()
-        .binary_detection(grep_searcher::BinaryDetection::quit(b'\0'))
-        .heap_limit(Some(MAX_CHECKED_LINE))
-        .build();
-    let _ = searcher.search_reader(
-        matcher,
-        reader,
-        grep_searcher::sinks::Lossy(|_, _| {
-            hit = true;
-            Ok(false)
-        }),
-    );
-    hit
+/// `pattern` as the size check runs it: over a chunk of many lines, with
+/// `^` and `$` at each line's ends and no match across a newline, which is
+/// how the line search reads it. `None` when the pattern needs a newline,
+/// which no line holds.
+pub(crate) fn size_check_matcher(pattern: &str) -> Option<grep_regex::RegexMatcher> {
+    grep_regex::RegexMatcherBuilder::new()
+        .multi_line(true)
+        .line_terminator(Some(b'\n'))
+        .build(pattern)
+        .ok()
 }
 
 /// Add `path` to a walker's shared list.
@@ -2716,20 +2712,72 @@ mod tests {
         }
     }
 
-    /// The check reads a file as a stream and stops at the first hit, at the
-    /// first NUL byte, or at a line too long to hold. These readers never
-    /// end, so a check that read the whole file would never return.
+    /// A minified bundle is one line. The check held a line of at most
+    /// 1 MiB, so a 2 MB one-line file that holds the query near its start
+    /// errored, the error was dropped, and the file was no longer named.
     #[test]
-    fn the_size_check_stops_early_on_endless_input() {
-        use std::io::Read as _;
-        let matcher = grep_regex::RegexMatcher::new(r"\bneedle\b").unwrap();
-        let hit = std::io::Cursor::new(b"first line\nneedle here\n".to_vec())
-            .chain(std::io::repeat(b'\n'));
-        assert!(stream_holds(hit, &matcher));
-        let binary = std::io::Cursor::new(b"header\0".to_vec()).chain(std::io::repeat(b'a'));
-        assert!(!stream_holds(binary, &matcher));
-        let one_line = std::io::repeat(b'a');
-        assert!(!stream_holds(one_line, &matcher));
+    fn a_big_one_line_file_is_named_when_it_holds_the_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut bytes = b"var a=1;function needle_target_fn(){return a};".to_vec();
+        bytes.resize(2_000_000, b'a');
+        std::fs::write(tmp.path().join("bundle.js"), bytes).unwrap();
+        let cache = OutlineCache::new();
+        for out in [
+            search_symbol("needle_target_fn", tmp.path(), &cache, None, false).unwrap(),
+            search_content("needle_target_fn", tmp.path(), &cache, None, false).unwrap(),
+            search_regex("needle_t.rget_fn", tmp.path(), &cache, None, false).unwrap(),
+        ] {
+            assert!(out.contains("not searched: bundle.js"), "{out}");
+        }
+    }
+
+    /// A text file is binary to tilth only when a NUL byte sits in its
+    /// first 512 bytes, the rule the read path uses. The check stopped at
+    /// any NUL, so a big log with one stray NUL in the middle was not named.
+    #[test]
+    fn a_big_log_with_a_stray_nul_is_named_when_it_holds_the_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        let limit = usize::try_from(tilth_core::source::MAX_FILE_SIZE).unwrap();
+        let filler = "2026-11-11 12:00:00 INFO a log line\n";
+        let pad = filler.repeat(limit / filler.len() + 1);
+        std::fs::write(
+            tmp.path().join("app.log"),
+            format!("{pad}\0stray\n{pad}needle_target_fn failed\n"),
+        )
+        .unwrap();
+        let cache = OutlineCache::new();
+        for out in [
+            search_symbol("needle_target_fn", tmp.path(), &cache, None, false).unwrap(),
+            search_content("needle_target_fn", tmp.path(), &cache, None, false).unwrap(),
+        ] {
+            assert!(out.contains("not searched: app.log"), "{out}");
+        }
+    }
+
+    /// The caller walk checked big files with a substring search, so a big
+    /// file holding only a longer name (`big_callee_v2`) was named as
+    /// holding `big_callee`. It shares search's word check now.
+    #[test]
+    fn caller_walks_do_not_name_a_big_file_holding_only_a_longer_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let limit = usize::try_from(tilth_core::source::MAX_FILE_SIZE).unwrap();
+        let filler = "// padding line to push the file over the size limit\n";
+        let pad = filler.repeat(limit / filler.len() + 1);
+        std::fs::write(
+            tmp.path().join("lib.rs"),
+            "pub fn big_callee() {}\nfn small_caller() { big_callee(); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("big.rs"),
+            format!("{pad}fn big_caller() {{ big_callee_v2(); }}\n"),
+        )
+        .unwrap();
+        let bloom = tilth_core::index::bloom::BloomFilterCache::new();
+        let out =
+            callers::search_callers_expanded("big_callee", tmp.path(), &bloom, 0, None, None, false)
+                .unwrap();
+        assert!(!out.contains("not searched"), "{out}");
     }
 
     /// The caller walk skipped big files with no word, so callers, grok and
