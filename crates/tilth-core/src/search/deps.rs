@@ -66,7 +66,8 @@ pub struct Dependent {
     pub via: Option<PathBuf>,
 }
 
-/// Analyse the dependency graph for `path` within `scope`.
+/// Analyse the dependency graph for `path` within `scope`. The paths in the
+/// result are canonical.
 ///
 /// Phase 1: Extract exported symbols from the outline.
 /// Phase 2: Forward dependencies — what this file uses.
@@ -76,9 +77,16 @@ pub fn analyze_deps(
     scope: &Path,
     bloom: &crate::index::bloom::BloomFilterCache,
 ) -> Result<DepsResult, TilthError> {
-    // Canonicalize for reliable path comparison (callers return absolute paths).
+    // Canonicalize both, so the walk names files the way import resolution
+    // and the target do: through a symlinked scope (any path under `/tmp`
+    // on macOS) they would never compare equal. Every path returned is
+    // canonical.
     let path = &path.canonicalize().map_err(|e| TilthError::IoError {
         path: path.to_path_buf(),
+        source: e,
+    })?;
+    let scope = &scope.canonicalize().map_err(|e| TilthError::IoError {
+        path: scope.to_path_buf(),
         source: e,
     })?;
 
@@ -718,6 +726,7 @@ mod tests {
     fn dependents_of(root: &Path, rel: &str) -> Vec<(String, Vec<String>, Option<String>)> {
         let bloom = crate::index::bloom::BloomFilterCache::new();
         let result = analyze_deps(&root.join(rel), root, &bloom).unwrap();
+        let root = &root.canonicalize().unwrap();
         result
             .used_by
             .into_iter()
@@ -823,6 +832,33 @@ mod tests {
                     vec![],
                     Some("src/pkg/sub/__init__.py".to_string())
                 ),
+            ]
+        );
+    }
+
+    /// A scope reached through a symlink (on macOS, any path under `/tmp`)
+    /// names its files by the link, while the target is canonical. The
+    /// target's own calls must still not make it its own dependent, and a
+    /// dependent's `via` must sit under the scope like its path.
+    #[cfg(unix)]
+    #[test]
+    fn a_scope_through_a_symlink_gives_the_same_dependents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().canonicalize().unwrap().join("real");
+        write(&real, "src/service.ts", "export function serve() { return 1; }\nexport function twice() { return serve() + serve(); }\n");
+        write(&real, "src/index.ts", "export * from \"./service\";\n");
+        write(&real, "c.ts", "import { serve } from \"./src\";\nexport const s = serve;\n");
+        write(&real, "d.ts", "import { serve } from \"./src/service\";\nexport const t = 1;\n");
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let found = dependents_of(&link, "src/service.ts");
+        assert_eq!(found, dependents_of(&real, "src/service.ts"));
+        assert_eq!(
+            found,
+            [
+                ("src/index.ts".to_string(), vec![], None),
+                ("c.ts".to_string(), vec![], Some("src/index.ts".to_string())),
+                ("d.ts".to_string(), vec![], None),
             ]
         );
     }
