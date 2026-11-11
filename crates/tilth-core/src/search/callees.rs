@@ -193,7 +193,7 @@ pub fn resolve_callees(
         return Vec::new();
     }
 
-    let file_type = crate::lang::detect_file_type(source_path);
+    let file_type = crate::lang::detect_file_type_with_content(source_path, source_content);
     let crate::types::FileType::Code(lang) = file_type else {
         return Vec::new();
     };
@@ -229,7 +229,7 @@ pub fn resolve_callees(
             continue;
         };
 
-        let import_type = crate::lang::detect_file_type(&import_path);
+        let import_type = crate::lang::detect_file_type_with_content(&import_path, &import_content);
         let crate::types::FileType::Code(import_lang) = import_type else {
             continue;
         };
@@ -366,12 +366,11 @@ fn resolve_second_hop(
     visited: &mut HashSet<(PathBuf, u32)>,
     budget: &mut usize,
 ) -> Vec<ResolvedCallee> {
-    let file_type = crate::lang::detect_file_type(&parent.file);
-    let crate::types::FileType::Code(lang) = file_type else {
+    let Ok(content) = crate::source::read_source(&parent.file) else {
         return Vec::new();
     };
-
-    let Ok(content) = crate::source::read_source(&parent.file) else {
+    let file_type = crate::lang::detect_file_type_with_content(&parent.file, &content);
+    let crate::types::FileType::Code(lang) = file_type else {
         return Vec::new();
     };
 

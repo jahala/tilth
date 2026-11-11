@@ -115,7 +115,7 @@ fn push_entries(
     depth: usize,
     out: &mut Vec<OutlineEntry>,
 ) {
-    if is_or_body_of(node, PASS_THROUGH_KINDS) {
+    if is_or_body_of(node, node.parent(), PASS_THROUGH_KINDS) {
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             push_entries(child, lines, lang, depth, out);
@@ -146,7 +146,10 @@ fn node_to_entry(
         | "constructor_declaration"
         | "init_declaration"
         | "deinit_declaration"
-        | "protocol_function_declaration" => {
+        | "protocol_function_declaration"
+        | "abstract_method_signature"
+        | "method"
+        | "singleton_method" => {
             let name = extract_definition_name(node, lines).unwrap_or_else(|| {
                 // Swift deinit has no name field — use the node kind as name
                 if kind_str == "deinit_declaration" {
@@ -159,8 +162,9 @@ fn node_to_entry(
             (OutlineKind::Function, name, Some(sig))
         }
 
-        // Classes & structs
-        "class_declaration" | "class_definition" => {
+        // Classes & structs. `class` is Ruby's; a JS/TS class expression
+        // never sits where outline entries are read.
+        "class_declaration" | "class_definition" | "abstract_class_declaration" | "class" => {
             let name = find_child_text(node, "name", lines)
                 .or_else(|| find_child_text(node, "identifier", lines))
                 .unwrap_or_else(|| "<anonymous>".into());
@@ -259,24 +263,31 @@ fn node_to_entry(
             (OutlineKind::Import, text, None)
         }
 
-        // Exports — `export` is a modifier on a wrapped declaration, not a
-        // peer of `function`/`class`/`const`. Recurse into the inner
-        // declaration so the entry renders with its real kind. Falling back to
-        // `OutlineKind::Export` only when there is no nameable declaration
-        // inside (`export { … }`, `export * from …`, `export default <expr>`).
-        // Without this, `export_statement`'s `name` is the full source span
-        // (already starts with `export `), and the renderer prepends the
-        // `Export` kind_label `"export"` again — producing the doubled-keyword
-        // outline header `export export async function foo(`.
-        "export_statement" => {
+        // Wrappers — `export` and Python decorators are modifiers on a wrapped
+        // declaration, not peers of `function`/`class`/`const`. Recurse into
+        // the inner declaration so the entry renders with its real kind. An
+        // `export` shares the declaration's line, so the entry's range is
+        // extended to cover it and still points at the whole statement. A
+        // decorated entry keeps the `def`/`class` line as its first line, the
+        // line every view prints for it. An `export` with no nameable declaration inside
+        // (`export { … }`, `export * from …`, `export default <expr>`) falls
+        // back to `OutlineKind::Export`. Without the unwrap,
+        // `export_statement`'s `name` is the full source span (already starts
+        // with `export `), and the renderer prepends the `Export` kind_label
+        // `"export"` again — producing the doubled-keyword outline header
+        // `export export async function foo(`.
+        "export_statement" | "decorated_definition" => {
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
                 if let Some(mut inner) = node_to_entry(child, lines, lang, depth) {
-                    // Extend the entry's range to cover the `export` keyword
-                    // so the outline byte range still points at the statement.
-                    inner.start_line = start_line;
+                    if kind_str == "export_statement" {
+                        inner.start_line = start_line;
+                    }
                     return Some(inner);
                 }
+            }
+            if kind_str == "decorated_definition" {
+                return None;
             }
             // No nameable inner declaration; strip leading `export ` so the
             // rendered name doesn't duplicate the `kind_label`.
@@ -1566,7 +1577,7 @@ mod doc_comment_tests {
 }
 
 #[cfg(test)]
-mod c_family_outline_tests {
+mod outline_tree_tests {
     use super::get_outline_entries;
     use crate::lang::c::C_DEFINITIONS_FIXTURE;
     use crate::lang::cpp::CPP_DEFINITIONS_FIXTURE;
@@ -1660,5 +1671,142 @@ mod c_family_outline_tests {
             tree(get_outline_entries(CPP_DEFINITIONS_FIXTURE, Lang::Cpp)),
             expected
         );
+    }
+
+    #[test]
+    fn ruby_outline_lists_classes_modules_and_methods() {
+        // #226: a class's instance methods and a module's `def self.`
+        // functions are entries, and a class inside a module collects its
+        // methods like a top-level class.
+        use OutlineKind::{Class, Function, Module};
+        let src = "module Shop
+  class Store
+    def save
+      1
+    end
+
+    def self.build
+      new
+    end
+  end
+end
+
+module Util
+  def self.slugify(s)
+    s
+  end
+
+  def self.titleize(s)
+    s
+  end
+end
+";
+        let expected = vec![
+            Node(
+                "Shop".into(),
+                Module,
+                1,
+                11,
+                vec![Node(
+                    "Store".into(),
+                    Class,
+                    2,
+                    10,
+                    vec![leaf("save", Function, 3, 5), leaf("build", Function, 7, 9)],
+                )],
+            ),
+            Node(
+                "Util".into(),
+                Module,
+                13,
+                21,
+                vec![
+                    leaf("slugify", Function, 14, 16),
+                    leaf("titleize", Function, 18, 20),
+                ],
+            ),
+        ];
+        assert_eq!(tree(get_outline_entries(src, Lang::Ruby)), expected);
+    }
+
+    #[test]
+    fn python_outline_lists_decorated_definitions_from_their_def_line() {
+        use OutlineKind::{Class, Function};
+        let src = "@decorator
+def top():
+    pass
+
+class Service:
+    @property
+    def prop(self):
+        pass
+
+    def plain(self):
+        pass
+
+@dataclass
+class Point:
+    @staticmethod
+    def origin():
+        pass
+";
+        let expected = vec![
+            leaf("top", Function, 2, 3),
+            Node(
+                "Service".into(),
+                Class,
+                5,
+                11,
+                vec![
+                    leaf("prop", Function, 7, 8),
+                    leaf("plain", Function, 10, 11),
+                ],
+            ),
+            Node(
+                "Point".into(),
+                Class,
+                14,
+                17,
+                vec![leaf("origin", Function, 16, 17)],
+            ),
+        ];
+        assert_eq!(tree(get_outline_entries(src, Lang::Python)), expected);
+    }
+
+    #[test]
+    fn typescript_outline_lists_abstract_classes_and_their_members() {
+        use OutlineKind::{Class, Function};
+        let src = "abstract class Shape {
+  abstract area(): number;
+  describe() {}
+}
+export abstract class Base {
+  run() {}
+}
+export default abstract class Fallback {}
+";
+        let expected = vec![
+            Node(
+                "Shape".into(),
+                Class,
+                1,
+                4,
+                vec![
+                    leaf("area", Function, 2, 2),
+                    leaf("describe", Function, 3, 3),
+                ],
+            ),
+            Node(
+                "Base".into(),
+                Class,
+                5,
+                7,
+                vec![leaf("run", Function, 6, 6)],
+            ),
+            leaf("Fallback", Class, 8, 8),
+        ];
+        for lang in [Lang::TypeScript, Lang::Tsx] {
+            assert_eq!(tree(get_outline_entries(src, lang)), expected, "{lang:?}");
+        }
     }
 }

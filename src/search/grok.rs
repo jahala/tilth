@@ -199,6 +199,7 @@ fn read_code_file(path: &Path) -> Result<(String, Lang), TilthError> {
         .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
     let bom = content.len() - tilth_core::source::strip_bom(&content).len();
     content.drain(..bom);
+    let lang = tilth_core::lang::refine_lang(lang, path, &content);
     Ok((content, lang))
 }
 

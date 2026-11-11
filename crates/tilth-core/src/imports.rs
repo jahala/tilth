@@ -7,7 +7,7 @@ use std::sync::{LazyLock, Mutex};
 
 use streaming_iterator::StreamingIterator;
 
-use crate::lang::detect_file_type;
+use crate::lang::detect_file_type_with_content;
 use crate::types::{FileType, Lang};
 
 /// The local files a code file's imports resolve to, read through `cache`'s
@@ -31,7 +31,7 @@ pub fn resolve_related_files(file_path: &Path, cache: &crate::cache::OutlineCach
 /// Same as `resolve_related_files` but takes pre-read content to avoid a redundant file read.
 #[must_use]
 pub fn resolve_related_files_with_content(file_path: &Path, content: &str) -> Vec<PathBuf> {
-    let FileType::Code(lang) = detect_file_type(file_path) else {
+    let FileType::Code(lang) = detect_file_type_with_content(file_path, content) else {
         return Vec::new();
     };
     resolve_imports(file_path, lang, &extract_imports(content, lang))

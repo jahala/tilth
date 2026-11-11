@@ -8,11 +8,11 @@ use std::fs;
 use std::path::Path;
 
 use tilth_core::{
-    analyze_deps, detect_file_type, extract_import_source, extract_imports, find_callers_batch,
-    get_outline_entries, is_external, is_import_line, is_test_file,
-    resolve_related_files_with_content, test_entries, BloomFilterCache, CallerMatch, Dependent,
-    DepsResult, FileType, Import, Lang, LocalDep, OutlineEntry, OutlineKind, TestEntry, TestKind,
-    TilthError,
+    analyze_deps, detect_file_type, detect_file_type_with_content, extract_import_source,
+    extract_imports, find_callers_batch, get_outline_entries, is_external, is_import_line,
+    is_test_file, resolve_related_files_with_content, test_entries, BloomFilterCache, CallerMatch,
+    Dependent, DepsResult, FileType, Import, Lang, LocalDep, OutlineEntry, OutlineKind, TestEntry,
+    TestKind, TilthError,
 };
 
 struct Sample {
@@ -96,6 +96,20 @@ fn detects_languages_by_path() {
         FileType::Code(Lang::JavaScript)
     );
     assert_eq!(detect_file_type(Path::new("notes.md")), FileType::Markdown);
+}
+
+#[test]
+fn a_header_is_detected_by_its_content() {
+    let header = Path::new("widget.h");
+    assert_eq!(detect_file_type(header), FileType::Code(Lang::C));
+    assert_eq!(
+        detect_file_type_with_content(header, "class Widget {\n};\n"),
+        FileType::Code(Lang::Cpp)
+    );
+    assert_eq!(
+        detect_file_type_with_content(header, "struct widget { int w; };\n"),
+        FileType::Code(Lang::C)
+    );
 }
 
 #[test]
