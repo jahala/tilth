@@ -83,58 +83,30 @@ fn resolve_with_source(
     }
 }
 
+/// Resolve a symbol target to its top-ranked definition. A qualified target
+/// (`Type::method`, `Type.method`) resolves among the definitions its owner
+/// holds. When the owner holds none, the error lists the definitions of the
+/// name there are, so the next call can name one.
 fn resolve_by_name(name: &str, scope: &Path) -> Result<(ResolvedTarget, String, Lang), TilthError> {
-    // The literal spec (`Type::method`) never equals a bare definition name, so
-    // this attempt only fires for genuinely bare targets.
-    if let Some(resolved) = resolve_def_by_query(name, scope)? {
-        return Ok(resolved);
-    }
-    // Qualified target (`Type::method` or `Type.method`): retry with the trailing
-    // segment. The retry is bounded — it fires only when the literal lookup found
-    // no definition, leaving bare-symbol resolution unchanged.
-    let bare = split_qualified(name);
-    if bare != name && !bare.is_empty() {
-        if let Some(resolved) = resolve_def_by_query(bare, scope)? {
-            return Ok(resolved);
-        }
-    }
-    Err(TilthError::NotFound {
-        path: PathBuf::from(name),
-        suggestion: None,
-    })
-}
-
-/// Split a qualified target into its bare trailing name.
-///
-/// `"Type::method"` → `"method"`, `"a::b::method"` → `"method"`,
-/// `"Type.method"` → `"method"`, `"method"` → `"method"`.
-fn split_qualified(name: &str) -> &str {
-    match name.rfind([':', '.']) {
-        Some(idx) => &name[idx + 1..],
-        None => name,
-    }
-}
-
-/// Search for `query` as a symbol and resolve its top-ranked definition to a
-/// full target. Returns `None` when no definition matches `query` at all, so the
-/// caller can retry with a different query.
-fn resolve_def_by_query(
-    query: &str,
-    scope: &Path,
-) -> Result<Option<(ResolvedTarget, String, Lang)>, TilthError> {
     // Only the top-ranked definition is used, so the short match list is
     // enough; the count of the others comes from the exact total. Grok's own
     // caps come from `GrokCaps`.
-    let result = search_symbol_raw(query, scope, None, false)?;
+    let result = search_symbol_raw(name, scope, None, false)?;
     let Some(top) = result.matches.iter().find(|m| m.is_definition) else {
-        return Ok(None);
+        let suggestion = (!result.other_owners.is_empty())
+            .then(|| crate::search::owner_candidates(name, &result.other_owners, scope));
+        return Err(TilthError::NotFound {
+            path: PathBuf::from(name),
+            suggestion,
+        });
     };
     let other_def_count = result.definitions.saturating_sub(1);
     let (start, _end) = top.def_range.ok_or_else(|| TilthError::ParseError {
         path: top.path.clone(),
-        reason: format!("definition match for `{query}` had no def_range"),
+        reason: format!("definition match for `{name}` had no def_range"),
     })?;
-    enrich_from_outline(top.path.clone(), start, query.to_string(), other_def_count).map(Some)
+    let def_name = top.def_name.clone().unwrap_or_else(|| name.to_string());
+    enrich_from_outline(top.path.clone(), start, def_name, name, other_def_count)
 }
 
 fn resolve_by_path_line(
@@ -143,6 +115,10 @@ fn resolve_by_path_line(
 ) -> Result<(ResolvedTarget, String, Lang), TilthError> {
     let (content, lang) = read_code_file(path)?;
     let entries = get_outline_entries(&content, lang);
+    // A decorator or attribute line belongs to the definition it decorates,
+    // though that definition's outline entry may start below it.
+    let line = tilth_core::lang::treesitter::decorated_definition_line(&content, lang, line)
+        .unwrap_or(line);
     let entry = find_entry_at_line(&entries, line).ok_or_else(|| TilthError::NotFound {
         path: path.to_path_buf(),
         suggestion: Some(format!("no definition encloses line {line}")),
@@ -203,25 +179,31 @@ fn read_code_file(path: &Path) -> Result<(String, Lang), TilthError> {
     Ok((content, lang))
 }
 
-/// Read the file at `path`, find the outline entry that starts at `start_line`
-/// (or the deepest entry enclosing it), and convert to `ResolvedTarget`.
+/// Read the file at `path`, find the outline entry named `name` that starts
+/// at `start_line` (or else any entry starting there, or the deepest one
+/// enclosing it), and convert to `ResolvedTarget`. `query` is what the user
+/// asked for, which a refusal names.
 fn enrich_from_outline(
     path: PathBuf,
     start_line: u32,
     name: String,
+    query: &str,
     other_def_count: usize,
 ) -> Result<(ResolvedTarget, String, Lang), TilthError> {
-    // On the symbol route the user asked for `name`, not the path the search
+    // On the symbol route the user asked for `query`, not the path the search
     // resolved it to — a refusal must name their query, not our detour.
     let (content, lang) = read_code_file(&path).map_err(|e| match e {
         TilthError::InvalidQuery { reason, .. } => TilthError::InvalidQuery {
-            query: name.clone(),
+            query: query.to_string(),
             reason,
         },
         other => other,
     })?;
     let entries = get_outline_entries(&content, lang);
-    let entry = find_by_start_line(&entries, start_line)
+    // A one-line class and its first method start on the same line; the
+    // name tells them apart.
+    let entry = find_named_at(&entries, start_line, &name)
+        .or_else(|| find_by_start_line(&entries, start_line))
         .or_else(|| find_entry_at_line(&entries, start_line));
     let target = match entry {
         Some(e) => target_from_entry(e, path, other_def_count),
@@ -268,6 +250,19 @@ fn find_entry_at_line(entries: &[OutlineEntry], line: u32) -> Option<&OutlineEnt
         }
     }
     best
+}
+
+/// Walk the outline tree and return the deepest entry named `name` whose
+/// `start_line == line`.
+fn find_named_at<'a>(
+    entries: &'a [OutlineEntry],
+    line: u32,
+    name: &str,
+) -> Option<&'a OutlineEntry> {
+    entries.iter().find_map(|e| {
+        find_named_at(&e.children, line, name)
+            .or_else(|| (e.start_line == line && e.name == name).then_some(e))
+    })
 }
 
 /// Walk the outline tree and return the first entry whose `start_line == line`.
@@ -981,10 +976,13 @@ fn is_recursive_call_site(
     // Edge case: a legitimately distinct same-named call site nested inside the
     // target body (e.g. a recursive closure with the same name) would also be
     // filtered here. Acceptable tradeoff — true self-recursion is the common case.
-    m.path == canonical_target
+    // The walker's paths keep the scope's spelling, which is the target's
+    // own path when the scope sits behind a symlink. The label carries the
+    // owner (`Walker.walk`); the target's name does not.
+    (m.path == canonical_target || m.path == target.path)
         && m.line >= target.start_line
         && m.line <= target.end_line
-        && m.calling_function == target.name
+        && tilth_core::search::scope::split_qualified(&m.calling_function).1 == target.name
 }
 
 /// Collect siblings of the target: peer methods if the target is a method,
@@ -1104,54 +1102,183 @@ mod tests {
         );
     }
 
-    // -- split_qualified ---------------------------------------------------
+    // -- qualified names ---------------------------------------------------
 
-    #[test]
-    fn split_qualified_double_colon() {
-        assert_eq!(split_qualified("Type::method"), "method");
+    fn grok_target(dir: &Path, spec: &str) -> Result<ResolvedTarget, TilthError> {
+        let bloom = BloomFilterCache::default();
+        let session = crate::session::Session::default();
+        grok(spec, dir, &bloom, &session, GrokCaps::default()).map(|r| r.target)
     }
 
+    /// A qualified target resolves to the definition its owner holds, with
+    /// either separator, and not to another owner's definition of the name.
     #[test]
-    fn split_qualified_dot() {
-        assert_eq!(split_qualified("Type.method"), "method");
+    fn grok_resolves_a_qualified_name_by_its_owner() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(
+            tmp.path(),
+            "m.rs",
+            "pub struct A;\npub struct B;\nimpl A {\n    pub fn run(&self) {}\n}\nimpl B {\n    pub fn run(&self) {}\n}\n",
+        );
+        write_fixture(
+            tmp.path(),
+            "q.ts",
+            "class Target { foo() { return 1; } }\nclass Other { foo() { return 2; } }\n",
+        );
+        write_fixture(
+            tmp.path(),
+            "store.py",
+            "class Store:\n    def get(self, key):\n        return key\n\nclass Cache:\n    def get(self, key):\n        return 1\n",
+        );
+        write_fixture(
+            tmp.path(),
+            "render.go",
+            "package render\n\nfunc (r JSON) Render() error { return nil }\n\nfunc (r XML) Render() error { return nil }\n",
+        );
+        for (spec, file, line, name) in [
+            ("B::run", "m.rs", 7, "run"),
+            ("B.run", "m.rs", 7, "run"),
+            ("A::run", "m.rs", 4, "run"),
+            ("Other.foo", "q.ts", 2, "foo"),
+            ("Target.foo", "q.ts", 1, "foo"),
+            ("Cache.get", "store.py", 6, "get"),
+            ("XML.Render", "render.go", 5, "Render"),
+        ] {
+            let target = grok_target(tmp.path(), spec).unwrap();
+            assert_eq!(
+                (
+                    target.path.file_name().unwrap().to_str().unwrap(),
+                    target.start_line,
+                    target.name.as_str()
+                ),
+                (file, line, name),
+                "{spec}"
+            );
+            assert_eq!(target.other_def_count, 0, "{spec} has one definition");
+        }
     }
 
+    /// A qualified target whose owner holds no definition of the name is not
+    /// found, and the error names the definitions there are.
     #[test]
-    fn split_qualified_multi_segment_double_colon() {
-        // Only the trailing segment matters — the retry is bounded to one hop.
-        assert_eq!(split_qualified("a::b::method"), "method");
+    fn grok_names_the_owners_when_the_qualifier_matches_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(
+            tmp.path(),
+            "m.rs",
+            "pub struct A;\nimpl A {\n    pub fn run(&self) {}\n}\npub fn run() {}\n",
+        );
+        match grok_target(tmp.path(), "Gamma::run").unwrap_err() {
+            TilthError::NotFound { path, suggestion } => {
+                assert_eq!(path, PathBuf::from("Gamma::run"));
+                assert_eq!(suggestion.as_deref(), Some("A::run (m.rs:3), run (m.rs:5)"));
+            }
+            other => panic!("expected NotFound, got {other}"),
+        }
     }
 
+    /// `path:line` on a decorator or attribute line resolves to the
+    /// definition it decorates, not to the class or module around it.
     #[test]
-    fn split_qualified_no_separator_is_identity() {
-        assert_eq!(split_qualified("method"), "method");
+    fn grok_path_line_on_a_decorator_resolves_to_the_decorated_definition() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ts = write_fixture(
+            tmp.path(),
+            "service.ts",
+            "@Injectable()\nclass Service {\n  @First()\n  @Second()\n  method() {\n    return 1;\n  }\n}\n",
+        );
+        let py = write_fixture(
+            tmp.path(),
+            "s.py",
+            "class S:\n    @property\n    @other\n    def run(self):\n        return 1\n",
+        );
+        let rs = write_fixture(
+            tmp.path(),
+            "t.rs",
+            "mod t {\n    #[test]\n    #[ignore]\n    fn case() {\n        go();\n    }\n}\n",
+        );
+        for (path, line, name) in [
+            (&ts, 1, "Service"),
+            (&ts, 3, "method"),
+            (&ts, 4, "method"),
+            (&py, 2, "run"),
+            (&py, 3, "run"),
+            (&rs, 2, "case"),
+            (&rs, 3, "case"),
+        ] {
+            let (target, _, _) = resolve_by_path_line(path, line).unwrap();
+            assert_eq!(target.name, name, "{}:{line}", path.display());
+        }
     }
 
+    /// A recursive method call is the method calling itself, not a caller,
+    /// though its label carries the owner (`Walker.walk`).
     #[test]
-    fn split_qualified_trailing_separator_yields_empty() {
-        // `rfind` matches the last char in the string; the caller (`resolve_by_name`)
-        // guards on `!bare.is_empty()` so this never triggers a second lookup.
-        assert_eq!(split_qualified("Type::"), "");
-        assert_eq!(split_qualified("Type."), "");
+    fn grok_does_not_list_a_recursive_method_as_its_own_caller() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(
+            tmp.path(),
+            "w.ts",
+            "class Walker {\n  walk(n: number): number {\n    return n ? this.walk(n - 1) : 0;\n  }\n}\n\
+             export function start(w: Walker) { return w.walk(3); }\n",
+        );
+        let bloom = BloomFilterCache::default();
+        let session = crate::session::Session::default();
+        let result = grok(
+            "Walker.walk",
+            tmp.path(),
+            &bloom,
+            &session,
+            GrokCaps::default(),
+        )
+        .unwrap();
+        let callers: Vec<&str> = result
+            .callers
+            .iter()
+            .map(|c| c.calling_function.as_str())
+            .collect();
+        assert_eq!(callers, ["start"]);
+        assert_eq!(result.total_callers, 1);
     }
 
+    /// Many callers in test files fill the tests section; the callers section
+    /// still lists the production callers.
     #[test]
-    fn split_qualified_mixed_separators_uses_rightmost() {
-        // `rfind` scans for either separator and takes the last match overall,
-        // not the last match of a single separator kind.
-        assert_eq!(split_qualified("a.b::method"), "method");
-        assert_eq!(split_qualified("a::b.method"), "method");
-    }
-
-    #[test]
-    fn split_qualified_non_ascii_byte_boundary_safe() {
-        // The separator search is byte-based (`rfind` over `[':', '.']`, both
-        // single-byte ASCII), so slicing at `idx + 1` always lands on a UTF-8
-        // char boundary even when the segments themselves are multi-byte.
-        assert_eq!(split_qualified("café::méthode"), "méthode");
-        assert_eq!(split_qualified("类型.方法"), "方法");
-        // No separator at all — identity, and no panic on multi-byte input.
-        assert_eq!(split_qualified("メソッド"), "メソッド");
+    fn grok_keeps_its_callers_when_test_callers_outnumber_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(
+            tmp.path(),
+            "src/lib.rs",
+            "pub fn target_fn() -> u32 { 1 }\n",
+        );
+        let mut prod = String::new();
+        for i in 0..75 {
+            let _ = writeln!(prod, "pub fn c{i}() -> u32 {{ target_fn() }}");
+        }
+        write_fixture(tmp.path(), "src/callers.rs", &prod);
+        let mut tests = String::new();
+        for i in 0..65 {
+            let _ = writeln!(
+                tests,
+                "#[test]\nfn t{i}() {{ assert_eq!(target_fn(), 1); }}"
+            );
+        }
+        write_fixture(tmp.path(), "src/cases_test.rs", &tests);
+        let bloom = BloomFilterCache::default();
+        let session = crate::session::Session::default();
+        let result = grok(
+            "target_fn",
+            tmp.path(),
+            &bloom,
+            &session,
+            GrokCaps::default(),
+        )
+        .unwrap();
+        assert_eq!((result.callers.len(), result.total_callers), (5, 75));
+        assert_eq!((result.tests.len(), result.total_tests), (8, 65));
+        let text = format_grok(&result, tmp.path());
+        assert!(text.contains("## callers (5 of 75)"), "{text}");
+        assert!(text.contains("## tests (8 of 65)"), "{text}");
     }
 
     // -- find_entry_at_line ----------------------------------------------

@@ -84,7 +84,57 @@ pub(crate) fn sorted(list: std::sync::Mutex<Vec<PathBuf>>) -> Vec<PathBuf> {
 /// The note under a result that names files the walk skipped for size
 /// although they contain the query. Empty when there are none.
 fn skipped_large_note(result: &SearchResult) -> String {
-    skipped_files_note(&result.skipped_large, &result.scope)
+    let mut note = other_owners_note(result);
+    note.push_str(&skipped_files_note(&result.skipped_large, &result.scope));
+    note
+}
+
+/// The note for a qualified query whose owner holds no definition of the
+/// name: where the name is defined instead. Empty when there is nothing to
+/// say.
+fn other_owners_note(result: &SearchResult) -> String {
+    let (Some(owner), name) = tilth_core::search::scope::split_qualified(&result.query) else {
+        return String::new();
+    };
+    if result.other_owners.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n\n> No `{name}` is defined in `{owner}`. Definitions of `{name}`: {}",
+        owner_candidates(&result.query, &result.other_owners, &result.scope)
+    )
+}
+
+/// The definitions in `others`, each written as the qualified name the
+/// query's own separator would give it, with its place: `A::run (m.rs:3)`,
+/// or `run (m.rs:5)` for one at the top level. The first five are listed.
+pub(crate) fn owner_candidates(
+    query: &str,
+    others: &[crate::types::OtherOwner],
+    scope: &Path,
+) -> String {
+    const SHOWN: usize = 5;
+    let name = tilth_core::search::scope::split_qualified(query).1;
+    let sep = if query.ends_with(&format!("::{name}")) {
+        "::"
+    } else {
+        "."
+    };
+    let mut listed: Vec<String> = others
+        .iter()
+        .take(SHOWN)
+        .map(|o| {
+            let place = format!("{}:{}", rel(&o.path, scope), o.line);
+            match &o.owner {
+                Some(owner) => format!("{owner}{sep}{name} ({place})"),
+                None => format!("{name} ({place})"),
+            }
+        })
+        .collect();
+    if others.len() > SHOWN {
+        listed.push(format!("and {} more", others.len() - SHOWN));
+    }
+    listed.join(", ")
 }
 
 /// The note that names files a walk skipped for size although they contain

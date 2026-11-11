@@ -361,6 +361,127 @@ mod tests {
         assert_eq!(callers, ["comment_caller", "docstring_caller"]);
     }
 
+    /// Each `(line, label)` of the call sites of `target` in `file`.
+    fn caller_labels(file: &str, source: &str, target: &str) -> Vec<(u32, String)> {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(file), source).unwrap();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let targets: HashSet<String> = std::iter::once(target.to_string()).collect();
+        let found = find_callers_batch(&targets, dir.path(), &bloom, None, None, |sites| {
+            sites
+                .into_iter()
+                .map(|(_, m)| (m.line, m.calling_function))
+                .collect::<Vec<_>>()
+        })
+        .unwrap();
+        let mut labels: Vec<(u32, String)> = found.per_file.into_iter().flatten().collect();
+        labels.sort();
+        labels
+    }
+
+    fn labels(pairs: &[(u32, &str)]) -> Vec<(u32, String)> {
+        pairs.iter().map(|&(l, s)| (l, s.to_string())).collect()
+    }
+
+    /// A call in a local variable's initializer is made by the function that
+    /// declares the variable, so it carries that function's name. A
+    /// top-level binding has no function around it and keeps its own name.
+    #[test]
+    fn a_call_in_a_local_initializer_is_labelled_by_its_function() {
+        let ts = "function target() { return 1; }\n\
+                  function outer() {\n\
+                  \x20 const result = target();\n\
+                  \x20 let other = target(), more = 2;\n\
+                  \x20 var legacy = target();\n\
+                  \x20 function nested() { const result = target(); return result; }\n\
+                  }\n\
+                  class Service {\n\
+                  \x20 run() { const result = target(); return result; }\n\
+                  }\n\
+                  function* generate() { const value = target(); yield value; }\n\
+                  const topLevel = target();\n";
+        assert_eq!(
+            caller_labels("calls.ts", ts, "target"),
+            labels(&[
+                (3, "outer"),
+                (4, "outer"),
+                (5, "outer"),
+                (6, "nested"),
+                (9, "Service.run"),
+                (11, "generate"),
+                (12, "topLevel"),
+            ])
+        );
+
+        let rust = "fn rust_target() -> u32 { 1 }\n\
+                    fn rust_outer() -> u32 {\n\
+                    \x20   const LOCAL: u32 = rust_target();\n\
+                    \x20   static S: u32 = rust_target();\n\
+                    \x20   LOCAL + S\n\
+                    }\n\
+                    const TOP: u32 = rust_target();\n";
+        assert_eq!(
+            caller_labels("lib.rs", rust, "rust_target"),
+            labels(&[(3, "rust_outer"), (4, "rust_outer"), (7, "TOP")])
+        );
+
+        // A function value is labelled by its own name or the name it is
+        // bound to; an anonymous callback belongs to what is around it.
+        let js = "res.send = function send(body) {\n\
+                    var file = target(body);\n\
+                  };\n\
+                  app.handle = function (req) {\n\
+                    const out = target(req);\n\
+                  };\n\
+                  function outer() {\n\
+                    const cb = () => target();\n\
+                    [1].map(function () { const v = target(); });\n\
+                  }\n\
+                  const api = { load: function () { const v = target(); } };\n\
+                  describe('x', () => { const app = target(); });\n";
+        assert_eq!(
+            caller_labels("lib.js", js, "target"),
+            labels(&[
+                (2, "send"),
+                (5, "handle"),
+                (8, "cb"),
+                (9, "outer"),
+                (11, "load"),
+                (12, "<top-level>"),
+            ])
+        );
+
+        let bash = "target() { echo hi; }\nouter() {\n  value=$(target)\n  echo \"$value\"\n}\n";
+        assert_eq!(
+            caller_labels("run.sh", bash, "target"),
+            labels(&[(3, "outer")])
+        );
+    }
+
+    /// A method's label names the type it belongs to, however the language
+    /// attaches it: a Rust `impl` block, a Go receiver, or a C++ definition
+    /// outside its class.
+    #[test]
+    fn a_method_label_names_its_type() {
+        let rust = "struct A;\nimpl A {\n    fn run(&self) { go(); }\n}\n\
+                    impl<T> Wrap<T> {\n    fn run(&self) { go(); }\n}\n";
+        assert_eq!(
+            caller_labels("m.rs", rust, "go"),
+            labels(&[(3, "A.run"), (6, "Wrap.run")])
+        );
+
+        let go = "package p\n\ntype Context struct{}\n\n\
+                  func (c *Context) reset() { work() }\n\n\
+                  func (r JSON) Render() error { work(); return nil }\n";
+        assert_eq!(
+            caller_labels("ctx.go", go, "work"),
+            labels(&[(5, "Context.reset"), (7, "JSON.Render")])
+        );
+
+        let cpp = "struct B { int run(); };\nint B::run() { return go(); }\n";
+        assert_eq!(caller_labels("b.cpp", cpp, "go"), labels(&[(2, "B.run")]));
+    }
+
     /// `reached_bound` is set exactly when the walk found `stop_after` sites,
     /// so a caller labels a count a lower bound only when it may be one.
     #[test]

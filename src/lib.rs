@@ -388,7 +388,7 @@ fn run_inner(
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .collect();
-        let all_identifiers = parts.iter().all(|p| classify::is_identifier(p));
+        let all_identifiers = parts.iter().all(|p| classify::is_symbol_name(p));
         if parts.len() > 5 && all_identifiers {
             return Err(TilthError::InvalidQuery {
                 query: query.to_string(),

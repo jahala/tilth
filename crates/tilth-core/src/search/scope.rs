@@ -9,8 +9,10 @@ use std::path::Path;
 use crate::cache::OutlineCache;
 use crate::lang::elixir::{extract_elixir_definition_name, is_elixir_definition};
 use crate::lang::treesitter::{
-    extract_definition_name, node_text_simple, NodeTextMode, DEFINITION_KINDS, TYPE_KINDS,
+    extract_definition_name, is_local_binding, node_text_simple, NodeTextMode, DEFINITION_KINDS,
+    TYPE_KINDS,
 };
+use crate::types::Lang;
 
 /// Resolved enclosing-definition context for a (file, line). Used by the
 /// search formatter to annotate usages with their containing scope.
@@ -23,19 +25,30 @@ pub struct EnclosingScope {
     pub name: String,
 }
 
-/// Walk up the AST from `node` to the nearest definition, qualified with its
-/// enclosing type/module if one wraps it. Returns the AST node so the caller
-/// can read its kind, plus the rendered name and line range.
+/// Walk up the AST from `node` to the nearest definition, qualified with the
+/// type that owns it (see [`definition_owner`]). Returns the AST node so the
+/// caller can read its kind, plus the rendered name and line range.
+///
+/// A variable local to a function is not a definition (see
+/// [`is_local_binding`]), so a node in its initializer belongs to the
+/// function: `const result = target()` inside `outer` is in `outer`. A
+/// JavaScript function value is a definition when it has a name of its own
+/// or is bound to one (see [`function_value_name`]); an anonymous callback is
+/// part of the function around it.
 pub(super) fn walk_to_enclosing_definition<'a>(
     node: tree_sitter::Node<'a>,
     lines: &[&str],
-    lang: crate::types::Lang,
+    lang: Lang,
 ) -> Option<(tree_sitter::Node<'a>, String, (u32, u32))> {
     let mut current = Some(node);
     while let Some(n) = current {
-        let def_name = if DEFINITION_KINDS.contains(&n.kind()) {
+        let def_name = if matches!(lang, Lang::JavaScript | Lang::TypeScript | Lang::Tsx)
+            && FUNCTION_VALUE_KINDS.contains(&n.kind())
+        {
+            function_value_name(n, lines)
+        } else if DEFINITION_KINDS.contains(&n.kind()) && !is_local_binding(n) {
             extract_definition_name(n, lines)
-        } else if lang == crate::types::Lang::Elixir && is_elixir_definition(n, lines) {
+        } else if lang == Lang::Elixir && is_elixir_definition(n, lines) {
             extract_elixir_definition_name(n, lines)
         } else {
             None
@@ -46,30 +59,187 @@ pub(super) fn walk_to_enclosing_definition<'a>(
                 n.start_position().row as u32 + 1,
                 n.end_position().row as u32 + 1,
             );
-
-            // Walk further up to find an enclosing type/module and qualify the name.
-            // `defmodule` is a `call` node, not in TYPE_KINDS, so Elixir needs a
-            // separate check to produce `Module.func`.
-            let mut parent = n.parent();
-            while let Some(p) = parent {
-                if TYPE_KINDS.contains(&p.kind()) {
-                    if let Some(type_name) = extract_definition_name(p, lines) {
-                        return Some((n, format!("{type_name}.{name}"), range));
-                    }
-                }
-                if lang == crate::types::Lang::Elixir && is_elixir_definition(p, lines) {
-                    if let Some(type_name) = extract_elixir_definition_name(p, lines) {
-                        return Some((n, format!("{type_name}.{name}"), range));
-                    }
-                }
-                parent = p.parent();
-            }
-
+            let name = match definition_owner(n, lines, lang) {
+                Some(owner) => format!("{owner}.{name}"),
+                None => name,
+            };
             return Some((n, name, range));
         }
         current = n.parent();
     }
     None
+}
+
+/// JavaScript and TypeScript functions written as values.
+const FUNCTION_VALUE_KINDS: &[&str] = &[
+    "function_expression",
+    "function",
+    "arrow_function",
+    "generator_function",
+];
+
+/// The name a function value goes by: its own (`function send() {}`), or
+/// the name it is bound to (`const send = () => {}`, `res.send = function
+/// () {}`, `{ send() {} }`'s key, a class field). `None` for an anonymous
+/// callback.
+fn function_value_name(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
+    let text = |n: tree_sitter::Node| Some(node_text_simple(n, lines, NodeTextMode::Full));
+    if let Some(name) = node.child_by_field_name("name") {
+        return text(name);
+    }
+    let parent = node.parent()?;
+    let bound = match parent.kind() {
+        "variable_declarator" => parent.child_by_field_name("name"),
+        "assignment_expression" => parent.child_by_field_name("left").and_then(|left| {
+            if left.kind() == "member_expression" {
+                left.child_by_field_name("property")
+            } else {
+                Some(left)
+            }
+        }),
+        "pair" => parent.child_by_field_name("key"),
+        "public_field_definition" | "field_definition" => parent
+            .child_by_field_name("name")
+            .or_else(|| parent.child_by_field_name("property")),
+        _ => None,
+    }?;
+    matches!(
+        bound.kind(),
+        "identifier" | "property_identifier" | "private_property_identifier"
+    )
+    .then(|| text(bound))
+    .flatten()
+}
+
+/// The name of the type or module that owns definition `node`, if any: the
+/// nearest enclosing class, struct, trait, interface, module or Rust `impl`
+/// (by its type), a Go method's receiver type, or the class a C++ member
+/// defined outside it names (`int B::run()`). Elixir's `defmodule` is a
+/// `call`, so it is checked apart. This is the owner a qualified name such as
+/// `B::run` or `Context.reset` names.
+#[must_use]
+pub fn definition_owner(node: tree_sitter::Node, lines: &[&str], lang: Lang) -> Option<String> {
+    if let Some(owner) = receiver_type(node, lines).or_else(|| declarator_scope(node, lines)) {
+        return Some(owner);
+    }
+    let mut parent = node.parent();
+    while let Some(p) = parent {
+        if TYPE_KINDS.contains(&p.kind()) {
+            let name = if p.kind() == "impl_item" {
+                p.child_by_field_name("type")
+                    .and_then(|t| base_type_name(t, lines))
+            } else {
+                extract_definition_name(p, lines)
+            };
+            if name.is_some() {
+                return name;
+            }
+        }
+        if lang == Lang::Elixir && is_elixir_definition(p, lines) {
+            if let Some(name) = extract_elixir_definition_name(p, lines) {
+                return Some(name);
+            }
+        }
+        parent = p.parent();
+    }
+    None
+}
+
+/// Split a qualified name into its owner and its bare name, at the last `::`
+/// or `.`: `B::run` and `B.run` give `(Some("B"), "run")`, and
+/// `crate::m::B::run` gives `(Some("B"), "run")` too, since the owner is the
+/// type that holds the name. A name without a qualifier, or with an empty
+/// segment on either side of the last separator, is returned whole with no
+/// owner. Labels from [`walk_to_enclosing_definition`] use `.`, so this also
+/// splits them.
+#[must_use]
+pub fn split_qualified(name: &str) -> (Option<&str>, &str) {
+    let Some(cut) = name.rfind(['.', ':']) else {
+        return (None, name);
+    };
+    let bare = &name[cut + 1..];
+    let head = if name[..=cut].ends_with("::") {
+        &name[..cut - 1]
+    } else if name[..=cut].ends_with('.') {
+        &name[..cut]
+    } else {
+        return (None, name);
+    };
+    let owner = head.rsplit(['.', ':']).next().unwrap_or(head);
+    let is_word = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+    };
+    if is_word(owner) && is_word(bare) && !head.ends_with(':') {
+        (Some(owner), bare)
+    } else {
+        (None, name)
+    }
+}
+
+/// A Go method's receiver type: `Context` in `func (c *Context) reset()`.
+fn receiver_type(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
+    if node.kind() != "method_declaration" {
+        return None;
+    }
+    let receiver = node.child_by_field_name("receiver")?;
+    let mut cursor = receiver.walk();
+    let param = receiver
+        .named_children(&mut cursor)
+        .find(|c| c.kind() == "parameter_declaration")?;
+    base_type_name(param.child_by_field_name("type")?, lines)
+}
+
+/// The class a C or C++ function definition names in its declarator, as
+/// `B` in `int B::run()` or `int ns::B::run()`.
+fn declarator_scope(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
+    if node.kind() != "function_definition" {
+        return None;
+    }
+    let mut declarator = node.child_by_field_name("declarator");
+    while let Some(d) = declarator {
+        if d.kind() == "qualified_identifier" {
+            let mut qualified = d;
+            while let Some(inner) = qualified
+                .child_by_field_name("name")
+                .filter(|n| n.kind() == "qualified_identifier")
+            {
+                qualified = inner;
+            }
+            return base_type_name(qualified.child_by_field_name("scope")?, lines);
+        }
+        if !d.kind().ends_with("declarator") {
+            return None;
+        }
+        declarator = d.child_by_field_name("declarator");
+    }
+    None
+}
+
+/// The bare name of a type node: `Wrap` for `Wrap<T>`, `Foo` for
+/// `crate::a::Foo`, `*Foo` or `&Foo`.
+fn base_type_name(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
+    match node.kind() {
+        "type_identifier" | "identifier" | "namespace_identifier" | "constant" => {
+            Some(node_text_simple(node, lines, NodeTextMode::Full))
+        }
+        "generic_type" | "reference_type" => base_type_name(
+            node.child_by_field_name("type")
+                .or_else(|| node.child_by_field_name("name"))
+                .or_else(|| node.named_child(0))?,
+            lines,
+        ),
+        "scoped_type_identifier" | "qualified_type" | "template_type" | "scoped_identifier" => {
+            base_type_name(node.child_by_field_name("name")?, lines)
+        }
+        "pointer_type" => {
+            let mut cursor = node.walk();
+            let pointee = node.named_children(&mut cursor).last()?;
+            base_type_name(pointee, lines)
+        }
+        _ => None,
+    }
 }
 
 /// Find the nearest enclosing definition for `(path, line)` by re-parsing
@@ -111,11 +281,12 @@ pub fn enclosing_definition_at(
 /// Map a tree-sitter definition node to a short user-facing label. Every kind
 /// we handle is enumerated here, so adding a new language grammar is "add the
 /// node kind to this match" with no string heuristics elsewhere.
-fn kind_label(node: tree_sitter::Node, lines: &[&str], lang: crate::types::Lang) -> &'static str {
+fn kind_label(node: tree_sitter::Node, lines: &[&str], lang: Lang) -> &'static str {
     match node.kind() {
         "function_declaration"
         | "function_definition"
         | "function_item"
+        | "generator_function_declaration"
         | "method_definition"
         | "method_declaration"
         | "method"
@@ -125,7 +296,11 @@ fn kind_label(node: tree_sitter::Node, lines: &[&str], lang: crate::types::Lang)
         | "abstract_method_signature"
         | "function_signature"
         | "protocol_function_declaration"
-        | "decorated_definition" => "function",
+        | "decorated_definition"
+        | "function_expression"
+        | "function"
+        | "arrow_function"
+        | "generator_function" => "function",
         "class_declaration"
         | "class_definition"
         | "abstract_class_declaration"
@@ -152,7 +327,7 @@ fn kind_label(node: tree_sitter::Node, lines: &[&str], lang: crate::types::Lang)
         "object_declaration" | "object_definition" => "object",
         "impl_item" => "impl",
         "export_statement" => "export",
-        "call" if lang == crate::types::Lang::Elixir => elixir_kind_label(node, lines),
+        "call" if lang == Lang::Elixir => elixir_kind_label(node, lines),
         _ => "definition",
     }
 }
@@ -186,6 +361,29 @@ mod tests {
         let p = dir.join(name);
         fs::write(&p, content).unwrap();
         p
+    }
+
+    #[test]
+    fn split_qualified_takes_the_last_segment_and_its_owner() {
+        for (name, owner, bare) in [
+            ("Type::method", Some("Type"), "method"),
+            ("Type.method", Some("Type"), "method"),
+            ("a::b::method", Some("b"), "method"),
+            ("a.b::method", Some("b"), "method"),
+            ("a::b.method", Some("b"), "method"),
+            ("café::méthode", Some("café"), "méthode"),
+            ("类型.方法", Some("类型"), "方法"),
+            ("method", None, "method"),
+            ("メソッド", None, "メソッド"),
+            ("Type::", None, "Type::"),
+            ("Type.", None, "Type."),
+            ("::method", None, "::method"),
+            ("a:b", None, "a:b"),
+            ("a:::b", None, "a:::b"),
+            ("a..b", None, "a..b"),
+        ] {
+            assert_eq!(split_qualified(name), (owner, bare), "{name}");
+        }
     }
 
     #[test]
@@ -346,13 +544,11 @@ mod tests {
     }
 
     #[test]
-    fn enclosing_at_rust_impl_block_does_not_qualify_with_type() {
-        // tree-sitter-rust's `impl_item` exposes its type via a `type` field,
-        // not via the `name`/`identifier`/`declarator` fields that
-        // extract_definition_name probes. So methods inside `impl Foo {...}`
-        // produce the bare function name, not `"Foo.bar"`. Pre-existing
-        // behavior of find_enclosing_function — pinned here so a future
-        // qualifier improvement is an intentional, visible change.
+    fn enclosing_at_rust_impl_block_qualifies_with_its_type() {
+        // tree-sitter-rust's `impl_item` names its type in a `type` field, not
+        // a `name`. A method inside `impl Foo {...}` is still `Foo.bar`, the
+        // way a TypeScript method is `Class.method`, so a label can be passed
+        // back to grok as a qualified name.
         let tmp = tempfile::tempdir().unwrap();
         let p = write(
             tmp.path(),
@@ -362,7 +558,7 @@ mod tests {
         let cache = OutlineCache::new();
         let scope = enclosing_definition_at(&p, 4, &cache).unwrap();
         assert_eq!(scope.kind, "function");
-        assert_eq!(scope.name, "bar");
+        assert_eq!(scope.name, "Foo.bar");
     }
 
     #[test]

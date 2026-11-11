@@ -430,7 +430,17 @@ The biggest production-only file in the subsystem. Three layers stacked:
      modules, pass-through nodes (`#ifdef`, `extern "C"`, templates) and
      the body of a `TYPE_KINDS` node are free. A variable declared in a
      function body (`is_local_binding`) is never a definition. A wrapper
-     is not a definition of its own; the declaration it wraps is.
+     is not a definition of its own; the declaration it wraps is. A
+     definition's line is the line of its name, so decorators above it
+     sit in its range and its name line is not also a usage.
+   - A qualified query (`B::run`, `B.run`, `crate::m::B::run`) is split
+     by `scope::split_qualified` into an owner and a bare name. Its
+     definitions are those of the bare name whose
+     `scope::definition_owner` is that owner: the enclosing type, the
+     type of a Rust `impl`, a Go receiver, or the class in a C++
+     out-of-line declarator. Its usages are the qualified text itself.
+     When the owner holds none, the definitions other owners hold come
+     back in `other_owners`, and search and grok name them.
    - `find_defs_heuristic_buf` is a regex-free fallback for languages
      without grammars (Dockerfile, Make).
    - `find_defs_markdown_buf` handles ATX headings as
@@ -526,7 +536,11 @@ machinery:
   over `MAX_FILE_SIZE` are not parsed; the walk lists the ones whose
   text names a target, and callers, grok and deps name them in a note. Each caller is annotated with its enclosing scope via
   `scope::walk_to_enclosing_definition` so the user sees
-  `[caller: foo]` instead of just a line number. When the walk returns
+  `[caller: foo]` instead of just a line number. The label is the
+  nearest enclosing definition that is not a local variable, qualified
+  by its owner (`Service.run`, `Context.reset`): a call in
+  `const result = target()` inside `outer` is labelled `outer`. The 2nd
+  hop looks for the bare names of these labels. When the walk returns
   empty, a small `target_seen_in_scope` helper in the binary does an mmap-based
   literal scan so `no_callers_message` can distinguish typo from
   "real symbol with no direct callers" (indirect dispatch, dead code,

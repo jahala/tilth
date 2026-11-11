@@ -82,8 +82,9 @@ pub fn classify(query: &str, scope: &Path) -> QueryType {
         }
     }
 
-    // 6. Identifier — no whitespace, starts with letter/underscore/$/@
-    if is_identifier(query) {
+    // 6. Identifier — no whitespace, starts with letter/underscore/$/@ — or a
+    //    `::` path of identifiers (`B::run`, `std::path::Path`).
+    if is_symbol_name(query) {
         // Sub-classify: exact symbol vs concept
         if looks_like_exact_symbol(query) {
             return QueryType::Symbol(query.into());
@@ -263,6 +264,16 @@ fn is_repeat_count(rest: &[u8]) -> bool {
         && min.iter().all(u8::is_ascii_digit)
         && max.iter().all(u8::is_ascii_digit)
         && parts.next().is_none()
+}
+
+/// An identifier, or a `::` path of identifiers (`B::run`). Every segment
+/// must be a non-empty identifier, so `TODO:` and `a::::b` are not names.
+pub fn is_symbol_name(s: &str) -> bool {
+    if s.contains("::") {
+        s.split("::").all(is_identifier)
+    } else {
+        is_identifier(s)
+    }
 }
 
 /// Identifier check without regex: first byte is [a-zA-Z_$@],
@@ -517,6 +528,26 @@ mod tests {
             classify("Auth.validate", &scope),
             QueryType::Symbol(_)
         ));
+    }
+
+    #[test]
+    fn double_colon_paths_are_symbols() {
+        // `Type::method` is the qualified name grok documents; search takes it
+        // as a symbol too, with `Type.method`.
+        let scope = PathBuf::from(".");
+        for query in ["B::run", "std::path::Path", "a::b.c", "Vec::new"] {
+            assert!(
+                matches!(classify(query, &scope), QueryType::Symbol(ref q) if q == query),
+                "{query}"
+            );
+        }
+        // A lone colon or an empty segment is not a path.
+        for query in ["TODO:", "a:b", "::run", "B::", "a::::b"] {
+            assert!(
+                !matches!(classify(query, &scope), QueryType::Symbol(_)),
+                "{query}"
+            );
+        }
     }
 
     #[test]

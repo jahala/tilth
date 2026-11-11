@@ -98,6 +98,19 @@ pub struct SearchResult {
     /// even though they contain the query, sorted. The renderer names them,
     /// so a match that lives in a big file is never silently missing.
     pub skipped_large: Vec<PathBuf>,
+    /// For a qualified query (`Owner::name`, `Owner.name`) that matched no
+    /// definition: the definitions of the bare name that other owners hold,
+    /// sorted by path and line. Empty otherwise.
+    pub other_owners: Vec<OtherOwner>,
+}
+
+/// A definition of a qualified query's bare name that another owner holds,
+/// or no owner (`owner: None`, a top-level definition).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct OtherOwner {
+    pub path: PathBuf,
+    pub line: u32,
+    pub owner: Option<String>,
 }
 
 /// Pre-cap counts per subfacet. Defaults to all-zero for callers that don't

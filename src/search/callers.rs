@@ -289,8 +289,18 @@ fn write_second_hop_impact(
             .then_with(|| a.path.cmp(&b.path))
             .then_with(|| a.line.cmp(&b.line))
     };
+    // A label names its owner (`Service.run`); a call site names the method
+    // alone (`s.run()`), so the second hop looks for the bare names.
+    let hop2_targets: HashSet<String> = all_caller_names
+        .iter()
+        .map(|label| {
+            tilth_core::search::scope::split_qualified(label)
+                .1
+                .to_string()
+        })
+        .collect();
     let first: Mutex<(usize, Vec<(String, CallerMatch)>)> = Mutex::new((0, Vec::new()));
-    let walked = find_callers_batch(all_caller_names, scope, bloom, glob, None, |sites| {
+    let walked = find_callers_batch(&hop2_targets, scope, bloom, glob, None, |sites| {
         let mut seen: HashSet<String> = HashSet::new();
         let mut file_first: Vec<(String, CallerMatch)> = Vec::new();
         for (via, m) in sites {
@@ -719,5 +729,37 @@ mod tests {
             "footer reported {reported} but expected exactly 9 (8 hop-1 + 1 hop-2); \
              old post-truncation rebuild would undercount: {footer_line}"
         );
+    }
+
+    /// The second hop finds the callers of each first-hop caller by its own
+    /// name. A method's label carries its owner (`Service.run`); the call
+    /// sites of that method name only `run`.
+    #[test]
+    fn second_hop_reaches_the_callers_of_a_method() {
+        let dir = tempfile::tempdir().unwrap();
+        let bloom = BloomFilterCache::new();
+        std::fs::write(
+            dir.path().join("service.ts"),
+            "function target() { return 1; }\n\
+             class Service {\n  run() { return target(); }\n}\n\
+             function outer() {\n  const result = target();\n  return result;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("app.ts"),
+            "function app(s: Service) { return s.run(); }\n",
+        )
+        .unwrap();
+
+        let result =
+            search_callers_expanded("target", dir.path(), &bloom, 0, None, None, false).unwrap();
+
+        assert!(result.contains("[caller: Service.run]"), "{result}");
+        assert!(result.contains("[caller: outer]"), "{result}");
+        let impact = result
+            .split("-- impact (2nd hop) --")
+            .nth(1)
+            .unwrap_or_else(|| panic!("no 2nd-hop block:\n{result}"));
+        assert!(impact.contains("app.ts:1"), "{result}");
     }
 }
