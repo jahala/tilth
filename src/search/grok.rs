@@ -403,6 +403,10 @@ pub struct GrokResult {
     pub body: String,
     pub callees_internal: Vec<ResolvedCallee>,
     pub callees_external: Vec<String>,
+    /// Imported code files over the size limit that hold an extern
+    /// callee's name. Callee resolution does not parse them, so an extern
+    /// callee may be defined there.
+    pub callees_maybe_in: Vec<PathBuf>,
     pub callers: Vec<CallerMatch>,
     pub siblings: Vec<SiblingEntry>,
     pub tests: Vec<TestMatch>,
@@ -449,6 +453,7 @@ pub fn grok(
         .filter(|n| !resolved_names.contains(n.as_str()))
         .cloned()
         .collect();
+    let callees_maybe_in = oversized_imports_holding(&target.path, &content, &externals);
 
     // The target's path may differ from canonical form (symlinks, `../` segments).
     // The walker hands us canonical absolute paths in match/callee results; we
@@ -632,6 +637,7 @@ pub fn grok(
         body,
         callees_internal,
         callees_external,
+        callees_maybe_in,
         callers,
         siblings,
         tests,
@@ -643,6 +649,20 @@ pub fn grok(
         delegate_body,
         skipped_large: walk.skipped_large,
     })
+}
+
+/// The code files `path` imports that are over the size limit and hold
+/// one of `names` as a word, each read once. Callee resolution skips such
+/// files, so a callee they define resolves nowhere and shows as extern.
+fn oversized_imports_holding(path: &Path, content: &str, names: &[String]) -> Vec<PathBuf> {
+    if names.is_empty() {
+        return Vec::new();
+    }
+    let words: Vec<&str> = names.iter().map(String::as_str).collect();
+    tilth_core::imports::resolve_related_files_with_content(path, content)
+        .into_iter()
+        .filter(|p| tilth_core::search::callers::oversized_code_holding(p, &words))
+        .collect()
 }
 
 /// Slice the target's source body out of `content`. Caps at `max_lines` total
@@ -846,6 +866,14 @@ pub fn format_grok(result: &GrokResult, scope: &Path) -> String {
         let total = internal_count + external_count;
         if shown < total {
             let _ = writeln!(out, "... and {} more", total - shown);
+        }
+        for file in &result.callees_maybe_in {
+            let _ = writeln!(
+                out,
+                "callees may be defined in {} (over {}, not parsed)",
+                display_rel(file, scope),
+                tilth_core::source::max_file_size_label()
+            );
         }
     }
 
@@ -2011,6 +2039,7 @@ pub fn target() {
             body: String::new(),
             callees_internal: Vec::new(),
             callees_external: Vec::new(),
+            callees_maybe_in: Vec::new(),
             callers: Vec::new(),
             siblings: Vec::new(),
             tests: Vec::new(),
@@ -2044,6 +2073,7 @@ pub fn target() {
             body: String::new(),
             callees_internal: Vec::new(),
             callees_external: Vec::new(),
+            callees_maybe_in: Vec::new(),
             callers: Vec::new(),
             siblings: vec![SiblingEntry {
                 name: "peer".into(),
@@ -2724,5 +2754,57 @@ impl OutlineCache {
             ("test_support/worker.py", "def caller():\n    target()\n"),
             ("test_main.py", "def test_target():\n    target()\n"),
         ]);
+    }
+
+    /// Every unresolved callee whose name a big imported file held was
+    /// pinned on that file, so `log` was "defined" in `big.js`. Callees
+    /// stay extern, and the block names once each big imported file that
+    /// holds one of their names: they may be defined there.
+    #[test]
+    fn an_imported_file_over_the_size_limit_is_named_under_the_callees() {
+        let tmp = tempfile::tempdir().unwrap();
+        let limit = usize::try_from(tilth_core::source::MAX_FILE_SIZE).unwrap();
+        let filler = "// padding line to push the file over the size limit\n";
+        let pad = filler.repeat(limit / filler.len() + 1);
+        write_fixture(
+            tmp.path(),
+            "big.js",
+            &format!("export function bigHelper(x) {{ log(x); return x; }}\n{pad}"),
+        );
+        write_fixture(tmp.path(), "unused.js", &pad);
+        write_fixture(
+            tmp.path(),
+            "small.js",
+            "export function small(x) { return x; }\n",
+        );
+        write_fixture(
+            tmp.path(),
+            "a.js",
+            "import { bigHelper } from './big';\nimport { small } from './small';\n\
+             import './unused';\n\
+             export function target() {\n  log(1);\n  return bigHelper(small(1)) + outside(2);\n}\n",
+        );
+        let bloom = BloomFilterCache::default();
+        let session = crate::session::Session::default();
+        let result = grok("target", tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
+        let rendered = format_grok(&result, tmp.path());
+        assert!(
+            rendered.contains("## callees (1 internal, 3 extern)"),
+            "{rendered}"
+        );
+        for name in ["bigHelper", "log", "outside"] {
+            assert!(
+                rendered.contains(&format!("{name:<20} extern")),
+                "{rendered}"
+            );
+        }
+        assert_eq!(
+            rendered
+                .matches("callees may be defined in big.js (over 500 KB, not parsed)")
+                .count(),
+            1,
+            "{rendered}"
+        );
+        assert!(!rendered.contains("unused.js"), "{rendered}");
     }
 }

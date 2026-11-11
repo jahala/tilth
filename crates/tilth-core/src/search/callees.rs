@@ -261,7 +261,9 @@ fn resolve_same_package(
     source_path: &Path,
 ) {
     const MAX_FILES: usize = 20;
-    const MAX_FILE_SIZE: u64 = 100_000; // 100KB
+    // A tighter bound than `source::MAX_FILE_SIZE`: this scan parses up to
+    // `MAX_FILES` siblings on every expansion, not one file a query names.
+    const MAX_SIBLING_SIZE: u64 = 100_000;
 
     let Some(dir) = source_path.parent() else {
         return;
@@ -281,7 +283,7 @@ fn resolve_same_package(
             path != source_path
                 && name_str.ends_with(".go")
                 && !name_str.ends_with("_test.go")
-                && e.metadata().is_ok_and(|m| m.len() <= MAX_FILE_SIZE)
+                && e.metadata().is_ok_and(|m| m.len() <= MAX_SIBLING_SIZE)
         })
         .map(|e| e.path())
         .collect();

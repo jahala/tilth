@@ -21,6 +21,10 @@ pub(in crate::mcp) fn tool_read(
     edit_mode: bool,
 ) -> Result<String, String> {
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
+    // The budget every read is fitted to. With no `budget` argument it is
+    // the default cap the response gets anyway, so the outline is fitted
+    // to it instead of being cut there mid-entry.
+    let read_budget = budget.unwrap_or(crate::budget::DEFAULT_BUDGET);
     // Extract optional root for anchoring relative paths. A relative path
     // without an absolute `root` is unresolvable (the server cannot see the
     // caller's shell cwd) — propagate that refusal at each path-resolution site.
@@ -64,7 +68,12 @@ pub(in crate::mcp) fn tool_read(
             .unwrap_or(60);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(batch_timeout);
 
+        // Every file is read at its own size first. Only when the batch is
+        // over the budget do the biggest files shrink, each to a fair share
+        // (`fair_share`), so small files stay whole.
         let mut results = Vec::with_capacity(paths_arr.len());
+        // The files whose view a budget can shrink, by index in `results`.
+        let mut fitted: Vec<(usize, PathBuf)> = Vec::new();
         for (i, p) in paths_arr.iter().enumerate() {
             // Check deadline before each file
             if std::time::Instant::now() > deadline {
@@ -85,11 +94,42 @@ pub(in crate::mcp) fn tool_read(
             } else if force_stripped {
                 read_stripped_file(&path, cache)
             } else {
-                crate::read::read_file(&path, None, force_full, cache, edit_mode, budget)
+                let read = crate::read::read_file(
+                    &path,
+                    None,
+                    force_full,
+                    cache,
+                    edit_mode,
+                    Some(read_budget),
+                );
+                if read.is_ok() {
+                    fitted.push((results.len(), path.clone()));
+                }
+                read
             };
-            match read {
-                Ok(output) => results.push(output),
-                Err(e) => results.push(format!("# {} — error: {}", path.display(), e)),
+            results.push(match read {
+                Ok(output) => output,
+                Err(e) => format!("# {} — error: {}", path.display(), e),
+            });
+        }
+        // Each file's cost in the joined batch, its separator included.
+        let cost = |view: &str| crate::types::estimate_tokens(view.len() as u64 + 2);
+        let sizes: Vec<u64> = results.iter().map(|r| cost(r)).collect();
+        if let Some(share) = fair_share(&sizes, read_budget) {
+            for (i, path) in fitted {
+                if sizes[i] > share {
+                    if let Ok(view) = crate::read::read_file(
+                        &path,
+                        None,
+                        force_full,
+                        cache,
+                        edit_mode,
+                        // One token of the share is the separator's.
+                        Some(share.saturating_sub(1)),
+                    ) {
+                        results[i] = view;
+                    }
+                }
             }
         }
         let combined = results.join("\n\n");
@@ -135,44 +175,51 @@ pub(in crate::mcp) fn tool_read(
             ));
         }
         session.record_read(&path);
-        let output = match budget {
-            Some(b) => crate::read::read_ranges_with_budget(&path, &ranges, edit_mode, b)
-                .map_err(|e| e.to_string())?,
-            None => {
-                crate::read::read_ranges(&path, &ranges, edit_mode).map_err(|e| e.to_string())?
-            }
-        };
-        return Ok(output);
+        return crate::read::read_ranges_with_budget(&path, &ranges, edit_mode, read_budget)
+            .map_err(|e| e.to_string());
     }
 
     session.record_read(&path);
 
-    let mut output = if section.is_none() && force_signature {
-        read_signature_file(&path, cache).map_err(|e| e.to_string())?
-    } else if section.is_none() && force_stripped {
-        read_stripped_file(&path, cache).map_err(|e| e.to_string())?
-    } else {
-        crate::read::read_file(&path, section, force_full, cache, edit_mode, budget)
-            .map_err(|e| e.to_string())?
-    };
-
-    // Append related-file hint for outlined code files (not section reads, not batch).
+    // The related-file hint for outlined code files (not section reads, not
+    // batch). It is built first, so the read is fitted to the room it leaves
+    // and the final cut never removes the note that says what a fit left out.
+    let mut related_hint = String::new();
     if section.is_none() && crate::read::would_outline(&path) {
         let related = tilth_core::imports::resolve_related_files(&path, cache);
         if !related.is_empty() {
-            output.push_str("\n\n> Related: ");
+            related_hint.push_str("\n\n> Related: ");
             for (i, p) in related
                 .iter()
                 .take(crate::read::RELATED_HINT_LIMIT)
                 .enumerate()
             {
                 if i > 0 {
-                    output.push_str(", ");
+                    related_hint.push_str(", ");
                 }
-                let _ = write!(output, "{}", p.display());
+                let _ = write!(related_hint, "{}", p.display());
             }
         }
     }
+    let file_budget =
+        read_budget.saturating_sub(crate::types::estimate_tokens(related_hint.len() as u64));
+
+    let mut output = if section.is_none() && force_signature {
+        read_signature_file(&path, cache).map_err(|e| e.to_string())?
+    } else if section.is_none() && force_stripped {
+        read_stripped_file(&path, cache).map_err(|e| e.to_string())?
+    } else {
+        crate::read::read_file(
+            &path,
+            section,
+            force_full,
+            cache,
+            edit_mode,
+            Some(file_budget),
+        )
+        .map_err(|e| e.to_string())?
+    };
+    output.push_str(&related_hint);
 
     Ok(apply_budget(&output, budget))
 }
@@ -264,6 +311,27 @@ fn read_stripped_file(path: &Path, cache: &OutlineCache) -> Result<String, Tilth
         "// stripped {stripped} of {total_lines} lines (plain comments, debug logs, blank collapse) — non-editable view"
     );
     Ok(format!("{header}\n{note}\n\n{}", body.trim_end()))
+}
+
+/// The most each file of a batch may take so the batch fits in `budget`,
+/// when its files' `sizes` add up to more: files under the share keep their
+/// size, and what they leave is split evenly between the bigger ones.
+/// `None` when the batch fits as it is.
+fn fair_share(sizes: &[u64], budget: u64) -> Option<u64> {
+    if sizes.iter().sum::<u64>() <= budget {
+        return None;
+    }
+    let mut sorted = sizes.to_vec();
+    sorted.sort_unstable();
+    let mut left = budget;
+    for (k, &size) in sorted.iter().enumerate() {
+        let share = left / (sorted.len() - k) as u64;
+        if size > share {
+            return Some(share);
+        }
+        left -= size;
+    }
+    None
 }
 
 #[cfg(test)]
@@ -702,5 +770,165 @@ mod tests {
             err.contains("src/foo.rs") && err.contains("root"),
             "relative path without root must refuse with an actionable message: {err}"
         );
+    }
+
+    /// A JS file with one function per line: its outline is nearly as long
+    /// as the file, and both are far over the default budget.
+    fn write_dense_js(dir: &Path, name: &str) -> PathBuf {
+        let mut src = String::from("import { helper } from './helper';\n");
+        for i in 0..6000 {
+            let _ = writeln!(
+                src,
+                "export function functionNumber{i:05}(alpha, beta) {{ return alpha + beta; }}"
+            );
+        }
+        let path = dir.join(name);
+        std::fs::write(&path, src).unwrap();
+        std::fs::write(dir.join("helper.js"), "export function helper() {}\n").unwrap();
+        path
+    }
+
+    fn read_args(args: &Value) -> String {
+        tool_read(args, &OutlineCache::new(), &Session::new(), false).unwrap()
+    }
+
+    /// With no `budget`, the read skipped the outline fit: the full view
+    /// came back and the default cap cut it after the first functions,
+    /// hiding the rest. It reads like an explicit default budget now.
+    #[test]
+    fn tool_read_without_a_budget_fits_the_outline_to_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_dense_js(dir.path(), "dense.js");
+        let path = path.to_str().unwrap();
+        let implicit = read_args(&serde_json::json!({ "path": path }));
+        let explicit = read_args(&serde_json::json!({
+            "path": path,
+            "budget": crate::budget::DEFAULT_BUDGET,
+        }));
+        assert_eq!(implicit, explicit);
+        assert!(implicit.contains("[outline]"), "{}", &implicit[..200]);
+    }
+
+    /// The `> Related:` line went on after the outline was fitted, so the
+    /// final cut removed the note that says what the fit left out.
+    #[test]
+    fn tool_read_keeps_the_fit_note_with_the_related_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_dense_js(dir.path(), "dense.js");
+        let out = read_args(&serde_json::json!({
+            "path": path.to_str().unwrap(),
+            "budget": 24_000,
+        }));
+        assert!(
+            out.contains("> outline cut to fit the budget"),
+            "{}",
+            tail(&out)
+        );
+        assert!(out.contains("> Related: "), "{}", tail(&out));
+        assert!(!out.contains("... truncated"), "{}", tail(&out));
+    }
+
+    /// A batch gave each file the whole budget, so the first big file used
+    /// it up and the next was cut off behind "truncated".
+    #[test]
+    fn tool_read_batch_shares_the_budget_between_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = write_dense_js(dir.path(), "a.js");
+        let b = write_dense_js(dir.path(), "b.js");
+        let out = read_args(&serde_json::json!({
+            "paths": [a.to_str().unwrap(), b.to_str().unwrap()],
+        }));
+        assert!(out.contains("b.js"), "{}", tail(&out));
+        assert_eq!(
+            out.matches("> outline cut to fit the budget").count(),
+            2,
+            "{}",
+            tail(&out)
+        );
+        assert!(!out.contains("... truncated"), "{}", tail(&out));
+    }
+
+    /// Each file in a batch got an equal share of the budget up front, so a
+    /// 5k-token file next to nine small ones came back outlined although
+    /// the whole batch is about 6k tokens. A batch that fits keeps every
+    /// file as a lone read shows it.
+    #[test]
+    fn tool_read_batch_keeps_files_whole_when_the_batch_fits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut big = String::new();
+        for i in 0..240 {
+            let _ = writeln!(
+                big,
+                "export function handler{i:03}(request, response) {{ return response.send(request.body); }}"
+            );
+        }
+        std::fs::write(dir.path().join("big.js"), &big).unwrap();
+        let big_tokens = crate::types::estimate_tokens(big.len() as u64);
+        assert!((4_500..6_000).contains(&big_tokens), "{big_tokens} tokens");
+        let mut paths = vec![dir.path().join("big.js")];
+        for i in 0..9 {
+            let path = dir.path().join(format!("small{i}.js"));
+            std::fs::write(&path, format!("export const value{i} = {i};\n").repeat(20)).unwrap();
+            paths.push(path);
+        }
+        let names: Vec<&str> = paths.iter().map(|p| p.to_str().unwrap()).collect();
+        let out = read_args(&serde_json::json!({ "paths": names }));
+        for path in &names {
+            let alone = read_args(&serde_json::json!({ "path": path }));
+            assert!(
+                out.contains(&alone),
+                "{path} changed in the batch:\n{}",
+                tail(&out)
+            );
+        }
+    }
+
+    #[test]
+    fn fair_share_caps_only_the_files_over_it() {
+        assert_eq!(fair_share(&[5_000, 100, 100], 24_000), None);
+        assert_eq!(fair_share(&[30_000, 100], 24_000), Some(23_900));
+        assert_eq!(fair_share(&[20_000, 100, 20_000], 24_000), Some(11_950));
+    }
+
+    /// Over the budget, the biggest files shrink first and the small ones
+    /// stay whole.
+    #[test]
+    fn tool_read_batch_over_the_budget_shrinks_the_biggest_file_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = write_dense_js(dir.path(), "a.js");
+        let small = dir.path().join("small.js");
+        std::fs::write(&small, "export const answer = 42;\n").unwrap();
+        let out = read_args(&serde_json::json!({
+            "paths": [a.to_str().unwrap(), small.to_str().unwrap()],
+        }));
+        let alone = read_args(&serde_json::json!({ "path": small.to_str().unwrap() }));
+        assert!(out.contains(&alone), "{}", tail(&out));
+        assert_eq!(
+            out.matches("> outline cut to fit the budget").count(),
+            1,
+            "{}",
+            tail(&out)
+        );
+        let tokens = crate::types::estimate_tokens(out.len() as u64);
+        assert!(tokens <= crate::budget::DEFAULT_BUDGET, "{tokens} tokens");
+        assert!(!out.contains("... truncated"), "{}", tail(&out));
+    }
+
+    /// `sections` with no budget had no cap at all, so two big ranges
+    /// went past the host's response limit. They share the default now.
+    #[test]
+    fn tool_read_sections_without_a_budget_stay_under_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_dense_js(dir.path(), "dense.js");
+        let out = read_args(&serde_json::json!({
+            "path": path.to_str().unwrap(),
+            "sections": ["1-3000", "3001-6000"],
+        }));
+        let tokens = crate::types::estimate_tokens(out.len() as u64);
+        assert!(tokens <= crate::budget::DEFAULT_BUDGET, "{tokens} tokens");
+    }
+
+    fn tail(out: &str) -> &str {
+        &out[out.floor_char_boundary(out.len().saturating_sub(400))..]
     }
 }

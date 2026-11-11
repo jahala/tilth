@@ -29,7 +29,6 @@ pub(crate) const RELATED_HINT_LIMIT: usize = 8;
 /// outline saves too few tokens to be worth the information loss, so the full
 /// file is returned instead. Integer arithmetic: 80 means 80%.
 const OUTLINE_MIN_COMPRESSION: u64 = 80;
-const FILE_SIZE_CAP: u64 = 500_000; // 500KB
 
 /// Max file size for `full=true` reads. Files above this threshold get a
 /// warning header + outline instead of raw content, preventing multi-megabyte
@@ -369,7 +368,7 @@ pub fn read_file(
                 // The mark holds no line break, and this file has more lines
                 // than the view shows, so the count without it is the file's.
                 let line_count = u32::try_from(ends.total()).unwrap_or(u32::MAX);
-                let capped = full || byte_len > FILE_SIZE_CAP;
+                let capped = full || byte_len > tilth_core::source::MAX_FILE_SIZE;
                 let outline = cache.get_or_compute(path, mtime, || view.generate(&ends, capped));
                 if full {
                     return Ok(full_skipped_view(path, byte_len, line_count, cap, &outline));
@@ -436,7 +435,10 @@ pub fn read_file(
 
     // Large file → smart view by file type
     let file_type = detect_file_type_with_content(path, &content);
-    let capped = byte_len > FILE_SIZE_CAP;
+
+    // Over the size limit search and the parse cache skip, the outline
+    // lists at most `outline::OUTLINE_CAP` entries.
+    let capped = byte_len > tilth_core::source::MAX_FILE_SIZE;
 
     // The outline parses the file without its byte-order mark, as search
     // does; the full view above prints the bytes as they are, because its
@@ -1124,31 +1126,28 @@ mod tests {
         assert_eq!(resolve_heading(input, "hello"), None);
     }
 
+    /// Over the default cap, `full=true` gives the outline and a warning.
+    /// The test used to lower the cap through `TILTH_FULL_SIZE_CAP`, which
+    /// is process-wide, so grok tests running alongside it saw a 100-byte
+    /// cap and failed. It writes a file over the default cap instead, as
+    /// plain text, whose head-and-tail view is quick to build.
     #[test]
     fn full_true_size_cap_returns_outline() {
-        use std::io::Write;
-
-        // A file just over the default cap. Setting TILTH_FULL_SIZE_CAP here
-        // would change every other read test running in the same process.
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("large.rs");
-        let mut f = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
-        let mut i = 0;
-        while (i * 48) < 2_100_000 {
-            writeln!(f, "pub fn func_{i}() {{ println!(\"hello there\"); }}").unwrap();
-            i += 1;
-        }
-        drop(f);
-        assert!(std::fs::metadata(&path).unwrap().len() > full_read_size_cap());
+        let path = dir.path().join("large.txt");
+        let cap = usize::try_from(full_read_size_cap()).unwrap();
+        let filler = "// filler line that pushes the file over the full-read cap\n";
+        let mut src = String::from("pub fn func_0() { println!(\"hello\"); }\n");
+        src.push_str(&filler.repeat(cap / filler.len() + 1));
+        std::fs::write(&path, src).unwrap();
 
         let cache = OutlineCache::new();
         let result = read_file(&path, None, true, &cache, false, None).unwrap();
 
-        // Should contain the warning, not the full file content
         assert!(
             result.contains("full=true skipped"),
             "expected size cap warning, got: {}",
-            &result[..result.len().min(300)]
+            &result[..result.len().min(400)]
         );
         assert!(
             result.contains("func_0"),
@@ -1960,7 +1959,7 @@ mod tests {
 
             let file_type = detect_file_type(&path);
             assert!(matches!(View::of(file_type), View::Ends(_)), "{name}");
-            let capped = full || content.len() as u64 > FILE_SIZE_CAP;
+            let capped = full || content.len() as u64 > tilth_core::source::MAX_FILE_SIZE;
             let text = strip_bom(&content);
             let outline = outline::generate(&path, file_type, text, text.as_bytes(), capped);
             let lines = count_lines(content.as_bytes());

@@ -15,15 +15,18 @@
 
 use std::fs::{File, Metadata};
 use std::io::{self, Read, Seek};
-use std::ops::ControlFlow;
+use std::ops::{ControlFlow, Range};
 use std::path::Path;
 
 const BOM: &str = "\u{feff}";
 
 /// Files larger than this are not parsed or searched: symbol, content and
-/// regex search, callers, callees, deps and the parse cache all skip them.
-/// The one limit for all of them. Search names a skipped file that holds the
-/// query, so a skip is never silent there.
+/// regex search, callers, callees, deps and the parse cache all skip them,
+/// and a read outlines them with at most 100 entries. The one limit for all
+/// of them; only Go's same-package callee scan, which parses up to 20
+/// sibling files per call, keeps a tighter bound. Search, callers, grok and
+/// deps name a skipped file that holds the query, so a skip is never silent
+/// there.
 pub const MAX_FILE_SIZE: u64 = 500_000;
 
 /// `MAX_FILE_SIZE` as people read it, for notes that name the limit.
@@ -296,9 +299,225 @@ impl StreamFinder {
     }
 }
 
+/// `text` holds `word` as a whole identifier: no ASCII letter, digit, `_`
+/// or `$` joins it on a side where `word` itself ends in one. `renew` is no
+/// mention of `new`, and `$new` none in JavaScript either. Any other byte,
+/// a non-ASCII one included, is a boundary. An empty word is in no text.
+#[must_use]
+pub fn mentions(text: &[u8], word: &str) -> bool {
+    find_mention(text, 0, word.as_bytes()).is_some()
+}
+
+/// Does the file at `path` mention one of `words`, as [`mentions`] reads
+/// it? It is how search, callers, grok and deps tell whether a file they
+/// skip for size holds what they look for, and it streams the file
+/// through [`file_holds`], so a file of any size costs a few chunks of
+/// memory.
+#[must_use]
+pub fn file_mentions(path: &Path, words: &[&str]) -> bool {
+    let longest = words.iter().map(|w| w.len()).max().unwrap_or(0);
+    file_holds(path, longest, |window, from| {
+        words
+            .iter()
+            .filter_map(|w| find_mention(window, from, w.as_bytes()))
+            .min_by_key(|hit| (hit.start, hit.end))
+    })
+}
+
+/// Does the file at `path` hold a hit of `find`? The file is opened
+/// through [`OpenFile`] and streamed in bounded windows; see `holds` for
+/// what `find` and `overlap` mean. A file that cannot be read holds nothing.
+pub fn file_holds(
+    path: &Path,
+    overlap: usize,
+    find: impl FnMut(&[u8], usize) -> Option<Range<usize>>,
+) -> bool {
+    let Ok(Some(mut file)) = OpenFile::open(path) else {
+        return false;
+    };
+    file.reader()
+        .and_then(|reader| holds(reader, overlap, find))
+        .unwrap_or(false)
+}
+
+/// Bytes of context a finder may look at on each side of a hit: one UTF-8
+/// character, enough for a word boundary, `^` or `$`.
+const EDGE: usize = 4;
+
+/// Does `reader` hold a hit of `find`? Binary input holds nothing: a NUL
+/// byte in its first [`BINARY_WINDOW`] bytes, the rule every read uses.
+///
+/// The input streams through a window of one chunk plus the last
+/// `overlap + 2 * EDGE` bytes of the window before, so the check holds that
+/// much memory whatever the input's size or line length, and it stops at
+/// the first hit. `find(window, from)` returns the leftmost hit that starts
+/// at or after `from`, and may look `EDGE` bytes past either end of it. A
+/// hit is trusted only when the window holds that context, or the input's
+/// own end; a hit no longer than `overlap` is always judged whole in some
+/// window. When the leftmost hit runs past the window, the window is left
+/// for the next one, so a longer hit across a cut, or a shorter one after
+/// it, may go unseen.
+///
+/// [`BINARY_WINDOW`]: crate::lang::detection::BINARY_WINDOW
+///
+/// # Errors
+///
+/// Returns the reader's I/O error.
+fn holds(
+    reader: impl Read,
+    overlap: usize,
+    mut find: impl FnMut(&[u8], usize) -> Option<Range<usize>>,
+) -> io::Result<bool> {
+    let carry = overlap + 2 * EDGE;
+    let mut buf = vec![0; STREAM_CHUNK];
+    let mut window = Vec::with_capacity(carry + STREAM_CHUNK);
+    // Whether `window` starts at the input's first byte.
+    let mut at_start = true;
+    let mut verdict = None;
+    read_chunks(reader, &mut buf, |chunk| {
+        window.extend_from_slice(chunk);
+        if at_start && window.len() < crate::lang::detection::BINARY_WINDOW {
+            return ControlFlow::Continue(());
+        }
+        verdict = judge(&window, at_start, false, &mut find);
+        if verdict.is_some() {
+            return ControlFlow::Break(());
+        }
+        if window.len() > carry {
+            window.drain(..window.len() - carry);
+            at_start = false;
+        }
+        ControlFlow::Continue(())
+    })?;
+    Ok(verdict
+        .or_else(|| judge(&window, at_start, true, &mut find))
+        .unwrap_or(false))
+}
+
+/// What one window of [`holds`] settles: `Some(true)` for a trusted hit,
+/// `Some(false)` for binary input, `None` when the input's rest decides.
+fn judge(
+    window: &[u8],
+    at_start: bool,
+    at_end: bool,
+    find: &mut impl FnMut(&[u8], usize) -> Option<Range<usize>>,
+) -> Option<bool> {
+    if at_start && crate::lang::detection::is_binary(window) {
+        return Some(false);
+    }
+    // A hit that starts in a later window's first `EDGE` bytes was judged
+    // whole, with its context, in the window before.
+    let from = if at_start { 0 } else { EDGE };
+    let hit = find(window, from)?;
+    (at_end || hit.end + EDGE <= window.len()).then_some(true)
+}
+
+/// The first mention of `word` in `text` that starts at or after `from`,
+/// as [`mentions`] reads one. A byte before `from` still counts as context.
+fn find_mention(text: &[u8], from: usize, word: &[u8]) -> Option<Range<usize>> {
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+    let (&first, &last) = (word.first()?, word.last()?);
+    memchr::memmem::find_iter(text.get(from..)?, word)
+        .map(|at| from + at..from + at + word.len())
+        .find(|hit| {
+            let joined_before =
+                is_ident(first) && hit.start.checked_sub(1).is_some_and(|i| is_ident(text[i]));
+            let joined_after = is_ident(last) && text.get(hit.end).copied().is_some_and(is_ident);
+            !joined_before && !joined_after
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mention_in(reader: impl Read, word: &str) -> bool {
+        holds(reader, word.len(), |w, from| {
+            find_mention(w, from, word.as_bytes())
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_mention_is_a_whole_identifier() {
+        for (text, holds) in [
+            ("needle", true),
+            ("a needle;", true),
+            ("(needle)", true),
+            ("\u{2192}needle\u{2190}", true),
+            ("xneedle", false),
+            ("needlex", false),
+            ("needle_v2", false),
+            ("$needle", false),
+            ("needle_v2 needle", true),
+            ("needle_v2 xneedle", false),
+        ] {
+            assert_eq!(mentions(text.as_bytes(), "needle"), holds, "{text:?}");
+        }
+        assert!(!mentions(b"anything", ""));
+        // A side where the word ends in no identifier byte needs no boundary.
+        assert!(mentions(b"x@Override", "@Override"));
+    }
+
+    /// The check stops at the first hit. These readers never end, so a
+    /// check that read the whole input would never return.
+    #[test]
+    fn the_check_stops_at_the_first_hit_on_endless_input() {
+        let lines = io::Cursor::new(b"first line\nneedle here\n".to_vec()).chain(io::repeat(b'\n'));
+        assert!(mention_in(lines, "needle"));
+        let one_line = io::Cursor::new(b"var a=needle;".to_vec()).chain(io::repeat(b'a'));
+        assert!(mention_in(one_line, "needle"));
+    }
+
+    /// A NUL byte in the first 512 bytes makes the input binary, which
+    /// holds nothing, even when the reads hand it over a byte at a time. One
+    /// further on is a stray byte in a text file.
+    #[test]
+    fn only_a_nul_near_the_start_makes_the_input_binary() {
+        use crate::test_readers::OneByte;
+        assert!(!mention_in(&b"needle\0"[..], "needle"));
+        assert!(!mention_in(OneByte(b"needle header\0"), "needle"));
+        let mut late = vec![b'x'; 600];
+        late.extend_from_slice(b"\0 needle\n");
+        assert!(mention_in(&late[..], "needle"));
+    }
+
+    /// Every cut between windows, whatever bytes it falls between, and
+    /// reads of any size give the answer [`mentions`] gives on the whole
+    /// input.
+    #[test]
+    fn a_cut_between_windows_changes_no_answer() {
+        use crate::test_readers::OneByte;
+        for text in [
+            "needle",
+            "xneedle",
+            "needlex",
+            "needle_v2 needle",
+            "needle_v2 xneedle",
+        ] {
+            let input = |at: usize, room: usize| {
+                let mut input = vec![b' '; at];
+                input.extend_from_slice(text.as_bytes());
+                input.resize(at + text.len() + room, b' ');
+                input
+            };
+            let whole = mentions(text.as_bytes(), "needle");
+            // Reads of a byte cut after every byte once the first 512 are in.
+            for at in (0..4).chain(500..530) {
+                let input = input(at, 8);
+                assert_eq!(
+                    mention_in(OneByte(&input), "needle"),
+                    whole,
+                    "{text:?} at {at}"
+                );
+            }
+            // Whole reads cut every `STREAM_CHUNK` bytes, given room past the text.
+            for at in (1..=3).flat_map(|k| k * STREAM_CHUNK - 20..=k * STREAM_CHUNK + 4) {
+                let input = input(at, STREAM_CHUNK);
+                assert_eq!(mention_in(&input[..], "needle"), whole, "{text:?} at {at}");
+            }
+        }
+    }
 
     #[test]
     fn only_a_leading_mark_is_dropped() {

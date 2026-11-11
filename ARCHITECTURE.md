@@ -197,6 +197,10 @@ Per call, a `scope` that does not exist falls back to the caller's
 `root` with a warning that carries the same hint, so a typo still
 finds the answer and the next call can narrow. The CLI refuses a
 missing `--scope` with that hint instead of answering "0 matches".
+The hint lists directories for close names only inside the project (the
+CLI's working directory or the call's `root`) or a checkout (a `.git` or
+package manifest above it); above those, such as at `/` or a mount
+point, it names the nearest existing directory and lists nothing.
 
 The request loop (`mcp.rs:139-219`) parses each line as JSON and hands
 off to `handle_request`, which switches on `method`. The handler
@@ -791,9 +795,16 @@ TypeScript bundles or vendored single-file libraries. Above the cap,
 heuristics. The search walkers skip files over the same limit; a
 skipped file that contains what the walk looked for is named under the
 result (``> 1 file over 500 KB contains `run` and was not searched: …``).
+The check (`tilth_core::source::file_holds`) streams the file in 64 KB
+chunks and stops at the first match, so a multi-gigabyte file in the
+scope costs a few chunks of memory whatever its line length. A NUL byte
+in the first 512 bytes makes the file binary, which holds nothing.
+Symbol search, callers, grok and deps look for whole identifiers
+(`file_mentions`); content and regex search for the query's match.
 Deps checks a big file for the target's names and its module's name,
 which for a package's entry file (`mod.rs`, `index.ts`, `__init__.py`)
-is its directory's name.
+is its directory's name. grok names each imported file over the limit
+that holds an extern callee's name: those callees may be defined there.
 Parsing grows linearly with size, about 0.2 ms per KB for Rust and
 Python, so a 1 MB file costs about twice what a 500 KB one does; that
 is why the limit stays where it is.

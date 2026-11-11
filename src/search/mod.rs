@@ -112,27 +112,34 @@ fn parse_pattern(query: &str) -> (&str, bool) {
     }
 }
 
-/// Does a file over the size limit contain what the search looks for? The
-/// walkers skip such a file without parsing it, and this one plain read is
-/// what lets the result name it instead of leaving it out in silence.
-pub(crate) fn oversized_holds(path: &Path, found: impl Fn(&[u8]) -> bool) -> bool {
-    tilth_core::source::read(path).is_ok_and(|bytes| found(&bytes))
+/// Does a file over the size limit hold a match of `check`? The walkers
+/// skip such a file without parsing it, and this check is what lets the
+/// result name it instead of leaving it out in silence. It streams the
+/// file through [`tilth_core::source::file_holds`]. `check` comes from
+/// [`size_check_matcher`], so it matches within a line, as the line search
+/// does; a match longer than `REGEX_OVERLAP` across a window's cut is not
+/// seen.
+pub(crate) fn oversized_holds(path: &Path, check: &grep_regex::RegexMatcher) -> bool {
+    use grep_matcher::Matcher as _;
+    tilth_core::source::file_holds(path, REGEX_OVERLAP, |window, from| {
+        let found = check.find_at(window, from).ok().flatten()?;
+        Some(found.start()..found.end())
+    })
 }
 
-/// Does `matcher` match anywhere in `bytes`? Stops at the first hit.
-pub(crate) fn has_match(matcher: &grep_regex::RegexMatcher, bytes: &[u8]) -> bool {
-    let mut hit = false;
-    // The sink only stops the search early and never errors, and a slice
-    // needs no I/O, so the `Result` carries nothing.
-    let _ = grep_searcher::Searcher::new().search_slice(
-        matcher,
-        bytes,
-        grep_searcher::sinks::Lossy(|_, _| {
-            hit = true;
-            Ok(false)
-        }),
-    );
-    hit
+/// The longest regex match the size check finds across a window's cut.
+const REGEX_OVERLAP: usize = 64 << 10;
+
+/// `pattern` as the size check runs it: over a window of many lines, with
+/// `^` and `$` at each line's ends and no match across a newline, which is
+/// how the line search reads it. `None` when the pattern needs a newline,
+/// which no line holds.
+pub(crate) fn size_check_matcher(pattern: &str) -> Option<grep_regex::RegexMatcher> {
+    grep_regex::RegexMatcherBuilder::new()
+        .multi_line(true)
+        .line_terminator(Some(b'\n'))
+        .build(pattern)
+        .ok()
 }
 
 /// Add `path` to a walker's shared list.
@@ -2783,6 +2790,69 @@ mod tests {
         }
         let quiet = search_symbol("unrelated", tmp.path(), &cache, None, false).unwrap();
         assert!(!quiet.contains("not searched"), "{quiet}");
+    }
+
+    /// A big binary file (a database, an archive) was read whole on every
+    /// search to look for the query in it, and was named when its bytes
+    /// happened to spell it. Search never reads binary files, so the note
+    /// must not name one either.
+    #[test]
+    fn a_big_binary_file_is_not_named_as_holding_the_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        let limit = usize::try_from(tilth_core::source::MAX_FILE_SIZE).unwrap();
+        let mut bytes = b"SQLite format 3\0".to_vec();
+        bytes.resize(limit + 1, 0);
+        bytes.extend_from_slice(b"\nneedle_target_fn\n");
+        std::fs::write(tmp.path().join("data.db"), bytes).unwrap();
+        let cache = OutlineCache::new();
+        for out in [
+            search_symbol("needle_target_fn", tmp.path(), &cache, None, false).unwrap(),
+            search_content("needle_target_fn", tmp.path(), &cache, None, false).unwrap(),
+        ] {
+            assert!(!out.contains("not searched"), "{out}");
+        }
+    }
+
+    /// A minified bundle is one line. The check held a line of at most
+    /// 1 MiB, so a 2 MB one-line file that holds the query near its start
+    /// errored, the error was dropped, and the file was no longer named.
+    #[test]
+    fn a_big_one_line_file_is_named_when_it_holds_the_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut bytes = b"var a=1;function needle_target_fn(){return a};".to_vec();
+        bytes.resize(2_000_000, b'a');
+        std::fs::write(tmp.path().join("bundle.js"), bytes).unwrap();
+        let cache = OutlineCache::new();
+        for out in [
+            search_symbol("needle_target_fn", tmp.path(), &cache, None, false).unwrap(),
+            search_content("needle_target_fn", tmp.path(), &cache, None, false).unwrap(),
+            search_regex("needle_t.rget_fn", tmp.path(), &cache, None, false).unwrap(),
+        ] {
+            assert!(out.contains("not searched: bundle.js"), "{out}");
+        }
+    }
+
+    /// A text file is binary to tilth only when a NUL byte sits in its
+    /// first 512 bytes, the rule the read path uses. The check stopped at
+    /// any NUL, so a big log with one stray NUL in the middle was not named.
+    #[test]
+    fn a_big_log_with_a_stray_nul_is_named_when_it_holds_the_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        let limit = usize::try_from(tilth_core::source::MAX_FILE_SIZE).unwrap();
+        let filler = "2026-11-11 12:00:00 INFO a log line\n";
+        let pad = filler.repeat(limit / filler.len() + 1);
+        std::fs::write(
+            tmp.path().join("app.log"),
+            format!("{pad}\0stray\n{pad}needle_target_fn failed\n"),
+        )
+        .unwrap();
+        let cache = OutlineCache::new();
+        for out in [
+            search_symbol("needle_target_fn", tmp.path(), &cache, None, false).unwrap(),
+            search_content("needle_target_fn", tmp.path(), &cache, None, false).unwrap(),
+        ] {
+            assert!(out.contains("not searched: app.log"), "{out}");
+        }
     }
 
     /// The caller walk skipped big files with no word, so callers, grok and

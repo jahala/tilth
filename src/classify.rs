@@ -220,18 +220,27 @@ fn has_regex_metachar(s: &str) -> bool {
 /// - `.*` or `.?` with name characters on both sides (`Searcher.*Builder`).
 ///   `Cargo.*`, `*.test.*`, `.*rc` and `foo.*.bak` are file globs, because
 ///   there the dot starts an extension or a dotfile;
-/// - a `+` or `{n}` / `{n,m}` quantifier after `.`, `]` or `)`;
+/// - a `+` after `.`, `]` or `)`;
+/// - a `{n}`, `{n,}` or `{n,m}` repeat count after `]` or `)`, or after a
+///   `.` that follows a name character (`name.{3,5}`). After `*.` it is a
+///   brace list of extensions: `man/*.{1,8}` is a glob;
 /// - a backslash escape (`\w`, `\(`, `\.`), except on Windows, where a
-///   backslash separates path components.
+///   backslash separates path components. In a path (`app/\[slug\]/*.tsx`)
+///   an escaped glob character names a directory or file with that
+///   character in it, so it is a glob escape there.
 ///
 /// Parentheses alone do not count: `app/(auth)/*.tsx` is a route-group glob.
 fn is_regex_shaped(query: &str) -> bool {
     let b = query.as_bytes();
     let name_char = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let glob_char = |c: u8| matches!(c, b'*' | b'?' | b'[' | b']' | b'{' | b'}');
+    // Path components joined by `/`, none of them empty (`https\?://` is not).
+    let path = b.contains(&b'/') && !query.contains("//");
     if b.contains(&b'|') || b.first() == Some(&b'^') || b.last() == Some(&b'$') {
         return true;
     }
-    for i in 0..b.len() {
+    let mut i = 0;
+    while i < b.len() {
         let prev = i.checked_sub(1).map(|j| b[j]);
         let next = b.get(i + 1).copied();
         match b[i] {
@@ -242,17 +251,27 @@ fn is_regex_shaped(query: &str) -> bool {
                 return true;
             }
             b'+' if matches!(prev, Some(b'.' | b']' | b')')) => return true,
-            b'{' if matches!(prev, Some(b'.' | b']' | b')')) && is_repeat_count(&b[i + 1..]) => {
-                return true;
+            b'{' if is_repeat_count(&b[i + 1..]) => {
+                let after_dot =
+                    prev == Some(b'.') && i.checked_sub(2).map(|j| b[j]).is_some_and(name_char);
+                if after_dot || matches!(prev, Some(b']' | b')')) {
+                    return true;
+                }
+            }
+            b'\\' if !cfg!(windows) && path && next.is_some_and(glob_char) => {
+                i += 2;
+                continue;
             }
             b'\\' if !cfg!(windows) && next.is_some_and(|c| c.is_ascii_graphic()) => return true,
             _ => {}
         }
+        i += 1;
     }
     false
 }
 
-/// `rest` starts right after a `{`: is it `n}` or `n,m}`, a regex repeat count?
+/// `rest` starts right after a `{`: is it `n}`, `n,}` or `n,m}`, a regex
+/// repeat count?
 fn is_repeat_count(rest: &[u8]) -> bool {
     let Some(close) = rest.iter().position(|&c| c == b'}') else {
         return false;
@@ -388,6 +407,19 @@ mod tests {
             "log\\.[a-z]*",
             "fn.+main*",
             "[0-9]{3}*",
+            "a.{2,4}b",
+            "x.{3}",
+            "x.{2,}",
+            "name.{3,5}",
+            "id.{0,40}",
+            #[cfg(not(windows))]
+            "\\[TODO\\]",
+            #[cfg(not(windows))]
+            "\\[[0-9]*\\]",
+            #[cfg(not(windows))]
+            "https\\?://.*",
+            #[cfg(not(windows))]
+            "\\*[a-z]*",
         ] {
             assert!(
                 matches!(classify(query, &scope), QueryType::Regex(ref p) if p == query),
@@ -422,6 +454,11 @@ mod tests {
             "app/(auth)/*.tsx",
             "include/c++/*",
             "TODO.*",
+            "man/*.{1,8}",
+            "*.{1,2}",
+            "logs/*.{1,2}.gz",
+            #[cfg(not(windows))]
+            "app/\\[slug\\]/*.tsx",
         ] {
             assert!(
                 matches!(classify(query, &scope), QueryType::Glob(_)),
