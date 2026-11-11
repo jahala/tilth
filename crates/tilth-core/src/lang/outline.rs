@@ -659,7 +659,7 @@ fn first_identifier_text(node: tree_sitter::Node, lines: &[&str]) -> Option<Stri
 /// comment starts its own line, so one that trails the statement before
 /// `node` is no doc. The comments above the nearest touch the one below
 /// them: a blank line ends the doc. The nearest may sit a blank line above
-/// `node`, as a JSDoc block does in many codebases (express, for one).
+/// `node`, as a `/** */` block often does in JavaScript.
 fn extract_doc(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
     let is_comment = |n: tree_sitter::Node| {
         let kind = n.kind();
@@ -1795,7 +1795,7 @@ mod doc_comment_tests {
 
     /// A comment that trails the statement before a definition documents
     /// that statement. A comment on its own lines a blank line above stays
-    /// the doc, the way a JSDoc block above a function often sits.
+    /// the doc, the way a `/** */` block above a function often sits.
     #[test]
     fn a_comment_trailing_code_is_no_doc() {
         let entries = get_outline_entries(
