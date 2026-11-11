@@ -158,11 +158,14 @@ pub fn missing_scope_hint(raw: &Path, resolved: &Path) -> String {
 }
 
 /// Directories under `base` (relative to it) whose name is within a small
-/// edit distance of `wanted` (one edit per three characters, at least one), closest and shallowest first. The search stops
-/// three levels down and after 2,000 directories, skips the walker's
-/// `SKIP_DIRS` and hidden directories, and returns at most three names.
+/// edit distance of `wanted`, one edit per three characters and at least
+/// one, closest and shallowest first. The search goes three levels down and
+/// stops after 2,000 directories, skips the walker's `SKIP_DIRS` and hidden
+/// directories, and returns at most three names.
 fn close_directories(base: &Path, wanted: &str) -> Vec<PathBuf> {
-    const MAX_DEPTH: usize = 4;
+    /// Directories at depth 0 (`base`) to 2 are listed, so their children
+    /// reach three levels below `base`.
+    const MAX_DEPTH: usize = 3;
     const MAX_DIRS: usize = 2_000;
     let limit = (wanted.chars().count() / 3).max(1);
     let mut found: Vec<(usize, usize, PathBuf)> = Vec::new();
@@ -204,7 +207,7 @@ fn close_directories(base: &Path, wanted: &str) -> Vec<PathBuf> {
     found.into_iter().take(3).map(|(_, _, p)| p).collect()
 }
 
-/// Holds expanded search dependencies, allocated once./// Holds expanded search dependencies, allocated once.
+/// Holds expanded search dependencies, allocated once.
 /// Avoids scattered `Option<T>` + `unwrap()` throughout dispatch.
 struct ExpandedCtx {
     session: session::Session,
