@@ -116,3 +116,34 @@ fn completions_into_a_closed_pipe_exits_quietly() {
     let out = run_into_closed_pipe(&["--completions", "bash"], dir.path());
     assert_quiet_exit(&out, "completions");
 }
+
+/// A mistyped `--scope` is refused on every CLI path, with the close
+/// directory named, instead of answering "0 matches" with exit 0. The MCP
+/// server's launch `--scope` used to be ignored the same way: the server
+/// started and served whatever directory it was launched in.
+#[test]
+fn a_missing_scope_is_refused_on_every_path() {
+    let dir = project();
+    for args in [
+        &["shared_helper", "--scope", "scr"][..],
+        &["shared_helper", "--callers", "--scope", "scr"],
+        &["src/lib.rs", "--deps", "--scope", "scr"],
+        &["--map", "--scope", "scr"],
+        &["grok", "shared_helper", "--scope", "scr"],
+        &["--mcp", "--scope", "scr"],
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_tilth"))
+            .args(args)
+            .current_dir(dir.path())
+            .stdin(Stdio::null())
+            .output()
+            .expect("run tilth");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(3), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains("scope \"scr\" is not a valid directory. Did you mean \"src\"?"),
+            "{args:?}: {stderr}"
+        );
+        assert!(out.stdout.is_empty(), "{args:?} printed a result");
+    }
+}

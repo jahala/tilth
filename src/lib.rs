@@ -56,7 +56,7 @@ pub mod __fuzz {
     }
 }
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use classify::classify;
 use tilth_core::cache::OutlineCache;
@@ -105,7 +105,106 @@ pub fn refuse_file_scope(raw: &Path, resolved: &Path, hint: FileScopeHint) -> Re
     ))
 }
 
-/// Holds expanded search dependencies, allocated once.
+/// A hint for a `scope` that is not an existing directory, usually a typo.
+/// One rule for the CLI, which refuses the scope, and the MCP tools, which
+/// warn and fall back to `root`.
+///
+/// `raw` is the scope as the caller wrote it and `resolved` the path that
+/// was checked, as in [`refuse_file_scope`]. The hint names up to three
+/// existing directories whose name is close to the scope's last component,
+/// found under the nearest existing parent and up to three levels below it,
+/// so `src/serach` suggests `src/search` and `read` suggests `src/read`.
+/// With nothing close, it names that nearest existing parent. Suggested
+/// paths stay in the caller's frame: a relative scope gets relative paths.
+#[must_use]
+pub fn missing_scope_hint(raw: &Path, resolved: &Path) -> String {
+    let Some(wanted) = resolved
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+    else {
+        return String::new();
+    };
+    // A relative path's last parent is "", which names the current directory.
+    let dir_or_cwd = |p: &Path| -> PathBuf {
+        if p.as_os_str().is_empty() {
+            PathBuf::from(".")
+        } else {
+            p.to_path_buf()
+        }
+    };
+    let mut base = resolved;
+    let mut raw_base = raw;
+    while !dir_or_cwd(base).is_dir() {
+        let (Some(parent), Some(raw_parent)) = (base.parent(), raw_base.parent()) else {
+            return String::new();
+        };
+        base = parent;
+        raw_base = raw_parent;
+    }
+    let base = dir_or_cwd(base);
+
+    let close = close_directories(&base, &wanted);
+    if close.is_empty() {
+        return format!(
+            "The nearest existing directory is \"{}\".",
+            dir_or_cwd(raw_base).display()
+        );
+    }
+    let named: Vec<String> = close
+        .iter()
+        .map(|rel| format!("\"{}\"", raw_base.join(rel).display()))
+        .collect();
+    format!("Did you mean {}?", named.join(" or "))
+}
+
+/// Directories under `base` (relative to it) whose name is within a small
+/// edit distance of `wanted` (one edit per three characters, at least one), closest and shallowest first. The search stops
+/// three levels down and after 2,000 directories, skips the walker's
+/// `SKIP_DIRS` and hidden directories, and returns at most three names.
+fn close_directories(base: &Path, wanted: &str) -> Vec<PathBuf> {
+    const MAX_DEPTH: usize = 4;
+    const MAX_DIRS: usize = 2_000;
+    let limit = (wanted.chars().count() / 3).max(1);
+    let mut found: Vec<(usize, usize, PathBuf)> = Vec::new();
+    let mut queue = std::collections::VecDeque::from([(PathBuf::new(), 0usize)]);
+    let mut visited = 0;
+    while let Some((rel, depth)) = queue.pop_front() {
+        if depth >= MAX_DEPTH || visited >= MAX_DIRS {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(base.join(&rel)) else {
+            continue;
+        };
+        let mut children: Vec<PathBuf> = entries
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .filter_map(|e| {
+                let name = e.file_name().to_str()?.to_string();
+                let skip = name.starts_with('.')
+                    || tilth_core::search::walk::SKIP_DIRS.contains(&name.as_str());
+                (!skip).then(|| rel.join(name))
+            })
+            .collect();
+        children.sort();
+        for child in children {
+            visited += 1;
+            let name = child
+                .file_name()
+                .map_or_else(String::new, |n| n.to_string_lossy().to_lowercase());
+            // Optimal string alignment counts a swapped pair (`scr` for
+            // `src`) as one edit, the most common typo in a path.
+            let distance = strsim::osa_distance(wanted, &name);
+            if distance <= limit {
+                found.push((distance, depth, child.clone()));
+            }
+            queue.push_back((child, depth + 1));
+        }
+    }
+    found.sort();
+    found.into_iter().take(3).map(|(_, _, p)| p).collect()
+}
+
+/// Holds expanded search dependencies, allocated once./// Holds expanded search dependencies, allocated once.
 /// Avoids scattered `Option<T>` + `unwrap()` throughout dispatch.
 struct ExpandedCtx {
     session: session::Session,
@@ -596,6 +695,45 @@ mod tests {
             err,
             "scope \"x.py\" is a file, and scope must be an existing directory. \
              Set scope to its directory (\".\") instead."
+        );
+    }
+
+    /// A checkout with `src/search`, `src/read` and `docs`.
+    fn dir_tree() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for d in ["src/search", "src/read", "docs"] {
+            std::fs::create_dir_all(dir.path().join(d)).unwrap();
+        }
+        dir
+    }
+
+    /// A typo in the last component names the close sibling, in the frame
+    /// the caller wrote the scope in.
+    #[test]
+    fn missing_scope_hint_names_a_close_sibling() {
+        let dir = dir_tree();
+        let hint = missing_scope_hint(Path::new("src/serach"), &dir.path().join("src/serach"));
+        assert_eq!(hint, "Did you mean \"src/search\"?");
+    }
+
+    /// A directory given without its parent is found deeper in the tree.
+    #[test]
+    fn missing_scope_hint_finds_the_name_deeper() {
+        let dir = dir_tree();
+        let hint = missing_scope_hint(Path::new("read"), &dir.path().join("read"));
+        assert_eq!(hint, "Did you mean \"src/read\"?");
+    }
+
+    /// With nothing close, the hint names the nearest directory that exists.
+    #[test]
+    fn missing_scope_hint_falls_back_to_the_nearest_parent() {
+        let dir = dir_tree();
+        let raw = dir.path().join("src/zzqqxx/deeper");
+        let hint = missing_scope_hint(&raw, &raw);
+        let src = dir.path().join("src");
+        assert_eq!(
+            hint,
+            format!("The nearest existing directory is \"{}\".", src.display())
         );
     }
 

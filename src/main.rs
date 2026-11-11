@@ -272,15 +272,13 @@ fn main() {
         if cli.no_overview {
             std::env::set_var("TILTH_NO_OVERVIEW", "1");
         }
-        // Pass --scope to MCP if it's not the default "."
+        // Pass --scope to MCP if it's not the default ".". A scope that is
+        // not a directory stops the launch: the server used to ignore it
+        // and serve the directory it happened to start in.
         let mcp_scope = if cli.scope.as_os_str() == "." {
             None
         } else {
-            Some(
-                cli.scope
-                    .canonicalize()
-                    .unwrap_or_else(|_| cli.scope.clone()),
-            )
+            Some(cli_scope(cli.scope, FileScopeHint::Directory).unwrap_or_else(|e| usage_exit(&e)))
         };
         if let Err(e) = tilth::mcp::run(cli.edit, mcp_scope.as_deref()) {
             eprintln!("mcp error: {e}");
@@ -412,10 +410,20 @@ fn main() {
 }
 
 /// Canonicalize `--scope`, refusing a file the same way the MCP tools do.
-/// A path that does not exist passes through unchanged, as before.
+/// A directory that does not exist is refused too, with the close existing
+/// directories named. It used to walk nothing and answer "0 matches" with
+/// exit 0, which read as a real result. The MCP tools fall back to `root`
+/// with the same hint instead, because there a typo still finds the answer.
 fn cli_scope(raw: PathBuf, hint: FileScopeHint) -> Result<PathBuf, String> {
     let scope = raw.canonicalize().unwrap_or_else(|_| raw.clone());
     tilth::refuse_file_scope(&raw, &scope, hint)?;
+    if !scope.is_dir() {
+        return Err(format!(
+            "scope \"{}\" is not a valid directory. {}",
+            raw.display(),
+            tilth::missing_scope_hint(&raw, &scope)
+        ));
+    }
     Ok(scope)
 }
 
@@ -651,6 +659,19 @@ mod tests {
             write_output(&mut bytes, output).unwrap();
             assert_eq!(bytes, b"body\n");
         }
+    }
+
+    /// A mistyped `--scope` used to search nothing and print "0 matches"
+    /// with exit 0. It is a usage error that names the close directory.
+    #[test]
+    fn cli_scope_refuses_a_missing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("binding")).unwrap();
+        let err = cli_scope(dir.path().join("bindng"), FileScopeHint::Glob).unwrap_err();
+        assert!(
+            err.contains("is not a valid directory") && err.contains("binding\"?"),
+            "unexpected refusal: {err}"
+        );
     }
 
     /// #195: `--scope <file>` gets the same refusal as the MCP tools. It used

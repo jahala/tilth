@@ -183,7 +183,14 @@ explicit `--scope` argument > MCP `roots/list` response > nearest
 `package_root(cwd)` > `cwd`. The chosen root becomes the process's
 working directory, so every later tool call resolves relative paths
 against it. This was added specifically to handle MCP hosts (Codex was
-the documented case) that launch tilth with `cwd=/`.
+the documented case) that launch tilth with `cwd=/`. A `--scope` that
+is not a directory stops the launch with a usage error naming the
+close directories (`missing_scope_hint`).
+
+Per call, a `scope` that does not exist falls back to the caller's
+`root` with a warning that carries the same hint, so a typo still
+finds the answer and the next call can narrow. The CLI refuses a
+missing `--scope` with that hint instead of answering "0 matches".
 
 The request loop (`mcp.rs:139-219`) parses each line as JSON and hands
 off to `handle_request`, which switches on `method`. The handler
@@ -271,9 +278,11 @@ non-obvious twists:
   (concept queries prefer real defs), accept; otherwise try
   `search_content_raw`; otherwise — if the original symbol search had
   any usages even without definitions — fall back to those; otherwise
-  `NotFound` with a similar-file suggestion. The `Fallthrough` arm
-  (path-like-but-didn't-resolve queries) shares the same cascade with
-  `prefer_definitions: false` so any symbol match is accepted.
+  the standard `0 matches` result, with a similar-file hint when one
+  exists. The `Fallthrough` arm (path-like-but-didn't-resolve queries)
+  shares the same cascade with `prefer_definitions: false` so any symbol
+  match is accepted; with no match at all it ends in `NotFound`, because
+  that query really named a missing path.
 - **Multi-word concept relaxation.** `Concept(text)` with whitespace
   goes through `multi_word_concept_search`. First tries an exact-phrase
   content search; on no hits, escapes each word and runs a relaxed
