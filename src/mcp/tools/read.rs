@@ -20,6 +20,10 @@ pub(in crate::mcp) fn tool_read(
     edit_mode: bool,
 ) -> Result<String, String> {
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
+    // The budget every read is fitted to. With no `budget` argument it is
+    // the default cap the response gets anyway, so the outline is fitted
+    // to it instead of being cut there mid-entry.
+    let read_budget = budget.unwrap_or(crate::budget::DEFAULT_BUDGET);
     // Extract optional root for anchoring relative paths. A relative path
     // without an absolute `root` is unresolvable (the server cannot see the
     // caller's shell cwd) — propagate that refusal at each path-resolution site.
@@ -64,6 +68,9 @@ pub(in crate::mcp) fn tool_read(
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(batch_timeout);
 
         let mut results = Vec::with_capacity(paths_arr.len());
+        // Each file gets an equal share of what the files before it left,
+        // so a big first file cannot use up the budget of the rest.
+        let mut used = 0u64;
         for (i, p) in paths_arr.iter().enumerate() {
             // Check deadline before each file
             if std::time::Instant::now() > deadline {
@@ -84,12 +91,16 @@ pub(in crate::mcp) fn tool_read(
             } else if force_stripped {
                 read_stripped_file(&path, cache).map(|(body, _, _)| body)
             } else {
-                crate::read::read_file(&path, None, force_full, cache, edit_mode, budget)
+                let left = (paths_arr.len() - i) as u64;
+                let share = read_budget.saturating_sub(used) / left;
+                crate::read::read_file(&path, None, force_full, cache, edit_mode, Some(share))
             };
-            match read {
-                Ok(output) => results.push(output),
-                Err(e) => results.push(format!("# {} — error: {}", path.display(), e)),
-            }
+            let output = match read {
+                Ok(output) => output,
+                Err(e) => format!("# {} — error: {}", path.display(), e),
+            };
+            used += crate::types::estimate_tokens(output.len() as u64 + 2);
+            results.push(output);
         }
         let combined = results.join("\n\n");
         return Ok(apply_budget(&combined, budget));
@@ -134,17 +145,34 @@ pub(in crate::mcp) fn tool_read(
             ));
         }
         session.record_read(&path);
-        let output = match budget {
-            Some(b) => crate::read::read_ranges_with_budget(&path, &ranges, edit_mode, b)
-                .map_err(|e| e.to_string())?,
-            None => {
-                crate::read::read_ranges(&path, &ranges, edit_mode).map_err(|e| e.to_string())?
-            }
-        };
-        return Ok(output);
+        return crate::read::read_ranges_with_budget(&path, &ranges, edit_mode, read_budget)
+            .map_err(|e| e.to_string());
     }
 
     session.record_read(&path);
+
+    // The related-file hint for outlined code files (not section reads, not
+    // batch). It is built first, so the read is fitted to the room it leaves
+    // and the final cut never removes the note that says what a fit left out.
+    let mut related_hint = String::new();
+    if section.is_none() && crate::read::would_outline(&path) {
+        let related = tilth_core::imports::resolve_related_files(&path, cache);
+        if !related.is_empty() {
+            related_hint.push_str("\n\n> Related: ");
+            for (i, p) in related
+                .iter()
+                .take(crate::read::RELATED_HINT_LIMIT)
+                .enumerate()
+            {
+                if i > 0 {
+                    related_hint.push_str(", ");
+                }
+                let _ = write!(related_hint, "{}", p.display());
+            }
+        }
+    }
+    let file_budget =
+        read_budget.saturating_sub(crate::types::estimate_tokens(related_hint.len() as u64));
 
     let mut output = if section.is_none() && force_signature {
         read_signature_file(&path, cache)
@@ -155,27 +183,10 @@ pub(in crate::mcp) fn tool_read(
             .map(|(body, _, _)| body)
             .map_err(|e| e.to_string())?
     } else {
-        crate::read::read_file(&path, section, force_full, cache, edit_mode, budget)
+        crate::read::read_file(&path, section, force_full, cache, edit_mode, Some(file_budget))
             .map_err(|e| e.to_string())?
     };
-
-    // Append related-file hint for outlined code files (not section reads, not batch).
-    if section.is_none() && crate::read::would_outline(&path) {
-        let related = tilth_core::imports::resolve_related_files(&path, cache);
-        if !related.is_empty() {
-            output.push_str("\n\n> Related: ");
-            for (i, p) in related
-                .iter()
-                .take(crate::read::RELATED_HINT_LIMIT)
-                .enumerate()
-            {
-                if i > 0 {
-                    output.push_str(", ");
-                }
-                let _ = write!(output, "{}", p.display());
-            }
-        }
-    }
+    output.push_str(&related_hint);
 
     Ok(apply_budget(&output, budget))
 }
@@ -669,5 +680,90 @@ mod tests {
             err.contains("src/foo.rs") && err.contains("root"),
             "relative path without root must refuse with an actionable message: {err}"
         );
+    }
+
+    /// A JS file with one function per line: its outline is nearly as long
+    /// as the file, and both are far over the default budget.
+    fn write_dense_js(dir: &Path, name: &str) -> PathBuf {
+        let mut src = String::from("import { helper } from './helper';\n");
+        for i in 0..6000 {
+            let _ = writeln!(
+                src,
+                "export function functionNumber{i:05}(alpha, beta) {{ return alpha + beta; }}"
+            );
+        }
+        let path = dir.join(name);
+        std::fs::write(&path, src).unwrap();
+        std::fs::write(dir.join("helper.js"), "export function helper() {}\n").unwrap();
+        path
+    }
+
+    fn read_args(args: &Value) -> String {
+        tool_read(args, &OutlineCache::new(), &Session::new(), false).unwrap()
+    }
+
+    /// With no `budget`, the read skipped the outline fit: the full view
+    /// came back and the default cap cut it after the first functions,
+    /// hiding the rest. It reads like an explicit default budget now.
+    #[test]
+    fn tool_read_without_a_budget_fits_the_outline_to_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_dense_js(dir.path(), "dense.js");
+        let path = path.to_str().unwrap();
+        let implicit = read_args(&serde_json::json!({ "path": path }));
+        let explicit = read_args(&serde_json::json!({
+            "path": path,
+            "budget": crate::budget::DEFAULT_BUDGET,
+        }));
+        assert_eq!(implicit, explicit);
+        assert!(implicit.contains("[outline]"), "{}", &implicit[..200]);
+    }
+
+    /// The `> Related:` line went on after the outline was fitted, so the
+    /// final cut removed the note that says what the fit left out.
+    #[test]
+    fn tool_read_keeps_the_fit_note_with_the_related_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_dense_js(dir.path(), "dense.js");
+        let out = read_args(&serde_json::json!({
+            "path": path.to_str().unwrap(),
+            "budget": 24_000,
+        }));
+        assert!(out.contains("> outline cut to fit the budget"), "{}", tail(&out));
+        assert!(out.contains("> Related: "), "{}", tail(&out));
+        assert!(!out.contains("... truncated"), "{}", tail(&out));
+    }
+
+    /// A batch gave each file the whole budget, so the first big file used
+    /// it up and the next was cut off behind "truncated".
+    #[test]
+    fn tool_read_batch_shares_the_budget_between_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = write_dense_js(dir.path(), "a.js");
+        let b = write_dense_js(dir.path(), "b.js");
+        let out = read_args(&serde_json::json!({
+            "paths": [a.to_str().unwrap(), b.to_str().unwrap()],
+        }));
+        assert!(out.contains("b.js"), "{}", tail(&out));
+        assert_eq!(out.matches("> outline cut to fit the budget").count(), 2, "{}", tail(&out));
+        assert!(!out.contains("... truncated"), "{}", tail(&out));
+    }
+
+    /// `sections` with no budget had no cap at all, so two big ranges
+    /// went past the host's response limit. They share the default now.
+    #[test]
+    fn tool_read_sections_without_a_budget_stay_under_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_dense_js(dir.path(), "dense.js");
+        let out = read_args(&serde_json::json!({
+            "path": path.to_str().unwrap(),
+            "sections": ["1-3000", "3001-6000"],
+        }));
+        let tokens = crate::types::estimate_tokens(out.len() as u64);
+        assert!(tokens <= crate::budget::DEFAULT_BUDGET, "{tokens} tokens");
+    }
+
+    fn tail(out: &str) -> &str {
+        &out[out.floor_char_boundary(out.len().saturating_sub(400))..]
     }
 }
