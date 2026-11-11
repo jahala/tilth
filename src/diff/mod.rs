@@ -114,6 +114,13 @@ impl SymbolChange {
         }
     }
 
+    /// Whether `name` names this symbol: its qualified name, spelled with
+    /// `::` or `.`, or its bare name.
+    #[must_use]
+    pub fn answers_to(&self, name: &str) -> bool {
+        self.name == name || self.qualified_name() == name.replace('.', "::")
+    }
+
     /// The span to show: the new one, or the old one for a symbol that is gone.
     #[must_use]
     pub fn span(&self) -> Span {
@@ -213,11 +220,34 @@ pub fn resolve_source(
         let ds = match s {
             "staged" => DiffSource::GitStaged,
             "uncommitted" | "working" => DiffSource::GitUncommitted,
-            r => DiffSource::GitRef(r.to_string()),
+            r => DiffSource::GitRef(expand_parent_shorthand(r)?),
         };
         return Ok(ds);
     }
     Ok(DiffSource::GitUncommitted)
+}
+
+/// Spell git's parent shorthands as the range they mean, so the patch and
+/// the content of both sides come from the same two revisions: `X^!` and
+/// `X^-` are `X^..X`, and `X^-N` is `X^N..X`. `X^@` names every parent of
+/// `X` and no second side, so it is refused. Any other revision is kept.
+fn expand_parent_shorthand(rev: &str) -> Result<String, String> {
+    if rev.ends_with("^@") {
+        return Err(format!(
+            "'{rev}' names every parent of a commit; use {}^! to see what the commit changed",
+            &rev[..rev.len() - 2]
+        ));
+    }
+    if let Some(commit) = rev.strip_suffix("^!") {
+        return Ok(format!("{commit}^..{commit}"));
+    }
+    if let Some((commit, n)) = rev.rsplit_once("^-") {
+        if n.bytes().all(|b| b.is_ascii_digit()) {
+            let n = if n.is_empty() { "1" } else { n };
+            return Ok(format!("{commit}^{n}..{commit}"));
+        }
+    }
+    Ok(rev.to_string())
 }
 
 /// Where one side of a diff reads a file's content from.
@@ -529,7 +559,9 @@ pub fn diff(
     let (overlays, meta): (Vec<FileOverlay>, Vec<FileMeta>) = files.into_iter().unzip();
 
     if blast {
-        let mut blast_warnings = compute_blast(&overlays, repo);
+        // Callers are counted under the caller's root, which may sit below
+        // the repository top that git commands run in.
+        let mut blast_warnings = compute_blast(&overlays, &base);
         warnings.append(&mut blast_warnings);
     }
 
@@ -769,11 +801,9 @@ fn keep_search_matches(overlay: &mut FileOverlay, term: &str) -> bool {
     !overlay.symbol_changes.is_empty() || has_term(&overlay.other_lines)
 }
 
-/// Find callers of signature-changed symbols and return warnings.
-///
-/// The caller search runs over `repo` when provided — searching the process
-/// cwd for a diff anchored elsewhere would count the wrong checkout's callers.
-fn compute_blast(overlays: &[FileOverlay], repo: Option<&Path>) -> Vec<String> {
+/// Find callers of signature-changed symbols under `scope` and return
+/// warnings. `scope` is the caller's root, or the cwd without one.
+fn compute_blast(overlays: &[FileOverlay], scope: &Path) -> Vec<String> {
     let sig_changed: HashSet<String> = overlays
         .iter()
         .flat_map(|o| o.symbol_changes.iter())
@@ -785,17 +815,13 @@ fn compute_blast(overlays: &[FileOverlay], repo: Option<&Path>) -> Vec<String> {
         return Vec::new();
     }
 
-    let scope = match repo {
-        Some(r) => r.to_path_buf(),
-        None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-    };
     let bloom = tilth_core::index::bloom::BloomFilterCache::new();
 
     // Stops at the same bound as a write's blast radius, so a diff stays
     // fast on a huge tree; the count then says it is a lower bound.
     let per_file = tilth_core::find_callers_batch(
         &sig_changed,
-        &scope,
+        scope,
         &bloom,
         None,
         Some(crate::search::blast::BLAST_STOP_AFTER),
@@ -893,6 +919,22 @@ fn diff_log(
             .collect();
         if let Some(spec) = scope {
             overlays.retain(|o| spec.hit(o).is_some());
+            // `file:function` keeps the commits that changed the function,
+            // and names only it in them.
+            if let Some(f) = &spec.function {
+                if overlays.iter().any(|o| spec.hit(o) == Some(Hit::Under)) {
+                    return Err(format!(
+                        "'{}' is a directory; `{f}` needs a file scope such as path/to/file.rs:{f}",
+                        spec.raw
+                    ));
+                }
+                for overlay in &mut overlays {
+                    overlay.symbol_changes.retain(|c| {
+                        !matches!(c.change, ChangeType::Unchanged) && c.answers_to(f)
+                    });
+                }
+                overlays.retain(|o| !o.symbol_changes.is_empty());
+            }
             if overlays.is_empty() {
                 continue;
             }
@@ -2106,5 +2148,108 @@ diff --git a/src/main.rs b/src/main.rs
         );
         let out = diff_at(dir.path(), &DiffSource::GitUncommitted, None).unwrap();
         assert!(out.contains("generated, 3 lines changed"), "{out}");
+    }
+
+    /// `file:name` picks the one changed symbol of that name. An unchanged
+    /// symbol of the same name in another type is no rival.
+    #[test]
+    fn function_scope_ignores_unchanged_symbols_of_the_same_name() {
+        let dir = repo_with(&[("src/service.ts", TWO_RUNS)]);
+        let changed = TWO_RUNS.replacen("value = 1", "value = 2", 1);
+        write_files(dir.path(), &[("src/service.ts", &changed)]);
+        let out = diff_at(dir.path(), &DiffSource::GitUncommitted, Some("src/service.ts:run"))
+            .unwrap();
+        assert!(!out.contains("ambiguous"), "{out}");
+        assert!(out.contains("A::run") && out.contains("value = 2"), "{out}");
+    }
+
+    /// `X^!` is the change `X` made, and `X^-1` the same: git reads both as
+    /// the range from `X`'s first parent to `X`. Read as one revision
+    /// compared with the working tree, no symbol could be matched.
+    #[test]
+    fn parent_shorthands_name_the_commit_s_own_change() {
+        let dir = repo_with(&[("src/a.rs", "fn alpha() {\n    1\n}\n")]);
+        write_files(dir.path(), &[("src/a.rs", "fn alpha() {\n    2\n}\n")]);
+        commit_all(dir.path(), "second");
+        // A later, uncommitted edit must not leak into the commit's diff.
+        write_files(dir.path(), &[("src/a.rs", "fn alpha() {\n    3\n}\n")]);
+        let range = diff_at(dir.path(), &last_commit(), None).unwrap();
+        assert!(range.contains("[~]      alpha"), "{range}");
+        for spec in ["HEAD^!", "HEAD^-1", "HEAD^-"] {
+            let source = resolve_source(Some(spec), None, None, None, None).unwrap();
+            let out = diff_at(dir.path(), &source, None).unwrap();
+            assert!(out.contains("[~]      alpha"), "{spec}:\n{out}");
+            assert!(out.contains("1 file"), "{spec}:\n{out}");
+        }
+        // `X^@` names every parent of X, which compares nothing with nothing
+        // the way a two-sided diff does.
+        let err = resolve_source(Some("HEAD^@"), None, None, None, None).unwrap_err();
+        assert!(err.contains("^!"), "{err}");
+    }
+
+    /// Blast counts the callers under the caller's root, not under the whole
+    /// repository the root sits in.
+    #[test]
+    fn diff_blast_counts_callers_under_root_only() {
+        let calls = "fn caller() {\n    hello();\n}\n";
+        let dir = repo_with(&[
+            ("app/src/main.rs", "fn hello() {\n    1;\n}\n"),
+            ("app/src/c.rs", calls),
+            ("other/c.rs", calls),
+        ]);
+        write_files(
+            dir.path(),
+            &[("app/src/main.rs", "fn hello(n: u8) {\n    1;\n}\n")],
+        );
+        let out = diff(
+            &DiffSource::GitUncommitted,
+            Some(&dir.path().join("app")),
+            None,
+            None,
+            true,
+            0,
+            None,
+        )
+        .unwrap();
+        assert!(
+            out.contains("blast: `hello` signature changed — 1 caller may need updating"),
+            "{out}"
+        );
+    }
+
+    /// In log mode `file:function` keeps the commits that changed that
+    /// function, and names only it.
+    #[test]
+    fn log_function_scope_keeps_commits_that_changed_the_function() {
+        let dir = repo_with(&[(
+            "src/a.rs",
+            "fn alpha() {\n    1\n}\n\nfn beta() {\n    1\n}\n",
+        )]);
+        write_files(
+            dir.path(),
+            &[("src/a.rs", "fn alpha() {\n    2\n}\n\nfn beta() {\n    1\n}\n")],
+        );
+        commit_all(dir.path(), "touch alpha");
+        write_files(
+            dir.path(),
+            &[("src/a.rs", "fn alpha() {\n    2\n}\n\nfn beta() {\n    2\n}\n")],
+        );
+        commit_all(dir.path(), "touch beta");
+        let out = diff_at(
+            dir.path(),
+            &DiffSource::Log("HEAD~2..HEAD".into()),
+            Some("src/a.rs:beta"),
+        )
+        .unwrap();
+        assert!(out.contains("1 commit,"), "{out}");
+        assert!(out.contains("touch beta") && !out.contains("touch alpha"), "{out}");
+        assert!(out.contains("[~] beta") && !out.contains("alpha"), "{out}");
+        let err = diff_at(
+            dir.path(),
+            &DiffSource::Log("HEAD~2..HEAD".into()),
+            Some("src/:beta"),
+        )
+        .unwrap_err();
+        assert!(err.contains("needs a file scope"), "{err}");
     }
 }

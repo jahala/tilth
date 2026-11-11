@@ -204,7 +204,8 @@ pub(crate) fn format_file_detail(
 /// Format detailed view of a single named function within a file's diff.
 ///
 /// `fn_name` is a qualified name (`Type::method`, or `Type.method`) or a bare
-/// one. A bare name that several changed symbols share is ambiguous.
+/// one. A bare name that several changed symbols share is ambiguous. An
+/// unchanged symbol of the name is shown only when no changed one has it.
 pub(crate) fn format_function_detail(overlay: &FileOverlay, fn_name: &str) -> String {
     let wanted = fn_name.replace('.', "::");
     let qualified: Vec<&SymbolChange> = overlay
@@ -212,7 +213,7 @@ pub(crate) fn format_function_detail(overlay: &FileOverlay, fn_name: &str) -> St
         .iter()
         .filter(|c| c.qualified_name() == wanted)
         .collect();
-    let candidates = if qualified.is_empty() {
+    let mut candidates: Vec<&SymbolChange> = if qualified.is_empty() {
         overlay
             .symbol_changes
             .iter()
@@ -221,6 +222,12 @@ pub(crate) fn format_function_detail(overlay: &FileOverlay, fn_name: &str) -> St
     } else {
         qualified
     };
+    if candidates
+        .iter()
+        .any(|c| !matches!(c.change, ChangeType::Unchanged))
+    {
+        candidates.retain(|c| !matches!(c.change, ChangeType::Unchanged));
+    }
 
     let change = match candidates.as_slice() {
         [] => {
