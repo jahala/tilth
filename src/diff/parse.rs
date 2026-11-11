@@ -3,7 +3,9 @@ use std::path::PathBuf;
 use super::{DiffLine, DiffLineKind, FileDiff, FileStatus, Hunk};
 use tilth_core::lang::detection::is_generated_by_name;
 
-/// Parse `git diff --no-color` unified diff output into a list of `FileDiff`s.
+/// Parse a unified diff into a list of `FileDiff`s. A file starts at a
+/// `diff --git` line, as git writes it, or at a `--- `/`+++ ` header pair
+/// followed by a hunk, as `diff -u` writes it.
 #[expect(clippy::too_many_lines, reason = "the diff model is rebuilt in #312")]
 pub(crate) fn parse_unified_diff(raw: &str) -> Vec<FileDiff> {
     if raw.is_empty() {
@@ -18,6 +20,9 @@ pub(crate) fn parse_unified_diff(raw: &str) -> Vec<FileDiff> {
     let mut status = FileStatus::Modified;
     let mut is_binary = false;
     let mut hunks: Vec<Hunk> = Vec::new();
+    // A `diff --git` line came, and the `--- ` line naming the same file has
+    // not yet.
+    let mut git_header_open = false;
 
     // Per-hunk state: the hunk, and the old and new number of its next line.
     let mut current_hunk: Option<Hunk> = None;
@@ -29,13 +34,16 @@ pub(crate) fn parse_unified_diff(raw: &str) -> Vec<FileDiff> {
     let mut old_left: u32 = 0;
     let mut new_left: u32 = 0;
 
-    // Commit the current in-progress file (if any) to `results`.
+    // Commit the current in-progress file (if any) to `results`. Hunks
+    // that no file header named are dropped, never handed to the next file.
     macro_rules! flush_file {
         () => {
+            if let Some(h) = current_hunk.take() {
+                hunks.push(h);
+            }
+            let file_hunks = std::mem::take(&mut hunks);
+            let file_old_path = old_path.take();
             if let Some(p) = path.take() {
-                if let Some(h) = current_hunk.take() {
-                    hunks.push(h);
-                }
                 let generated = p
                     .file_name()
                     .and_then(|n| n.to_str())
@@ -43,9 +51,9 @@ pub(crate) fn parse_unified_diff(raw: &str) -> Vec<FileDiff> {
                     .unwrap_or(false);
                 results.push(FileDiff {
                     path: p,
-                    old_path: old_path.take(),
+                    old_path: file_old_path,
                     status,
-                    hunks: std::mem::take(&mut hunks),
+                    hunks: file_hunks,
                     is_generated: generated,
                     is_binary,
                 });
@@ -53,7 +61,8 @@ pub(crate) fn parse_unified_diff(raw: &str) -> Vec<FileDiff> {
         };
     }
 
-    for line in raw.lines() {
+    let mut lines = raw.lines();
+    while let Some(line) = lines.next() {
         // ── Hunk body, counted ──────────────────────────────────────────────
         if let Some(hunk) = current_hunk
             .as_mut()
@@ -102,6 +111,7 @@ pub(crate) fn parse_unified_diff(raw: &str) -> Vec<FileDiff> {
             // Reset per-file state for the new file.
             is_binary = false;
             status = FileStatus::Modified;
+            git_header_open = true;
             // Extract the `b/` path (right-hand side) which is canonical.
             // Format: `diff --git a/<path> b/<path>`
             // Paths may contain spaces; split at " b/" from the right.
@@ -138,6 +148,21 @@ pub(crate) fn parse_unified_diff(raw: &str) -> Vec<FileDiff> {
 
         // ── `--- a/` / `+++ b/` ──────────────────────────────────────────────
         if let Some(src) = line.strip_prefix("--- ") {
+            if !git_header_open {
+                // A file without a `diff --git` line, as `diff -u` writes
+                // it: `--- old`, `+++ new`, then a hunk.
+                let mut ahead = lines.clone();
+                let dst = ahead.next().and_then(|l| l.strip_prefix("+++ "));
+                let hunk_follows = ahead.next().is_some_and(|l| l.starts_with("@@ "));
+                if let Some(dst) = dst.filter(|_| hunk_follows) {
+                    lines.next();
+                    flush_file!();
+                    is_binary = false;
+                    (path, status) = plain_header_file(src, dst);
+                    continue;
+                }
+            }
+            git_header_open = false;
             if src == "/dev/null" {
                 status = FileStatus::Added;
             }
@@ -210,6 +235,29 @@ pub(crate) fn parse_unified_diff(raw: &str) -> Vec<FileDiff> {
     results
 }
 
+/// The path and status of a file that a `--- src`/`+++ dst` header pair
+/// starts. When both sides carry the `a/` and `b/` prefixes, they are
+/// dropped, as git drops its own.
+fn plain_header_file(src: &str, dst: &str) -> (Option<PathBuf>, FileStatus) {
+    let (old, new) = (header_path(src), header_path(dst));
+    let status = match (old, new) {
+        (None, _) => FileStatus::Added,
+        (_, None) => FileStatus::Deleted,
+        _ => FileStatus::Modified,
+    };
+    let prefixed =
+        old.is_none_or(|p| p.starts_with("a/")) && new.is_none_or(|p| p.starts_with("b/"));
+    let path = new.or(old).map(|p| if prefixed { &p[2..] } else { p });
+    (path.map(PathBuf::from), status)
+}
+
+/// The path a `--- ` or `+++ ` header names: the text before the tab that
+/// may start a timestamp, or `None` for `/dev/null`.
+fn header_path(header: &str) -> Option<&str> {
+    let path = header.split_once('\t').map_or(header, |(p, _)| p);
+    (path != "/dev/null").then_some(path)
+}
+
 /// Parse `@@ -old_start[,old_count] +new_start[,new_count] @@ ...` and return
 /// `(old_start, old_count, new_start, new_count)`, or `None` when either
 /// start line fails to parse (malformed hunk — skip it instead of defaulting to 0).
@@ -252,6 +300,7 @@ fn parse_range_spec(spec: &str) -> Option<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     // ── 1. Basic modified file ────────────────────────────────────────────────
     #[test]
@@ -634,5 +683,114 @@ diff --git a/q.sql b/q.sql
                 (DiffLineKind::Added, 4, "SELECT 4;"),
             ]
         );
+    }
+
+    // ── 16. Patches without a `diff --git` line ──────────────────────────────
+    #[test]
+    fn a_plain_unified_diff_is_read() {
+        // `diff -u o.rs n.rs` writes no `diff --git` line, and a tab and a
+        // timestamp follow each path.
+        let raw = "\
+--- o.rs\t2026-11-11 21:48:12
++++ n.rs\t2026-11-11 21:48:12
+@@ -1,3 +1,3 @@
+ fn a() {
+-    1;
++    2;
+ }
+";
+        let diffs = parse_unified_diff(raw);
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].path, PathBuf::from("n.rs"));
+        assert_eq!(diffs[0].old_path, None);
+        assert_eq!(diffs[0].status, FileStatus::Modified);
+        let lines: Vec<(DiffLineKind, u32, &str)> = diffs[0].hunks[0]
+            .lines
+            .iter()
+            .map(|l| (l.kind, l.line, l.content.as_str()))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                (DiffLineKind::Context, 1, "fn a() {"),
+                (DiffLineKind::Removed, 2, "    1;"),
+                (DiffLineKind::Added, 2, "    2;"),
+                (DiffLineKind::Context, 3, "}"),
+            ]
+        );
+    }
+
+    #[test]
+    fn each_plain_header_pair_starts_a_file() {
+        // `diff -ruN a b` names both trees, so the paths lose `a/` and `b/`
+        // as git's do; `/dev/null` marks an added or a deleted file.
+        let raw = "\
+diff -ruN a/one.rs b/one.rs
+--- a/one.rs\t2026-11-11 21:48:12
++++ b/one.rs\t2026-11-11 21:48:13
+@@ -1 +1 @@
+-fn one() {}
++fn uno() {}
+--- /dev/null
++++ b/two.rs
+@@ -0,0 +1 @@
++fn two() {}
+--- a/three.rs
++++ /dev/null
+@@ -1 +0,0 @@
+-fn three() {}
+";
+        let diffs = parse_unified_diff(raw);
+        let files: Vec<(&Path, FileStatus, usize)> = diffs
+            .iter()
+            .map(|d| (d.path.as_path(), d.status, d.hunks[0].lines.len()))
+            .collect();
+        assert_eq!(
+            files,
+            [
+                (Path::new("one.rs"), FileStatus::Modified, 2),
+                (Path::new("two.rs"), FileStatus::Added, 1),
+                (Path::new("three.rs"), FileStatus::Deleted, 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_plain_header_keeps_paths_that_do_not_pair_as_a_and_b() {
+        // Only the `a/` `b/` pair is a prefix; a real `b/` directory stays.
+        let raw = "\
+--- b/x.rs.orig
++++ b/x.rs
+@@ -1 +1 @@
+-fn x() {}
++fn y() {}
+";
+        let diffs = parse_unified_diff(raw);
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].path, PathBuf::from("b/x.rs"));
+    }
+
+    #[test]
+    fn a_hunk_no_header_names_is_not_given_to_the_next_file() {
+        let raw = "\
+@@ -1 +1 @@
+-stray
++hunk
+diff --git a/k.rs b/k.rs
+--- a/k.rs
++++ b/k.rs
+@@ -1 +1 @@
+-fn k() {}
++fn q() {}
+";
+        let diffs = parse_unified_diff(raw);
+        assert_eq!(diffs.len(), 1);
+        let contents: Vec<&str> = diffs[0]
+            .hunks
+            .iter()
+            .flat_map(|h| &h.lines)
+            .map(|l| l.content.as_str())
+            .collect();
+        assert_eq!(contents, ["fn k() {}", "fn q() {}"]);
     }
 }
