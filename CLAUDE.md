@@ -115,7 +115,7 @@ cargo publish --dry-run -p tilth-core  # the library packages on its own
 python3 scripts/check/output_parity.py --base OLD --new NEW --repos <fixture repos>  # byte-for-byte output parity of two tilth builds
 ```
 
-The toolchain is pinned in `rust-toolchain.toml`, and CI and the release build install it from there. Clippy's lints change between releases, so bumping it is a deliberate PR that re-runs clippy.
+The toolchain is pinned in `rust-toolchain.toml`, and CI and the release build install it from there. Clippy's lints change between releases, so bumping it is a deliberate PR that re-runs clippy. The file lists no components, so release builds skip clippy and rustfmt; the CI check job and a local checkout add them with `rustup component add clippy rustfmt`.
 
 Lints live in `[workspace.lints]` in the root `Cargo.toml` (pedantic, a nursery subset, and restrictions on unwrap, expect, print and unsafe). `clippy.toml` exempts `#[test]` functions and `#[cfg(test)]` modules from the unwrap, expect, print and dbg lints, and nothing else: a helper function in `tests/*.rs` needs its own `#[expect]`. An exception is an `#[expect(lint, reason = "...")]` on the item or statement it excuses, never an `allow`: `allow_attributes` fails the build. A temporary exception's reason names its tracking issue, as in `reason = "split by responsibility in #315"`. A permanent one starts with `by design: `. `tests/expect_reasons.rs` fails on any other reason. Results go to stdout through `write_stdout` (CLI) or the MCP transport's writer, and diagnostics through `diag::emit`; `clippy.toml` forbids `std::io::stdout` and `std::io::stderr` everywhere else.
 
