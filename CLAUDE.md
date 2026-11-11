@@ -57,6 +57,7 @@ src/
     format.rs          Progressive-disclosure formatters: overview, file detail, function detail, log, conflicts.
   read/
     mod.rs             File reading with smart view (full vs outline based on token count).
+    ends.rs            A text's first and last lines and line count, fed in pieces: the log, CSV and fallback views stream through it.
     outline/
       mod.rs           generate() — dispatches to the right outline backend by file type, appends the truncation note when a cap is hit.
       code.rs          Outline string formatting for code files. Uses lang/outline for extraction.

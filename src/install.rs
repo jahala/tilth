@@ -117,6 +117,10 @@ fn atomic_write(path: &std::path::Path, content: &str) -> Result<(), String> {
         .map_err(|e| format!("failed to write {}: {e}", path.display()))
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "by design: a host's own config file, at a path tilth names, never a walked one"
+)]
 fn write_json_config(host_info: &HostInfo, edit: bool) -> Result<(), String> {
     let servers_key = match host_info.format {
         ConfigFormat::Json { servers_key } | ConfigFormat::JsonLocal { servers_key } => servers_key,
@@ -145,6 +149,10 @@ fn write_json_config(host_info: &HostInfo, edit: bool) -> Result<(), String> {
 }
 
 /// Writes a `[mcp_servers.tilth]` section into a TOML config file.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "by design: a host's own config file, at a path tilth names, never a walked one"
+)]
 fn write_toml_config(host_info: &HostInfo, edit: bool) -> Result<(), String> {
     let (command, args) = tilth_command_and_args(edit);
 

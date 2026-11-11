@@ -73,7 +73,7 @@ tilth uses the syntax tree to tell a definition from a mention, and it lists def
 
 An expanded definition ends with a `-- calls --` footer. It lists the functions the definition calls, each with its file, line range and signature. An agent can follow a call chain from there without searching again.
 
-A qualified name such as `Engine::handleHTTPRequest` or `Context.reset` finds the definition that type holds, in search and in grok.
+A qualified name such as `Engine::handleHTTPRequest` or `Context.reset` finds the definition that type holds, in search and in grok. A qualifier that names a module or package (`gin.New`, `crate::search::symbol::search`) finds the function at the top level of that module, and `Self::new`, `self.run` or `this.handle` find the name in whichever type holds it.
 
 When a search finds more than it shows, the header says so, for example `10 of 43 matches`. The total counts every match in scope, and the same search gives the same answer every time. Add `--full` to raise the limit from 10 to 100.
 
@@ -113,7 +113,7 @@ $ tilth isTrustedProxy --callers --scope .
 -> if (i == 0) || (!engine.isTrustedProxy(ip)) {
 ```
 
-Each call site is labelled with the function it sits in, qualified by its type. When there are more than 10 call sites, the header says `10 of N call sites` and a last line counts the rest. `--full` raises the limit to 100.
+Each call site is labelled with the function it sits in, qualified by its type. A label can be passed back as the target: `--callers Engine.validateHeader` finds the calls of `validateHeader`, and says that the receiver's type is not checked. When there are more than 10 call sites, the header says `10 of N call sites` and a last line counts the rest. `--full` raises the limit to 100.
 
 In MCP mode, use `kind: "callers"` on `tilth_search`.
 
@@ -140,7 +140,7 @@ recovery_test.go:22            TestPanicClean       → RecoveryWithWriter
 ...
 ```
 
-"Used by" lists the files that call the file's names, and the files that import it without a call (`imports it`), also through a re-exporting `index.ts` or `__init__.py` (`imports it through …`). It lists the first 15 dependents and counts the rest. `--full` lists them all.
+"Used by" lists the files that call the file's names, and the files that import it without a call (`imports it`), also through a re-exporting `index.ts` or `__init__.py` (`imports it through …`). It lists the first 15 dependents and counts the rest. `--full` lists them all. The header counts the dependents found by a call alone, with no import of the file (`3 dependents, 1 of them by name only`), since such a call may reach another function of the same name.
 
 In MCP mode, use the `tilth_deps` tool.
 
@@ -367,7 +367,6 @@ tilth is about 35,000 lines of Rust with no runtime dependencies.
 - The **ignore** crate walks directories in parallel. By default tilth searches every file, including gitignored ones, and skips common build and dependency folders such as `node_modules`, `target` and `.venv`.
 - To honor `.gitignore`, `.ignore` and Git exclude rules as well, set `TILTH_RESPECT_GITIGNORE=1` before starting tilth, or pass `--respect-gitignore` on the CLI. Over MCP, `tilth_search` and `tilth_list` take `gitignore: true` or `false` to choose for a single call.
 - A `.tilthignore` file uses the `.gitignore` syntax and is always honored, whatever the gitignore setting. It applies to its own directory and everything below, also when the search scope starts deeper. Use it for folders tilth should never search.
-- **memmap2** reads files through memory maps.
 - **DashMap** holds the outline cache, which is invalidated when a file's modified time changes.
 
 Definitions and usages are searched in parallel through `rayon::join`. Callees are resolved when a definition is expanded. tilth extracts the callee names with tree-sitter queries and looks them up in the file's own outline and in the files it imports. The callers query runs the same patterns in reverse across the codebase, with a `memchr` pre-filter to skip files that cannot match.

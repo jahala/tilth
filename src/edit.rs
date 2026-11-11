@@ -108,19 +108,8 @@ fn apply_edits(path: &Path, edits: &[Edit]) -> Result<EditResult, TilthError> {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     // Read file
-    let content = fs::read_to_string(path).map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => TilthError::NotFound {
-            path: path.to_path_buf(),
-            suggestion: None,
-        },
-        std::io::ErrorKind::PermissionDenied => TilthError::PermissionDenied {
-            path: path.to_path_buf(),
-        },
-        _ => TilthError::IoError {
-            path: path.to_path_buf(),
-            source: e,
-        },
-    })?;
+    let content = tilth_core::source::read_to_string(path)
+        .map_err(|e| TilthError::from_io(path, e, || None))?;
 
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len();
@@ -600,6 +589,10 @@ fn render_applied(
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "by design: tests read the files they check directly"
+)]
 mod tests {
     use super::*;
 

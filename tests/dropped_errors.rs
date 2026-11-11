@@ -5,6 +5,11 @@
 //! ignored. The cases rely on Unix permissions and on removing the directory a
 //! process runs in, so they run on Unix only. Two cases check warnings next
 //! to these, where nothing fails.
+
+#![expect(
+    clippy::disallowed_methods,
+    reason = "by design: tests read the files they check directly"
+)]
 #![cfg(unix)]
 
 use std::io::Write;

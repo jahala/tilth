@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 pub(crate) mod budget;
 pub(crate) mod classify;
 pub mod diag;

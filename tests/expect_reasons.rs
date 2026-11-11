@@ -8,6 +8,11 @@
 //! macro's body only as tokens, so an attribute written inside a
 //! `macro_rules!` body, or in any other macro's input, is not checked.
 
+#![expect(
+    clippy::disallowed_methods,
+    reason = "by design: tests read the files they check directly"
+)]
+
 use std::path::{Path, PathBuf};
 
 use syn::visit::Visit;

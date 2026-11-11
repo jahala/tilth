@@ -100,7 +100,6 @@ regex-syntax = "0.8"
 
 # Byte scanning (SIMD-accelerated)
 memchr = { workspace = true }
-memmap2 = "0.9"
 
 # Parallelism
 rayon = "1"

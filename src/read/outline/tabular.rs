@@ -1,45 +1,33 @@
-/// CSV/TSV outline: column headers + row count + first 5 + last 3 rows.
-/// Uses memchr for line counting on the raw bytes, then only collects
-/// the head/tail slices needed for display.
-pub fn outline(content: &str, _max_lines: usize) -> String {
-    let buf = content.as_bytes();
-    if buf.is_empty() {
+use crate::read::ends::{Ends, Shape};
+
+/// The CSV/TSV view: the header line and 5 rows, then the last 3 rows.
+pub(crate) const TABULAR: Shape = Shape { head: 6, tail: 3 };
+
+/// The CSV/TSV outline of a text's [`TABULAR`] ends: column headers, row
+/// count, the first 5 rows and the last 3. A text with more rows than the
+/// outline shows marks the gap and counts the rows left out.
+pub(crate) fn render(ends: &Ends<'_>) -> String {
+    let head = ends.head();
+    let head: Vec<&str> = head.lines().collect();
+    let Some((columns, rows)) = head.split_first() else {
         return "(empty)".to_string();
-    }
-
-    // Count lines via memchr — O(n) SIMD scan, no Vec allocation
-    let total = crate::read::count_lines(buf) as usize;
-
-    // We still need to index into lines for head/tail display,
-    // but only collect offsets, not full line slices
-    let lines: Vec<&str> = content.lines().collect();
+    };
+    let tail = ends.tail();
+    let tail: Vec<&str> = tail.lines().collect();
+    let total = ends.total();
 
     let mut out = Vec::new();
-
-    // Header
-    out.push(format!("columns: {}", lines[0]));
-    out.push(format!("rows: {}", total.saturating_sub(1)));
+    out.push(format!("columns: {columns}"));
+    out.push(format!("rows: {}", total - 1));
     out.push(String::new());
-
-    // First 5 data rows
-    let head_end = 6.min(lines.len()); // header + 5 rows
-    for line in &lines[1..head_end] {
-        out.push(line.to_string());
-    }
-
-    // Gap indicator + last 3 rows
-    if total > 9 {
-        out.push(format!("... {} rows omitted", total - 9));
+    out.extend(rows.iter().map(ToString::to_string));
+    if !ends.shows_all() {
+        out.push(format!(
+            "... {} rows omitted",
+            total - head.len() - tail.len()
+        ));
         out.push(String::new());
-        let tail_start = lines.len().saturating_sub(3);
-        for line in &lines[tail_start..] {
-            out.push(line.to_string());
-        }
-    } else if lines.len() > head_end {
-        for line in &lines[head_end..] {
-            out.push(line.to_string());
-        }
     }
-
+    out.extend(tail.iter().map(ToString::to_string));
     out.join("\n")
 }

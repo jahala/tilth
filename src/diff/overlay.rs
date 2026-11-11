@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use tilth_core::lang::detect_file_type_with_content;
 use tilth_core::lang::outline::get_outline_entries;
@@ -38,6 +37,8 @@ pub(crate) fn compute_overlay(
         removed,
         conflicts: Vec::new(),
         new_content: None,
+        is_generated: file_diff.is_generated,
+        is_binary: file_diff.is_binary,
     };
 
     // Binary or generated files: counts only, the formatter summarizes them.
@@ -50,7 +51,8 @@ pub(crate) fn compute_overlay(
         // symbol as added or deleted. Skip it; the lines still show.
         Err(_) => Vec::new(),
         Ok((old, new)) => {
-            let changes = symbol_changes(&file_diff.path, &old, &new);
+            let old_path = file_diff.old_path.as_deref().unwrap_or(&file_diff.path);
+            let changes = symbol_changes(old_path, &file_diff.path, &old, &new);
             if file_diff.status != FileStatus::Deleted {
                 overlay.new_content = Some(new);
             }
@@ -67,7 +69,8 @@ pub(crate) fn compute_overlay(
 }
 
 /// Cross-file move detection: match Deleted symbols in one file with Added
-/// symbols in another by (kind, name). Unique pairs become `Moved{old_path}`.
+/// symbols in another by kind and qualified name, so a method moves only
+/// within its own type. Unique pairs become `Moved{old_path}`.
 pub(crate) fn cross_file_matching(overlays: &mut [FileOverlay]) {
     // Collect all Deleted and Added symbols with their overlay index + change index.
     let mut deleted: HashMap<(OutlineKind, String), Vec<(usize, usize)>> = HashMap::new();
@@ -78,13 +81,13 @@ pub(crate) fn cross_file_matching(overlays: &mut [FileOverlay]) {
             match &change.change {
                 ChangeType::Deleted => {
                     deleted
-                        .entry((change.kind, change.name.clone()))
+                        .entry((change.kind, change.qualified_name()))
                         .or_default()
                         .push((oi, ci));
                 }
                 ChangeType::Added => {
                     added
-                        .entry((change.kind, change.name.clone()))
+                        .entry((change.kind, change.qualified_name()))
                         .or_default()
                         .push((oi, ci));
                 }
@@ -163,7 +166,7 @@ pub(crate) fn signature_warnings<'a>(
 /// Scan a file for merge conflict markers and extract conflict blocks.
 pub(crate) fn detect_conflicts(path: &Path, repo: Option<&Path>) -> Vec<Conflict> {
     let disk = on_disk(repo, path);
-    let Ok(content) = std::fs::read_to_string(&disk) else {
+    let Ok(content) = tilth_core::source::read_to_string(&disk) else {
         return Vec::new();
     };
 
@@ -230,15 +233,21 @@ pub(crate) fn count_changed_lines(hunks: &[Hunk]) -> (usize, usize) {
 // Symbols
 // ---------------------------------------------------------------------------
 
-/// Match the symbols of the old and new content of one file. A file that is
-/// not code, or has no outline, has none.
-fn symbol_changes(path: &Path, old: &str, new: &str) -> Vec<SymbolChange> {
-    let FileType::Code(lang) = detect_file_type_with_content(path, diff_side(old, new)) else {
-        return Vec::new();
+/// Match the symbols of the old and new content of one file. Each side is
+/// read in its own language, from its own path and content: a rename can
+/// change the extension, and a `.h` can gain or lose C++. A side that is not
+/// code, or has no outline, has no symbols; when neither has any, there is
+/// nothing to match.
+fn symbol_changes(old_path: &Path, path: &Path, old: &str, new: &str) -> Vec<SymbolChange> {
+    let symbols = |path: &Path, content: &str| match detect_file_type_with_content(path, content) {
+        FileType::Code(lang) if !content.is_empty() => Some(build_diff_symbols(content, lang)),
+        _ => None,
     };
-    let old_syms = build_diff_symbols(&get_outline_entries(old, lang), old, lang);
-    let new_syms = build_diff_symbols(&get_outline_entries(new, lang), new, lang);
-    match_symbols(&old_syms, &new_syms)
+    let (old_syms, new_syms) = (symbols(old_path, old), symbols(path, new));
+    if old_syms.is_none() && new_syms.is_none() {
+        return Vec::new();
+    }
+    match_symbols(&old_syms.unwrap_or_default(), &new_syms.unwrap_or_default())
 }
 
 /// Give each patch line to the innermost changed symbol whose span holds it:
@@ -319,11 +328,11 @@ fn read_side(side: &Side, path: &Path, repo: Option<&Path>) -> Result<String, St
         Side::Index => git_show(&format!(":{path_str}"), repo),
         Side::WorkingTree => {
             let disk = on_disk(repo, path);
-            std::fs::read_to_string(&disk).map_err(|e| format!("read {}: {e}", disk.display()))
+            tilth_core::source::read_to_string(&disk)
+                .map_err(|e| format!("read {}: {e}", disk.display()))
         }
-        Side::File(file) => {
-            std::fs::read_to_string(file).map_err(|e| format!("read {}: {e}", file.display()))
-        }
+        Side::File(file) => tilth_core::source::read_to_string(file)
+            .map_err(|e| format!("read {}: {e}", file.display())),
         Side::Unavailable => Ok(String::new()),
     }
 }
@@ -337,11 +346,7 @@ fn on_disk(repo: Option<&Path>, path: &Path) -> PathBuf {
 }
 
 pub(super) fn git_show(spec: &str, repo: Option<&Path>) -> Result<String, String> {
-    let mut cmd = Command::new("git");
-    if let Some(dir) = repo {
-        cmd.current_dir(dir);
-    }
-    let output = cmd
+    let output = super::git_command(repo)
         .args([
             "-c",
             "core.quotePath=false",
@@ -356,16 +361,6 @@ pub(super) fn git_show(spec: &str, repo: Option<&Path>) -> Result<String, String
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         Err(format!("git show {spec}: {}", stderr.trim()))
-    }
-}
-
-/// The side of a diff that decides a file's language: the new content, or the
-/// old when the file was deleted.
-fn diff_side<'a>(old_content: &'a str, new_content: &'a str) -> &'a str {
-    if new_content.is_empty() {
-        old_content
-    } else {
-        new_content
     }
 }
 
@@ -506,5 +501,20 @@ mod tests {
             hunk(vec![line(DiffLineKind::Removed)]),
         ];
         assert_eq!(count_changed_lines(&hunks), (2, 2));
+    }
+
+    /// Each side of a diff is parsed in its own language. A header that
+    /// loses its C++ was parsed as C on both sides, so its old class read as
+    /// a garbled function and was reported under the wrong kind.
+    #[test]
+    fn each_side_is_parsed_in_its_own_language() {
+        let old = "#pragma once\nclass Shape {\n public:\n  int area() { return 0; }\n};\n";
+        let new = "#pragma once\nstruct shape { int sides; };\nint area(struct shape *s);\n";
+        let changes = symbol_changes(Path::new("shape.h"), Path::new("shape.h"), old, new);
+        let shape = changes.iter().find(|c| c.name == "Shape").expect("Shape");
+        assert!(
+            shape.kind == OutlineKind::Class && matches!(shape.change, ChangeType::Deleted),
+            "{changes:#?}"
+        );
     }
 }

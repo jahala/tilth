@@ -6,10 +6,18 @@ allow-expect-in-tests = true
 allow-print-in-tests = true
 allow-dbg-in-tests = true
 
+# Every read of a file a walk or a caller names goes through
+# `tilth_core::source::OpenFile` (or `source::read`, `read_to_string`,
+# `read_source`), whose open never waits on a pipe and which reads a pipe,
+# socket or device as empty.
+
 # Each stream has one sink: results go through `write_stdout` (CLI) or the
 # MCP transport's writer, diagnostics through `diag::emit`. `print_stdout`
 # and `print_stderr` cover the macros.
 disallowed-methods = [
   { path = "std::io::stdout", reason = "write results through `write_stdout` (CLI) or the MCP transport's writer" },
   { path = "std::io::stderr", reason = "write diagnostics through `diag::emit`" },
+  { path = "std::fs::read", reason = "read through `tilth_core::source`, whose open never waits on a pipe" },
+  { path = "std::fs::read_to_string", reason = "read through `tilth_core::source`, whose open never waits on a pipe" },
+  { path = "std::fs::File::open", reason = "open through `tilth_core::source::OpenFile`, which never waits on a pipe" },
 ]
