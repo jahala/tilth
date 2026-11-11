@@ -1468,6 +1468,8 @@ fn get_outline_str(path: &std::path::Path, cache: &OutlineCache) -> Option<std::
         return None;
     }
     Some(cache.get_or_compute(path, mtime, || {
+        // An unreadable file gets an empty outline, so its matches show no
+        // outline context; the matches themselves are reported either way.
         let content = tilth_core::source::read_source(path).unwrap_or_default();
         let buf = content.as_bytes();
         read::outline::generate(path, file_type, &content, buf, false)

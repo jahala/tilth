@@ -204,6 +204,23 @@ fn cross_worktree_warning(path: &Path, cwd: &Path) -> Option<String> {
     ))
 }
 
+/// [`cross_worktree_warning`] for `path`, written relative to the server's
+/// working directory. An unreadable working directory leaves nothing to
+/// compare with, so that is reported through `diag` instead.
+fn relative_write_warning(path: &Path) -> Option<String> {
+    match std::env::current_dir() {
+        Ok(cwd) => cross_worktree_warning(path, &cwd),
+        Err(e) => {
+            crate::diag::emit(format_args!(
+                "tilth: warning: no cross-worktree check for {}: \
+                 cannot read the current directory: {e}",
+                path.display()
+            ));
+            None
+        }
+    }
+}
+
 /// Returns the resolved absolute path of `path` for success output, falling
 /// back to `path.display()` if canonicalize fails. Callers must only invoke
 /// this after a successful write so the file exists.
@@ -281,18 +298,21 @@ pub(in crate::mcp) fn tool_write(
     // whenever the server was launched from a different directory than
     // `root` (the headline cross-worktree scenario `root` exists to solve).
     // Only when BOTH `scope` and `root` are absent does this fall back to the
-    // server cwd, exactly as before.
-    let scope_root: PathBuf = args.get("scope").and_then(|v| v.as_str()).map_or_else(
-        || {
-            root.clone()
-                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()))
-        },
-        PathBuf::from,
-    );
+    // server cwd, exactly as before. A cwd that cannot be read leaves no
+    // boundary, so every write is refused with that cause.
+    let scope_arg = args.get("scope").and_then(Value::as_str);
+    let scope_root: std::io::Result<PathBuf> = match (scope_arg, &root) {
+        (Some(scope), _) => Ok(PathBuf::from(scope)),
+        (None, Some(root)) => Ok(root.clone()),
+        (None, None) => std::env::current_dir().map_err(|e| {
+            std::io::Error::new(e.kind(), format!("cannot read the current directory: {e}"))
+        }),
+    };
     // Canonicalize the scope once for the overwrite/append containment check.
     // Fail closed on canonicalize failure: an unresolvable scope refuses
     // writes rather than silently disabling the guard.
-    let scope_canon: Result<PathBuf, std::io::Error> = scope_root.canonicalize();
+    let scope_canon: Result<PathBuf, std::io::Error> =
+        scope_root.and_then(|scope| scope.canonicalize());
 
     let mut hash_tasks: Vec<crate::edit::FileEditTask> = Vec::new();
     // Resolved paths for hash-mode files that were relative with no `root`, so
@@ -379,9 +399,7 @@ pub(in crate::mcp) fn tool_write(
                         }
                         // Warn when a relative path (no `root`) crosses a worktree boundary.
                         if root.is_none() && !PathBuf::from(path_str).is_absolute() {
-                            let cwd =
-                                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                            if let Some(warn) = cross_worktree_warning(&path, &cwd) {
+                            if let Some(warn) = relative_write_warning(&path) {
                                 block.push_str(&warn);
                             }
                         }
@@ -445,9 +463,7 @@ pub(in crate::mcp) fn tool_write(
                         }
                         // Warn when a relative path (no `root`) crosses a worktree boundary.
                         if root.is_none() && !PathBuf::from(path_str).is_absolute() {
-                            let cwd =
-                                std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                            if let Some(warn) = cross_worktree_warning(&path, &cwd) {
+                            if let Some(warn) = relative_write_warning(&path) {
                                 block.push_str(&warn);
                             }
                         }
@@ -481,16 +497,13 @@ pub(in crate::mcp) fn tool_write(
                 // warn over the relative paths we tracked. cross_worktree_warning
                 // self-filters paths whose file was never written (canonicalize
                 // fails). Pre-canonicalize into a HashSet to de-duplicate.
-                if !hash_relative_paths.is_empty() {
-                    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                    let canon_relative: std::collections::HashSet<PathBuf> = hash_relative_paths
-                        .iter()
-                        .map(|r| r.canonicalize().unwrap_or_else(|_| r.clone()))
-                        .collect();
-                    for p in &canon_relative {
-                        if let Some(warn) = cross_worktree_warning(p, &cwd) {
-                            output.push_str(&warn);
-                        }
+                let canon_relative: std::collections::HashSet<PathBuf> = hash_relative_paths
+                    .iter()
+                    .map(|r| r.canonicalize().unwrap_or_else(|_| r.clone()))
+                    .collect();
+                for p in &canon_relative {
+                    if let Some(warn) = relative_write_warning(p) {
+                        output.push_str(&warn);
                     }
                 }
             }

@@ -529,7 +529,7 @@ pub fn diff(
     let (overlays, meta): (Vec<FileOverlay>, Vec<FileMeta>) = files.into_iter().unzip();
 
     if blast {
-        let mut blast_warnings = compute_blast(&overlays, repo);
+        let mut blast_warnings = compute_blast(&overlays, repo.unwrap_or(&base));
         warnings.append(&mut blast_warnings);
     }
 
@@ -769,11 +769,11 @@ fn keep_search_matches(overlay: &mut FileOverlay, term: &str) -> bool {
     !overlay.symbol_changes.is_empty() || has_term(&overlay.other_lines)
 }
 
-/// Find callers of signature-changed symbols and return warnings.
+/// Find callers of signature-changed symbols in `scope` and return warnings.
 ///
-/// The caller search runs over `repo` when provided — searching the process
-/// cwd for a diff anchored elsewhere would count the wrong checkout's callers.
-fn compute_blast(overlays: &[FileOverlay], repo: Option<&Path>) -> Vec<String> {
+/// `scope` is the diff's checkout: searching the process cwd for a diff
+/// anchored elsewhere would count the wrong checkout's callers.
+fn compute_blast(overlays: &[FileOverlay], scope: &Path) -> Vec<String> {
     let sig_changed: HashSet<String> = overlays
         .iter()
         .flat_map(|o| o.symbol_changes.iter())
@@ -785,17 +785,13 @@ fn compute_blast(overlays: &[FileOverlay], repo: Option<&Path>) -> Vec<String> {
         return Vec::new();
     }
 
-    let scope = repo.map_or_else(
-        || std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-        Path::to_path_buf,
-    );
     let bloom = tilth_core::index::bloom::BloomFilterCache::new();
 
     // Stops at the same bound as a write's blast radius, so a diff stays
     // fast on a huge tree; the count then says it is a lower bound.
     let per_file = tilth_core::find_callers_batch(
         &sig_changed,
-        &scope,
+        scope,
         &bloom,
         None,
         Some(crate::search::blast::BLAST_STOP_AFTER),

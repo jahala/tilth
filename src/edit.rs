@@ -561,12 +561,23 @@ fn render_applied(
                 output.push_str(&parse);
             }
             let abs_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-            let scope = tilth_core::lang::package_root(&abs_path).map_or_else(
-                || std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-                Path::to_path_buf,
-            );
-            if let Some(blast) = crate::search::blast::blast_radius(path, edits, &scope, bloom) {
-                output.push_str(&blast);
+            // Callers are searched in the file's package, or in the working
+            // directory for a file outside any package.
+            let scope = tilth_core::lang::package_root(&abs_path)
+                .map_or_else(std::env::current_dir, |root| Ok(root.to_path_buf()));
+            match scope {
+                Ok(scope) => {
+                    if let Some(blast) =
+                        crate::search::blast::blast_radius(path, edits, &scope, bloom)
+                    {
+                        output.push_str(&blast);
+                    }
+                }
+                Err(e) => crate::diag::emit(format_args!(
+                    "tilth: warning: no blast radius for {}: \
+                     cannot read the current directory: {e}",
+                    path.display()
+                )),
             }
             Ok(output)
         }

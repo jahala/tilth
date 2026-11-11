@@ -187,3 +187,100 @@ fn mcp_warns_about_a_client_root_it_cannot_enter() {
         "the refused root must be reported, got: {stderr}"
     );
 }
+
+/// One `tools/call` request for `tool` with `arguments`, as a stdin line.
+fn tool_call(id: u32, tool: &str, arguments: &serde_json::Value) -> String {
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": { "name": tool, "arguments": arguments },
+    });
+    format!("{request}\n")
+}
+
+/// The text of the tool result with `id` in an MCP session's stdout.
+#[expect(
+    clippy::expect_used,
+    reason = "by design: a test helper, where a panic is the test failure"
+)]
+fn tool_text(stdout: &[u8], id: u32) -> String {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|response| response["id"] == id)
+        .and_then(|response| {
+            response["result"]["content"][0]["text"]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .expect("a tool result with this id")
+}
+
+/// A write with neither `scope` nor `root` is contained in the server's
+/// working directory. When that could not be read, the refusal blamed the
+/// stand-in path "." instead of naming the cause.
+#[test]
+fn write_names_an_unreadable_working_directory_as_the_refusal_cause() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let target = tmp.path().join("new.txt");
+    let write = tool_call(
+        2,
+        "tilth_write",
+        &serde_json::json!({
+            "files": [{ "path": target, "mode": "overwrite", "content": "x\n" }],
+        }),
+    );
+    let out = run_in_removed_dir(&["--mcp", "--edit"], &format!("{INITIALIZE}\n{write}"));
+    let text = tool_text(&out.stdout, 2);
+    assert!(
+        text.contains("refusing write") && text.contains("cannot read the current directory"),
+        "the refusal must name the unreadable directory, got: {text}"
+    );
+    assert!(!target.exists(), "the write must be refused");
+}
+
+/// The blast radius of an edit to a file outside any package searches the
+/// server's working directory. When that could not be read, it searched the
+/// stand-in path "." and reported no callers without a word.
+#[test]
+fn edit_warns_when_its_blast_radius_has_nowhere_to_search() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let file = tmp.path().join("lib.rs");
+    std::fs::write(&file, "fn old() {}\n").expect("write the file to edit");
+    let read = tool_call(2, "tilth_read", &serde_json::json!({ "path": file }));
+    let read_out = mcp(
+        &["--mcp", "--edit"],
+        tmp.path(),
+        &format!("{INITIALIZE}\n{read}"),
+    );
+    let read_text = tool_text(&read_out.stdout, 2);
+    let anchor = read_text
+        .lines()
+        .find_map(|line| line.strip_suffix("|fn old() {}"))
+        .expect("the hashline of the definition");
+
+    let edit = tool_call(
+        2,
+        "tilth_write",
+        &serde_json::json!({
+            "scope": tmp.path(),
+            "files": [{
+                "path": file,
+                "edits": [{ "start": anchor, "content": "fn renamed(x: u32) {}" }],
+            }],
+        }),
+    );
+    let out = run_in_removed_dir(&["--mcp", "--edit"], &format!("{INITIALIZE}\n{edit}"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        std::fs::read_to_string(&file).expect("read the edited file"),
+        "fn renamed(x: u32) {}\n",
+        "the edit must apply, tool result: {}",
+        tool_text(&out.stdout, 2)
+    );
+    assert!(
+        stderr.contains("no blast radius"),
+        "the skipped caller search must be reported, got: {stderr}"
+    );
+}
