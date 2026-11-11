@@ -39,7 +39,12 @@ pub(in crate::mcp) fn tool_search(
         .map(PathBuf::from);
     let context = context_path.as_deref();
     let glob = args.get("glob").and_then(|v| v.as_str());
-    let budget = args.get("budget").and_then(serde_json::Value::as_u64);
+    // Expanded search and the response cap must use the same budget.
+    let budget = Some(
+        args.get("budget")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(crate::budget::DEFAULT_BUDGET),
+    );
 
     let output = match kind {
         "symbol" => {
@@ -547,6 +552,82 @@ mod tests {
         for i in 0..n {
             std::fs::write(dir.join(format!("{prefix}_{i:02}.rs")), body(i)).unwrap();
         }
+    }
+
+    #[test]
+    fn later_search_expands_a_definition_omitted_by_the_budget() {
+        use std::fmt::Write as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut source = String::from("pub fn big_target() {\n");
+        for i in 0..400 {
+            let _ = writeln!(source, "    let v{i} = {i} + 1;");
+        }
+        source.push_str("}\n\nfn user() {\n    big_target();\n}\n");
+        std::fs::write(tmp.path().join("big.rs"), source).unwrap();
+
+        check_budgeted_expansion(
+            tmp.path(),
+            "big_target",
+            300,
+            "big_target",
+            "let v0 =",
+            "expansion omitted to fit budget",
+        );
+    }
+
+    #[test]
+    fn later_search_expands_a_definition_cut_from_a_multi_search() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (file, symbol, marker) in [
+            ("first.rs", "first_target", "marker_one"),
+            ("second.rs", "second_target", "marker_two"),
+        ] {
+            let source = format!("pub fn {symbol}() {{\n    let {marker} = 1;\n}}\n");
+            std::fs::write(tmp.path().join(file), source).unwrap();
+        }
+
+        check_budgeted_expansion(
+            tmp.path(),
+            "first_target,second_target",
+            100,
+            "second_target",
+            "let marker_two =",
+            "... truncated (",
+        );
+    }
+
+    fn check_budgeted_expansion(
+        scope: &std::path::Path,
+        tight_query: &str,
+        tight_budget: u64,
+        next_query: &str,
+        source: &str,
+        omission: &str,
+    ) {
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let search = |query: &str, budget: u64| {
+            let args = serde_json::json!({ "query": query, "scope": scope, "budget": budget });
+            tool_search(&args, &cache, &session, &bloom).unwrap()
+        };
+
+        let tight = search(tight_query, tight_budget);
+        assert!(
+            tight.contains(omission) && !tight.contains(source),
+            "{tight}"
+        );
+        let roomy = search(next_query, 10_000);
+        assert!(
+            roomy.contains(source) && !roomy.contains("[shown earlier]"),
+            "{roomy}"
+        );
+        let repeated = search(next_query, 10_000);
+        assert!(
+            repeated.contains("[shown earlier]") && !repeated.contains(source),
+            "{repeated}"
+        );
     }
 
     fn run_search(args: &Value) -> String {

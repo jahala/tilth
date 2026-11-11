@@ -10,9 +10,22 @@ pub const DEFAULT_BUDGET: u64 = 24_000;
 /// 2. Truncate content at section boundaries to avoid broken output
 /// 3. Never exceed the budget
 pub fn apply(output: &str, budget: u64) -> String {
-    let current = estimate_tokens(output.len() as u64);
-    if current <= budget {
+    let kept = retained_prefix_len(output, budget);
+    if kept == output.len() {
         return output.to_string();
+    }
+
+    let remaining_tokens = estimate_tokens((output.len() - kept) as u64);
+    format!(
+        "{}\n\n... truncated ({remaining_tokens} tokens omitted, budget: {budget})",
+        &output[..kept]
+    )
+}
+
+/// Number of original bytes preserved by the position-based budget cut.
+pub(crate) fn retained_prefix_len(output: &str, budget: u64) -> usize {
+    if estimate_tokens(output.len() as u64) <= budget {
+        return output.len();
     }
 
     let header_reserve = 50u64;
@@ -21,11 +34,10 @@ pub fn apply(output: &str, budget: u64) -> String {
 
     // Find the first newline after the header (first line)
     let header_end = output.find('\n').unwrap_or(0);
-    let header = &output[..header_end];
     let body = &output[header_end..];
 
     if body.len() <= max_bytes {
-        return output.to_string();
+        return output.len();
     }
 
     let safe_max = body.floor_char_boundary(max_bytes);
@@ -48,13 +60,7 @@ pub fn apply(output: &str, budget: u64) -> String {
         .or_else(|| truncated.rfind('\n').filter(|&p| p > 0))
         .unwrap_or(safe_max);
 
-    let clean_body = &body[..cut_point];
-
-    let omitted_bytes = output.len() - header_end - cut_point;
-    let remaining_tokens = estimate_tokens(omitted_bytes as u64);
-    format!(
-        "{header}{clean_body}\n\n... truncated ({remaining_tokens} tokens omitted, budget: {budget})"
-    )
+    header_end + cut_point
 }
 
 #[cfg(test)]

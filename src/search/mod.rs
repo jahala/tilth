@@ -29,6 +29,54 @@ use crate::format::rel;
 
 const EXPAND_FULL_FILE_THRESHOLD: u64 = 800;
 
+#[derive(Debug)]
+struct Expansion {
+    path: PathBuf,
+    line: u32,
+    mtime: SystemTime,
+    end: usize,
+}
+
+/// Preserve dedup within the response without updating the shared session
+/// until the final budget is known.
+struct RenderSession<'a> {
+    previous: Option<&'a Session>,
+    staged: HashSet<(PathBuf, u32, SystemTime)>,
+}
+
+impl<'a> RenderSession<'a> {
+    fn new(previous: Option<&'a Session>) -> Self {
+        Self {
+            previous,
+            staged: HashSet::new(),
+        }
+    }
+
+    fn is_expanded(&self, path: &Path, line: u32, mtime: SystemTime) -> bool {
+        self.previous
+            .is_some_and(|session| session.is_expanded(path, line, mtime))
+            || self.staged.contains(&(path.to_path_buf(), line, mtime))
+    }
+}
+
+/// Record only definitions whose closing fence survives the final position
+/// cut. The caller uses the same prefix when it applies the response budget.
+fn record_visible_expansions(
+    session: &Session,
+    output: &str,
+    budget: Option<u64>,
+    expansions: impl IntoIterator<Item = Expansion>,
+) {
+    let end = budget.map_or(output.len(), |tokens| {
+        crate::budget::retained_prefix_len(output, tokens)
+    });
+    for expansion in expansions {
+        if expansion.end <= end {
+            session.record_expand(&expansion.path, expansion.line, expansion.mtime);
+        }
+    }
+}
+
 /// Cap for inlined markdown section bodies in the default preview slot.
 /// Long sections get a tail "… (N more lines — pass --expand to see the full
 /// section)" so the user knows to expand for the rest.
@@ -222,7 +270,9 @@ pub fn search_multi_symbol_expanded(
         expand.max(queries.len())
     };
     let mut expanded_files = HashSet::new();
-    let mut sections = Vec::with_capacity(queries.len());
+    let mut render_session = RenderSession::new(Some(session));
+    let mut combined = String::new();
+    let mut expansions = Vec::new();
 
     for query in queries {
         let result = symbol::search(query, scope, context, glob, full)?;
@@ -239,7 +289,7 @@ pub fn search_multi_symbol_expanded(
             &result.matches,
             &result.scope,
             cache,
-            Some(session),
+            &mut render_session,
             bloom,
             &mut expand_remaining,
             &mut expanded_files,
@@ -257,11 +307,21 @@ pub fn search_multi_symbol_expanded(
         // budget.unwrap_or(DEFAULT_BUDGET): keeps the no-budget path byte-
         // identical to before this fix (see format_search_result's own comment).
         let budget_tokens = budget.unwrap_or(crate::budget::DEFAULT_BUDGET);
-        out = crate::search::alloc::fit_to_budget(&out, &segments, budget_tokens);
-        sections.push(out);
+        out = alloc::fit_to_budget(&out, &mut segments, budget_tokens);
+        if !combined.is_empty() {
+            combined.push_str("\n\n---\n");
+        }
+        let offset = combined.len();
+        expansions.extend(segments.into_iter().filter_map(|block| {
+            let mut expansion = block.expansion?;
+            expansion.end += offset;
+            Some(expansion)
+        }));
+        combined.push_str(&out);
     }
 
-    Ok(sections.join("\n\n---\n"))
+    record_visible_expansions(session, &combined, budget, expansions);
+    Ok(combined)
 }
 
 pub fn search_content(
@@ -397,7 +457,7 @@ fn format_matches(
     matches: &[Match],
     scope: &Path,
     cache: &OutlineCache,
-    session: Option<&Session>,
+    session: &mut RenderSession<'_>,
     bloom: &tilth_core::index::bloom::BloomFilterCache,
     expand_remaining: &mut usize,
     expanded_files: &mut HashSet<PathBuf>,
@@ -418,7 +478,7 @@ fn format_matches(
         if group.len() == 1 {
             // Single match — format as before
             let start = out.len();
-            let body_start = format_single_match(
+            let (body_start, expansion) = format_single_match(
                 group[0],
                 scope,
                 cache,
@@ -434,6 +494,7 @@ fn format_matches(
                 start,
                 body_start,
                 end: out.len(),
+                expansion,
             });
         } else {
             // Multiple usages collapsed into one entry
@@ -449,6 +510,7 @@ fn format_matches(
                 start,
                 body_start: out.len(),
                 end: out.len(),
+                expansion: None,
             });
         }
     }
@@ -586,13 +648,13 @@ fn format_single_match(
     m: &Match,
     scope: &Path,
     cache: &OutlineCache,
-    session: Option<&Session>,
+    session: &mut RenderSession<'_>,
     bloom: &tilth_core::index::bloom::BloomFilterCache,
     expand_remaining: &mut usize,
     expanded_files: &mut HashSet<PathBuf>,
     multi_file: bool,
     out: &mut String,
-) -> usize {
+) -> (usize, Option<Expansion>) {
     let kind = if m.impl_target.is_some() {
         "impl"
     } else if m.is_definition {
@@ -665,7 +727,7 @@ fn format_single_match(
                             "… ({truncated} more lines — pass --expand to see the full section)"
                         );
                     }
-                    return out.len();
+                    return (out.len(), None);
                 }
             }
         }
@@ -679,8 +741,7 @@ fn format_single_match(
         .and_then(|md| md.modified().ok());
     let deduped = m.is_definition
         && m.def_range.is_some()
-        && session
-            .is_some_and(|s| current_mtime.is_some_and(|t| s.is_expanded(&m.path, m.line, t)));
+        && current_mtime.is_some_and(|t| session.is_expanded(&m.path, m.line, t));
     // expand_match always prints a range containing m.line (def_range starts
     // at m.line for definitions; the ±10 fallback for def_range: None / usages
     // trivially contains it), so the raw "-> [line] text" preview would
@@ -704,6 +765,7 @@ fn format_single_match(
     // Everything from here on is the expansion, which a tight budget can
     // drop while keeping the lines above.
     let body_start = out.len();
+    let mut expansion = None;
 
     if *expand_remaining > 0 {
         if deduped {
@@ -721,12 +783,6 @@ fn format_single_match(
             let skip = multi_file && expanded_files.contains(&m.path);
             if !skip {
                 if let Some((code, content)) = expand_match(m, scope) {
-                    if m.is_definition && m.def_range.is_some() {
-                        if let (Some(s), Some(t)) = (session, current_mtime) {
-                            s.record_expand(&m.path, m.line, t);
-                        }
-                    }
-
                     let file_type =
                         tilth_core::lang::detect_file_type_with_content(&m.path, &content);
                     let mut skip_lines = strip::strip_noise(&content, &m.path, m.def_range);
@@ -759,6 +815,15 @@ fn format_single_match(
                     out.push_str(&stripped_code);
 
                     if m.is_definition && m.def_range.is_some() {
+                        if let (Some(_), Some(mtime)) = (session.previous, current_mtime) {
+                            session.staged.insert((m.path.clone(), m.line, mtime));
+                            expansion = Some(Expansion {
+                                path: m.path.clone(),
+                                line: m.line,
+                                mtime,
+                                end: out.len(),
+                            });
+                        }
                         if let tilth_core::types::FileType::Code(lang) = file_type {
                             let callee_names = tilth_core::search::callees::extract_callee_names(
                                 &content,
@@ -860,7 +925,7 @@ fn format_single_match(
             }
         }
     }
-    body_start
+    (body_start, expansion)
 }
 
 /// Format a symbol/content search result.
@@ -1039,6 +1104,7 @@ fn format_search_result(
         result.usages,
     );
     let mut out = header;
+    let mut render_session = RenderSession::new(session);
     let mut expand_remaining = expand;
     let mut expanded_files = HashSet::new();
     let mut segments: Vec<alloc::Block> = Vec::new();
@@ -1072,7 +1138,7 @@ fn format_search_result(
                 &faceted.definitions,
                 &result.scope,
                 cache,
-                session,
+                &mut render_session,
                 bloom,
                 &mut expand_remaining,
                 &mut expanded_files,
@@ -1097,7 +1163,7 @@ fn format_search_result(
                 &faceted.implementations,
                 &result.scope,
                 cache,
-                session,
+                &mut render_session,
                 bloom,
                 &mut expand_remaining,
                 &mut expanded_files,
@@ -1141,7 +1207,7 @@ fn format_search_result(
                 &faceted.usages_local,
                 &result.scope,
                 cache,
-                session,
+                &mut render_session,
                 bloom,
                 &mut expand_remaining,
                 &mut expanded_files,
@@ -1166,7 +1232,7 @@ fn format_search_result(
                 &faceted.usages_cross,
                 &result.scope,
                 cache,
-                session,
+                &mut render_session,
                 bloom,
                 &mut expand_remaining,
                 &mut expanded_files,
@@ -1203,7 +1269,7 @@ fn format_search_result(
             &result.matches,
             &result.scope,
             cache,
-            session,
+            &mut render_session,
             bloom,
             &mut expand_remaining,
             &mut expanded_files,
@@ -1231,12 +1297,16 @@ fn format_search_result(
     // to before this fix — DEFAULT_BUDGET remains the default, it is simply no
     // longer a hardcode that shadows a real caller-supplied budget.
     let budget_tokens = budget.unwrap_or(crate::budget::DEFAULT_BUDGET);
-    out = crate::search::alloc::fit_to_budget(&out, &segments, budget_tokens);
+    out = alloc::fit_to_budget(&out, &mut segments, budget_tokens);
 
     let tokens = estimate_tokens(out.len() as u64);
     let token_str = format_token_count(tokens);
     let _ = write!(out, "\n\n({token_str} tokens)");
 
+    if let Some(session) = session {
+        let expansions = segments.into_iter().filter_map(|block| block.expansion);
+        record_visible_expansions(session, &out, budget, expansions);
+    }
     Ok(out)
 }
 
@@ -1830,7 +1900,7 @@ mod tests {
             &m,
             tmp.path(),
             &cache,
-            None,
+            &mut RenderSession::new(None),
             &bloom,
             &mut expand_remaining,
             &mut expanded_files,
@@ -1881,7 +1951,7 @@ mod tests {
             &m,
             tmp.path(),
             &cache,
-            None,
+            &mut RenderSession::new(None),
             &bloom,
             &mut expand_remaining,
             &mut expanded_files,
@@ -2001,7 +2071,7 @@ mod tests {
             &m,
             tmp.path(),
             &cache,
-            None,
+            &mut RenderSession::new(None),
             &bloom,
             &mut expand_remaining,
             &mut expanded_files,
@@ -2059,7 +2129,7 @@ mod tests {
             &m,
             tmp.path(),
             &cache,
-            None,
+            &mut RenderSession::new(None),
             &bloom,
             &mut expand_remaining,
             &mut expanded_files,
@@ -2132,7 +2202,7 @@ mod tests {
             &m,
             tmp.path(),
             &cache,
-            None,
+            &mut RenderSession::new(None),
             &bloom,
             &mut expand_remaining,
             &mut expanded_files,
@@ -2256,7 +2326,7 @@ mod tests {
             &matches,
             tmp.path(),
             &cache,
-            None,
+            &mut RenderSession::new(None),
             &bloom,
             &mut expand_remaining,
             &mut expanded_files,
