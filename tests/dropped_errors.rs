@@ -13,16 +13,16 @@ use std::process::{Command, Output, Stdio};
 
 const TILTH: &str = env!("CARGO_BIN_EXE_tilth");
 
-/// Run `tilth args` from a working directory that no longer exists. The shell
-/// enters the directory, removes it, and then becomes tilth, so tilth starts
-/// in a directory whose path cannot be read.
+/// Run `tilth args` from `parent/gone`, a working directory that no longer
+/// exists. The shell enters the directory, removes it, and then becomes
+/// tilth, so tilth starts in a directory whose path cannot be read. A
+/// relative path through `..` still reaches `parent`.
 #[expect(
     clippy::expect_used,
     reason = "by design: a test helper, where a panic is the test failure"
 )]
-fn run_in_removed_dir(args: &[&str], stdin: &str) -> Output {
-    let parent = tempfile::tempdir().expect("create temp dir");
-    let gone = parent.path().join("gone");
+fn run_in_removed_dir(parent: &Path, args: &[&str], stdin: &str) -> Output {
+    let gone = parent.join("gone");
     std::fs::create_dir(&gone).expect("create dir to remove");
     let mut child = Command::new("sh")
         .arg("-c")
@@ -117,7 +117,8 @@ const INITIALIZE: &str =
 /// project ("No project fingerprint could be generated.").
 #[test]
 fn overview_reports_an_unreadable_working_directory() {
-    let out = run_in_removed_dir(&["overview"], "");
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let out = run_in_removed_dir(tmp.path(), &["overview"], "");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "stderr: {stderr}");
     assert!(
@@ -130,7 +131,8 @@ fn overview_reports_an_unreadable_working_directory() {
 /// working directory, and then fingerprint the empty path at initialize.
 #[test]
 fn mcp_warns_about_an_unreadable_working_directory() {
-    let out = run_in_removed_dir(&["--mcp"], &format!("{INITIALIZE}\n"));
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let out = run_in_removed_dir(tmp.path(), &["--mcp"], &format!("{INITIALIZE}\n"));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
     assert!(
@@ -217,6 +219,22 @@ fn tool_text(stdout: &[u8], id: u32) -> String {
         .expect("a tool result with this id")
 }
 
+/// The hash anchor `tilth_read` gives the line `text` of `file`.
+#[expect(
+    clippy::expect_used,
+    reason = "by design: a test helper, where a panic is the test failure"
+)]
+fn hash_anchor(file: &Path, text: &str) -> String {
+    let dir = file.parent().expect("the file has a parent");
+    let read = tool_call(2, "tilth_read", &serde_json::json!({ "path": file }));
+    let out = mcp(&["--mcp", "--edit"], dir, &format!("{INITIALIZE}\n{read}"));
+    tool_text(&out.stdout, 2)
+        .lines()
+        .find_map(|line| line.strip_suffix(&format!("|{text}")))
+        .expect("the hashline of the line")
+        .to_owned()
+}
+
 /// A write with neither `scope` nor `root` is contained in the server's
 /// working directory. When that could not be read, the refusal blamed the
 /// stand-in path "." instead of naming the cause.
@@ -231,7 +249,11 @@ fn write_names_an_unreadable_working_directory_as_the_refusal_cause() {
             "files": [{ "path": target, "mode": "overwrite", "content": "x\n" }],
         }),
     );
-    let out = run_in_removed_dir(&["--mcp", "--edit"], &format!("{INITIALIZE}\n{write}"));
+    let out = run_in_removed_dir(
+        tmp.path(),
+        &["--mcp", "--edit"],
+        &format!("{INITIALIZE}\n{write}"),
+    );
     let text = tool_text(&out.stdout, 2);
     assert!(
         text.contains("refusing write") && text.contains("cannot read the current directory"),
@@ -243,22 +265,25 @@ fn write_names_an_unreadable_working_directory_as_the_refusal_cause() {
 /// The blast radius of an edit to a file outside any package searches the
 /// server's working directory. When that could not be read, it searched the
 /// stand-in path "." and reported no callers without a word.
+///
+/// The file must sit outside any package, but a package manifest in any
+/// directory above the temp dir puts it inside one, and no fixture path can
+/// rule that out. So the test looks for one first, and skips with the path
+/// it found.
 #[test]
 fn edit_warns_when_its_blast_radius_has_nowhere_to_search() {
     let tmp = tempfile::tempdir().expect("create temp dir");
     let file = tmp.path().join("lib.rs");
     std::fs::write(&file, "fn old() {}\n").expect("write the file to edit");
-    let read = tool_call(2, "tilth_read", &serde_json::json!({ "path": file }));
-    let read_out = mcp(
-        &["--mcp", "--edit"],
-        tmp.path(),
-        &format!("{INITIALIZE}\n{read}"),
-    );
-    let read_text = tool_text(&read_out.stdout, 2);
-    let anchor = read_text
-        .lines()
-        .find_map(|line| line.strip_suffix("|fn old() {}"))
-        .expect("the hashline of the definition");
+    let canonical = file.canonicalize().expect("resolve the file to edit");
+    if let Some(package) = tilth_core::lang::package_root(&canonical) {
+        eprintln!(
+            "skipped: {} holds a package manifest, so the file is not outside every package",
+            package.display()
+        );
+        return;
+    }
+    let anchor = hash_anchor(&file, "fn old() {}");
 
     let edit = tool_call(
         2,
@@ -271,7 +296,11 @@ fn edit_warns_when_its_blast_radius_has_nowhere_to_search() {
             }],
         }),
     );
-    let out = run_in_removed_dir(&["--mcp", "--edit"], &format!("{INITIALIZE}\n{edit}"));
+    let out = run_in_removed_dir(
+        tmp.path(),
+        &["--mcp", "--edit"],
+        &format!("{INITIALIZE}\n{edit}"),
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(
         std::fs::read_to_string(&file).expect("read the edited file"),
@@ -282,5 +311,83 @@ fn edit_warns_when_its_blast_radius_has_nowhere_to_search() {
     assert!(
         stderr.contains("no blast radius"),
         "the skipped caller search must be reported, got: {stderr}"
+    );
+}
+
+/// A relative write is checked against the server's working directory for a
+/// landing in another worktree. When that could not be read, the check was
+/// skipped with a warning per path, failed writes included. A batch now
+/// warns once if a relative write landed, and not at all if none did.
+#[test]
+fn relative_writes_that_cannot_be_checked_warn_once_per_batch() {
+    const SKIPPED: &str = "no cross-worktree check";
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let files = tmp.path().join("files");
+    std::fs::create_dir(&files).expect("create the files dir");
+    std::fs::write(files.join("a.txt"), "old a\n").expect("write a.txt");
+    std::fs::write(files.join("b.txt"), "old b\n").expect("write b.txt");
+    let anchor = hash_anchor(&files.join("a.txt"), "old a");
+    let hash = |name: &str| {
+        serde_json::json!({
+            "path": format!("../files/{name}"),
+            "edits": [{ "start": anchor, "content": "new" }],
+        })
+    };
+    let overwrite = |name: &str| serde_json::json!({ "path": format!("../files/{name}"), "mode": "overwrite", "content": "new\n" });
+    // Relative paths resolve from the removed directory through `..`.
+    let batch = |id: u32, entries: Vec<serde_json::Value>| {
+        tool_call(
+            id,
+            "tilth_write",
+            &serde_json::json!({ "scope": files, "files": entries }),
+        )
+    };
+
+    // Nothing lands: b.txt exists and is create-only, missing.txt has no
+    // line to anchor to.
+    let failed = batch(2, vec![overwrite("b.txt"), hash("missing.txt")]);
+    let out = run_in_removed_dir(
+        tmp.path(),
+        &["--mcp", "--edit"],
+        &format!("{INITIALIZE}\n{failed}"),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        stderr.matches(SKIPPED).count(),
+        0,
+        "a batch that wrote nothing has nothing to check, tool result: {}\nstderr: {stderr}",
+        tool_text(&out.stdout, 2)
+    );
+
+    // Two writes land, a hash edit of a.txt and a new c.txt; two fail.
+    let mixed = batch(
+        2,
+        vec![
+            hash("a.txt"),
+            overwrite("b.txt"),
+            overwrite("c.txt"),
+            hash("missing.txt"),
+        ],
+    );
+    let out = run_in_removed_dir(
+        tmp.path(),
+        &["--mcp", "--edit"],
+        &format!("{INITIALIZE}\n{mixed}"),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let text = tool_text(&out.stdout, 2);
+    assert_eq!(
+        std::fs::read_to_string(files.join("a.txt")).expect("read a.txt"),
+        "new\n",
+        "the hash edit must apply, tool result: {text}"
+    );
+    assert!(
+        files.join("c.txt").exists(),
+        "c.txt must be created, tool result: {text}"
+    );
+    assert_eq!(
+        stderr.matches(SKIPPED).count(),
+        1,
+        "one warning per batch, tool result: {text}\nstderr: {stderr}"
     );
 }

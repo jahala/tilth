@@ -204,18 +204,32 @@ fn cross_worktree_warning(path: &Path, cwd: &Path) -> Option<String> {
     ))
 }
 
-/// [`cross_worktree_warning`] for `path`, written relative to the server's
-/// working directory. An unreadable working directory leaves nothing to
-/// compare with, so that is reported through `diag` instead.
-fn relative_write_warning(path: &Path) -> Option<String> {
-    match std::env::current_dir() {
-        Ok(cwd) => cross_worktree_warning(path, &cwd),
-        Err(e) => {
-            crate::diag::emit(format_args!(
-                "tilth: warning: no cross-worktree check for {}: \
-                 cannot read the current directory: {e}",
-                path.display()
-            ));
+/// The cross-worktree check for the relative writes of one batch, against
+/// the server's working directory as read once for that batch.
+struct RelativeWrites<'a> {
+    cwd: &'a std::io::Result<PathBuf>,
+    /// A relative write landed while `cwd` could not be read.
+    unchecked: bool,
+}
+
+impl RelativeWrites<'_> {
+    /// The [`cross_worktree_warning`] for a relative write that landed at
+    /// `path`. An unreadable working directory leaves nothing to compare
+    /// with, so the write is only counted for [`Self::skipped`].
+    fn landed(&mut self, path: &Path) -> Option<String> {
+        if let Ok(cwd) = self.cwd {
+            cross_worktree_warning(path, cwd)
+        } else {
+            self.unchecked = true;
+            None
+        }
+    }
+
+    /// Why the batch's relative writes went unchecked, if any did.
+    fn skipped(&self) -> Option<&std::io::Error> {
+        if self.unchecked {
+            self.cwd.as_ref().err()
+        } else {
             None
         }
     }
@@ -300,13 +314,24 @@ pub(in crate::mcp) fn tool_write(
     // Only when BOTH `scope` and `root` are absent does this fall back to the
     // server cwd, exactly as before. A cwd that cannot be read leaves no
     // boundary, so every write is refused with that cause.
+    //
+    // The cwd is read once for the batch: it is also what relative writes
+    // are checked against for a cross-worktree landing.
+    let cwd = std::env::current_dir().map_err(|e| {
+        std::io::Error::new(e.kind(), format!("cannot read the current directory: {e}"))
+    });
+    let mut relative_writes = RelativeWrites {
+        cwd: &cwd,
+        unchecked: false,
+    };
     let scope_arg = args.get("scope").and_then(Value::as_str);
     let scope_root: std::io::Result<PathBuf> = match (scope_arg, &root) {
         (Some(scope), _) => Ok(PathBuf::from(scope)),
         (None, Some(root)) => Ok(root.clone()),
-        (None, None) => std::env::current_dir().map_err(|e| {
-            std::io::Error::new(e.kind(), format!("cannot read the current directory: {e}"))
-        }),
+        (None, None) => cwd
+            .as_ref()
+            .cloned()
+            .map_err(|e| std::io::Error::new(e.kind(), e.to_string())),
     };
     // Canonicalize the scope once for the overwrite/append containment check.
     // Fail closed on canonicalize failure: an unresolvable scope refuses
@@ -399,7 +424,7 @@ pub(in crate::mcp) fn tool_write(
                         }
                         // Warn when a relative path (no `root`) crosses a worktree boundary.
                         if root.is_none() && !PathBuf::from(path_str).is_absolute() {
-                            if let Some(warn) = relative_write_warning(&path) {
+                            if let Some(warn) = relative_writes.landed(&path) {
                                 block.push_str(&warn);
                             }
                         }
@@ -463,7 +488,7 @@ pub(in crate::mcp) fn tool_write(
                         }
                         // Warn when a relative path (no `root`) crosses a worktree boundary.
                         if root.is_none() && !PathBuf::from(path_str).is_absolute() {
-                            if let Some(warn) = relative_write_warning(&path) {
+                            if let Some(warn) = relative_writes.landed(&path) {
                                 block.push_str(&warn);
                             }
                         }
@@ -494,15 +519,16 @@ pub(in crate::mcp) fn tool_write(
                 output.push_str(&combined);
                 // Cross-worktree warning for hash-mode relative paths. apply_batch
                 // returns only the combined text (not the applied path list), so
-                // warn over the relative paths we tracked. cross_worktree_warning
-                // self-filters paths whose file was never written (canonicalize
-                // fails). Pre-canonicalize into a HashSet to de-duplicate.
+                // warn over the relative paths we tracked, skipping any with no
+                // file on disk, which no edit wrote. Pre-canonicalize into a
+                // HashSet to de-duplicate.
                 let canon_relative: std::collections::HashSet<PathBuf> = hash_relative_paths
                     .iter()
+                    .filter(|r| r.exists())
                     .map(|r| r.canonicalize().unwrap_or_else(|_| r.clone()))
                     .collect();
                 for p in &canon_relative {
-                    if let Some(warn) = relative_write_warning(p) {
+                    if let Some(warn) = relative_writes.landed(p) {
                         output.push_str(&warn);
                     }
                 }
@@ -526,6 +552,11 @@ pub(in crate::mcp) fn tool_write(
         for p in &direct_applied {
             session.record_read(p);
         }
+    }
+    if let Some(e) = relative_writes.skipped() {
+        crate::diag::emit(format_args!(
+            "tilth: warning: no cross-worktree check for this batch's relative paths: {e}"
+        ));
     }
     Ok(output)
 }
