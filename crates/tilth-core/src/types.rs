@@ -106,7 +106,13 @@ pub enum OutlineKind {
 #[must_use]
 pub fn is_test_file(path: &std::path::Path) -> bool {
     let s = path.to_string_lossy();
-    s.contains(".test.") || s.contains(".spec.") || s.contains("__tests__/")
+    s.contains(".test.")
+        || s.contains(".spec.")
+        || s.contains("__tests__/")
+        || path.file_name().is_some_and(|name| {
+            let name = name.to_string_lossy();
+            name.ends_with("_test.go") || (name.starts_with("test_") && name.ends_with(".py"))
+        })
 }
 
 /// UTF-8 safe string truncation. Never panics on multi-byte characters.

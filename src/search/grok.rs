@@ -2539,4 +2539,42 @@ impl OutlineCache {
             );
         }
     }
+
+    fn assert_test_callers(fixtures: [(&str, &str); 3]) {
+        let tmp = tempfile::tempdir().unwrap();
+        for (path, source) in fixtures {
+            write_fixture(tmp.path(), path, source);
+        }
+        let bloom = BloomFilterCache::default();
+        let session = crate::session::Session::default();
+        let result = grok("target", tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
+        assert_eq!(result.total_callers, 1);
+        assert_eq!(result.total_tests, 1);
+        assert!(result.callers[0].path.ends_with(fixtures[1].0));
+        assert!(result.tests[0].path.ends_with(fixtures[2].0));
+    }
+
+    #[test]
+    fn grok_recognizes_go_test_callers() {
+        assert_test_callers([
+            ("main.go", "package example\nfunc target() {}\n"),
+            (
+                "test_support.go",
+                "package example\nfunc caller() { target() }\n",
+            ),
+            (
+                "main_test.go",
+                "package example\nfunc TestTarget() { target() }\n",
+            ),
+        ]);
+    }
+
+    #[test]
+    fn grok_recognizes_python_test_callers() {
+        assert_test_callers([
+            ("main.py", "def target():\n    pass\n"),
+            ("test_support/worker.py", "def caller():\n    target()\n"),
+            ("test_main.py", "def test_target():\n    target()\n"),
+        ]);
+    }
 }
