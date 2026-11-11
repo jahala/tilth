@@ -502,9 +502,31 @@ fn single_query_search(
         return search::format_raw_result(&sym_result, cache);
     }
 
-    Err(TilthError::NotFound {
-        path: scope.join(text),
-        suggestion: read::suggest_similar_file(scope, text),
+    // Fallthrough only carries path-shaped queries (`src/foo.rs`) that name
+    // no existing file, so for them "not found" is the true answer.
+    if !prefer_definitions {
+        return Err(TilthError::NotFound {
+            path: scope.join(text),
+            suggestion: read::suggest_similar_file(scope, text),
+        });
+    }
+    no_matches(&content_result, cache, scope, text)
+}
+
+/// A word or phrase that matched nothing: the standard `0 matches` result,
+/// plus a did-you-mean when a file in `scope` has a close name. This used to
+/// be `TilthError::NotFound`, which printed `not found: <scope>/<query>` and
+/// exited 2, as if the query had named a missing file.
+fn no_matches(
+    result: &types::SearchResult,
+    cache: &OutlineCache,
+    scope: &Path,
+    name: &str,
+) -> Result<String, TilthError> {
+    let out = search::format_raw_result(result, cache)?;
+    Ok(match read::suggest_similar_file(scope, name) {
+        Some(file) => format!("{out}\n\n> A file has a similar name: {file}"),
+        None => out,
     })
 }
 
@@ -549,10 +571,7 @@ fn multi_word_concept_search(
     }
 
     let first_word = words.first().copied().unwrap_or(text);
-    Err(TilthError::NotFound {
-        path: scope.join(text),
-        suggestion: read::suggest_similar_file(scope, first_word),
-    })
+    no_matches(&content_result, cache, scope, first_word)
 }
 
 #[cfg(test)]
@@ -703,5 +722,50 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A word or phrase that matches nothing is a search with no results,
+    /// not a missing path. It used to fail with `not found: <scope>/<query>`
+    /// and exit 2, as if the query named a file.
+    #[test]
+    fn zero_hit_search_says_no_matches() {
+        let dir = fixture();
+        let cache = OutlineCache::new();
+        for query in ["zzqqxx", "zzqq xxyy"] {
+            let out = run(query, dir.path(), None, None, None, &cache)
+                .unwrap_or_else(|e| panic!("{query:?} must not be an error, got: {e}"));
+            assert!(
+                out.starts_with(&format!("# Search: \"{query}\" in "))
+                    && out.contains("— 0 matches"),
+                "{query:?}: {out}"
+            );
+            assert!(!out.contains("not found"), "{query:?}: {out}");
+        }
+    }
+
+    /// A name close to an existing file keeps its did-you-mean, now as a hint
+    /// under the empty result.
+    #[test]
+    fn zero_hit_search_keeps_the_file_name_hint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("config"), "x\n").unwrap();
+        let cache = OutlineCache::new();
+        let out = run("confg", dir.path(), None, None, None, &cache).expect("no error");
+        assert!(out.contains("— 0 matches"), "{out}");
+        assert!(
+            out.contains("config"),
+            "the hint must name the close file: {out}"
+        );
+    }
+
+    /// A path-shaped query that names no file still says so: there the
+    /// query really is a missing path.
+    #[test]
+    fn zero_hit_path_query_still_reports_the_missing_path() {
+        let dir = fixture();
+        let cache = OutlineCache::new();
+        let err = run("src/nothing_here.rs", dir.path(), None, None, None, &cache)
+            .expect_err("a missing path is an error");
+        assert!(err.to_string().starts_with("not found: "), "{err}");
     }
 }
