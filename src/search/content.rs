@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
@@ -13,7 +13,6 @@ use tilth_core::error::TilthError;
 
 const MAX_MATCHES: usize = 10;
 const FULL_MAX_MATCHES: usize = 100;
-const MAX_SEARCH_FILE_SIZE: u64 = 500_000;
 
 /// Content search using ripgrep crates. Literal by default, regex if `is_regex`.
 pub fn search(
@@ -59,6 +58,7 @@ fn search_capped(
     })?;
 
     let matches: Mutex<Vec<Match>> = Mutex::new(Vec::new());
+    let skipped_large: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
     // Relaxed is correct: walker.run() joins all threads before we read the final value.
     let total_found = AtomicUsize::new(0);
 
@@ -70,6 +70,7 @@ fn search_capped(
     walker.run(|| {
         let matcher = &matcher;
         let matches = &matches;
+        let skipped_large = &skipped_large;
         let total_found = &total_found;
 
         Box::new(move |entry| {
@@ -95,7 +96,10 @@ fn search_capped(
             // Skip oversized files — tree-sitter and ripgrep shouldn't spend time on minified bundles
             let file_size = match std::fs::metadata(path) {
                 Ok(meta) => {
-                    if meta.len() > MAX_SEARCH_FILE_SIZE {
+                    if meta.len() > tilth_core::source::MAX_FILE_SIZE {
+                        if super::oversized_holds(path, |b| super::has_match(matcher, b)) {
+                            super::record(skipped_large, path);
+                        }
                         return ignore::WalkState::Continue;
                     }
                     meta.len()
@@ -110,10 +114,11 @@ fn search_capped(
             let Ok(bytes) = std::fs::read(path) else {
                 return ignore::WalkState::Continue;
             };
+            let bytes = tilth_core::source::strip_bom_bytes(&bytes);
 
-            // Catch unmarked minified bundles in the 100KB–500KB range.
+            // Catch unmarked minified bundles between 100 KB and the size cap.
             if file_size >= tilth_core::lang::detection::MINIFIED_CHECK_THRESHOLD
-                && tilth_core::lang::detection::is_minified_by_content(&bytes)
+                && tilth_core::lang::detection::is_minified_by_content(bytes)
             {
                 return ignore::WalkState::Continue;
             }
@@ -125,7 +130,7 @@ fn search_capped(
 
             let _ = searcher.search_slice(
                 matcher,
-                &bytes,
+                bytes,
                 UTF8(|line_num, line| {
                     file_matches.push(Match {
                         path: path.to_path_buf(),
@@ -190,6 +195,7 @@ fn search_capped(
         definitions: 0,
         usages: total,
         facet_totals: FacetTotals::default(),
+        skipped_large: super::sorted(skipped_large),
     })
 }
 

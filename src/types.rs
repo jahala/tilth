@@ -94,6 +94,10 @@ pub struct SearchResult {
     /// merged set before truncation; used by the renderer to print
     /// `displayed/total` headings and the per-facet hidden-count tail line.
     pub facet_totals: FacetTotals,
+    /// Files over `tilth_core::source::MAX_FILE_SIZE` that the walk skipped
+    /// even though they contain the query, sorted. The renderer names them,
+    /// so a match that lives in a big file is never silently missing.
+    pub skipped_large: Vec<PathBuf>,
 }
 
 /// Pre-cap counts per subfacet. Defaults to all-zero for callers that don't

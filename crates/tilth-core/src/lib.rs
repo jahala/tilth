@@ -35,6 +35,8 @@ pub mod lang;
 #[doc(hidden)]
 pub mod search;
 #[doc(hidden)]
+pub mod source;
+#[doc(hidden)]
 pub mod test_structure;
 #[doc(hidden)]
 pub mod types;
@@ -46,7 +48,7 @@ pub use imports::{
 pub use index::bloom::BloomFilterCache;
 pub use lang::detect_file_type;
 pub use lang::outline::{extract_import_source, get_outline_entries};
-pub use search::callers::{find_callers_batch, CallerMatch};
+pub use search::callers::{find_callers_batch, CallerMatch, CallerWalk};
 pub use search::deps::{analyze_deps, Dependent, DepsResult, LocalDep};
 pub use test_structure::{test_entries, TestEntry, TestKind};
 pub use types::{is_test_file, FileType, Lang, OutlineEntry, OutlineKind};

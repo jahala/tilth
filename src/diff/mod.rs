@@ -470,12 +470,12 @@ fn compute_blast(overlays: &[FileOverlay], repo: Option<&Path>) -> Vec<String> {
         }
         counts
     });
-    let Ok(per_file) = per_file else {
+    let Ok(walk) = per_file else {
         return Vec::new();
     };
     // Sorted by name so the lines come out in the same order every run.
     let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
-    for file in per_file {
+    for file in walk.per_file {
         for (target, n) in file {
             *counts.entry(target).or_default() += n;
         }

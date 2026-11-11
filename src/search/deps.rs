@@ -95,6 +95,9 @@ pub fn format_deps(result: &DepsResult, scope: &Path, budget: Option<usize>, ful
         }
     };
 
+    // Kept under any budget: a skipped file may hold dependents nobody checked.
+    let output = output + &crate::search::skipped_files_note(&result.skipped_large, scope);
+
     let token_est = crate::types::estimate_tokens(output.len() as u64);
     format!("{output}\n\n[~{token_est} tokens]")
 }
@@ -287,6 +290,7 @@ mod tests {
             uses_local: Vec::new(),
             uses_external: Vec::new(),
             used_by,
+            skipped_large: Vec::new(),
             exported_count: 1,
             searched_count: 1,
         }

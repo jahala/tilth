@@ -195,8 +195,10 @@ fn read_code_file(path: &Path) -> Result<(String, Lang), TilthError> {
     }
     // Try the strict conversion first: it takes ownership of the buffer, so
     // the (near-universal) valid-UTF-8 case decodes without a second copy.
-    let content = String::from_utf8(bytes)
+    let mut content = String::from_utf8(bytes)
         .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+    let bom = content.len() - tilth_core::source::strip_bom(&content).len();
+    content.drain(..bom);
     Ok((content, lang))
 }
 
@@ -315,7 +317,7 @@ fn read_delegate_content(
     if callee_file == target_path {
         Some(target_content.to_string())
     } else if std::fs::metadata(callee_file).is_ok_and(|m| m.len() <= cap) {
-        fs::read_to_string(callee_file).ok()
+        tilth_core::source::read_source(callee_file).ok()
     } else {
         None
     }
@@ -408,6 +410,9 @@ pub struct GrokResult {
     /// internal callee with no external callees), this holds that callee and
     /// its sliced body so the formatter can render it inline. `None` otherwise.
     pub delegate_body: Option<(ResolvedCallee, String)>,
+    /// Code files the caller walk skipped for size although they name the
+    /// target.
+    pub skipped_large: Vec<PathBuf>,
 }
 
 /// Top-level entry: resolve the spec, then gather the structural neighborhood.
@@ -487,7 +492,7 @@ pub fn grok(
             .then_with(|| a.1.line.cmp(&b.1.line))
     };
     let split: std::sync::Mutex<CallerSplit> = std::sync::Mutex::new(CallerSplit::default());
-    find_callers_batch(&symbols, scope, bloom, None, |sites| {
+    let walk = find_callers_batch(&symbols, scope, bloom, None, |sites| {
         let mut file = CallerSplit::default();
         for (_, m) in sites {
             if is_recursive_call_site(&m, &canonical_target, &target) {
@@ -589,7 +594,7 @@ pub fn grok(
                 &callee.file,
                 &target.path,
                 &content,
-                tilth_core::search::bloom_walk::MAX_FILE_SIZE,
+                tilth_core::source::MAX_FILE_SIZE,
             );
             callee_content.map(|cc| {
                 // Build a minimal ResolvedTarget so body_with_dedup can handle dedup.
@@ -630,6 +635,7 @@ pub fn grok(
         total_siblings,
         total_tests,
         delegate_body,
+        skipped_large: walk.skipped_large,
     })
 }
 
@@ -901,6 +907,11 @@ pub fn format_grok(result: &GrokResult, scope: &Path) -> String {
                 result.total_tests - result.tests.len()
             );
         }
+    }
+
+    let skipped_note = crate::search::skipped_files_note(&result.skipped_large, scope);
+    if !skipped_note.is_empty() {
+        let _ = writeln!(out, "{skipped_note}");
     }
 
     out
@@ -1733,6 +1744,7 @@ pub fn target() {
             total_siblings: 0,
             total_tests: 0,
             delegate_body: None,
+            skipped_large: Vec::new(),
         };
         let out = format_grok(&result, Path::new("."));
         assert!(out.contains("ambiguous: 3 other definitions match"));
@@ -1771,6 +1783,7 @@ pub fn target() {
             total_siblings: 17,
             total_tests: 0,
             delegate_body: None,
+            skipped_large: Vec::new(),
         };
         let out = format_grok(&result, Path::new("."));
         assert!(out.contains("... and 16 more"));

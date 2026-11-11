@@ -40,6 +40,7 @@ struct TargetSites {
 /// files, since it ends on path and line, so the result does not depend on
 /// the order files arrive in. Only `keep` sites per target are held at once,
 /// which keeps memory flat on a large tree: each site holds its file's text.
+/// Also returns the code files skipped for size that hold a target.
 fn collect_sites(
     targets: &HashSet<String>,
     scope: &Path,
@@ -47,9 +48,9 @@ fn collect_sites(
     glob: Option<&str>,
     context: Option<&Path>,
     keep: usize,
-) -> Result<HashMap<String, TargetSites>, TilthError> {
+) -> Result<(HashMap<String, TargetSites>, Vec<PathBuf>), TilthError> {
     let merged: Mutex<HashMap<String, TargetSites>> = Mutex::new(HashMap::new());
-    find_callers_batch(targets, scope, bloom, glob, |sites| {
+    let walk = find_callers_batch(targets, scope, bloom, glob, |sites| {
         let mut by_target: HashMap<String, TargetSites> = HashMap::new();
         for (target, m) in sites {
             let entry = by_target.entry(target).or_default();
@@ -73,9 +74,10 @@ fn collect_sites(
             entry.kept.truncate(keep);
         }
     })?;
-    Ok(merged
+    let merged = merged
         .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner))
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Ok((merged, walk.skipped_large))
 }
 
 /// Scan `scope` for the literal `target` byte sequence. Used by the
@@ -133,13 +135,16 @@ pub fn search_callers_expanded(
 ) -> Result<String, TilthError> {
     let max_matches = if full { FULL_MAX_MATCHES } else { MAX_MATCHES };
     let single: HashSet<String> = std::iter::once(target.to_string()).collect();
-    let sites = collect_sites(&single, scope, bloom, glob, context, max_matches)?
-        .remove(target)
-        .unwrap_or_default();
+    let (mut by_target, skipped_large) =
+        collect_sites(&single, scope, bloom, glob, context, max_matches)?;
+    let sites = by_target.remove(target).unwrap_or_default();
+    let skipped_note = crate::search::skipped_files_note(&skipped_large, scope);
 
     if sites.total == 0 {
         let target_seen = target_seen_in_scope(target, scope, glob);
-        return Ok(no_callers_message(target, scope, target_seen, glob));
+        let mut message = no_callers_message(target, scope, target_seen, glob);
+        message.push_str(&skipped_note);
+        return Ok(message);
     }
 
     let mut output = String::new();
@@ -152,6 +157,8 @@ pub fn search_callers_expanded(
         bloom,
         glob,
     );
+
+    output.push_str(&skipped_note);
 
     let tokens = crate::types::estimate_tokens(output.len() as u64);
     let _ = write!(
@@ -376,7 +383,8 @@ pub fn search_callers_multi_expanded(
         .collect();
 
     let target_set: HashSet<String> = ordered.iter().map(ToString::to_string).collect();
-    let mut by_target = collect_sites(&target_set, scope, bloom, glob, context, max_matches)?;
+    let (mut by_target, skipped_large) =
+        collect_sites(&target_set, scope, bloom, glob, context, max_matches)?;
 
     // Render in the caller-supplied target order so output is deterministic.
     let mut output = String::new();
@@ -399,6 +407,12 @@ pub fn search_callers_multi_expanded(
             bloom,
             glob,
         );
+        output.push('\n');
+    }
+
+    let skipped_note = crate::search::skipped_files_note(&skipped_large, scope);
+    if !skipped_note.is_empty() {
+        output.push_str(skipped_note.trim_start_matches('\n'));
         output.push('\n');
     }
 

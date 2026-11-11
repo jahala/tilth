@@ -68,7 +68,7 @@ pub(crate) fn blast_radius(
     scope: &Path,
     bloom: &tilth_core::index::bloom::BloomFilterCache,
 ) -> Option<String> {
-    let content = std::fs::read_to_string(path).ok()?;
+    let content = tilth_core::source::read_source(path).ok()?;
 
     let FileType::Code(lang) = detect_file_type(path) else {
         return None;
@@ -103,7 +103,8 @@ pub(crate) fn blast_radius(
         }
         file
     })
-    .ok()?;
+    .ok()?
+    .per_file;
 
     if files.iter().all(|f| f.by_symbol.is_empty() && f.tests == 0) {
         return None;

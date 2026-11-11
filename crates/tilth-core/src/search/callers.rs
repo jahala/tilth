@@ -31,6 +31,15 @@ pub struct CallerMatch {
     pub content: Arc<String>,
 }
 
+/// What a caller walk returns: one `per_file` result for each file with a
+/// call site, in path order, and the code files it skipped for size although
+/// they contain a target, sorted.
+#[derive(Debug)]
+pub struct CallerWalk<T> {
+    pub per_file: Vec<T>,
+    pub skipped_large: Vec<PathBuf>,
+}
+
 /// Find every call site of any symbol in `targets` under `scope`, in one
 /// parallel walk that always runs to the end.
 ///
@@ -40,6 +49,8 @@ pub struct CallerMatch {
 /// sorted by file path, so the output does not depend on thread timing. A
 /// caller that needs exact totals counts inside `per_file` and keeps only
 /// the sites it will show; that is what bounds memory on a large tree.
+/// Code files over `MAX_FILE_SIZE` are not parsed; the ones whose text holds
+/// a target are listed in `skipped_large`, so a caller can say so.
 // The std hasher is part of the signature dependents pin; a generic hasher
 // would change it for every caller.
 #[allow(clippy::implicit_hasher)]
@@ -49,17 +60,19 @@ pub fn find_callers_batch<T, F>(
     bloom: &crate::index::bloom::BloomFilterCache,
     glob: Option<&str>,
     per_file: F,
-) -> Result<Vec<T>, TilthError>
+) -> Result<CallerWalk<T>, TilthError>
 where
     T: Send,
     F: Fn(Vec<(String, CallerMatch)>) -> T + Sync,
 {
     let found: Mutex<Vec<(PathBuf, T)>> = Mutex::new(Vec::new());
+    let skipped_large: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
     let walker = super::walk::walker(scope, glob)?;
 
     walker.run(|| {
         let found = &found;
+        let skipped_large = &skipped_large;
         let per_file = &per_file;
 
         Box::new(move |entry| {
@@ -73,12 +86,20 @@ where
 
             let path = entry.path();
 
+            if oversized_code_holding(path, targets) {
+                skipped_large
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(path.to_path_buf());
+                return ignore::WalkState::Continue;
+            }
+
             // Read + size-gate + bloom prefilter in one shared step.
             let Some((content, _mtime)) = super::bloom_walk::read_with_bloom_check(
                 path,
                 targets,
                 bloom,
-                super::bloom_walk::MAX_FILE_SIZE,
+                crate::source::MAX_FILE_SIZE,
             ) else {
                 return ignore::WalkState::Continue;
             };
@@ -123,7 +144,34 @@ where
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     found.sort_by(|(a, _), (b, _)| a.cmp(b));
-    Ok(found.into_iter().map(|(_, kept)| kept).collect())
+    let mut skipped_large = skipped_large
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    skipped_large.sort();
+    Ok(CallerWalk {
+        per_file: found.into_iter().map(|(_, kept)| kept).collect(),
+        skipped_large,
+    })
+}
+
+/// Is `path` a code file the walk would parse, over the size cap, whose text
+/// holds one of `targets`?
+fn oversized_code_holding(path: &Path, targets: &HashSet<String>) -> bool {
+    let too_big = std::fs::metadata(path).is_ok_and(|m| m.len() > crate::source::MAX_FILE_SIZE);
+    if !too_big {
+        return false;
+    }
+    let FileType::Code(lang) = detect_file_type(path) else {
+        return false;
+    };
+    if outline_language(lang).is_none() {
+        return false;
+    }
+    std::fs::read(path).is_ok_and(|bytes| {
+        targets
+            .iter()
+            .any(|t| memchr::memmem::find(&bytes, t.as_bytes()).is_some())
+    })
 }
 
 /// Tree-sitter call site detection for a set of target symbols.
@@ -284,7 +332,12 @@ mod tests {
                 .collect::<Vec<_>>()
         })
         .unwrap();
-        let callers: Vec<&str> = found.iter().flatten().map(String::as_str).collect();
+        let callers: Vec<&str> = found
+            .per_file
+            .iter()
+            .flatten()
+            .map(String::as_str)
+            .collect();
         assert_eq!(callers, ["comment_caller", "docstring_caller"]);
     }
 }

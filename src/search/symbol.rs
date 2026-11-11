@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
@@ -98,6 +98,8 @@ fn search_capped(
     let definitions: usize = walked.per_file.iter().map(|f| f.definitions).sum();
     let total: usize = walked.per_file.iter().map(|f| f.total).sum();
     let mut merged = walked.kept;
+    let mut skipped_large = walked.skipped_large;
+    skipped_large.sort();
     display_order(&mut merged, query, scope, context, now);
 
     let file_facets: Vec<super::facets::FileFacets> =
@@ -114,6 +116,7 @@ fn search_capped(
         definitions,
         usages: total - definitions,
         facet_totals,
+        skipped_large,
     })
 }
 
@@ -128,6 +131,15 @@ struct Walked {
     /// The first `keep` matches in display order.
     kept: Vec<Match>,
     per_file: Vec<FileCount>,
+    /// Files skipped for size although they hold the query.
+    skipped_large: Vec<PathBuf>,
+}
+
+/// What one file adds to a symbol search.
+enum Scan {
+    Matches(Vec<Match>),
+    /// Over the size cap, and the query occurs in it.
+    TooLarge,
 }
 
 /// Walk `scope` once and collect the definitions and usages of `query`.
@@ -148,6 +160,7 @@ fn walk(
     let found: Mutex<Walked> = Mutex::new(Walked {
         kept: Vec::new(),
         per_file: Vec::new(),
+        skipped_large: Vec::new(),
     });
 
     let walker = tilth_core::search::walk::walker(scope, glob)?;
@@ -165,10 +178,18 @@ fn walk(
             }
 
             let path = entry.path();
-            let mut file_matches = matches_in_file(path, query, matcher);
-            if file_matches.is_empty() {
-                return ignore::WalkState::Continue;
-            }
+            let mut file_matches = match matches_in_file(path, query, matcher) {
+                Scan::Matches(m) if !m.is_empty() => m,
+                Scan::Matches(_) => return ignore::WalkState::Continue,
+                Scan::TooLarge => {
+                    found
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .skipped_large
+                        .push(path.to_path_buf());
+                    return ignore::WalkState::Continue;
+                }
+            };
 
             let count = FileCount {
                 total: file_matches.len(),
@@ -202,47 +223,53 @@ fn walk(
 /// `memchr::memmem` (SIMD), then reuses the buffer for both the tree-sitter
 /// definition pass and the word-boundary usage pass. Definitions fall back
 /// to a keyword heuristic for code without a grammar.
-fn matches_in_file(path: &Path, query: &str, matcher: &RegexMatcher) -> Vec<Match> {
+fn matches_in_file(path: &Path, query: &str, matcher: &RegexMatcher) -> Scan {
+    let none = || Scan::Matches(Vec::new());
     // Skip files that look minified by filename — `.min.js`, `app-min.css`.
     if path
         .file_name()
         .and_then(|n| n.to_str())
         .is_some_and(tilth_core::lang::detection::is_minified_by_name)
     {
-        return Vec::new();
+        return none();
     }
 
-    // Skip oversized files — avoid tree-sitter parsing multi-MB minified bundles
+    // Skip oversized files — avoid tree-sitter parsing multi-MB minified
+    // bundles — but say so when one holds the query.
     let file_size = match std::fs::metadata(path) {
         Ok(meta) => {
-            if meta.len() > 500_000 {
-                return Vec::new();
+            if meta.len() > tilth_core::source::MAX_FILE_SIZE {
+                if super::oversized_holds(path, |b| super::has_match(matcher, b)) {
+                    return Scan::TooLarge;
+                }
+                return none();
             }
             meta.len()
         }
         Err(_) => 0,
     };
 
-    let Ok(bytes) = fs::read(path) else {
-        return Vec::new();
+    let Ok(raw) = fs::read(path) else {
+        return none();
     };
+    let bytes = tilth_core::source::strip_bom_bytes(&raw);
 
     // Fast byte check — a word-boundary usage or a definition both need the
     // symbol's bytes somewhere in the file.
-    if memchr::memmem::find(&bytes, query.as_bytes()).is_none() {
-        return Vec::new();
+    if memchr::memmem::find(bytes, query.as_bytes()).is_none() {
+        return none();
     }
 
     // Catch unmarked minified bundles that slipped past the filename check.
     if file_size >= tilth_core::lang::detection::MINIFIED_CHECK_THRESHOLD
-        && tilth_core::lang::detection::is_minified_by_content(&bytes)
+        && tilth_core::lang::detection::is_minified_by_content(bytes)
     {
-        return Vec::new();
+        return none();
     }
 
     let (file_lines, mtime) = file_metadata(path);
 
-    let mut matches = match std::str::from_utf8(&bytes) {
+    let mut matches = match std::str::from_utf8(bytes) {
         Ok(content) => definitions_in(path, query, content, file_lines, mtime),
         Err(_) => Vec::new(),
     };
@@ -251,7 +278,7 @@ fn matches_in_file(path: &Path, query: &str, matcher: &RegexMatcher) -> Vec<Matc
     let mut searcher = Searcher::new();
     let _ = searcher.search_slice(
         matcher,
-        &bytes,
+        bytes,
         UTF8(|line_num, line| {
             let line_num = line_num as u32;
             let on_definition = matches[..def_count].iter().any(|d| d.line == line_num);
@@ -274,7 +301,7 @@ fn matches_in_file(path: &Path, query: &str, matcher: &RegexMatcher) -> Vec<Matc
         }),
     );
 
-    matches
+    Scan::Matches(matches)
 }
 
 /// The definitions of `query` in one file's content.

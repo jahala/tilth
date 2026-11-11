@@ -438,7 +438,7 @@ fn parse_cargo_toml(root: &Path) -> Option<ManifestInfo> {
         version: Option<String>,
     }
 
-    let content = fs::read_to_string(root.join("Cargo.toml")).ok()?;
+    let content = tilth_core::source::read_source(&root.join("Cargo.toml")).ok()?;
     let parsed: CargoToml = toml::from_str(&content).ok()?;
     let (name, version) = parsed.package.map_or((None, None), |p| (p.name, p.version));
     let mut deps: Vec<String> = parsed
@@ -462,7 +462,7 @@ fn parse_package_json(root: &Path) -> Option<ManifestInfo> {
         dependencies: Option<serde_json::Map<String, serde_json::Value>>,
     }
 
-    let content = fs::read_to_string(root.join("package.json")).ok()?;
+    let content = tilth_core::source::read_source(&root.join("package.json")).ok()?;
     let parsed: PackageJson = serde_json::from_str(&content).ok()?;
     let mut deps: Vec<String> = parsed
         .dependencies
@@ -478,7 +478,7 @@ fn parse_package_json(root: &Path) -> Option<ManifestInfo> {
 }
 
 fn parse_go_mod(root: &Path) -> Option<ManifestInfo> {
-    let content = fs::read_to_string(root.join("go.mod")).ok()?;
+    let content = tilth_core::source::read_source(&root.join("go.mod")).ok()?;
     let mut name = None;
     let mut deps: Vec<String> = Vec::new();
     let mut in_require = false;
@@ -530,7 +530,7 @@ fn parse_pyproject_toml(root: &Path) -> Option<ManifestInfo> {
         dependencies: Option<Vec<String>>,
     }
 
-    let content = fs::read_to_string(root.join("pyproject.toml")).ok()?;
+    let content = tilth_core::source::read_source(&root.join("pyproject.toml")).ok()?;
     let parsed: PyProject = toml::from_str(&content).ok()?;
     let project = parsed.project.unwrap_or_default();
     let mut deps: Vec<String> = project
@@ -711,7 +711,7 @@ fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opti
             break;
         }
         let full = root.join(rel_path);
-        let Ok(content) = fs::read_to_string(&full) else {
+        let Ok(content) = tilth_core::source::read_source(&full) else {
             continue;
         };
 
@@ -861,6 +861,20 @@ mod tests {
             hot.as_deref(),
             Some("src/other.rs ×2, src/types.rs(Outline) ×2")
         );
+    }
+
+    /// Editors on Windows save `package.json` with a byte-order mark, and
+    /// `serde_json` refuses one, so the manifest vanished from the fingerprint.
+    #[test]
+    fn a_byte_order_mark_keeps_the_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("package.json"),
+            "\u{feff}{\"name\": \"bom-app\", \"version\": \"1.2.3\"}\n",
+        )
+        .unwrap();
+        let manifest = parse_package_json(tmp.path()).expect("manifest parsed");
+        assert_eq!(manifest.name.as_deref(), Some("bom-app"));
     }
 
     #[test]

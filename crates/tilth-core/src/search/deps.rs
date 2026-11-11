@@ -3,7 +3,6 @@
 //! `tilth_deps`.
 
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::error::TilthError;
@@ -26,6 +25,9 @@ pub struct DepsResult {
     /// Every file that calls one of the target's symbols, same directory
     /// first, then non-tests before tests, then by path.
     pub used_by: Vec<Dependent>,
+    /// Code files skipped for size although they name one of the target's
+    /// symbols, so they may be dependents nobody checked.
+    pub skipped_large: Vec<PathBuf>,
     pub exported_count: usize,
     /// Actual number of symbols searched (may be < `exported_count` if capped).
     pub searched_count: usize,
@@ -63,7 +65,7 @@ pub fn analyze_deps(
         source: e,
     })?;
 
-    let content = fs::read_to_string(path).map_err(|e| TilthError::IoError {
+    let content = crate::source::read_source(path).map_err(|e| TilthError::IoError {
         path: path.clone(),
         source: e,
     })?;
@@ -75,6 +77,7 @@ pub fn analyze_deps(
             uses_local: Vec::new(),
             uses_external: Vec::new(),
             used_by: Vec::new(),
+            skipped_large: Vec::new(),
             exported_count: 0,
             searched_count: 0,
         });
@@ -163,7 +166,7 @@ pub fn analyze_deps(
 
     // ── Phase 3: Reverse dependencies ────────────────────────────────────────
 
-    let used_by = if searched_count > 0 {
+    let (used_by, skipped_large) = if searched_count > 0 {
         let symbols_set: HashSet<String> = all_names.iter().cloned().collect();
         // One `Dependent` per file that calls the target's symbols. Calls from
         // within the target file itself are self-references, not dependents.
@@ -187,7 +190,7 @@ pub fn analyze_deps(
         })?;
 
         let target_dir = path.parent();
-        let mut dependents: Vec<Dependent> = found.into_iter().flatten().collect();
+        let mut dependents: Vec<Dependent> = found.per_file.into_iter().flatten().collect();
 
         // Sort: same directory first, non-tests before tests, then alphabetical
         dependents.sort_by(|a, b| {
@@ -199,9 +202,9 @@ pub fn analyze_deps(
                 .then_with(|| a.path.cmp(&b.path))
         });
 
-        dependents
+        (dependents, found.skipped_large)
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
 
     Ok(DepsResult {
@@ -209,6 +212,7 @@ pub fn analyze_deps(
         uses_local,
         uses_external,
         used_by,
+        skipped_large,
         exported_count,
         searched_count,
     })
@@ -272,6 +276,7 @@ fn is_valid_module_path(source: &str) -> bool {
 mod tests {
     use super::*;
     use std::fmt::Write as _;
+    use std::fs;
 
     /// The external modules `analyze_deps` reports for one file.
     fn externals_of(file: &str, content: &str) -> Vec<String> {
@@ -282,6 +287,37 @@ mod tests {
         analyze_deps(&path, tmp.path(), &bloom)
             .unwrap()
             .uses_external
+    }
+
+    /// A UTF-8 byte-order mark sits in front of line 1, so a file that opens
+    /// with an import lost it: `\u{feff}#include "b.h"` is not an include.
+    #[test]
+    fn a_byte_order_mark_keeps_the_first_import() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("b.h"), "int b(void);\n").unwrap();
+        fs::write(tmp.path().join("c.h"), "int c(void);\n").unwrap();
+        let a = tmp.path().join("a.cpp");
+        fs::write(
+            &a,
+            "\u{feff}#include \"b.h\"\n#include \"c.h\"\nint a() { return b() + c(); }\n",
+        )
+        .unwrap();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let deps = analyze_deps(&a, tmp.path(), &bloom).unwrap();
+        let mut local: Vec<String> = deps
+            .uses_local
+            .iter()
+            .map(|d| d.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        local.sort();
+        assert_eq!(local, ["b.h", "c.h"]);
+
+        let py = tmp.path().join("m.py");
+        fs::write(&py, "\u{feff}import requests\nimport numpy\n").unwrap();
+        assert_eq!(
+            analyze_deps(&py, tmp.path(), &bloom).unwrap().uses_external,
+            ["numpy", "requests"]
+        );
     }
 
     /// Each spec of a Go import block is its own module. Read line by line,

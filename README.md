@@ -8,7 +8,7 @@ tilth is one binary. It works as a command-line tool and as an MCP server, which
 
 ```
 $ tilth fastapi/dependencies/utils.py
-# fastapi/dependencies/utils.py (1027 lines, ~9.6k tokens)
+# fastapi/dependencies/utils.py (1026 lines, ~9.6k tokens)
 
 [1-]   imports: dataclasses, inspect, sys
 [86-110]     fn ensure_multipart_is_installed

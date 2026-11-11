@@ -49,6 +49,9 @@ crates/tilth-core/src/
 │                    tree_sitter::Tree, both keyed by (path, mtime)
 ├── imports.rs       Imports as data (one per module named), import lines, related-file resolution
 ├── test_structure.rs describe/it/test calls as TestEntry data
+├── source.rs        read_source: reads a file for parsing or search
+│                    without its byte-order mark; MAX_FILE_SIZE, the
+│                    one size limit every parse and search walk shares
 │
 ├── search/          Cross-file queries
 │   ├── walk.rs          Walker and ignore policy (SKIP_DIRS, .tilthignore,
@@ -183,7 +186,14 @@ explicit `--scope` argument > MCP `roots/list` response > nearest
 `package_root(cwd)` > `cwd`. The chosen root becomes the process's
 working directory, so every later tool call resolves relative paths
 against it. This was added specifically to handle MCP hosts (Codex was
-the documented case) that launch tilth with `cwd=/`.
+the documented case) that launch tilth with `cwd=/`. A `--scope` that
+is not a directory stops the launch with a usage error naming the
+close directories (`missing_scope_hint`).
+
+Per call, a `scope` that does not exist falls back to the caller's
+`root` with a warning that carries the same hint, so a typo still
+finds the answer and the next call can narrow. The CLI refuses a
+missing `--scope` with that hint instead of answering "0 matches".
 
 The request loop (`mcp.rs:139-219`) parses each line as JSON and hands
 off to `handle_request`, which switches on `method`. The handler
@@ -271,9 +281,11 @@ non-obvious twists:
   (concept queries prefer real defs), accept; otherwise try
   `search_content_raw`; otherwise — if the original symbol search had
   any usages even without definitions — fall back to those; otherwise
-  `NotFound` with a similar-file suggestion. The `Fallthrough` arm
-  (path-like-but-didn't-resolve queries) shares the same cascade with
-  `prefer_definitions: false` so any symbol match is accepted.
+  the standard `0 matches` result, with a similar-file hint when one
+  exists. The `Fallthrough` arm (path-like-but-didn't-resolve queries)
+  shares the same cascade with `prefer_definitions: false` so any symbol
+  match is accepted; with no match at all it ends in `NotFound`, because
+  that query really named a missing path.
 - **Multi-word concept relaxation.** `Concept(text)` with whitespace
   goes through `multi_word_concept_search`. First tries an exact-phrase
   content search; on no hits, escapes each word and runs a relaxed
@@ -313,7 +325,10 @@ ladder, in priority order:
    regex when it's actually a path.
 2. **Glob** — contains `*`, `?`, `{`, or `[` and no spaces. The
    no-spaces guard distinguishes real globs from content like
-   `import { X }`.
+   `import { X }`. A query in this shape that also uses syntax no file
+   glob needs (`|`, a leading `^`, `.*` between name characters as in
+   `Searcher.*Builder`, a `+` or `{n}` quantifier, a backslash escape)
+   is a `Regex` instead (`is_regex_shaped`).
 3. **Path** — starts with `./` or `../`, or contains `/` without
    spaces. If the resolved path exists, returns `FilePath`; otherwise
    `Fallthrough` so the symbol/content cascades still get a shot.
@@ -391,7 +406,7 @@ gitignore-style with whitelist, negation (`!`), and brace expansion.
 The biggest production-only file in the subsystem. Three layers stacked:
 
 1. **`search()`** — top-level entry. One walk via `walker` reads each
-   file once (cap: 500 KB), finds its definitions with the right
+   file once (cap: `MAX_FILE_SIZE`), finds its definitions with the right
    per-language extractor and its usages with a word-boundary scan,
    and drops a usage that sits on a definition's line. The walk always
    runs to the end, so the totals are exact and the same query gives
@@ -401,8 +416,9 @@ The biggest production-only file in the subsystem. Three layers stacked:
    order (`display_order`: rank, then code definitions, doc-heading
    definitions, usages) ends on path and line, so it is total, and a
    match in the overall top N is in its own file's top N; the bound
-   loses nothing. `FacetTotals` are summed from the per-file counts.
-   Returns a `SearchResult`.
+   loses nothing. `FacetTotals` are summed from the per-file counts,
+   and a file skipped for size that holds the query is named in
+   `skipped_large`. Returns a `SearchResult`.
 2. **Per-language definition extraction**:
    - `find_defs_treesitter` walks the tree-sitter tree and picks
      definitions whose name field equals the query. Uses
@@ -498,7 +514,9 @@ machinery:
   keeps only what it shows, merged into a running top N under a total
   order, so totals are exact, output is the same on every run, and
   memory stays flat on a large tree (each `CallerMatch` holds its
-  file's text). A capped list says how many it left out. Each caller is annotated with its enclosing scope via
+  file's text). A capped list says how many it left out. Code files
+  over `MAX_FILE_SIZE` are not parsed; the walk lists the ones whose
+  text names a target, and callers, grok and deps name them in a note. Each caller is annotated with its enclosing scope via
   `scope::walk_to_enclosing_definition` so the user sees
   `[caller: foo]` instead of just a line number. When the walk returns
   empty, a small `target_seen_in_scope` helper in the binary does an mmap-based
@@ -655,10 +673,16 @@ file repeatedly modified will accumulate stale entries until the
 process exits. In practice the working set of active files is small
 enough that this hasn't been a concern.
 
-The 500 KB ceiling on `get_or_parse` keeps tree-sitter parses from
-blowing up memory on generated TypeScript bundles or vendored
-single-file libraries. Above the cap, `get_or_parse` returns `None` and
-callers fall back to text-based heuristics.
+The ceiling on `get_or_parse` (`tilth_core::source::MAX_FILE_SIZE`,
+500 KB) keeps tree-sitter parses from blowing up memory on generated
+TypeScript bundles or vendored single-file libraries. Above the cap,
+`get_or_parse` returns `None` and callers fall back to text-based
+heuristics. The search walkers skip files over the same limit; a
+skipped file that contains the query is named under the result
+(`> 1 file over 500 KB contains the query and was not searched: …`).
+Parsing grows linearly with size, about 0.2 ms per KB for Rust and
+Python, so a 1 MB file costs about twice what a 500 KB one does; that
+is why the limit stays where it is.
 
 ### `Session` (`session.rs`)
 

@@ -304,6 +304,7 @@ fn callers_across_two_files_name_the_calling_function_and_line() {
     let found: Vec<(String, CallerMatch)> =
         find_callers_batch(&targets, dir.path(), &bloom, None, |sites| sites)
             .unwrap()
+            .per_file
             .into_iter()
             .flatten()
             .collect();

@@ -212,7 +212,10 @@ fn read_signature_file(path: &Path, cache: &OutlineCache) -> Result<(String, u32
     // Build the signature header only on the code path — the non-code fallback
     // above returns the normal read and never uses it.
     let header = crate::format::file_header(path, meta.len(), line_count, ViewMode::Signature);
-    let entries = get_outline_entries(&content, lang);
+    // Parse without the byte-order mark, so a line-1 import is still one,
+    // but print the file's own lines: their hash anchors must match what
+    // `tilth_write` reads from disk. Removing the mark keeps line numbers.
+    let entries = get_outline_entries(tilth_core::source::strip_bom(&content), lang);
     let lines: Vec<&str> = content.lines().collect();
     let mut body = String::new();
     render_signature_entries(&entries, &lines, &mut body);
@@ -245,7 +248,8 @@ fn render_signature_entries(entries: &[OutlineEntry], lines: &[&str], out: &mut 
 // call. Wiring a structured cache is a separate change. The param is still used by
 // the non-code fallback (read_file), so it keeps its real name.
 fn read_stripped_file(path: &Path, cache: &OutlineCache) -> Result<(String, u32, u32), TilthError> {
-    let content = std::fs::read_to_string(path).map_err(|e| match e.kind() {
+    // A non-editable view, so it reads like search does: without the mark.
+    let content = tilth_core::source::read_source(path).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => TilthError::NotFound {
             path: path.to_path_buf(),
             suggestion: None,
