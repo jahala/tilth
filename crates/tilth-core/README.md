@@ -28,6 +28,7 @@ are shared with the `tilth` binary and carry no stability promise.
 | `is_external(&str, Lang) -> bool` | Whether that module lies outside the project. |
 | `resolve_related_files_with_content(&Path, &str) -> Vec<PathBuf>` | The local files a file's imports resolve to. |
 | `find_callers_batch(&HashSet<String>, &Path, &BloomFilterCache, Option<&str>, stop_after: Option<usize>, per_file) -> Result<CallerWalk<T>, TilthError>` | Call sites of a set of symbols across a directory. `per_file` reduces each file's sites to what you keep; results come in path order, with the code files skipped for size that name a target. `stop_after` ends the walk once that many sites are found, and `reached_bound` then says the counts are lower bounds. |
+| `find_callers_and_owners(targets, owner_names, &Path, &BloomFilterCache, Option<&str>, per_file) -> Result<CallerWalk<T>, TilthError>` | The same walk, which also hands `per_file` the types that define each of `owner_names`, found in the same parse. |
 | `CallerWalk`, `CallerMatch`, `BloomFilterCache` | A walk's results; one call site; the per-file pre-filter the walk shares. |
 | `analyze_deps(&Path, &Path, &BloomFilterCache) -> Result<DepsResult, TilthError>` | What a file uses and what uses it. |
 | `DepsResult`, `LocalDep`, `Dependent` | The shape of a dependency report. |

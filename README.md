@@ -73,7 +73,7 @@ tilth uses the syntax tree to tell a definition from a mention, and it lists def
 
 An expanded definition ends with a `-- calls --` footer. It lists the functions the definition calls, each with its file, line range and signature. An agent can follow a call chain from there without searching again.
 
-A qualified name such as `Engine::handleHTTPRequest` or `Context.reset` finds the definition that type holds, in search and in grok.
+A qualified name such as `Engine::handleHTTPRequest` or `Context.reset` finds the definition that type holds, in search and in grok. A qualifier that names a module or package (`gin.New`, `crate::search::symbol::search`) finds the function at the top level of that module, and `Self::new`, `self.run` or `this.handle` find the name in whichever type holds it.
 
 When a search finds more than it shows, the header says so, for example `10 of 43 matches`. The total counts every match in scope, and the same search gives the same answer every time. Add `--full` to raise the limit from 10 to 100.
 
@@ -113,7 +113,7 @@ $ tilth isTrustedProxy --callers --scope .
 -> if (i == 0) || (!engine.isTrustedProxy(ip)) {
 ```
 
-Each call site is labelled with the function it sits in, qualified by its type. When there are more than 10 call sites, the header says `10 of N call sites` and a last line counts the rest. `--full` raises the limit to 100.
+Each call site is labelled with the function it sits in, qualified by its type. A label can be passed back as the target: `--callers Engine.validateHeader` finds the calls of `validateHeader`, and says that the receiver's type is not checked. When there are more than 10 call sites, the header says `10 of N call sites` and a last line counts the rest. `--full` raises the limit to 100.
 
 In MCP mode, use `kind: "callers"` on `tilth_search`.
 
