@@ -146,6 +146,17 @@ pub fn resolve_source(
     patch: Option<&str>,
     log: Option<&str>,
 ) -> Result<DiffSource, String> {
+    // `source` and `log` name a revision or range and go to git as
+    // arguments. One that starts with `-` would be read as an option, and
+    // `--output=<path>` makes git overwrite that file.
+    for (name, value) in [("source", source), ("log", log)] {
+        if value.is_some_and(|v| v.starts_with('-')) {
+            return Err(format!(
+                "{name} must not start with '-': name a revision or range such as \
+                 HEAD~1 or main..feature"
+            ));
+        }
+    }
     if let Some(p) = patch {
         return Ok(DiffSource::Patch(PathBuf::from(p)));
     }
@@ -218,7 +229,8 @@ fn run_git_diff(source: &DiffSource, repo: Option<&Path>) -> Result<String, Stri
             cmd.arg("--staged");
         }
         DiffSource::GitRef(r) => {
-            cmd.arg(r);
+            // Whatever the caller passed is a revision, never an option.
+            cmd.arg("--end-of-options").arg(r);
         }
         DiffSource::Files(fa, fb) => {
             cmd.arg("--no-index").arg("--").arg(fa).arg(fb);
@@ -491,7 +503,12 @@ fn diff_log(
         cmd.current_dir(dir);
     }
     let output = cmd
-        .args(["log", "--format=%H %at %s%x00%an", range])
+        .args([
+            "log",
+            "--format=%H %at %s%x00%an",
+            "--end-of-options",
+            range,
+        ])
         .output()
         .map_err(|e| format!("failed to run git log: {e}"))?;
 
@@ -575,6 +592,42 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::Path;
+
+    /// Every git call that takes a caller's revision ends option parsing
+    /// before it, so a revision that reaches git without passing through
+    /// `resolve_source` still cannot act as an option. `--output=<path>` would
+    /// otherwise make git overwrite that file.
+    #[test]
+    fn git_revision_arguments_cannot_act_as_options() {
+        let repo = setup_test_repo();
+        let outside = tempfile::tempdir().expect("failed to create tempdir");
+        let victim = outside.path().join("victim.txt");
+        let injected = format!("--output={}", victim.display());
+
+        std::fs::write(&victim, "keep me\n").unwrap();
+        let _ = run_git_diff(&DiffSource::GitRef(injected.clone()), Some(repo.path()));
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "keep me\n",
+            "git diff"
+        );
+
+        std::fs::write(&victim, "keep me\n").unwrap();
+        let _ = diff_log(&injected, Some(repo.path()), None, None);
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "keep me\n",
+            "git log"
+        );
+
+        std::fs::write(&victim, "keep me\n").unwrap();
+        let _ = overlay::git_show(&injected, Some(repo.path()));
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "keep me\n",
+            "git show"
+        );
+    }
 
     /// Create a test git repo with an initial commit containing a Rust file.
     fn setup_test_repo() -> tempfile::TempDir {

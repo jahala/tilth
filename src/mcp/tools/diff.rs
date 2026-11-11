@@ -170,6 +170,35 @@ mod tests {
         );
     }
 
+    /// `source` and `log` name a revision or range. A value that starts with
+    /// `-` would reach git as an option instead: `--output=<path>` makes
+    /// `git diff` or `git log` overwrite any file the server can write, from a
+    /// tool that is meant to be read-only. Both are refused, and the target
+    /// file is untouched.
+    #[test]
+    fn tool_diff_refuses_option_shaped_source_and_log() {
+        let repo = repo_with_uncommitted_fn("marker");
+        let outside = tempfile::tempdir().expect("failed to create tempdir");
+        let victim = outside.path().join("victim.txt");
+        for key in ["source", "log"] {
+            std::fs::write(&victim, "keep me\n").unwrap();
+            let args = serde_json::json!({
+                key: format!("--output={}", victim.display()),
+                "root": repo.path().to_str().unwrap(),
+            });
+            let err = tool_diff(&args).expect_err("an option-shaped value must be refused");
+            assert!(
+                err.contains(key) && err.contains("must not start with '-'"),
+                "refusal must name the argument and the rule: {err}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&victim).unwrap(),
+                "keep me\n",
+                "{key}: git must never run with the injected option"
+            );
+        }
+    }
+
     #[test]
     fn tool_diff_missing_root_dir_refused() {
         // Fail closed: running git inside a nonexistent root would surface as
