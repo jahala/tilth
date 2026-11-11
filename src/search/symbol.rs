@@ -120,22 +120,13 @@ fn search_capped(
 ) -> Result<SearchResult, TilthError> {
     let (owner, name) = split_qualified(query);
     let wanted = Wanted { query, name, owner };
-    let matcher = word_matcher(query, query)?;
-    // A file may define `name` without spelling the qualified text, so a
-    // file skipped for size is reported when it holds the bare name.
-    let name_matcher = match owner {
-        Some(_) => Some(word_matcher(query, name)?),
-        None => None,
-    };
-    let matchers = Matchers {
-        usage: &matcher,
-        name: name_matcher.as_ref().unwrap_or(&matcher),
-    };
+    // The query's text, whose occurrences are its usages.
+    let usage = word_matcher(query, query)?;
 
     // One clock for the per-file bound and the final sort, so both rank by
     // the same scores.
     let now = SystemTime::now();
-    let walked = walk(wanted, matchers, scope, context, glob, now, keep)?;
+    let walked = walk(wanted, &usage, scope, context, glob, now, keep)?;
 
     let definitions: usize = walked.per_file.iter().map(|f| f.definitions).sum();
     let code_definitions: usize = walked
@@ -195,15 +186,6 @@ struct Walked {
     other_owners: Vec<OtherOwner>,
 }
 
-/// The two patterns a symbol search scans for: the query's text, whose
-/// occurrences are its usages, and the bare name its definitions carry. They
-/// are the same for a bare query.
-#[derive(Clone, Copy)]
-struct Matchers<'a> {
-    usage: &'a RegexMatcher,
-    name: &'a RegexMatcher,
-}
-
 /// What one file adds to a symbol search.
 enum Scan {
     Matches(FileDefs),
@@ -227,7 +209,7 @@ struct FileDefs {
 /// kept does not depend on the order files arrive in.
 fn walk(
     wanted: Wanted,
-    matchers: Matchers,
+    usage: &RegexMatcher,
     scope: &Path,
     context: Option<&Path>,
     glob: Option<&str>,
@@ -256,7 +238,7 @@ fn walk(
             }
 
             let path = entry.path();
-            let (mut file_matches, others) = match matches_in_file(path, wanted, matchers) {
+            let (mut file_matches, others) = match matches_in_file(path, wanted, usage) {
                 Scan::Matches(found) if found.matches.is_empty() && found.others.is_empty() => {
                     return ignore::WalkState::Continue
                 }
@@ -308,7 +290,7 @@ fn walk(
 /// `memchr::memmem` (SIMD), then reuses the buffer for both the tree-sitter
 /// definition pass and the word-boundary usage pass. Definitions fall back
 /// to a keyword heuristic for code without a grammar.
-fn matches_in_file(path: &Path, wanted: Wanted, matchers: Matchers) -> Scan {
+fn matches_in_file(path: &Path, wanted: Wanted, usage: &RegexMatcher) -> Scan {
     let none = || Scan::Matches(FileDefs::default());
     let query = wanted.query;
     // Skip files that look minified by filename — `.min.js`, `app-min.css`.
@@ -325,7 +307,10 @@ fn matches_in_file(path: &Path, wanted: Wanted, matchers: Matchers) -> Scan {
     let file_size = match std::fs::metadata(path) {
         Ok(meta) => {
             if meta.len() > tilth_core::source::MAX_FILE_SIZE {
-                if super::oversized_holds(path, |b| super::has_match(matchers.name, b)) {
+                // A file may define `name` without spelling the qualified
+                // text, so a file skipped for size is named when it holds
+                // the bare name.
+                if tilth_core::source::file_mentions(path, &[wanted.name]) {
                     return Scan::TooLarge;
                 }
                 return none();
@@ -369,7 +354,7 @@ fn matches_in_file(path: &Path, wanted: Wanted, matchers: Matchers) -> Scan {
     // The UTF8 sink ends this file's usage scan at its first matching line
     // that is not UTF-8, and the error is dropped here: #308.
     let _ = searcher.search_slice(
-        matchers.usage,
+        usage,
         bytes,
         UTF8(|line_num, line| {
             let line_num = line_num as u32;

@@ -856,6 +856,7 @@ dependencies = [
  "crossbeam-channel",
  "dashmap",
  "globset",
+ "grep-matcher",
  "grep-regex",
  "grep-searcher",
  "home",

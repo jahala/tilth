@@ -13,6 +13,7 @@ use crate::lang::detect_file_type_with_content;
 use crate::lang::outline::get_outline_entries;
 use crate::search::callees::{extract_callee_names, resolve_callees};
 use crate::search::callers::find_callers_batch;
+use crate::source::mentions;
 use crate::types::{is_test_file, FileType, Lang, OutlineKind};
 
 /// How many of a file's names the call-site search looks for. Each name
@@ -483,13 +484,8 @@ fn imports_one_of(
         return ImportScan::No;
     };
     if meta.len() > crate::source::MAX_FILE_SIZE {
-        let names_a_module = crate::source::read(file).is_ok_and(|bytes| {
-            targets
-                .iter()
-                .filter_map(|target| module_name(target))
-                .any(|name| mentions(&bytes, name))
-        });
-        return if names_a_module {
+        let modules: Vec<&str> = targets.iter().filter_map(|t| module_name(t)).collect();
+        return if crate::source::file_mentions(file, &modules) {
             ImportScan::TooLarge
         } else {
             ImportScan::No
@@ -649,17 +645,6 @@ fn module_name(path: &Path) -> Option<&str> {
         path.file_stem()
     };
     name?.to_str()
-}
-
-/// `content` holds `name` as a whole identifier.
-pub(crate) fn mentions(content: &[u8], name: &str) -> bool {
-    let bytes = content;
-    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
-    memchr::memmem::find_iter(bytes, name.as_bytes()).any(|at| {
-        let before = at.checked_sub(1).map(|i| bytes[i]);
-        let after = bytes.get(at + name.len()).copied();
-        !before.is_some_and(is_ident) && !after.is_some_and(is_ident)
-    })
 }
 
 /// A name a call can spell: letters, digits, `_` and `$`.

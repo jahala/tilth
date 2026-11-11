@@ -138,14 +138,23 @@ pub fn fit(outline: &str, names: Option<String>, room: u64) -> String {
     let compacted = names.is_some();
     let lines_text = names.unwrap_or_else(|| outline.to_string());
     let is_entry = |line: &str| line.trim_start().starts_with('[');
-    let total = lines_text.lines().filter(|l| is_entry(l)).count();
-    let note = |shown: usize| {
+    let lines: Vec<&str> = lines_text.lines().collect();
+    let total_entries = lines.iter().filter(|l| is_entry(l)).count();
+    // What the first `kept` lines leave out, as entries when an entry goes
+    // and as lines when only other lines (a view without `[n]` entries, a
+    // closing note) do. Nothing left out and nothing compacted: no note.
+    let note = |kept: usize, entries: usize| {
         let mut parts = Vec::new();
         if compacted {
             parts.push("signatures and docs left out".to_string());
         }
-        if shown < total {
-            parts.push(format!("{shown} of {total} entries shown"));
+        if entries < total_entries {
+            parts.push(format!("{entries} of {total_entries} entries shown"));
+        } else if kept < lines.len() {
+            parts.push(format!("{kept} of {} lines shown", lines.len()));
+        }
+        if parts.is_empty() {
+            return String::new();
         }
         format!(
             "\n\n> outline cut to fit the budget: {}. Read a range with section, \
@@ -153,7 +162,6 @@ pub fn fit(outline: &str, names: Option<String>, room: u64) -> String {
             parts.join("; ")
         )
     };
-    let lines: Vec<&str> = lines_text.lines().collect();
     // Bytes and entries of the first k lines, so each cut is measured
     // without joining: the note's count changes with the cut.
     let mut bytes = vec![0usize];
@@ -166,10 +174,10 @@ pub fn fit(outline: &str, names: Option<String>, room: u64) -> String {
     let keep = (0..=lines.len())
         .rev()
         .find(|&k| {
-            crate::types::estimate_tokens((bytes[k] + note(entries[k]).len()) as u64) <= room
+            crate::types::estimate_tokens((bytes[k] + note(k, entries[k]).len()) as u64) <= room
         })
         .unwrap_or(0);
-    format!("{}{}", lines[..keep].join("\n"), note(entries[keep]))
+    format!("{}{}", lines[..keep].join("\n"), note(keep, entries[keep]))
 }
 
 /// Append a note when the outline likely hit `max_lines` and more symbols
@@ -201,6 +209,42 @@ fn with_omission_note(outline: String, max_lines: usize) -> String {
 mod tests {
     use super::with_omission_note;
     use std::fmt::Write as _;
+
+    /// A head-and-tail view, a log or a key list has no `[n]` entries, so
+    /// the fit note said "outline cut to fit the budget: ." with nothing
+    /// after it. It counts lines for such a view.
+    #[test]
+    fn fit_note_counts_lines_when_the_view_has_no_entries() {
+        let view = (0..400).fold(String::new(), |mut s, i| {
+            let _ = writeln!(s, "log line {i} with some text in it");
+            s
+        });
+        let cut = super::fit(&view, None, 200);
+        assert!(!cut.contains("budget: ."), "{cut}");
+        let shown = cut.lines().filter(|l| l.starts_with("log line")).count();
+        assert!(
+            cut.contains(&format!("{shown} of 400 lines shown")),
+            "{}",
+            &cut[cut.len().saturating_sub(200)..]
+        );
+    }
+
+    /// When the cut dropped only lines that are not entries, such as the
+    /// closing "outline truncated" note of a capped outline, every entry
+    /// stayed and the note still said "outline cut to fit the budget: ."
+    /// with nothing after it.
+    #[test]
+    fn fit_note_names_cut_lines_when_every_entry_stays() {
+        let mut view = (0..20).fold(String::new(), |mut s, i| {
+            let _ = writeln!(s, "[{i}] fn f{i}()");
+            s
+        });
+        view.push_str(&"> a closing note that is not an entry. ".repeat(20));
+        let cut = super::fit(&view, None, 120);
+        assert!(!cut.contains("budget: ."), "{cut}");
+        assert!(cut.contains("[19] fn f19()"), "{cut}");
+        assert!(cut.contains("20 of 21 lines shown"), "{cut}");
+    }
 
     #[test]
     fn note_appended_when_at_cap() {

@@ -140,10 +140,12 @@ where
     let reached = |n: usize| stop_after.is_some_and(|bound| n >= bound);
 
     let walker = super::walk::walker(scope, glob)?;
+    let words: Vec<&str> = targets.iter().map(String::as_str).collect();
 
     walker.run(|| {
         let found = &found;
         let skipped_large = &skipped_large;
+        let words = &words;
         let sites_found = &sites_found;
         let per_file = &per_file;
 
@@ -162,7 +164,7 @@ where
 
             let path = entry.path();
 
-            if oversized_code_holding(path, targets) {
+            if oversized_code_holding(path, words) {
                 skipped_large
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -275,8 +277,10 @@ fn owners_in_tree(
 }
 
 /// Is `path` a code file the walk would parse, over the size cap, whose text
-/// names one of `targets` as a whole word? `renew` is no call of `new`.
-fn oversized_code_holding(path: &Path, targets: &HashSet<String>) -> bool {
+/// mentions one of `words` as a whole identifier? `renew` is no call of
+/// `new`. The check streams the file, so any size costs a few chunks.
+#[must_use]
+pub fn oversized_code_holding(path: &Path, words: &[&str]) -> bool {
     let too_big = std::fs::metadata(path).is_ok_and(|m| m.len() > crate::source::MAX_FILE_SIZE);
     if !too_big {
         return false;
@@ -284,11 +288,7 @@ fn oversized_code_holding(path: &Path, targets: &HashSet<String>) -> bool {
     let FileType::Code(lang) = detect_file_type(path) else {
         return false;
     };
-    if outline_language(lang).is_none() {
-        return false;
-    }
-    crate::source::read(path)
-        .is_ok_and(|bytes| targets.iter().any(|t| super::deps::mentions(&bytes, t)))
+    outline_language(lang).is_some() && crate::source::file_mentions(path, words)
 }
 
 /// Tree-sitter call site detection for a set of target symbols, from one
