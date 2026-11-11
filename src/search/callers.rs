@@ -145,8 +145,10 @@ pub fn search_callers_expanded(
     let (mut by_target, skipped_large) =
         collect_sites(&single, scope, bloom, glob, context, max_matches)?;
     let sites = by_target.remove(name).unwrap_or_default();
-    let held: &[&str] = if name == target { &[] } else { &[name] };
-    let skipped_note = crate::search::skipped_files_note(&skipped_large, scope, held);
+    let held = crate::search::names_phrase([name]);
+    let skipped_note = crate::search::skipped_files_note(&skipped_large, &held, scope)
+        .map(|sentence| format!("\n\n> {sentence}"))
+        .unwrap_or_default();
 
     if sites.total == 0 {
         let target_seen = target_seen_in_scope(name, scope, glob);
@@ -546,10 +548,9 @@ pub fn search_callers_multi_expanded(
         output.push('\n');
     }
 
-    let skipped_note = crate::search::skipped_files_note(&skipped_large, scope, &names);
-    if !skipped_note.is_empty() {
-        output.push_str(skipped_note.trim_start_matches('\n'));
-        output.push('\n');
+    let held = crate::search::names_phrase(names.iter().copied());
+    if let Some(sentence) = crate::search::skipped_files_note(&skipped_large, &held, scope) {
+        let _ = writeln!(output, "> {sentence}");
     }
 
     let tokens = crate::types::estimate_tokens(output.len() as u64);

@@ -100,7 +100,8 @@ fn resolve_by_name(name: &str, scope: &Path) -> Result<(ResolvedTarget, String, 
             suggestion,
         });
     };
-    let other_def_count = result.definitions.saturating_sub(1);
+    // A doc heading that names the symbol is no rival definition.
+    let other_def_count = result.code_definitions.saturating_sub(1);
     let (start, _end) = top.def_range.ok_or_else(|| TilthError::ParseError {
         path: top.path.clone(),
         reason: format!("definition match for `{name}` had no def_range"),
@@ -911,10 +912,9 @@ pub fn format_grok(result: &GrokResult, scope: &Path) -> String {
     }
 
     // The walk looked for the target's bare name, whatever qualified it.
-    let skipped_note =
-        crate::search::skipped_files_note(&result.skipped_large, scope, &[&result.target.name]);
-    if !skipped_note.is_empty() {
-        let _ = writeln!(out, "{skipped_note}");
+    let held = crate::search::names_phrase([result.target.name.as_str()]);
+    if let Some(sentence) = crate::search::skipped_files_note(&result.skipped_large, &held, scope) {
+        let _ = writeln!(out, "\n\n> {sentence}");
     }
 
     out
@@ -1462,6 +1462,38 @@ mod tests {
         let mut f = fs::File::create(&path).unwrap();
         f.write_all(body.as_bytes()).unwrap();
         path
+    }
+
+    /// A Markdown heading that names the symbol counts as a definition in
+    /// search, but it is no rival for grok to pick: only code definitions
+    /// make the target ambiguous.
+    #[test]
+    fn doc_headings_do_not_make_a_target_ambiguous() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(
+            tmp.path(),
+            "lib.rs",
+            "pub fn render_page() -> u32 {\n    1\n}\n",
+        );
+        write_fixture(
+            tmp.path(),
+            "README.md",
+            "# Docs\n\n## render_page\n\nText.\n",
+        );
+        write_fixture(
+            tmp.path(),
+            "GUIDE.md",
+            "# More\n\n## render_page\n\nMore.\n",
+        );
+        let target = grok_target(tmp.path(), "render_page").unwrap();
+        assert_eq!(target.other_def_count, 0);
+        write_fixture(
+            tmp.path(),
+            "other.rs",
+            "pub fn render_page() -> u32 {\n    2\n}\n",
+        );
+        let target = grok_target(tmp.path(), "render_page").unwrap();
+        assert_eq!(target.other_def_count, 1);
     }
 
     #[test]

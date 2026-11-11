@@ -661,8 +661,11 @@ fn first_identifier_text(node: tree_sitter::Node, lines: &[&str]) -> Option<Stri
 /// The doc comment above `node`: the comment right before it, and the
 /// comments directly above that one, line after line. Line comments (`//`,
 /// `///`, `#`) are one node per line, so a doc written in them is several
-/// comments; reading only the nearest kept a doc's last line alone. A
-/// blank line, or a comment that trails code, ends the doc.
+/// comments; reading only the nearest kept a doc's last line alone. Each
+/// comment starts its own line, so one that trails the statement before
+/// `node` is no doc. The comments above the nearest touch the one below
+/// them: a blank line ends the doc. The nearest may sit a blank line above
+/// `node`, as a `/** */` block often does in JavaScript.
 fn extract_doc(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
     let is_comment = |n: tree_sitter::Node| {
         let kind = n.kind();
@@ -675,20 +678,24 @@ fn extract_doc(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
             .and_then(|line| line.get(..start.column))
             .is_some_and(|before| before.trim().is_empty())
     };
-    let nearest = node.prev_sibling().filter(|p| is_comment(*p))?;
-    let mut block = vec![nearest];
-    let mut top = nearest;
-    while let Some(above) = top.prev_sibling() {
-        // A Rust line comment ends after its newline, at column 0 of the
-        // next line.
+    // `above` ends on the line before `below` starts. A Rust line comment
+    // ends after its newline, at column 0 of the next line.
+    let touches = |above: tree_sitter::Node, below: tree_sitter::Node| {
         let end = above.end_position();
         let last_row = if end.column == 0 && end.row > above.start_position().row {
             end.row - 1
         } else {
             end.row
         };
-        let adjacent = last_row + 1 == top.start_position().row;
-        if !(is_comment(above) && adjacent && starts_its_line(above) && starts_its_line(top)) {
+        last_row + 1 == below.start_position().row
+    };
+    let nearest = node
+        .prev_sibling()
+        .filter(|p| is_comment(*p) && starts_its_line(*p))?;
+    let mut block = vec![nearest];
+    let mut top = nearest;
+    while let Some(above) = top.prev_sibling() {
+        if !(is_comment(above) && touches(above, top) && starts_its_line(above)) {
             break;
         }
         block.push(above);
@@ -1790,6 +1797,32 @@ mod doc_comment_tests {
         let entries = get_outline_entries(grouped, Lang::Go);
         let b = entries.iter().find(|e| e.name == "B").expect("B");
         assert_eq!(b.doc.as_deref(), Some("B is documented."));
+    }
+
+    /// A comment that trails the statement before a definition documents
+    /// that statement. A comment on its own lines a blank line above stays
+    /// the doc, the way a `/** */` block above a function often sits.
+    #[test]
+    fn a_comment_trailing_code_is_no_doc() {
+        let entries = get_outline_entries(
+            "TIMEOUT = 3  # seconds\ndef fetch():\n    return TIMEOUT\n",
+            Lang::Python,
+        );
+        assert_eq!(
+            entries.iter().find(|e| e.name == "fetch").unwrap().doc,
+            None
+        );
+        assert_eq!(
+            first_doc("int x = 1; /* x */\nint f(void) { return 0; }\n", Lang::C),
+            None
+        );
+        assert_eq!(
+            first_doc(
+                "/**\n * Create an app.\n */\n\nfunction createApp() {}\n",
+                Lang::JavaScript
+            ),
+            Some("Create an app.".to_string())
+        );
     }
 }
 

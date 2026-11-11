@@ -138,6 +138,12 @@ fn search_capped(
     let walked = walk(wanted, matchers, scope, context, glob, now, keep)?;
 
     let definitions: usize = walked.per_file.iter().map(|f| f.definitions).sum();
+    let code_definitions: usize = walked
+        .per_file
+        .iter()
+        .filter(|f| f.in_code)
+        .map(|f| f.definitions)
+        .sum();
     let total: usize = walked.per_file.iter().map(|f| f.total).sum();
     let mut merged = walked.kept;
     let mut skipped_large = walked.skipped_large;
@@ -161,9 +167,11 @@ fn search_capped(
         matches: merged,
         total_found: total,
         definitions,
+        code_definitions,
         usages: total - definitions,
         facet_totals,
         skipped_large,
+        skipped_for: name.to_string(),
         other_owners,
     })
 }
@@ -172,6 +180,8 @@ fn search_capped(
 struct FileCount {
     total: usize,
     definitions: usize,
+    /// The file is code, so its definitions are not doc headings.
+    in_code: bool,
     facets: super::facets::FileFacets,
 }
 
@@ -264,6 +274,10 @@ fn walk(
             let count = FileCount {
                 total: file_matches.len(),
                 definitions: file_matches.iter().filter(|m| m.is_definition).count(),
+                in_code: matches!(
+                    tilth_core::lang::detect_file_type(path),
+                    tilth_core::types::FileType::Code(_)
+                ),
                 facets: super::facets::count_file(path, &file_matches),
             };
             display_order(&mut file_matches, wanted.name, scope, context, now);
