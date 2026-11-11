@@ -9,7 +9,7 @@ use std::path::Path;
 use crate::cache::OutlineCache;
 use crate::lang::elixir::{extract_elixir_definition_name, is_elixir_definition};
 use crate::lang::treesitter::{
-    extract_definition_name, is_local_binding, node_text_simple, NodeTextMode, DEFINITION_KINDS,
+    binds_in_function, extract_definition_name, node_text_simple, NodeTextMode, DEFINITION_KINDS,
     TYPE_KINDS,
 };
 use crate::types::Lang;
@@ -29,8 +29,8 @@ pub struct EnclosingScope {
 /// type that owns it (see [`definition_owner`]). Returns the AST node so the
 /// caller can read its kind, plus the rendered name and line range.
 ///
-/// A variable local to a function is not a definition (see
-/// [`is_local_binding`]), so a node in its initializer belongs to the
+/// A variable declared in a function is not a definition here (see
+/// [`binds_in_function`]), so a node in its initializer belongs to the
 /// function: `const result = target()` inside `outer` is in `outer`. A
 /// JavaScript function value is a definition when it has a name of its own
 /// or is bound to one (see [`function_value_name`]); an anonymous callback is
@@ -71,7 +71,7 @@ pub(super) fn definition_name(
         && FUNCTION_VALUE_KINDS.contains(&node.kind())
     {
         function_value_name(node, lines)
-    } else if DEFINITION_KINDS.contains(&node.kind()) && !is_local_binding(node, lines) {
+    } else if DEFINITION_KINDS.contains(&node.kind()) && !binds_in_function(node) {
         extract_definition_name(node, lines)
     } else if lang == Lang::Elixir && is_elixir_definition(node, lines) {
         extract_elixir_definition_name(node, lines)

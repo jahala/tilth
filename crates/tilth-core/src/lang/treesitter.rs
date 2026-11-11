@@ -234,17 +234,25 @@ const BINDING_KINDS: &[&str] = &[
 ];
 
 /// Whether definition `node` binds a variable local to a function: a binding
-/// kind whose nearest enclosing function or type is a function.
-///
-/// A Bash assignment is local only when `local`, `declare` or `typeset`
-/// declares it in a function (and `declare -g` makes it global): a plain
-/// `VAR=1` in a function sets a global.
+/// declared in a function (see [`binds_in_function`]) that the language
+/// scopes to it. A Bash assignment is local only when `local`, `declare` or
+/// `typeset` declares it (`declare -g` makes it global): a plain `VAR=1` in
+/// a function sets a global.
 #[must_use]
 pub fn is_local_binding(node: tree_sitter::Node, lines: &[&str]) -> bool {
-    if !BINDING_KINDS.contains(&node.kind()) {
+    if node.kind() == "variable_assignment" && !is_bash_local_declaration(node.parent(), lines) {
         return false;
     }
-    if node.kind() == "variable_assignment" && !is_bash_local_declaration(node.parent(), lines) {
+    binds_in_function(node)
+}
+
+/// Whether definition `node` is a binding kind whose nearest enclosing
+/// function or type is a function. Code in its initializer runs when the
+/// function runs, so a caller label names the function, whether or not the
+/// binding outlives it.
+#[must_use]
+pub fn binds_in_function(node: tree_sitter::Node) -> bool {
+    if !BINDING_KINDS.contains(&node.kind()) {
         return false;
     }
     let mut parent = node.parent();
