@@ -151,13 +151,11 @@ pub(crate) fn sorted(list: std::sync::Mutex<Vec<PathBuf>>) -> Vec<PathBuf> {
 }
 
 /// The notes under a result: where else a qualified name is defined, and
-/// the files the walk skipped for size although they hold the query, or a
-/// qualified query's bare name. Empty when there is nothing to say.
+/// the files the walk skipped for size although they hold what it looked
+/// for. Empty when there is nothing to say.
 fn skipped_large_note(result: &SearchResult) -> String {
     let mut note = other_owners_note(result);
-    // A qualified query's big files are those that hold its bare name,
-    // which a definition of it carries.
-    let held = names_phrase([tilth_core::search::scope::split_qualified(&result.query).1]);
+    let held = names_phrase([result.skipped_for.as_str()]);
     if let Some(skipped) = skipped_files_note(&result.skipped_large, &held, &result.scope) {
         note.push_str("\n\n> ");
         note.push_str(&skipped);

@@ -172,6 +172,7 @@ fn search_capped(
         usages: total - definitions,
         facet_totals,
         skipped_large,
+        skipped_for: name.to_string(),
         other_owners,
     })
 }

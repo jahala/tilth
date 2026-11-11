@@ -197,6 +197,7 @@ fn search_capped(
         usages: total,
         facet_totals: FacetTotals::default(),
         skipped_large: super::sorted(skipped_large),
+        skipped_for: pattern.to_string(),
         other_owners: Vec::new(),
     })
 }
