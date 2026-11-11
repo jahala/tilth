@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
+use crate::format::fmt_tokens;
 use crate::read::outline;
 use crate::types::estimate_tokens;
 use tilth_core::cache::OutlineCache;
@@ -114,27 +115,6 @@ fn compute_dir_totals(tree: &BTreeMap<PathBuf, Vec<FileEntry>>) -> BTreeMap<Path
         }
     }
     totals
-}
-
-/// Compact human token count for directory rollups.
-/// Uses the same scale as `tilth_list` output (`12.3k`, `1.2M`).
-///
-/// The k→M switchover triggers at `999_950` rather than `1_000_000` so values
-/// that would round to `"1000.0k"` under `{:.1}` formatting roll cleanly into
-/// the M tier (`"1.0M"`) instead of producing four-digit k labels.
-fn fmt_tokens(n: u64) -> String {
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "by design: display only, rounded to one decimal"
-    )]
-    let f = n as f64;
-    if f >= 999_950.0 {
-        format!("{:.1}M", f / 1_000_000.0)
-    } else if n >= 1_000 {
-        format!("{:.1}k", f / 1_000.0)
-    } else {
-        n.to_string()
-    }
 }
 
 struct FileEntry {
@@ -296,29 +276,6 @@ mod tests {
         tree.insert(PathBuf::from("empty"), vec![]);
         let totals = compute_dir_totals(&tree);
         assert_eq!(totals.get(&PathBuf::from("empty")).copied(), Some(0));
-    }
-
-    #[test]
-    fn fmt_tokens_thresholds() {
-        assert_eq!(fmt_tokens(0), "0");
-        assert_eq!(fmt_tokens(999), "999");
-        assert_eq!(fmt_tokens(1_000), "1.0k");
-        assert_eq!(fmt_tokens(12_345), "12.3k");
-        assert_eq!(fmt_tokens(1_000_000), "1.0M");
-        assert_eq!(fmt_tokens(2_500_000), "2.5M");
-    }
-
-    /// Boundary: values that would round to "1000.0k" under `{:.1}`
-    /// formatting must roll over to the M tier instead of producing a
-    /// four-digit k label.
-    #[test]
-    fn fmt_tokens_rolls_over_at_999_950() {
-        // Just below the rollover boundary — still formats as k.
-        assert_eq!(fmt_tokens(999_949), "999.9k");
-        // At and above the boundary — formats as M, not "1000.0k".
-        assert_eq!(fmt_tokens(999_950), "1.0M");
-        assert_eq!(fmt_tokens(999_999), "1.0M");
-        assert_eq!(fmt_tokens(1_499_999), "1.5M");
     }
 
     #[test]

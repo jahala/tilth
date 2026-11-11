@@ -3,6 +3,7 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+use crate::format::fmt_tokens;
 use crate::types::estimate_tokens;
 
 #[derive(Debug, Default)]
@@ -29,28 +30,12 @@ impl DirNode {
     }
 }
 
-/// Compact human token count, matching `map.rs::fmt_tokens`'s k/M scale and rounding.
-fn fmt_tokens(t: u64) -> String {
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "by design: display only, rounded to one decimal"
-    )]
-    let f = t as f64;
-    if f >= 999_950.0 {
-        format!("~{:.1}M tokens", f / 1_000_000.0)
-    } else if t >= 1000 {
-        format!("~{:.1}k tokens", f / 1_000.0)
-    } else {
-        format!("~{t} tokens")
-    }
-}
-
 fn render_dir(name: &str, node: &DirNode, prefix: &str, out: &mut String, is_root: bool) {
     let total_tokens = estimate_tokens(node.total_bytes);
     if is_root {
         let _ = writeln!(
             out,
-            "{name}/      {tok}   {n} files",
+            "{name}/      ~{tok} tokens   {n} files",
             tok = fmt_tokens(total_tokens),
             n = node.file_count
         );
@@ -74,7 +59,7 @@ fn render_dir(name: &str, node: &DirNode, prefix: &str, out: &mut String, is_roo
         if let Some(child) = child {
             let _ = writeln!(
                 out,
-                "{prefix}{connector}{name}/      {tok}   {fc} files",
+                "{prefix}{connector}{name}/      ~{tok} tokens   {fc} files",
                 tok = fmt_tokens(estimate_tokens(*bytes)),
                 fc = child.file_count
             );
@@ -83,7 +68,7 @@ fn render_dir(name: &str, node: &DirNode, prefix: &str, out: &mut String, is_roo
         } else {
             let _ = writeln!(
                 out,
-                "{prefix}{connector}{name}      {tok}",
+                "{prefix}{connector}{name}      ~{tok} tokens",
                 tok = fmt_tokens(estimate_tokens(*bytes))
             );
         }
@@ -135,7 +120,7 @@ mod tests {
         let out = render_tree(&scope, &files);
         let expected = fmt_tokens(estimate_tokens(4000) + estimate_tokens(8000));
         assert!(
-            out.contains(&format!("src/      {expected}")),
+            out.contains(&format!("src/      ~{expected} tokens")),
             "dir rollup should equal sum of child tokens: {out}"
         );
     }
