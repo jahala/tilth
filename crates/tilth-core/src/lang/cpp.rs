@@ -44,7 +44,8 @@ pub(crate) const SPEC: LangSpec = LangSpec {
 #[derive(Clone, Copy, PartialEq)]
 enum Token<'a> {
     Ident(&'a str),
-    Str(&'a str),
+    /// A string literal, so its words are not read as code.
+    Str,
     Punct(u8),
 }
 
@@ -73,14 +74,12 @@ fn tokens(src: &str) -> Vec<(Token<'_>, bool)> {
             }
             i += 2;
         } else if b == b'"' || b == b'\'' {
-            let start = i + 1;
             i += 1;
             while i < bytes.len() && bytes[i] != b && bytes[i] != b'\n' {
                 i += if bytes[i] == b'\\' { 2 } else { 1 };
             }
-            let end = i.min(bytes.len());
             if b == b'"' {
-                out.push((Token::Str(&src[start..end]), line_start));
+                out.push((Token::Str, line_start));
             }
             line_start = false;
             i += 1;
@@ -103,15 +102,24 @@ fn tokens(src: &str) -> Vec<(Token<'_>, bool)> {
 }
 
 /// Whether C/C++ source holds syntax only C++ has: a class with a body or a
-/// base list, a namespace, a template, an access specifier, a `::` scope, or
-/// an `extern "C"` block (C++ syntax that C headers guard for C++
-/// includers). C++ keywords used as C identifiers (`struct list *new`) and
-/// words in comments or strings do not count.
+/// base list, a namespace, a template, an access specifier, or a `::` scope
+/// outside a C23 attribute list (`[[gnu::cold, gnu::unused]]`). C++ keywords
+/// used as C identifiers (`struct list *new`) and words in comments or
+/// strings do not count. Neither does `extern "C" { ... }`: a portable C
+/// header wraps itself in one for C++ includers, and the code inside is C.
 pub(crate) fn has_cpp_syntax(src: &str) -> bool {
-    use Token::{Ident, Punct, Str};
+    use Token::{Ident, Punct};
     let toks = tokens(src);
     let at = |i: usize| toks.get(i).map(|t| t.0);
+    // How deep the walk is inside `[[ ... ]]`, by bracket.
+    let mut attribute_depth = 0usize;
     for (i, &(tok, line_start)) in toks.iter().enumerate() {
+        match tok {
+            Punct(b'[') if attribute_depth > 0 => attribute_depth += 1,
+            Punct(b'[') if at(i + 1) == Some(Punct(b'[')) => attribute_depth = 1,
+            Punct(b']') if attribute_depth > 0 => attribute_depth -= 1,
+            _ => {}
+        }
         let Ident(word) = tok else { continue };
         let cpp = match word {
             "class" => {
@@ -132,15 +140,12 @@ pub(crate) fn has_cpp_syntax(src: &str) -> bool {
             "public" | "private" | "protected" => {
                 line_start && at(i + 1) == Some(Punct(b':')) && at(i + 2) != Some(Punct(b':'))
             }
-            "extern" => {
-                matches!(at(i + 1), Some(Str("C" | "C++"))) && at(i + 2) == Some(Punct(b'{'))
-            }
             // `a::b`, but not a C23 attribute `[[gnu::unused]]`.
             _ => {
-                at(i + 1) == Some(Punct(b':'))
+                attribute_depth == 0
+                    && at(i + 1) == Some(Punct(b':'))
                     && at(i + 2) == Some(Punct(b':'))
                     && matches!(at(i + 3), Some(Ident(_) | Punct(b'~')))
-                    && !(i >= 2 && at(i - 1) == Some(Punct(b'[')) && at(i - 2) == Some(Punct(b'[')))
             }
         };
         if cpp {

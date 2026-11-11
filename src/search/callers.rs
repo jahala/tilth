@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use tilth_core::index::bloom::BloomFilterCache;
-use tilth_core::search::callers::{find_callers_batch, CallerMatch};
+use tilth_core::search::callers::{find_callers_and_owners, find_callers_batch, CallerMatch};
 use tilth_core::TilthError;
 
 const MAX_MATCHES: usize = 10;
@@ -134,14 +134,16 @@ pub fn search_callers_expanded(
     full: bool,
 ) -> Result<String, TilthError> {
     let max_matches = if full { FULL_MAX_MATCHES } else { MAX_MATCHES };
-    let single: HashSet<String> = std::iter::once(target.to_string()).collect();
+    let name = called_name(target);
+    let single: HashSet<String> = std::iter::once(name.to_string()).collect();
     let (mut by_target, skipped_large) =
         collect_sites(&single, scope, bloom, glob, context, max_matches)?;
-    let sites = by_target.remove(target).unwrap_or_default();
-    let skipped_note = crate::search::skipped_files_note(&skipped_large, scope);
+    let sites = by_target.remove(name).unwrap_or_default();
+    let held: &[&str] = if name == target { &[] } else { &[name] };
+    let skipped_note = crate::search::skipped_files_note(&skipped_large, scope, held);
 
     if sites.total == 0 {
-        let target_seen = target_seen_in_scope(target, scope, glob);
+        let target_seen = target_seen_in_scope(name, scope, glob);
         let mut message = no_callers_message(target, scope, target_seen, glob);
         message.push_str(&skipped_note);
         return Ok(message);
@@ -167,6 +169,13 @@ pub fn search_callers_expanded(
         crate::search::format_token_count(tokens)
     );
     Ok(output)
+}
+
+/// The name a call site of `target` is written with. A caller label names
+/// its owner (`Engine.handle`), but a call names the method alone
+/// (`e.handle()`), so a qualified target is looked up by its name.
+fn called_name(target: &str) -> &str {
+    tilth_core::search::scope::split_qualified(target).1
 }
 
 /// Render one target's caller bucket in the canonical shape shared by both
@@ -197,6 +206,13 @@ fn write_caller_bucket(
         total,
         if total == 1 { "" } else { "s" }
     );
+    let name = called_name(target);
+    if name != target {
+        let _ = writeln!(
+            output,
+            "> Calls are matched by the name `{name}`; the receiver's type is not checked."
+        );
+    }
 
     for (i, caller) in sorted_callers.iter().enumerate() {
         // Header: file:line [caller: calling_function]
@@ -251,17 +267,28 @@ fn write_caller_bucket(
     }
 }
 
-/// What the second-hop walk keeps.
-#[derive(Default)]
-struct Hop2 {
-    /// Distinct calling functions per file, summed over files.
-    unique_total: usize,
-    /// The first `IMPACT_MAX_RESULTS` sites, one per function per file, as
-    /// (name called, site).
-    listed: Vec<(String, CallerMatch)>,
-    /// Call sites of each method name several types define, which no
-    /// function is listed for.
-    unattributed: HashMap<String, usize>,
+/// One file's part of the second hop. Which method names several types
+/// define is known only once the walk ends, so a file keeps what either
+/// answer needs: the first call of each name by each function, and its
+/// call sites per name.
+struct Hop2File {
+    path: PathBuf,
+    /// (name called, calling function, line) for the first call of each
+    /// name by each function, in line order.
+    firsts: Vec<(String, String, u32)>,
+    /// Call sites of each name.
+    sites: HashMap<String, usize>,
+    /// (name, owner) for each owned definition of a method name.
+    owners: Vec<(String, String)>,
+}
+
+/// A function the second hop lists: where it first calls a name, and the
+/// name.
+struct Hop2Site {
+    via: String,
+    function: String,
+    path: PathBuf,
+    line: u32,
 }
 
 /// Adaptive 2nd-hop impact analysis, shared by single- and multi-target
@@ -290,22 +317,12 @@ fn write_second_hop_impact(
         .map(|c| (c.path.clone(), c.line))
         .collect();
 
-    // Per file: each calling function once, at its first call by line. The
-    // listing below is the first `IMPACT_MAX_RESULTS` of those by depth, path
-    // and line, a total order, so each file's are merged into a running first
-    // `IMPACT_MAX_RESULTS` as it arrives. The count of distinct functions is
-    // kept in full for the "... and N more" line and the affected total.
-    let hop2_order = |a: &(String, CallerMatch), b: &(String, CallerMatch)| {
-        let (a, b) = (&a.1, &b.1);
-        path_depth(&a.path, scope)
-            .cmp(&path_depth(&b.path, scope))
-            .then_with(|| a.path.cmp(&b.path))
-            .then_with(|| a.line.cmp(&b.line))
-    };
     // A label names its owner (`Service.run`); a call site names the method
     // alone (`s.run()`), so the second hop looks for the bare names. A site
     // of a method name that several types define could reach any of them,
-    // so those sites are counted apart instead of listed as affected.
+    // so those sites are counted apart instead of listed as affected. The
+    // walk that finds the sites also finds the types that define each
+    // method name, from the same parse.
     let mut hop2_targets: HashSet<String> = HashSet::new();
     let mut method_names: HashSet<String> = HashSet::new();
     for label in all_caller_names {
@@ -315,67 +332,102 @@ fn write_second_hop_impact(
             method_names.insert(name.to_string());
         }
     }
-    let Ok(owners) =
-        tilth_core::search::callers::definition_owners(&method_names, scope, bloom, glob)
-    else {
+
+    let walked = find_callers_and_owners(
+        &hop2_targets,
+        &method_names,
+        scope,
+        bloom,
+        glob,
+        |sites, owners| {
+            let mut file = Hop2File {
+                path: sites
+                    .first()
+                    .map(|(_, m)| m.path.clone())
+                    .unwrap_or_default(),
+                firsts: Vec::new(),
+                sites: HashMap::new(),
+                owners,
+            };
+            let mut seen: HashSet<(String, String)> = HashSet::new();
+            for (via, m) in sites {
+                if hop1_locations.contains(&(m.path.clone(), m.line)) {
+                    continue;
+                }
+                *file.sites.entry(via.clone()).or_default() += 1;
+                if seen.insert((via.clone(), m.calling_function.clone())) {
+                    file.firsts.push((via, m.calling_function, m.line));
+                }
+            }
+            file
+        },
+    );
+    let Ok(walked) = walked else {
         return;
     };
-    let ambiguous: HashMap<String, usize> = owners
+
+    let mut types: HashMap<&str, HashSet<&str>> = HashMap::new();
+    for (name, owner) in walked.per_file.iter().flat_map(|f| &f.owners) {
+        types.entry(name).or_default().insert(owner);
+    }
+    let ambiguous: HashMap<&str, usize> = types
         .into_iter()
         .filter(|(_, types)| types.len() > 1)
         .map(|(name, types)| (name, types.len()))
         .collect();
 
-    let first: Mutex<Hop2> = Mutex::new(Hop2::default());
-    let walked = find_callers_batch(&hop2_targets, scope, bloom, glob, None, |sites| {
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut file_first: Vec<(String, CallerMatch)> = Vec::new();
-        let mut file_unattributed: HashMap<String, usize> = HashMap::new();
-        for (via, m) in sites {
-            if hop1_locations.contains(&(m.path.clone(), m.line)) {
-                continue;
-            }
-            if ambiguous.contains_key(&via) {
-                *file_unattributed.entry(via).or_default() += 1;
-                continue;
-            }
-            if seen.insert(m.calling_function.clone()) && file_first.len() < IMPACT_MAX_RESULTS {
-                file_first.push((via, m));
+    // Per file: each calling function once, at its first call by line of a
+    // name not ambiguous. The listing is the first `IMPACT_MAX_RESULTS` of
+    // those by depth, path and line; the count of distinct functions is kept
+    // in full for the "... and N more" line and the affected total.
+    let mut unique_total = 0;
+    let mut listed: Vec<Hop2Site> = Vec::new();
+    let mut unattributed: HashMap<&str, usize> = HashMap::new();
+    let mut by_method_name = false;
+    for file in &walked.per_file {
+        for (via, &n) in &file.sites {
+            if ambiguous.contains_key(via.as_str()) {
+                *unattributed.entry(via).or_default() += n;
+            } else {
+                by_method_name |= method_names.contains(via);
             }
         }
-        let mut first = first
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        first.unique_total += seen.len();
-        first.listed.extend(file_first);
-        first.listed.sort_by(hop2_order);
-        first.listed.truncate(IMPACT_MAX_RESULTS);
-        for (via, n) in file_unattributed {
-            *first.unattributed.entry(via).or_default() += n;
+        let mut functions: HashSet<&str> = HashSet::new();
+        for (via, function, line) in &file.firsts {
+            if !ambiguous.contains_key(via.as_str()) && functions.insert(function) {
+                listed.push(Hop2Site {
+                    via: via.clone(),
+                    function: function.clone(),
+                    path: file.path.clone(),
+                    line: *line,
+                });
+            }
         }
-    });
-    if walked.is_err() {
-        return;
+        unique_total += functions.len();
     }
-    let Hop2 {
-        unique_total,
-        listed: hop2,
-        unattributed,
-    } = first
-        .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    listed.sort_by(|a, b| {
+        path_depth(&a.path, scope)
+            .cmp(&path_depth(&b.path, scope))
+            .then_with(|| a.path.cmp(&b.path))
+            .then_with(|| a.line.cmp(&b.line))
+    });
+    listed.truncate(IMPACT_MAX_RESULTS);
     if unique_total == 0 && unattributed.is_empty() {
         return;
     }
 
     output.push_str("\n-- impact (2nd hop) --\n");
 
-    for (via, m) in &hop2 {
-        let rel_path = m.path.strip_prefix(scope).unwrap_or(&m.path).display();
+    for site in &listed {
+        let rel_path = site
+            .path
+            .strip_prefix(scope)
+            .unwrap_or(&site.path)
+            .display();
         let _ = writeln!(
             output,
             "  {:<20} {}:{}  -> {}",
-            m.calling_function, rel_path, m.line, via
+            site.function, rel_path, site.line, site.via
         );
     }
 
@@ -387,11 +439,11 @@ fn write_second_hop_impact(
         );
     }
 
-    let mut unattributed: Vec<(&String, usize, usize)> = ambiguous
-        .iter()
-        .filter_map(|(name, types)| Some((name, unattributed.get(name).copied()?, *types)))
+    let mut unattributed: Vec<(&str, usize, usize)> = unattributed
+        .into_iter()
+        .map(|(name, sites)| (name, sites, ambiguous[name]))
         .collect();
-    unattributed.sort();
+    unattributed.sort_unstable();
     for (name, sites, types) in unattributed {
         let _ = writeln!(
             output,
@@ -407,8 +459,13 @@ fn write_second_hop_impact(
     // still exist beyond the cap).
     let _ = writeln!(
         output,
-        "\n{} functions affected across 2 hops.",
-        all_caller_names.len() + unique_total
+        "\n{} functions affected across 2 hops{}.",
+        all_caller_names.len() + unique_total,
+        if by_method_name {
+            " (method calls matched by name)"
+        } else {
+            ""
+        }
     );
 }
 
@@ -444,17 +501,28 @@ pub fn search_callers_multi_expanded(
         .filter(|t| seen.insert(*t))
         .collect();
 
-    let target_set: HashSet<String> = ordered.iter().map(ToString::to_string).collect();
-    let (mut by_target, skipped_large) =
+    // The bare names the walk looks for, in target order, each once.
+    let mut names: Vec<&str> = Vec::new();
+    for target in &ordered {
+        let name = called_name(target);
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    let target_set: HashSet<String> = names.iter().map(|n| (*n).to_string()).collect();
+    let (by_target, skipped_large) =
         collect_sites(&target_set, scope, bloom, glob, context, max_matches)?;
 
     // Render in the caller-supplied target order so output is deterministic.
+    // Two targets can share a name (`A.run,B.run`), so each reads its sites.
+    let none = TargetSites::default();
     let mut output = String::new();
     for target in &ordered {
-        let sites = by_target.remove(*target).unwrap_or_default();
+        let name = called_name(target);
+        let sites = by_target.get(name).unwrap_or(&none);
 
         if sites.total == 0 {
-            let target_seen = target_seen_in_scope(target, scope, glob);
+            let target_seen = target_seen_in_scope(name, scope, glob);
             output.push_str(&no_callers_message(target, scope, target_seen, glob));
             output.push_str("\n\n");
             continue;
@@ -472,7 +540,7 @@ pub fn search_callers_multi_expanded(
         output.push('\n');
     }
 
-    let skipped_note = crate::search::skipped_files_note(&skipped_large, scope);
+    let skipped_note = crate::search::skipped_files_note(&skipped_large, scope, &names);
     if !skipped_note.is_empty() {
         output.push_str(skipped_note.trim_start_matches('\n'));
         output.push('\n');
@@ -859,6 +927,90 @@ mod tests {
         assert!(
             impact.contains("3 functions affected across 2 hops."),
             "{result}"
+        );
+    }
+
+    /// A caller label names its owner (`Engine.handle`), and passing one back
+    /// to callers found nothing: no call site is written that way. A
+    /// qualified target is looked up by its name, and the header says so.
+    #[test]
+    fn a_qualified_target_finds_the_calls_of_its_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let bloom = BloomFilterCache::new();
+        std::fs::write(
+            dir.path().join("engine.go"),
+            "package gin\n\ntype Engine struct{}\n\nfunc (e *Engine) handle() {}\n\n\
+             func (e *Engine) ServeHTTP() {\n\te.handle()\n}\n",
+        )
+        .unwrap();
+        let bare =
+            search_callers_expanded("handle", dir.path(), &bloom, 0, None, None, false).unwrap();
+        assert!(bare.contains("[caller: Engine.ServeHTTP]"), "{bare}");
+        for target in ["Engine.handle", "Engine::handle"] {
+            let out =
+                search_callers_expanded(target, dir.path(), &bloom, 0, None, None, false).unwrap();
+            assert!(out.contains(&format!("# Callers of \"{target}\"")), "{out}");
+            assert!(out.contains("— 1 call site"), "{out}");
+            assert!(
+                out.contains("engine.go:8 [caller: Engine.ServeHTTP]"),
+                "{out}"
+            );
+            assert!(out.contains("matched by the name `handle`"), "{out}");
+        }
+        let multi = search_callers_multi_expanded(
+            &["Engine.handle", "ServeHTTP"],
+            dir.path(),
+            &bloom,
+            0,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(
+            multi.contains("# Callers of \"Engine.handle\" in"),
+            "{multi}"
+        );
+        assert!(
+            multi.contains("engine.go:8 [caller: Engine.ServeHTTP]"),
+            "{multi}"
+        );
+    }
+
+    /// The second hop traces a method by its name alone. When one type in
+    /// the repository defines the name, a call on any other receiver (a
+    /// `dict.get` for `Cache.get`) counts as reaching it, so the affected
+    /// total says the method calls were matched by name.
+    #[test]
+    fn a_second_hop_through_a_method_says_it_matched_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let bloom = BloomFilterCache::new();
+        std::fs::write(
+            dir.path().join("cache.py"),
+            "def fetch(key):\n    return key\n\n\nclass Cache:\n    def get(self, key):\n        return fetch(key)\n\n\n\
+             def lookup(d):\n    return d.get(\"k\")\n",
+        )
+        .unwrap();
+        let out =
+            search_callers_expanded("fetch", dir.path(), &bloom, 0, None, None, false).unwrap();
+        assert!(out.contains("[caller: Cache.get]"), "{out}");
+        assert!(out.contains("lookup"), "{out}");
+        assert!(
+            out.contains("2 functions affected across 2 hops (method calls matched by name)"),
+            "{out}"
+        );
+
+        // A second hop through plain functions has nothing to say.
+        std::fs::write(
+            dir.path().join("free.py"),
+            "def leaf():\n    return 1\n\n\ndef mid():\n    return leaf()\n\n\ndef top():\n    return mid()\n",
+        )
+        .unwrap();
+        let out =
+            search_callers_expanded("leaf", dir.path(), &bloom, 0, None, None, false).unwrap();
+        assert!(
+            out.contains("2 functions affected across 2 hops.\n"),
+            "{out}"
         );
     }
 }

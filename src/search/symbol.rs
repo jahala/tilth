@@ -7,9 +7,9 @@ use super::file_metadata;
 use tilth_core::lang::elixir::{is_elixir_container, is_elixir_definition};
 use tilth_core::lang::spec::{spec, DefinitionOps, DEFAULT_DEFS, DEFAULT_DEF_KINDS};
 use tilth_core::lang::treesitter::{
-    extract_definition_name, extract_impl_trait, extract_impl_type, extract_implemented_interfaces,
-    is_local_binding, is_or_body_of, node_text_simple, NodeTextMode, NAMESPACE_KINDS,
-    PASS_THROUGH_KINDS, TYPE_KINDS, WRAPPER_KINDS,
+    decorators_start, extract_definition_name, extract_impl_trait, extract_impl_type,
+    extract_implemented_interfaces, is_local_binding, is_or_body_of, node_text_simple,
+    NodeTextMode, NAMESPACE_KINDS, PASS_THROUGH_KINDS, TYPE_KINDS, WRAPPER_KINDS,
 };
 
 use crate::search::rank;
@@ -20,7 +20,9 @@ use grep_searcher::Searcher;
 use tilth_core::error::TilthError;
 use tilth_core::lang::detect_file_type_with_content;
 use tilth_core::lang::outline::{heading_text, outline_language, parse_markdown};
-use tilth_core::search::scope::{definition_owner, split_qualified};
+use tilth_core::search::scope::{
+    definition_owner, names_definition, names_module, split_qualified,
+};
 use tilth_core::types::FileType;
 
 const MAX_MATCHES: usize = 10;
@@ -85,8 +87,21 @@ struct Wanted<'a> {
     owner: Option<&'a str>,
 }
 
+/// Match `text` as a whole word. A boundary is asserted only next to a word
+/// character: `\b` cannot follow the `!` of Ruby's `save!`.
 fn word_matcher(query: &str, text: &str) -> Result<RegexMatcher, TilthError> {
-    let word_pattern = format!(r"\b{}\b", regex_syntax::escape(text));
+    let is_word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+    let start = if is_word(text.chars().next()) {
+        r"\b"
+    } else {
+        ""
+    };
+    let end = if is_word(text.chars().last()) {
+        r"\b"
+    } else {
+        ""
+    };
+    let word_pattern = format!("{start}{}{end}", regex_syntax::escape(text));
     RegexMatcher::new(&word_pattern).map_err(|e| TilthError::InvalidQuery {
         query: query.to_string(),
         reason: e.to_string(),
@@ -481,8 +496,8 @@ fn walk_for_definitions(
 
     // A wrapper is not a definition of its own: the declaration it wraps is,
     // at the same depth. An `export` or `declare` keyword shares the
-    // declaration's line, and the range starts at it. A decorator does not:
-    // the range starts at the `def`/`class` line, as its outline entry does.
+    // declaration's line, and the range starts at it. A Python decorator is
+    // beside the `def` inside its wrapper, so the range takes it in below.
     if WRAPPER_KINDS.contains(&kind) {
         let start = if kind == "decorated_definition" {
             wrapper_start
@@ -507,8 +522,13 @@ fn walk_for_definitions(
         }
         return;
     }
-    let start_row = wrapper_start.unwrap_or(node.start_position().row) as u32 + 1;
     let end_row = node.end_position().row as u32 + 1;
+    // A definition's range starts at its wrapper or at the decorators beside
+    // it, whichever is first: an expanded result shows a route's decorator.
+    let start_row = || {
+        let own = wrapper_start.unwrap_or(node.start_position().row);
+        decorators_start(node).map_or(own, |d| d.min(own)) as u32 + 1
+    };
 
     // Definition kinds and name/weight ops come from the per-language spec. For
     // a known language these are `spec(lang).definition_kinds` / `.definitions`
@@ -526,10 +546,10 @@ fn walk_for_definitions(
     let query = wanted.name;
     if def_kinds.contains(&kind) {
         // Check if this node defines the queried symbol
-        if defines_name(node, lines, query, def_ops)
-            && !is_local_binding(node)
-            && owned_as_wanted(node, lines, lang, wanted, path, found)
-        {
+        if defines_name(node, lines, query, def_ops).is_some_and(|defined| {
+            !is_local_binding(node, lines)
+                && owned_as_wanted(node, &defined, lines, lang, wanted, path, found)
+        }) {
             let row = name_row(node);
             let line_num = row as u32 + 1;
             let line_text = lines.get(row).unwrap_or(&"").trim_end();
@@ -541,7 +561,7 @@ fn walk_for_definitions(
                 exact: true,
                 file_lines,
                 mtime,
-                def_range: Some((start_row, end_row)),
+                def_range: Some((start_row(), end_row)),
                 def_name: Some(query.to_string()),
                 def_weight: (def_ops.weight)(node, lines),
                 impl_target: None,
@@ -570,7 +590,7 @@ fn walk_for_definitions(
                         exact: true,
                         file_lines,
                         mtime,
-                        def_range: Some((start_row, end_row)),
+                        def_range: Some((start_row(), end_row)),
                         def_name: Some(format!("impl {query} for {impl_type}")),
                         def_weight: 80,
                         impl_target: Some(query.to_string()),
@@ -598,7 +618,7 @@ fn walk_for_definitions(
                     exact: true,
                     file_lines,
                     mtime,
-                    def_range: Some((start_row, end_row)),
+                    def_range: Some((start_row(), end_row)),
                     def_name: Some(format!("{class_name} implements {query}")),
                     def_weight: 80,
                     impl_target: Some(query.to_string()),
@@ -609,7 +629,9 @@ fn walk_for_definitions(
         // Elixir: definitions are `call` nodes — check separately. Name and
         // weight come from `spec(Elixir).definitions` via `def_ops`.
         if let Some(name) = (def_ops.extract_name)(node, lines) {
-            if name == query && owned_as_wanted(node, lines, lang, wanted, path, found) {
+            if last_segment(&name) == query
+                && owned_as_wanted(node, &name, lines, lang, wanted, path, found)
+            {
                 let line_num = node.start_position().row as u32 + 1;
                 let line_text = lines
                     .get(node.start_position().row)
@@ -637,7 +659,7 @@ fn walk_for_definitions(
 
     // Recurse into children (for nested definitions, class bodies, impl blocks,
     // etc.).
-    let child_depth = if adds_nesting(node, parent, lang, lines) {
+    let child_depth = if adds_nesting(node, parent, def_kinds.contains(&kind), lang, lines) {
         depth + 1
     } else {
         depth
@@ -660,34 +682,44 @@ fn walk_for_definitions(
     }
 }
 
-/// Whether the children of `node` sit one nesting level deeper than `node`.
-/// The file's root nests its top-level declarations. Namespaces, modules and
-/// pass-through wrappers (`#ifdef`, `extern "C"`, `template <...>`) add no
-/// nesting, nor does a type's body: a method of a class in a namespace, or of
-/// a class nested in another class, is found like one in a top-level class,
-/// while a declaration in a function body stays a level deeper.
+/// Whether the children of `node`, a definition when `defines`, sit one
+/// nesting level deeper than `node`. The file's root nests its top-level
+/// declarations. A statement at the top that defines nothing (`if`, `try`,
+/// `with`) opens no scope, so it adds no nesting. Nor do namespaces, modules,
+/// pass-through wrappers (`#ifdef`, `extern "C"`, `template <...>`) or a
+/// type's body: a method of a class in a namespace, or of a class nested in
+/// another class, is found like one in a top-level class, while a
+/// declaration in a function body stays a level deeper.
 fn adds_nesting(
     node: tree_sitter::Node,
     parent: Option<tree_sitter::Node>,
+    defines: bool,
     lang: Option<tilth_core::types::Lang>,
     lines: &[&str],
 ) -> bool {
     let Some(parent) = parent else {
         return true;
     };
-    let free = is_or_body_of(node, Some(parent), NAMESPACE_KINDS)
+    let at_top = parent.parent().is_none();
+    let free = (at_top && !defines)
+        || is_or_body_of(node, Some(parent), NAMESPACE_KINDS)
         || is_or_body_of(node, Some(parent), PASS_THROUGH_KINDS)
-        || TYPE_KINDS.contains(&parent.kind())
+        // Python's file root is a `module`, a type kind, but a root is no type.
+        || (TYPE_KINDS.contains(&parent.kind()) && !at_top)
         || (lang == Some(tilth_core::types::Lang::Elixir)
             && is_elixir_container(node, Some(parent), lines));
     !free
 }
 
-/// Whether definition `node` has the owner a qualified query asks for. A bare
-/// query takes any owner. A definition another owner holds is recorded in
-/// `found.others`, so a search that matches none can say where the name is.
+/// Whether definition `node`, which defines `defined`, is the one a qualified
+/// query names: by its owner (see [`names_definition`]), or, for a
+/// definition no type holds, by the module its file is (see
+/// [`names_module`]). A bare query takes any owner. A definition another
+/// owner holds is recorded in `found.others`, so a search that matches none
+/// can say where the name is.
 fn owned_as_wanted(
     node: tree_sitter::Node,
+    defined: &str,
     lines: &[&str],
     lang: Option<tilth_core::types::Lang>,
     wanted: Wanted,
@@ -698,8 +730,17 @@ fn owned_as_wanted(
         return true;
     };
     let owner = lang.and_then(|l| definition_owner(node, lines, l));
-    if owner.as_deref() == Some(want) {
+    if names_definition(wanted.query, defined, owner.as_deref()) {
         return true;
+    }
+    if owner.is_none() && !defined.contains(['.', ':']) {
+        let mut root = node;
+        while let Some(parent) = root.parent() {
+            root = parent;
+        }
+        if names_module(want, path, root, lines) {
+            return true;
+        }
     }
     found.others.push(OtherOwner {
         path: path.to_path_buf(),
@@ -724,18 +765,40 @@ fn name_row(node: tree_sitter::Node) -> usize {
 /// several (`var a, b int`), each a named child under the `name` field, so
 /// the later names are checked too. A node `extract_name` gives no name binds
 /// nothing: a C `struct point` without a body names a type, it defines none.
-fn defines_name(node: tree_sitter::Node, lines: &[&str], query: &str, ops: &DefinitionOps) -> bool {
-    let Some(first) = (ops.extract_name)(node, lines) else {
-        return false;
-    };
-    if first == query {
-        return true;
+fn defines_name(
+    node: tree_sitter::Node,
+    lines: &[&str],
+    query: &str,
+    ops: &DefinitionOps,
+) -> Option<String> {
+    let first = (ops.extract_name)(node, lines)?;
+    if last_segment(&first) == query {
+        return Some(first);
     }
+    let text = |n: tree_sitter::Node| node_text_simple(n, lines, NodeTextMode::Full);
+    // Every name a declaration binds: each `name` of Go's `var x, y`, and
+    // each declarator of `const a = 1, b = 2` (JS, TS) or `const A = 1,
+    // B = 2;` (PHP).
     let mut cursor = node.walk();
-    let found = node
+    let named = node
         .children_by_field_name("name", &mut cursor)
-        .any(|n| n.is_named() && node_text_simple(n, lines, NodeTextMode::Full) == query);
-    found
+        .any(|n| n.is_named() && text(n) == query);
+    let mut cursor = node.walk();
+    let declared = node.named_children(&mut cursor).any(|n| {
+        let name = match n.kind() {
+            "variable_declarator" => n.child_by_field_name("name"),
+            "const_element" => n.named_child(0),
+            _ => None,
+        };
+        name.is_some_and(|n| text(n) == query)
+    });
+    (named || declared).then(|| query.to_string())
+}
+
+/// The last segment of a name a definition carries: `User` for Ruby's
+/// `class Admin::User`, `Accounts` for Elixir's `defmodule MyApp.Accounts`.
+fn last_segment(name: &str) -> &str {
+    split_qualified(name).1
 }
 
 /// Keyword heuristic fallback for files without tree-sitter grammars.
@@ -976,10 +1039,13 @@ mod tests {
         file_lines: u32,
         mtime: SystemTime,
     ) -> Vec<Match> {
+        // The query is split as `search_capped` splits it, so a dotted name
+        // such as Elixir's `MyApp.Greeter` takes the path a search takes.
+        let (owner, bare) = split_qualified(name);
         let wanted = Wanted {
             query: name,
-            name,
-            owner: None,
+            name: bare,
+            owner,
         };
         find_defs_treesitter(path, wanted, ts_lang, lang, code, file_lines, mtime).matches
     }
@@ -2063,14 +2129,14 @@ end
     fn a_wrapped_declaration_is_one_definition() {
         // The wrapper (`export`, a decorator) is not a second definition of
         // the name it wraps. The range covers an `export` and the decorators
-        // before it; a Python definition's range starts at its `def` line,
-        // where its outline entry starts.
+        // before it, in TypeScript and Python alike.
         let ts = "export function once() {}\n@Component({})\nexport class Widget {\n}\n";
         assert_definitions("app.ts", ts, &[("once", &[1]), ("Widget", &[3])]);
         assert_eq!(definition_range("app.ts", ts, "Widget"), Some((2, 4)));
 
         let py = "@decorator\n@other\ndef top():\n    pass\n";
-        assert_eq!(definition_range("svc.py", py, "top"), Some((3, 4)));
+        assert_definitions("svc.py", py, &[("top", &[3])]);
+        assert_eq!(definition_range("svc.py", py, "top"), Some((1, 4)));
     }
 
     #[test]
@@ -2107,7 +2173,7 @@ class K {
             ],
         );
 
-        let sh = "setup() {\n  local_var=1\n}\nGLOBAL=2\n";
+        let sh = "setup() {\n  local local_var=1\n}\nGLOBAL=2\n";
         assert_definitions("run.sh", sh, &[("local_var", &[]), ("GLOBAL", &[4])]);
 
         let kt = "val topLevel = 1\nfun f() {\n  val localVal = 2\n}\n";
@@ -2392,6 +2458,279 @@ int area() { return 1; }
             "shapes.h",
             c,
             &[("add", &[11]), ("point", &[4]), ("compare_fn", &[8])],
+        );
+    }
+
+    const RUST_RUNNER: &str = "pub struct Runner;
+
+impl Runner {
+    pub fn new() -> Self {
+        Self::helper();
+        Runner
+    }
+
+    fn helper() {}
+
+    pub fn run(&self) {
+        self.run();
+    }
+}
+";
+
+    /// A qualifier that names a module or package, or the type the code is
+    /// written in, finds the definition by its name (#296 dropped grok's
+    /// bare-name retry, and these came back "not found").
+    #[test]
+    fn a_qualifier_naming_a_module_or_self_finds_the_definition() {
+        let cases: &[(&str, &str, &str, &[u32])] = &[
+            (
+                "gin.go",
+                "package gin\n\nfunc New() int { return 1 }\n",
+                "gin.New",
+                &[3],
+            ),
+            // The package clause names it, whatever the file is called.
+            (
+                "recovery.go",
+                "package gin\n\nfunc Recovery() {}\n",
+                "gin.Recovery",
+                &[3],
+            ),
+            (
+                "symbol.rs",
+                "pub fn search() {}\n",
+                "crate::search::symbol::search",
+                &[1],
+            ),
+            (
+                "path.py",
+                "def join(a, b):\n    return a\n",
+                "os.path.join",
+                &[1],
+            ),
+            ("m.rs", RUST_RUNNER, "Self::new", &[4]),
+            ("m.rs", RUST_RUNNER, "self.run", &[11]),
+            ("s.ts", "class S {\n  handle() {}\n}\n", "this.handle", &[2]),
+            // A free function in a file the qualifier does not name is not
+            // the qualified name's definition.
+            ("m.rs", "pub fn run() {}\n", "B::run", &[]),
+        ];
+        for (file, fixture, query, expected) in cases {
+            let (lines, _) = qualified_search(file, fixture, query);
+            assert_eq!(lines, expected.to_vec(), "{file}: definitions of {query}");
+        }
+
+        // A package directory names the modules in it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join("utils")).expect("mkdir");
+        std::fs::write(
+            dir.path().join("utils/__init__.py"),
+            "def slug(s):\n    return s\n",
+        )
+        .expect("write");
+        let result = search("utils.slug", dir.path(), None, None, false).expect("search");
+        assert_eq!(result.definitions, 1, "{result:?}");
+    }
+
+    /// `Self`, `self`, `this` and `cls` stand for the type the call is
+    /// written in, so they never name a function no type holds.
+    #[test]
+    fn a_self_qualifier_skips_free_functions() {
+        let cases: &[(&str, &str, &str, &str, &str)] = &[
+            (
+                "util.py",
+                "def run():\n    return 1\n",
+                "job.py",
+                "class Job:\n    def run(self):\n        return 2\n",
+                "self.run",
+            ),
+            (
+                "util.rs",
+                "pub fn new() -> u8 {\n    1\n}\n",
+                "job.rs",
+                "pub struct Job;\n\nimpl Job {\n    pub fn new() -> Self {\n        Job\n    }\n}\n",
+                "Self::new",
+            ),
+        ];
+        for (free_file, free, owned_file, owned, query) in cases {
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::fs::write(dir.path().join(free_file), free).expect("write");
+            std::fs::write(dir.path().join(owned_file), owned).expect("write");
+            let result = search(query, dir.path(), None, None, false).expect("search");
+            let defs: Vec<&Path> = result
+                .matches
+                .iter()
+                .filter(|m| m.is_definition)
+                .map(|m| m.path.strip_prefix(dir.path()).expect("in dir"))
+                .collect();
+            assert_eq!(defs, [Path::new(owned_file)], "{query}: {result:?}");
+        }
+    }
+
+    /// A definition whose own name is qualified (an Elixir dotted module, a
+    /// Ruby `class Admin::User`, a nested TS or C++ namespace) is found by its
+    /// full name, its last segment, and as the owner of its members.
+    #[test]
+    fn a_definition_with_a_qualified_name_is_found_by_it() {
+        let ex = "defmodule MyApp.Accounts do\n  def get_user(id), do: id\nend\n";
+        let rb = "module Admin\nend\n\nclass Admin::User\n  def save!\n    true\n  end\nend\n";
+        let ts = "namespace A.B {\n  export function f() { return 1; }\n}\n";
+        let cpp = "namespace a::b {\nint g() { return 1; }\n}\n";
+        let cases: &[(&str, &str, &str, &[u32])] = &[
+            ("accounts.ex", ex, "MyApp.Accounts", &[1]),
+            ("accounts.ex", ex, "MyApp.Accounts.get_user", &[2]),
+            ("accounts.ex", ex, "Accounts.get_user", &[2]),
+            ("user.rb", rb, "Admin::User", &[4]),
+            ("user.rb", rb, "User", &[4]),
+            ("user.rb", rb, "User.save!", &[5]),
+            ("ns.ts", ts, "A.B", &[1]),
+            ("ns.ts", ts, "B.f", &[2]),
+            ("ns.cpp", cpp, "a::b", &[1]),
+            ("ns.cpp", cpp, "b::g", &[2]),
+        ];
+        for (file, fixture, query, expected) in cases {
+            let (lines, result) = qualified_search(file, fixture, query);
+            assert_eq!(lines, expected.to_vec(), "{file}: definitions of {query}");
+            assert!(result.other_owners.is_empty(), "{query}: {result:?}");
+        }
+    }
+
+    /// A name ending in `!` or `?` is matched as a whole word where it is
+    /// used: `\b` cannot follow a `!`.
+    #[test]
+    fn a_ruby_bang_method_has_usages() {
+        let rb = "class User\n  def save!\n    true\n  end\nend\n\nUser.new.save!\n";
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("u.rb"), rb).expect("write");
+        let result = search("save!", dir.path(), None, None, false).expect("search");
+        assert_eq!((result.definitions, result.usages), (1, 1), "{result:?}");
+    }
+
+    /// The decorators or attributes beside a definition are part of its
+    /// range, so an expanded result shows them (a `FastAPI` route's path is in
+    /// its decorator). The match stays on the line that names it.
+    #[test]
+    fn decorators_beside_a_definition_are_in_its_range() {
+        let py =
+            "app = object()\n\n\n@app.get(\"/items\")\n@auth\ndef read_items():\n    return 1\n";
+        let ts = "class Service {\n  @Get()\n  // route\n  @Auth()\n  handle() {\n    return 1;\n  }\n}\n";
+        let rs = "#[test]\n#[ignore]\nfn slow() {}\n";
+        for (file, fixture, query, line, range) in [
+            ("app.py", py, "read_items", 6, (4, 7)),
+            ("svc.ts", ts, "handle", 5, (2, 7)),
+            ("t.rs", rs, "slow", 3, (1, 3)),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::fs::write(dir.path().join(file), fixture).expect("write");
+            let result = search(query, dir.path(), None, None, false).expect("search");
+            let def = result
+                .matches
+                .iter()
+                .find(|m| m.is_definition)
+                .expect("definition");
+            assert_eq!((def.line, def.def_range), (line, Some(range)), "{file}");
+        }
+    }
+
+    /// Python's file root is a `module`, which is also a type kind. The root
+    /// is not a type: a function inside a method is a local, as it is in
+    /// TypeScript, and a function inside a top-level function is found.
+    #[test]
+    fn python_nesting_counts_from_the_file_root() {
+        let py = "def outer():\n    def inner():\n        return 1\n    return inner()\n\n\n\
+                  class K:\n    def m(self):\n        def deep():\n            return 2\n        return deep()\n";
+        let ts =
+            "class K {\n  m() {\n    function deep() { return 2; }\n    return deep();\n  }\n}\n";
+        assert_definitions(
+            "nest.py",
+            py,
+            &[("inner", &[2]), ("m", &[8]), ("deep", &[])],
+        );
+        assert_definitions("nest.ts", ts, &[("m", &[2]), ("deep", &[])]);
+    }
+
+    /// An `if`, `try` or `with` at the top of a file opens no scope: a class
+    /// in its body keeps its methods, as a top-level class does.
+    #[test]
+    fn a_class_under_top_level_control_flow_keeps_its_methods() {
+        for (file, fixture, class_line) in [
+            (
+                "compat.py",
+                "import sys\nif sys.version_info >= (3, 8):\n    class Compat:\n        def run(self):\n            return 1\n",
+                3,
+            ),
+            (
+                "compat.py",
+                "try:\n    class Compat:\n        def run(self):\n            return 1\nexcept ImportError:\n    pass\n",
+                2,
+            ),
+            (
+                "compat.py",
+                "with open(\"x\"):\n    class Compat:\n        def run(self):\n            return 1\n",
+                2,
+            ),
+            (
+                "compat.ts",
+                "if (ready) {\n  class Compat {\n    run() {\n      return 1;\n    }\n  }\n}\n",
+                2,
+            ),
+        ] {
+            assert_definitions(
+                file,
+                fixture,
+                &[("Compat", &[class_line]), ("run", &[class_line + 1])],
+            );
+        }
+    }
+
+    /// Every name of a declaration that binds several is a definition.
+    #[test]
+    fn each_name_of_a_multi_name_declaration_is_a_definition() {
+        let php = "<?php\nconst X = 1, Y = 2;\nclass C {\n  const A = 1, B = 2;\n}\n";
+        assert_definitions(
+            "c.php",
+            php,
+            &[("X", &[2]), ("Y", &[2]), ("A", &[4]), ("B", &[4])],
+        );
+        let js = "const a = 1, b = 2;\nexport let c = 3, d = 4;\n";
+        assert_definitions(
+            "m.js",
+            js,
+            &[("a", &[1]), ("b", &[1]), ("c", &[2]), ("d", &[2])],
+        );
+    }
+
+    /// Only `local` (or `declare` without `-g`) makes a Bash variable local
+    /// to its function. A plain assignment in a function sets a global.
+    #[test]
+    fn a_bash_assignment_in_a_function_is_a_global_definition() {
+        let sh = "setup() {\n  CONFIG=1\n  local tmp=2\n  declare scratch=3\n  declare -g LEVEL=4\n  export MODE=5\n}\n";
+        assert_definitions(
+            "s.sh",
+            sh,
+            &[
+                ("CONFIG", &[2]),
+                ("tmp", &[]),
+                ("scratch", &[]),
+                ("LEVEL", &[5]),
+                ("MODE", &[6]),
+            ],
+        );
+
+        // `-g` combines with other flags in one word. Flags without it keep
+        // the variable local.
+        let sh = "setup() {\n  declare -gA MAP=()\n  declare -gx EXPORTED=1\n  typeset -ga LIST=()\n  declare -rg FIXED=1\n  declare -A table=()\n  local -r frozen=1\n}\n";
+        assert_definitions(
+            "s.sh",
+            sh,
+            &[
+                ("MAP", &[2]),
+                ("EXPORTED", &[3]),
+                ("LIST", &[4]),
+                ("FIXED", &[5]),
+                ("table", &[]),
+                ("frozen", &[]),
+            ],
         );
     }
 }
