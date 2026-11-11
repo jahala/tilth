@@ -73,16 +73,18 @@ impl Ends {
 }
 
 /// Builds [`Ends`] from a text fed in order, in pieces of any size. It keeps
-/// the first lines and a window that always holds the last ones, so it
-/// holds no more than the lines it will hand over, plus one piece.
+/// the first lines and, after them, a window that always holds the last
+/// ones, so it holds no more than the lines it will hand over, plus one
+/// piece, and never holds a byte twice.
 pub(crate) struct EndsCollector {
     shape: Shape,
     head: Vec<u8>,
     /// How many whole lines `head` holds.
     head_lines: usize,
     /// Everything after the `shape.tail + 1`-th line break from the end of
-    /// what was fed, or all of it while there are fewer breaks. Whether the
-    /// text ends in a break or not, its last `shape.tail` lines are in here.
+    /// what was fed after `head`, or all of it while there are fewer
+    /// breaks. Whether the text ends in a break or not, its last
+    /// `shape.tail` lines after `head` are in here.
     window: Vec<u8>,
     /// How many line breaks `window` holds: always at most `shape.tail`.
     window_breaks: usize,
@@ -104,14 +106,16 @@ impl EndsCollector {
     /// Take the next piece of the text.
     pub(crate) fn feed(&mut self, piece: &[u8]) {
         self.counter.feed(piece);
-        self.feed_head(piece);
-        self.feed_window(piece);
+        let rest = self.feed_head(piece);
+        self.feed_window(rest);
     }
 
-    fn feed_head(&mut self, piece: &[u8]) {
+    /// Take the lines of `piece` that `head` still wants, and give back the
+    /// rest.
+    fn feed_head<'p>(&mut self, piece: &'p [u8]) -> &'p [u8] {
         let wanted = self.shape.head - self.head_lines;
         if wanted == 0 {
-            return;
+            return piece;
         }
         let mut found = 0;
         let mut end = piece.len();
@@ -122,8 +126,10 @@ impl EndsCollector {
                 break;
             }
         }
-        self.head.extend_from_slice(&piece[..end]);
+        let (taken, rest) = piece.split_at(end);
+        self.head.extend_from_slice(taken);
         self.head_lines += found;
+        rest
     }
 
     fn feed_window(&mut self, piece: &[u8]) {
@@ -293,6 +299,35 @@ mod tests {
                     decoded.lines().count(),
                     "{decoded:?}, piece {piece}"
                 );
+            }
+        }
+    }
+
+    /// The head and the window never hold the same bytes, so the collector
+    /// holds no more than it was fed, whatever the text's lines. A text of
+    /// one huge line, in memory or streamed, is then held once more at most,
+    /// not twice.
+    #[test]
+    fn the_collector_holds_each_byte_it_keeps_once() {
+        let shapes = [Shape { head: 10, tail: 5 }, Shape { head: 1, tail: 1 }];
+        for text in corpus() {
+            for shape in shapes {
+                for piece in [1, 3, 64, text.len()] {
+                    let mut collector = EndsCollector::new(shape);
+                    let mut fed = 0;
+                    for chunk in text.chunks(piece.max(1)) {
+                        collector.feed(chunk);
+                        fed += chunk.len();
+                        let held = collector.head.len() + collector.window.len();
+                        assert!(
+                            held <= fed,
+                            "{:?}, shape {}+{}, piece {piece}: {held} held of {fed}",
+                            String::from_utf8_lossy(&text),
+                            shape.head,
+                            shape.tail
+                        );
+                    }
+                }
             }
         }
     }
