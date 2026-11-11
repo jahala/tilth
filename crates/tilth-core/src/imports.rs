@@ -16,6 +16,11 @@ use crate::types::{FileType, Lang};
 /// imports are external.
 #[must_use]
 pub fn resolve_related_files(file_path: &Path, cache: &crate::cache::OutlineCache) -> Vec<PathBuf> {
+    // The path alone says whether a file is code, so a log or data file of
+    // any size is never read just to find it names no imports.
+    if !matches!(crate::lang::detect_file_type(file_path), FileType::Code(_)) {
+        return Vec::new();
+    }
     if let Some(parsed) = cache.get_or_parse(file_path) {
         let imports = imports_in_tree(parsed.tree.root_node(), &parsed.content, parsed.lang);
         return resolve_imports(file_path, parsed.lang, &imports);
@@ -894,6 +899,26 @@ fn resolve_bash(dir: &Path, source: &str) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use std::fs;
+
+    /// A pipe names no imports, and looking for them never blocks on one
+    /// that has no writer, whether its name says code or not.
+    #[cfg(unix)]
+    #[test]
+    fn a_pipe_never_blocks_the_imports_lookup() {
+        use crate::test_readers::{make_pipe, unless_blocked_on};
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["main.rs", "server.log"] {
+            let pipe = dir.path().join(name);
+            make_pipe(&pipe);
+            let cache = crate::cache::OutlineCache::new();
+            let related = unless_blocked_on(&pipe, || resolve_related_files(&pipe, &cache));
+            assert_eq!(
+                related.expect("the imports lookup blocked on a pipe"),
+                Vec::<PathBuf>::new(),
+                "{name}"
+            );
+        }
+    }
 
     #[test]
     fn every_tree_read_language_has_a_compiled_statement_query() {

@@ -84,8 +84,7 @@ fn collect_sites(
 /// single-symbol `search_callers_expanded` path to distinguish "typo,
 /// doesn't exist" from "real symbol with no direct callers" (indirect
 /// dispatch, dead code, framework registration, …) when the caller walk
-/// returned zero matches. mmap is lazy, so the scan only pages in regions
-/// that contain the needle prefix.
+/// returned zero matches.
 fn target_seen_in_scope(target: &str, scope: &Path, glob: Option<&str>) -> bool {
     let Ok(walker) = tilth_core::search::walk::walker(scope, glob) else {
         return false;
@@ -95,6 +94,8 @@ fn target_seen_in_scope(target: &str, scope: &Path, glob: Option<&str>) -> bool 
 
     walker.run(|| {
         let seen = &seen;
+        // One finder per walker thread, its buffers reused for every file.
+        let mut finder = tilth_core::source::StreamFinder::new(needle);
         Box::new(move |entry| {
             if seen.load(Ordering::Relaxed) {
                 return ignore::WalkState::Quit;
@@ -105,14 +106,19 @@ fn target_seen_in_scope(target: &str, scope: &Path, glob: Option<&str>) -> bool 
             if !entry.file_type().is_some_and(|ft| ft.is_file()) {
                 return ignore::WalkState::Continue;
             }
-            let path = entry.path();
-            let Ok(file) = std::fs::File::open(path) else {
+            // Streamed through the finder's buffer, so a multi-gigabyte file
+            // costs one chunk of memory, and the scan stops at the first
+            // match. The open never blocks, so a pipe swapped in for the
+            // file after the walk listed it reads as empty. A file that
+            // cannot be read counts as not naming the target, as before.
+            let Ok(Some(mut file)) = tilth_core::source::OpenFile::open(entry.path()) else {
                 return ignore::WalkState::Continue;
             };
-            let Ok(mmap) = (unsafe { memmap2::Mmap::map(&file) }) else {
-                return ignore::WalkState::Continue;
-            };
-            if memchr::memmem::find(&mmap, needle).is_some() {
+            if file
+                .reader()
+                .and_then(|reader| finder.contains(reader))
+                .unwrap_or(false)
+            {
                 seen.store(true, Ordering::Relaxed);
                 return ignore::WalkState::Quit;
             }

@@ -49,7 +49,8 @@ crates/tilth-core/src/
 │                    tree_sitter::Tree, both keyed by (path, mtime)
 ├── imports.rs       Imports as data (one per module named), import lines, related-file resolution
 ├── test_structure.rs describe/it/test calls as TestEntry data
-├── source.rs        read_source: reads a file for parsing or search
+├── source.rs        OpenFile, the one way tilth opens a file to read
+│                    it; read_source: reads a file for parsing or search
 │                    without its byte-order mark; MAX_FILE_SIZE, the
 │                    one size limit every parse and search walk shares
 │
@@ -125,6 +126,8 @@ src/
 │   ├── mod.rs           read_file decision tree, multi-section reader
 │   │                    (`read_ranges`), heading resolver, suggestion
 │   │                    fallback
+│   ├── ends.rs          A text's first and last lines and line count,
+│   │                    from memory or a stream
 │   └── outline/
 │       ├── mod.rs       Dispatch by FileType
 │       ├── code.rs      Tree-sitter outline for code
@@ -563,7 +566,7 @@ machinery:
   attributed (52 types define it)`) and left out of the functions
   affected. When one type defines it, its sites are counted, and the
   affected total says method calls were matched by name. When the walk returns
-  empty, a small `target_seen_in_scope` helper in the binary does an mmap-based
+  empty, a small `target_seen_in_scope` helper in the binary does a
   literal scan so `no_callers_message` can distinguish typo from
   "real symbol with no direct callers" (indirect dispatch, dead code,
   framework registration).
@@ -615,11 +618,15 @@ division.
 `read::read_file(path, section, full, cache, edit_mode)` is the
 gateway. The decision tree, in order:
 
-1. `metadata` errors → typed `TilthError::NotFound` /
-   `PermissionDenied` / `IoError` with a `suggest_similar` fallback
-   (Levenshtein on directory siblings).
+1. `metadata` and open errors → typed `TilthError::NotFound` /
+   `PermissionDenied` / `IoError` (`TilthError::from_io`, one mapping
+   for every step and for the edit read), with a `suggest_similar`
+   fallback (Levenshtein on directory siblings).
 2. **Directory** → `list_directory` (sorted entries, file types).
-3. **Empty file** → header with `ViewMode::Empty`.
+3. **Empty file, or not a regular file** → header with
+   `ViewMode::Empty`. A pipe, socket or device has no fixed contents and
+   is not opened. The path's metadata decides this before any open, so
+   an empty file shows as empty whatever its section or permissions.
 4. **`section: Some(...)` or `sections: [...]`** → `read_ranges`.
    Each range is either a line range (`"45-89"`) or a heading address
    (`"## Architecture"`, resolved by `resolve_heading`'s walk over
@@ -630,28 +637,57 @@ gateway. The decision tree, in order:
    header followed by per-block `─── lines X-Y ───` delimiters and are
    emitted in user-supplied order — overlap is honored verbatim, no
    coalescing. Returns the verbatim slice regardless of file size.
-5. **mmap + binary check** — `is_binary` looks for null bytes in the
-   first 512 bytes via `memchr`. Binary files emit just a header.
-6. **Generated** — by name (`Cargo.lock`, `package-lock.json`, etc.) or
-   content marker (`@generated`, `DO NOT EDIT`, `auto-generated`,
-   etc.).
-7. **Minified** — `.min.<ext>` convention or, for files >100KB, a
-   newline-density heuristic.
-8. **Full mode + oversized** — guard for `--full` on huge files. Caps
+   Line ranges stream through `LineSelector`, which copies the requested
+   lines out of each chunk, only counts the others and stops at the last
+   requested line. A heading needs the whole text to find its lines. An
+   empty file shows as empty, whatever its well-formed ranges; a
+   malformed range fails there as on any file.
+5. **The head decides first.** `detection::read_head` reads the first
+   `HEAD_WINDOW` bytes, and `is_binary` (null bytes in the first 512),
+   the generated markers (`@generated`, `DO NOT EDIT`, …, or a name such
+   as `Cargo.lock`) and the minified check (`.min.<ext>`, or for files
+   over 100 KB a newline-density heuristic) all look only there. A binary
+   file emits just a header; a generated or minified one emits a header
+   whose line count is streamed.
+6. **Log, CSV or unknown type, outlined.** Past the token threshold, or
+   over the cap with `--full`, these views show only a file's first and
+   last lines and its line count (`outline::EndsView`). The file streams
+   into `ends::EndsCollector`, so only the lines shown are held, each
+   once. A file with no more lines than the view shows is then held
+   whole by that pass, and goes on to step 7 without a second read. A
+   file whose outline OGATE rejects goes on to step 7 too, which reads
+   it whole.
+7. **Full mode + oversized.** This guards `--full` on huge files. Caps
    at `TILTH_FULL_SIZE_CAP` (default in `full_read_size_cap()`); above
    the cap, returns the outline with a banner explaining how to
-   override.
-9. **Below the token threshold or `--full`** → return full content
+   override. From this step on the file is read whole, up to the length
+   its open handle reported.
+8. **Below the token threshold or `--full`** → return full content
    (with `format::hashlines` if `edit_mode`, plain `number_lines`
    otherwise). Without `--full`, a full view over the caller's budget
    goes on to the outline instead.
-10. **Otherwise** → `outline::generate` per `FileType`, cached in
-    `OutlineCache::get_or_compute`. An outline over the budget is cut
-    by `outline::fit`: a code outline drops its signatures and docs
-    first (`outline::names_only`), so every symbol stays listed, then
-    whole entries from the end, and a closing line says which.
+9. **Otherwise** → `outline::generate` per `FileType`, cached in
+   `OutlineCache::get_or_compute`. OGATE returns the full view instead
+   when the outline saves too little. An outline over the budget is cut
+   by `outline::fit`: a code outline drops its signatures and docs
+   first (`outline::names_only`), so every symbol stays listed, then
+   whole entries from the end, and a closing line says which.
 
-The `outline/` submodule dispatches on `FileType`:
+Every read opens the file through `tilth_core::source::OpenFile`, as
+do `read_source`, `source::read` and `source::read_to_string`, which
+every parse, search and edit read goes through. On Unix it opens with
+`O_NONBLOCK`, checks the handle's own metadata and clears the flag on a
+regular file, so a pipe swapped in after the path was checked is still
+never read. A pipe, socket or device reads as empty everywhere. The one
+read that waits on a pipe is `tilth diff --patch`, which may be handed
+one.
+
+The signature and stripped views reshape only code. Any other file gets
+its default view, after a streamed check that it is UTF-8, so it fails
+as those views always made it fail.
+
+The `outline/` submodule dispatches on `FileType` through
+`outline::View`, the one mapping from file type to view:
 
 - `code.rs` — calls `lang::outline::walk_top_level` with the parsed
   tree-sitter tree, formats `OutlineEntry` instances as `[start-end]
@@ -661,10 +697,12 @@ The `outline/` submodule dispatches on `FileType`:
   indented code blocks).
 - `structured.rs` — JSON/YAML/TOML "keys" view (top-level keys + their
   shapes).
-- `tabular.rs` — CSV/TSV header + first/last few rows.
+- `tabular.rs`: CSV/TSV header + first/last few rows, rendered from
+  the text's `Ends`.
 - `test_file.rs` — describe/it grouping for test files, rendered over
   `tilth_core::test_entries`.
-- `fallback.rs` — last-resort head/tail when nothing else applies.
+- `fallback.rs`: last-resort head/tail and the log view, rendered from
+  the text's `Ends`.
 
 Two helpers feed the MCP layer:
 

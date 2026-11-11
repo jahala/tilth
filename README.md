@@ -367,7 +367,6 @@ tilth is about 35,000 lines of Rust with no runtime dependencies.
 - The **ignore** crate walks directories in parallel. By default tilth searches every file, including gitignored ones, and skips common build and dependency folders such as `node_modules`, `target` and `.venv`.
 - To honor `.gitignore`, `.ignore` and Git exclude rules as well, set `TILTH_RESPECT_GITIGNORE=1` before starting tilth, or pass `--respect-gitignore` on the CLI. Over MCP, `tilth_search` and `tilth_list` take `gitignore: true` or `false` to choose for a single call.
 - A `.tilthignore` file uses the `.gitignore` syntax and is always honored, whatever the gitignore setting. It applies to its own directory and everything below, also when the search scope starts deeper. Use it for folders tilth should never search.
-- **memmap2** reads files through memory maps.
 - **DashMap** holds the outline cache, which is invalidated when a file's modified time changes.
 
 Definitions and usages are searched in parallel through `rayon::join`. Callees are resolved when a definition is expanded. tilth extracts the callee names with tree-sitter queries and looks them up in the file's own outline and in the files it imports. The callers query runs the same patterns in reverse across the codebase, with a `memchr` pre-filter to skip files that cannot match.

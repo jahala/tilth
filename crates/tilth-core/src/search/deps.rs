@@ -482,7 +482,7 @@ fn imports_one_of(
         return ImportScan::No;
     };
     if meta.len() > crate::source::MAX_FILE_SIZE {
-        let names_a_module = std::fs::read(file).is_ok_and(|bytes| {
+        let names_a_module = crate::source::read(file).is_ok_and(|bytes| {
             targets
                 .iter()
                 .filter_map(|target| module_name(target))

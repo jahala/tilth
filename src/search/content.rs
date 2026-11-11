@@ -111,7 +111,7 @@ fn search_capped(
             // so the minified-check (when triggered) and the actual search
             // share a single kernel read — no double I/O, no TOCTOU window
             // between the heuristic and the search.
-            let Ok(bytes) = std::fs::read(path) else {
+            let Ok(bytes) = tilth_core::source::read(path) else {
                 return ignore::WalkState::Continue;
             };
             let bytes = tilth_core::source::strip_bom_bytes(&bytes);

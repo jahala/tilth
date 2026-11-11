@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 #![warn(clippy::pedantic)]
 #![allow(
     clippy::cast_possible_truncation,  // line numbers as u32, token counts — we target 64-bit

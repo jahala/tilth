@@ -156,7 +156,7 @@ fn read_code_file(path: &Path) -> Result<(String, Lang), TilthError> {
             ),
         });
     }
-    let bytes = fs::read(path).map_err(|e| TilthError::IoError {
+    let bytes = tilth_core::source::read(path).map_err(|e| TilthError::IoError {
         path: path.to_path_buf(),
         source: e,
     })?;
