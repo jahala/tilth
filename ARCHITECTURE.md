@@ -50,7 +50,8 @@ crates/tilth-core/src/
 ├── imports.rs       Imports as data (one per module named), import lines, related-file resolution
 ├── test_structure.rs describe/it/test calls as TestEntry data
 ├── source.rs        read_source: reads a file for parsing or search
-│                    without its byte-order mark
+│                    without its byte-order mark; MAX_FILE_SIZE, the
+│                    one size limit every parse and search walk shares
 │
 ├── search/          Cross-file queries
 │   ├── walk.rs          Walker and ignore policy (SKIP_DIRS, .tilthignore,
@@ -401,7 +402,7 @@ gitignore-style with whitelist, negation (`!`), and brace expansion.
 The biggest production-only file in the subsystem. Three layers stacked:
 
 1. **`search()`** — top-level entry. Walks files via `walker`, parses
-   each via `OutlineCache::get_or_parse` (cap: 500 KB), dispatches to
+   each via `OutlineCache::get_or_parse` (cap: `MAX_FILE_SIZE`), dispatches to
    the right per-language definition extractor, runs a usage scan,
    merges definitions + usages, ranks, facets (when >5 matches), and
    computes `FacetTotals` from the pre-cap merged set. Returns a
@@ -648,10 +649,16 @@ file repeatedly modified will accumulate stale entries until the
 process exits. In practice the working set of active files is small
 enough that this hasn't been a concern.
 
-The 500 KB ceiling on `get_or_parse` keeps tree-sitter parses from
-blowing up memory on generated TypeScript bundles or vendored
-single-file libraries. Above the cap, `get_or_parse` returns `None` and
-callers fall back to text-based heuristics.
+The ceiling on `get_or_parse` (`tilth_core::source::MAX_FILE_SIZE`,
+500 KB) keeps tree-sitter parses from blowing up memory on generated
+TypeScript bundles or vendored single-file libraries. Above the cap,
+`get_or_parse` returns `None` and callers fall back to text-based
+heuristics. The search walkers skip files over the same limit; a
+skipped file that contains the query is named under the result
+(`> 1 file over 500 KB contains the query and was not searched: …`).
+Parsing grows linearly with size, about 0.2 ms per KB for Rust and
+Python, so a 1 MB file costs about twice what a 500 KB one does; that
+is why the limit stays where it is.
 
 ### `Session` (`session.rs`)
 

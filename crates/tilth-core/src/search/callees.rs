@@ -224,7 +224,7 @@ pub fn resolve_callees(
             &import_path,
             remaining.iter().copied(),
             bloom,
-            super::bloom_walk::MAX_FILE_SIZE,
+            crate::source::MAX_FILE_SIZE,
         ) else {
             continue;
         };

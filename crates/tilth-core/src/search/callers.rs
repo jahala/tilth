@@ -77,7 +77,7 @@ pub fn find_callers_batch(
                 path,
                 targets,
                 bloom,
-                super::bloom_walk::MAX_FILE_SIZE,
+                crate::source::MAX_FILE_SIZE,
             ) else {
                 return ignore::WalkState::Continue;
             };

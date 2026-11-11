@@ -556,7 +556,7 @@ pub fn grok(
                 &callee.file,
                 &target.path,
                 &content,
-                tilth_core::search::bloom_walk::MAX_FILE_SIZE,
+                tilth_core::source::MAX_FILE_SIZE,
             );
             callee_content.map(|cc| {
                 // Build a minimal ResolvedTarget so body_with_dedup can handle dedup.

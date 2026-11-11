@@ -43,6 +43,71 @@ fn parse_pattern(query: &str) -> (&str, bool) {
     }
 }
 
+/// Does a file over the size limit contain what the search looks for? The
+/// walkers skip such a file without parsing it, and this one plain read is
+/// what lets the result name it instead of leaving it out in silence.
+pub(crate) fn oversized_holds(path: &Path, found: impl Fn(&[u8]) -> bool) -> bool {
+    std::fs::read(path).is_ok_and(|bytes| found(&bytes))
+}
+
+/// Does `matcher` match anywhere in `bytes`? Stops at the first hit.
+pub(crate) fn has_match(matcher: &grep_regex::RegexMatcher, bytes: &[u8]) -> bool {
+    let mut hit = false;
+    let _ = grep_searcher::Searcher::new().search_slice(
+        matcher,
+        bytes,
+        grep_searcher::sinks::Lossy(|_, _| {
+            hit = true;
+            Ok(false)
+        }),
+    );
+    hit
+}
+
+/// Add `path` to a walker's shared list.
+pub(crate) fn record(list: &std::sync::Mutex<Vec<PathBuf>>, path: &Path) {
+    list.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(path.to_path_buf());
+}
+
+/// A walker's shared list, taken and sorted so the output does not depend on
+/// thread timing.
+pub(crate) fn sorted(list: std::sync::Mutex<Vec<PathBuf>>) -> Vec<PathBuf> {
+    let mut paths = list
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    paths.sort();
+    paths
+}
+
+/// The note under a result that names files the walk skipped for size
+/// although they contain the query. Empty when there are none.
+fn skipped_large_note(result: &SearchResult) -> String {
+    const SHOWN: usize = 5;
+    let skipped = &result.skipped_large;
+    if skipped.is_empty() {
+        return String::new();
+    }
+    let mut names: Vec<String> = skipped
+        .iter()
+        .take(SHOWN)
+        .map(|p| rel(p, &result.scope))
+        .collect();
+    if skipped.len() > SHOWN {
+        names.push(format!("and {} more", skipped.len() - SHOWN));
+    }
+    let (count, verb) = match skipped.len() {
+        1 => ("1 file".to_string(), "contains the query and was"),
+        n => (format!("{n} files"), "contain the query and were"),
+    };
+    format!(
+        "\n\n> {count} over {} {verb} not searched: {}",
+        tilth_core::source::max_file_size_label(),
+        names.join(", ")
+    )
+}
+
 /// Get `file_lines` estimate and mtime from metadata. One `stat()` per file.
 pub(crate) fn file_metadata(path: &Path) -> (u32, SystemTime) {
     match std::fs::metadata(path) {
@@ -138,6 +203,7 @@ pub fn search_multi_symbol_expanded(
                 "\n\n... and {omitted} more matches. Narrow with scope."
             );
         }
+        out.push_str(&skipped_large_note(&result));
         // budget.unwrap_or(DEFAULT_BUDGET): keeps the no-budget path byte-
         // identical to before this fix (see format_search_result's own comment).
         let budget_tokens = budget.unwrap_or(crate::budget::DEFAULT_BUDGET);
@@ -1091,6 +1157,8 @@ fn format_search_result(
         }
     }
 
+    out.push_str(&skipped_large_note(result));
+
     // Apply value-based budget allocation before appending the token footer.
     // Under-budget: byte-identical. Over-budget: drops lowest-value match blocks.
     // budget.unwrap_or(DEFAULT_BUDGET) keeps the no-budget path byte-identical
@@ -1231,7 +1299,7 @@ fn get_outline_str(path: &std::path::Path, cache: &OutlineCache) -> Option<std::
     }
     let meta = std::fs::metadata(path).ok()?;
     let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-    if meta.len() > 500_000 {
+    if meta.len() > tilth_core::source::MAX_FILE_SIZE {
         return None;
     }
     Some(cache.get_or_compute(path, mtime, || {
@@ -2400,5 +2468,37 @@ mod tests {
             assert!(out.contains("bom_func"), "{out}");
             assert!(!out.contains('\u{feff}'), "stray BOM in: {out}");
         }
+    }
+
+    /// A file over the size limit that contains the query used to vanish:
+    /// "0 matches" and no word about the file. Search names it now, and
+    /// stays quiet about big files that do not contain the query.
+    #[test]
+    fn a_file_over_the_size_limit_is_named_when_it_holds_the_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        let limit = usize::try_from(tilth_core::source::MAX_FILE_SIZE).unwrap();
+        let filler = "// padding line to push the file over the size limit\n";
+        let pad = filler.repeat(limit / filler.len() + 1);
+        std::fs::write(
+            tmp.path().join("big.rs"),
+            format!("{pad}pub fn needle_target_fn() {{}}\n"),
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("other_big.rs"), &pad).unwrap();
+        std::fs::write(tmp.path().join("small.rs"), "fn unrelated() {}\n").unwrap();
+        let cache = OutlineCache::new();
+        for out in [
+            search_symbol("needle_target_fn", tmp.path(), &cache, None, false).unwrap(),
+            search_content("needle_target_fn", tmp.path(), &cache, None, false).unwrap(),
+            search_regex("needle_t.rget_fn", tmp.path(), &cache, None, false).unwrap(),
+        ] {
+            assert!(
+                out.contains("over 500 KB") && out.contains("not searched: big.rs"),
+                "the skipped file must be named: {out}"
+            );
+            assert!(!out.contains("other_big.rs"), "{out}");
+        }
+        let quiet = search_symbol("unrelated", tmp.path(), &cache, None, false).unwrap();
+        assert!(!quiet.contains("not searched"), "{quiet}");
     }
 }

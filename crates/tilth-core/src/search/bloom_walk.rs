@@ -8,10 +8,6 @@ use std::time::SystemTime;
 
 use crate::index::bloom::BloomFilterCache;
 
-/// Skip files larger than this; tree-sitter parses on huge files dominate
-/// query latency without surfacing useful matches.
-pub const MAX_FILE_SIZE: u64 = 500_000;
-
 /// Read `path`, validate size, and pass through only when at least one
 /// target is bloom-positive. Returns `(content, mtime)` for the next stage,
 /// or `None` to skip the file.
@@ -72,7 +68,9 @@ mod tests {
         fs::write(&p, "fn alpha() {}\n").unwrap();
         let bloom = BloomFilterCache::new();
         let targets: HashSet<String> = ["beta".to_string()].into_iter().collect();
-        assert!(read_with_bloom_check(&p, &targets, &bloom, MAX_FILE_SIZE).is_none());
+        assert!(
+            read_with_bloom_check(&p, &targets, &bloom, crate::source::MAX_FILE_SIZE).is_none()
+        );
     }
 
     #[test]
@@ -82,7 +80,8 @@ mod tests {
         fs::write(&p, "fn alpha() {}\n").unwrap();
         let bloom = BloomFilterCache::new();
         let targets: HashSet<String> = ["alpha".to_string()].into_iter().collect();
-        let (content, _) = read_with_bloom_check(&p, &targets, &bloom, MAX_FILE_SIZE).unwrap();
+        let (content, _) =
+            read_with_bloom_check(&p, &targets, &bloom, crate::source::MAX_FILE_SIZE).unwrap();
         assert!(content.contains("alpha"));
     }
 
@@ -95,6 +94,8 @@ mod tests {
         fs::write(&p, "fn alpha() {}\n").unwrap();
         let bloom = BloomFilterCache::new();
         let targets: HashSet<&str> = ["alpha"].into_iter().collect();
-        assert!(read_with_bloom_check(&p, &targets, &bloom, MAX_FILE_SIZE).is_some());
+        assert!(
+            read_with_bloom_check(&p, &targets, &bloom, crate::source::MAX_FILE_SIZE).is_some()
+        );
     }
 }
