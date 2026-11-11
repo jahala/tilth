@@ -68,7 +68,8 @@ pub fn make_pipe(path: &std::path::Path) {
 /// or `None` when it is still blocked after ten seconds. From then on this
 /// keeps releasing the pipe until `f` returns, so the test fails instead of
 /// hanging: holding the pipe open for writing lets a blocked open through,
-/// and closing it again ends a blocked read.
+/// and closing it again ends a blocked read. A panic in `f` ends the wait
+/// at once and fails the test with that panic.
 #[cfg(unix)]
 pub fn unless_blocked_on<T: Send>(
     pipe: &std::path::Path,
@@ -77,12 +78,24 @@ pub fn unless_blocked_on<T: Send>(
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
+    /// Marks `f` finished when dropped, so a panic in it marks it too.
+    struct Done<'a>(&'a AtomicBool);
+    impl Drop for Done<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
     let (sent, got) = std::sync::mpsc::channel();
     let done = AtomicBool::new(false);
     std::thread::scope(|scope| {
-        scope.spawn(|| {
+        let done = &done;
+        // `sent` moves into the thread, so a panic drops it and the wait
+        // below ends at once.
+        scope.spawn(move || {
+            let finished = Done(done);
             let result = f();
-            done.store(true, Ordering::SeqCst);
+            drop(finished);
             let _ = sent.send(result);
         });
         let result = got.recv_timeout(Duration::from_secs(10)).ok();

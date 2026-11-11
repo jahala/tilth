@@ -163,7 +163,7 @@ pub(crate) fn signature_warnings<'a>(
 /// Scan a file for merge conflict markers and extract conflict blocks.
 pub(crate) fn detect_conflicts(path: &Path, repo: Option<&Path>) -> Vec<Conflict> {
     let disk = on_disk(repo, path);
-    let Ok(content) = std::fs::read_to_string(&disk) else {
+    let Ok(content) = tilth_core::source::read_to_string(&disk) else {
         return Vec::new();
     };
 
@@ -319,11 +319,11 @@ fn read_side(side: &Side, path: &Path, repo: Option<&Path>) -> Result<String, St
         Side::Index => git_show(&format!(":{path_str}"), repo),
         Side::WorkingTree => {
             let disk = on_disk(repo, path);
-            std::fs::read_to_string(&disk).map_err(|e| format!("read {}: {e}", disk.display()))
+            tilth_core::source::read_to_string(&disk)
+                .map_err(|e| format!("read {}: {e}", disk.display()))
         }
-        Side::File(file) => {
-            std::fs::read_to_string(file).map_err(|e| format!("read {}: {e}", file.display()))
-        }
+        Side::File(file) => tilth_core::source::read_to_string(file)
+            .map_err(|e| format!("read {}: {e}", file.display())),
         Side::Unavailable => Ok(String::new()),
     }
 }

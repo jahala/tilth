@@ -49,7 +49,8 @@ crates/tilth-core/src/
 │                    tree_sitter::Tree, both keyed by (path, mtime)
 ├── imports.rs       Imports as data (one per module named), import lines, related-file resolution
 ├── test_structure.rs describe/it/test calls as TestEntry data
-├── source.rs        read_source: reads a file for parsing or search
+├── source.rs        OpenFile, the one way tilth opens a file to read
+│                    it; read_source: reads a file for parsing or search
 │                    without its byte-order mark; MAX_FILE_SIZE, the
 │                    one size limit every parse and search walk shares
 │
@@ -615,21 +616,23 @@ gateway. The decision tree, in order:
    coalescing. Returns the verbatim slice regardless of file size.
    Line ranges stream through `LineSelector`, which copies the requested
    lines out of each chunk, only counts the others and stops at the last
-   requested line. A heading needs the whole text to find its lines.
-5. **The head decides first** — `detection::read_head` reads the first
+   requested line. A heading needs the whole text to find its lines. An
+   empty file shows as empty, whatever its ranges.
+5. **The head decides first.** `detection::read_head` reads the first
    `HEAD_WINDOW` bytes, and `is_binary` (null bytes in the first 512),
    the generated markers (`@generated`, `DO NOT EDIT`, …, or a name such
    as `Cargo.lock`) and the minified check (`.min.<ext>`, or for files
    over 100 KB a newline-density heuristic) all look only there. A binary
    file emits just a header; a generated or minified one emits a header
    whose line count is streamed.
-6. **Log, CSV or unknown type, outlined** — past the token threshold, or
+6. **Log, CSV or unknown type, outlined.** Past the token threshold, or
    over the cap with `--full`, these views show only a file's first and
    last lines and its line count (`outline::EndsView`). The file streams
    into `ends::EndsCollector`, so only the lines shown are held. A file
-   with no more lines than the view shows, or whose outline OGATE
-   rejects, goes on to step 7, which reads it whole.
-7. **Full mode + oversized** — guard for `--full` on huge files. Caps
+   with no more lines than the view shows is then held whole by that
+   pass, and goes on to step 7 without a second read. A file whose
+   outline OGATE rejects goes on to step 7 too, which reads it whole.
+7. **Full mode + oversized.** This guards `--full` on huge files. Caps
    at `TILTH_FULL_SIZE_CAP` (default in `full_read_size_cap()`); above
    the cap, returns the outline with a banner explaining how to
    override. From this step on the file is read whole, up to the length
@@ -645,11 +648,21 @@ gateway. The decision tree, in order:
    first (`outline::names_only`), so every symbol stays listed, then
    whole entries from the end, and a closing line says which.
 
-Every read opens the file through `open_file`. On Unix it opens with
-`O_NONBLOCK` and checks the handle's own metadata, so a pipe swapped in
-after the path was checked is still never read.
+Every read opens the file through `tilth_core::source::OpenFile`, as
+do `read_source`, `source::read` and `source::read_to_string`, which
+every parse, search and edit read goes through. On Unix it opens with
+`O_NONBLOCK`, checks the handle's own metadata and clears the flag on a
+regular file, so a pipe swapped in after the path was checked is still
+never read. A pipe, socket or device reads as empty everywhere. The one
+read that waits on a pipe is `tilth diff --patch`, which may be handed
+one.
 
-The `outline/` submodule dispatches on `FileType`:
+The signature and stripped views reshape only code. Any other file gets
+its default view, after a streamed check that it is UTF-8, so it fails
+as those views always made it fail.
+
+The `outline/` submodule dispatches on `FileType` through
+`outline::View`, the one mapping from file type to view:
 
 - `code.rs` — calls `lang::outline::walk_top_level` with the parsed
   tree-sitter tree, formats `OutlineEntry` instances as `[start-end]
@@ -659,11 +672,11 @@ The `outline/` submodule dispatches on `FileType`:
   indented code blocks).
 - `structured.rs` — JSON/YAML/TOML "keys" view (top-level keys + their
   shapes).
-- `tabular.rs` — CSV/TSV header + first/last few rows, rendered from
+- `tabular.rs`: CSV/TSV header + first/last few rows, rendered from
   the text's `Ends`.
 - `test_file.rs` — describe/it grouping for test files, rendered over
   `tilth_core::test_entries`.
-- `fallback.rs` — last-resort head/tail and the log view, rendered from
+- `fallback.rs`: last-resort head/tail and the log view, rendered from
   the text's `Ends`.
 
 Two helpers feed the MCP layer:

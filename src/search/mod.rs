@@ -95,7 +95,7 @@ fn parse_pattern(query: &str) -> (&str, bool) {
 /// walkers skip such a file without parsing it, and this one plain read is
 /// what lets the result name it instead of leaving it out in silence.
 pub(crate) fn oversized_holds(path: &Path, found: impl Fn(&[u8]) -> bool) -> bool {
-    std::fs::read(path).is_ok_and(|bytes| found(&bytes))
+    tilth_core::source::read(path).is_ok_and(|bytes| found(&bytes))
 }
 
 /// Does `matcher` match anywhere in `bytes`? Stops at the first hit.

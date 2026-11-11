@@ -837,22 +837,24 @@ mod tests {
     use super::*;
     use std::fs;
 
-    /// A non-code file names no imports, and it is never read to find that
-    /// out. A pipe with no writer blocks whoever opens it, so a call that
-    /// returns proves the file was never opened.
+    /// A pipe names no imports, and looking for them never blocks on one
+    /// that has no writer, whether its name says code or not.
     #[cfg(unix)]
     #[test]
-    fn a_non_code_file_is_never_read_for_its_imports() {
+    fn a_pipe_never_blocks_the_imports_lookup() {
         use crate::test_readers::{make_pipe, unless_blocked_on};
         let dir = tempfile::tempdir().unwrap();
-        let pipe = dir.path().join("server.log");
-        make_pipe(&pipe);
-        let cache = crate::cache::OutlineCache::new();
-        let related = unless_blocked_on(&pipe, || resolve_related_files(&pipe, &cache));
-        assert_eq!(
-            related.expect("a non-code file was opened to look for imports"),
-            Vec::<PathBuf>::new()
-        );
+        for name in ["main.rs", "server.log"] {
+            let pipe = dir.path().join(name);
+            make_pipe(&pipe);
+            let cache = crate::cache::OutlineCache::new();
+            let related = unless_blocked_on(&pipe, || resolve_related_files(&pipe, &cache));
+            assert_eq!(
+                related.expect("the imports lookup blocked on a pipe"),
+                Vec::<PathBuf>::new(),
+                "{name}"
+            );
+        }
     }
 
     #[test]

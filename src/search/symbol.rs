@@ -1,4 +1,3 @@
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
@@ -307,7 +306,7 @@ fn matches_in_file(path: &Path, wanted: Wanted, matchers: Matchers) -> Scan {
         Err(_) => 0,
     };
 
-    let Ok(raw) = fs::read(path) else {
+    let Ok(raw) = tilth_core::source::read(path) else {
         return none();
     };
     let bytes = tilth_core::source::strip_bom_bytes(&raw);

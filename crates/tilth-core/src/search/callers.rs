@@ -304,7 +304,7 @@ fn oversized_code_holding(path: &Path, targets: &HashSet<String>) -> bool {
     if outline_language(lang).is_none() {
         return false;
     }
-    std::fs::read(path).is_ok_and(|bytes| {
+    crate::source::read(path).is_ok_and(|bytes| {
         targets
             .iter()
             .any(|t| memchr::memmem::find(&bytes, t.as_bytes()).is_some())

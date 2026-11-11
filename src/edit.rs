@@ -107,7 +107,7 @@ fn apply_edits(path: &Path, edits: &[Edit]) -> Result<EditResult, TilthError> {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     // Read file
-    let content = fs::read_to_string(path).map_err(|e| match e.kind() {
+    let content = tilth_core::source::read_to_string(path).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => TilthError::NotFound {
             path: path.to_path_buf(),
             suggestion: None,

@@ -69,7 +69,7 @@ fn write_via_temp(
     // rather than clobbering their write. An unreadable target counts as
     // changed — the file the caller verified is no longer there to write over.
     if let Some(expected) = expected {
-        if !std::fs::read(path).is_ok_and(|current| current == expected) {
+        if !tilth_core::source::read(path).is_ok_and(|current| current == expected) {
             let _ = std::fs::remove_file(&tmp);
             return Ok(WriteOutcome::Stale);
         }

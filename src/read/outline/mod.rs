@@ -7,7 +7,7 @@ pub mod test_file;
 
 use std::path::Path;
 
-use tilth_core::types::FileType;
+use tilth_core::types::{FileType, Lang};
 
 use crate::read::ends::{Ends, Shape};
 
@@ -40,15 +40,36 @@ pub fn generate(
         }
     }
 
-    let outline = match file_type {
-        FileType::Code(lang) => code::outline(content, lang, max_lines),
-        FileType::Markdown => markdown::outline(buf, max_lines),
-        FileType::StructuredData => structured::outline(path, content, max_lines),
-        FileType::Tabular => tabular::outline(content, max_lines),
-        FileType::Log => fallback::log_view(content),
-        FileType::Other => fallback::head_tail(content),
+    let outline = match View::of(file_type) {
+        View::Code(lang) => code::outline(content, lang, max_lines),
+        View::Markdown => markdown::outline(buf, max_lines),
+        View::Structured => structured::outline(path, content, max_lines),
+        View::Ends(view) => view.outline_of_text(content),
     };
     with_omission_note(outline, max_lines)
+}
+
+/// What [`generate`] makes a file type's outline from: the whole text, or
+/// only its first and last lines. The one mapping from file type to view,
+/// so a text in memory and a file streamed from disk get the same view.
+pub(crate) enum View {
+    Code(Lang),
+    Markdown,
+    Structured,
+    Ends(EndsView),
+}
+
+impl View {
+    pub(crate) fn of(file_type: FileType) -> Self {
+        match file_type {
+            FileType::Code(lang) => Self::Code(lang),
+            FileType::Markdown => Self::Markdown,
+            FileType::StructuredData => Self::Structured,
+            FileType::Log => Self::Ends(EndsView::Log),
+            FileType::Tabular => Self::Ends(EndsView::Tabular),
+            FileType::Other => Self::Ends(EndsView::Other),
+        }
+    }
 }
 
 /// A view that shows only a text's first and last lines and its line count,
@@ -61,16 +82,6 @@ pub(crate) enum EndsView {
 }
 
 impl EndsView {
-    /// The view [`generate`] gives `file_type`, when it is one of these.
-    pub(crate) fn of(file_type: FileType) -> Option<Self> {
-        match file_type {
-            FileType::Log => Some(Self::Log),
-            FileType::Tabular => Some(Self::Tabular),
-            FileType::Other => Some(Self::Other),
-            FileType::Code(_) | FileType::Markdown | FileType::StructuredData => None,
-        }
-    }
-
     /// How many lines the view shows from each end.
     pub(crate) fn shape(self) -> Shape {
         match self {
@@ -81,14 +92,21 @@ impl EndsView {
     }
 
     /// What [`generate`] returns for a text whose [`shape`](Self::shape)
-    /// ends are `ends`. They must leave lines out: a text with no more lines
-    /// than the view shows is its own view, which only `generate` has.
+    /// ends are `ends`.
     pub(crate) fn generate(self, ends: &Ends, capped: bool) -> String {
-        let outline = match self {
-            Self::Log | Self::Other => fallback::join(ends),
+        with_omission_note(self.render(ends), max_lines(capped))
+    }
+
+    /// The view of `text`, held in memory, before any omission note.
+    fn outline_of_text(self, text: &str) -> String {
+        self.render(&Ends::of_text(text, self.shape()))
+    }
+
+    fn render(self, ends: &Ends) -> String {
+        match self {
+            Self::Log | Self::Other => fallback::excerpt(ends),
             Self::Tabular => tabular::render(ends),
-        };
-        with_omission_note(outline, max_lines(capped))
+        }
     }
 }
 

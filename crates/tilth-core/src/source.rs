@@ -8,8 +8,13 @@
 //! goes through here and drops the mark. Views that print hash anchors keep
 //! the file's bytes as they are, because `tilth_write` verifies its anchors
 //! against the file on disk.
+//!
+//! Every read of a file that a caller names or a walk finds, in this crate
+//! and in the `tilth` binary, opens it through [`OpenFile`], so none waits
+//! on a pipe.
 
-use std::io::{self, Read};
+use std::fs::{File, Metadata};
+use std::io::{self, Read, Seek};
 use std::ops::ControlFlow;
 use std::path::Path;
 
@@ -40,12 +45,164 @@ pub fn strip_bom_bytes(bytes: &[u8]) -> &[u8] {
 }
 
 /// Read a UTF-8 file for parsing or search, without its byte-order mark.
+/// It reads as [`read_to_string`] does, so a pipe, socket or device reads
+/// as empty.
+///
+/// # Errors
+///
+/// Returns the open's or the read's I/O error, and an
+/// [`io::ErrorKind::InvalidData`] error for text that is not UTF-8.
 pub fn read_source(path: &Path) -> io::Result<String> {
-    let mut text = std::fs::read_to_string(path)?;
+    let mut text = read_to_string(path)?;
     if text.starts_with(BOM) {
         text.drain(..BOM.len());
     }
     Ok(text)
+}
+
+/// The bytes of the file at `path`, as [`std::fs::read`] gives them, but
+/// opened through [`OpenFile`]: a pipe, socket or device reads as empty
+/// and never blocks, and the read stops at the length the file had when
+/// it was opened.
+///
+/// # Errors
+///
+/// Returns the open's or the read's I/O error.
+pub fn read(path: &Path) -> io::Result<Vec<u8>> {
+    match OpenFile::open(path)? {
+        Some(mut file) => file.read_all(),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// The text of the file at `path`, as [`std::fs::read_to_string`] gives
+/// it, but opened through [`OpenFile`], as [`read`] is.
+///
+/// # Errors
+///
+/// Returns the open's or the read's I/O error, and an
+/// [`io::ErrorKind::InvalidData`] error for text that is not UTF-8.
+pub fn read_to_string(path: &Path) -> io::Result<String> {
+    match OpenFile::open(path)? {
+        Some(mut file) => file.read_to_string(),
+        None => Ok(String::new()),
+    }
+}
+
+/// A file open for reading, with its handle's metadata. Every read of it
+/// stops at the length that metadata gives, so a file that grows while it
+/// is read is read as it was when it was opened.
+///
+/// This is the one way tilth opens a file to read it. A pipe, socket or
+/// device has no fixed contents, so tilth treats it as empty and never
+/// reads it: [`OpenFile::open`] gives `None` for one.
+pub struct OpenFile {
+    file: File,
+    meta: Metadata,
+}
+
+impl OpenFile {
+    /// Open `path` for reading, or `None` when it is a pipe, socket or
+    /// device. On Unix the open does not block, so a pipe that has no
+    /// writer is found out from the handle's own metadata instead of
+    /// hanging the open, and nothing can swap one in between a look at the
+    /// path and the open. A regular file's handle then blocks as usual. A
+    /// directory opens, and reading it fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns the open's I/O error.
+    pub fn open(path: &Path) -> io::Result<Option<Self>> {
+        let file = open_for_reading(path)?;
+        let meta = file.metadata()?;
+        if meta.is_dir() {
+            return Ok(Some(Self { file, meta }));
+        }
+        if !meta.is_file() {
+            return Ok(None);
+        }
+        #[cfg(unix)]
+        clear_nonblocking(&file)?;
+        Ok(Some(Self { file, meta }))
+    }
+
+    /// The file's length when it was opened.
+    #[must_use]
+    pub fn len(&self) -> u64 {
+        self.meta.len()
+    }
+
+    /// Whether the file was empty when it was opened.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The metadata of the open handle.
+    #[must_use]
+    pub fn metadata(&self) -> &Metadata {
+        &self.meta
+    }
+
+    /// The file from its start, up to its length at open.
+    ///
+    /// # Errors
+    ///
+    /// Returns the seek's I/O error.
+    pub fn reader(&mut self) -> io::Result<io::Take<&mut File>> {
+        self.file.rewind()?;
+        Ok((&mut self.file).take(self.meta.len()))
+    }
+
+    /// All of the file, up to its length at open.
+    ///
+    /// # Errors
+    ///
+    /// Returns the read's I/O error.
+    pub fn read_all(&mut self) -> io::Result<Vec<u8>> {
+        let mut bytes = Vec::with_capacity(self.capacity());
+        self.reader()?.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    /// All of the file as text, up to its length at open.
+    ///
+    /// # Errors
+    ///
+    /// Returns the read's I/O error, and an [`io::ErrorKind::InvalidData`]
+    /// error for text that is not UTF-8.
+    pub fn read_to_string(&mut self) -> io::Result<String> {
+        let mut text = String::with_capacity(self.capacity());
+        self.reader()?.read_to_string(&mut text)?;
+        Ok(text)
+    }
+
+    fn capacity(&self) -> usize {
+        usize::try_from(self.len()).unwrap_or(0)
+    }
+}
+
+/// Open `path` read-only. On Unix the open never waits for a pipe's writer.
+#[cfg(unix)]
+fn open_for_reading(path: &Path) -> io::Result<File> {
+    use rustix::fs::{Mode, OFlags};
+    let flags = OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    Ok(File::from(rustix::fs::open(path, flags, Mode::empty())?))
+}
+
+#[cfg(not(unix))]
+fn open_for_reading(path: &Path) -> io::Result<File> {
+    File::open(path)
+}
+
+/// Make reads of `file` block again, as they do on a handle opened the
+/// usual way. `O_NONBLOCK` only kept the open from waiting on a pipe.
+#[cfg(unix)]
+fn clear_nonblocking(file: &File) -> io::Result<()> {
+    use rustix::fs::{fcntl_getfl, fcntl_setfl, OFlags};
+    let flags = fcntl_getfl(file)?;
+    fcntl_setfl(file, flags.difference(OFlags::NONBLOCK))?;
+    Ok(())
 }
 
 /// How many bytes a streamed read hands over at a time. A buffer of this
@@ -166,6 +323,60 @@ mod tests {
         let path = dir.path().join("a.rs");
         std::fs::write(&path, "\u{feff}use a;\n").unwrap();
         assert_eq!(read_source(&path).unwrap(), "use a;\n");
+    }
+
+    /// A regular file's handle blocks as a usual one does: the open's
+    /// `O_NONBLOCK` is cleared once the handle is known to be a file.
+    #[cfg(unix)]
+    #[test]
+    fn a_regular_files_handle_blocks_as_usual() {
+        use rustix::fs::{fcntl_getfl, OFlags};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "fn a() {}\n").unwrap();
+        let file = OpenFile::open(&path).unwrap().unwrap();
+        let flags = fcntl_getfl(&file.file).unwrap();
+        assert!(!flags.contains(OFlags::NONBLOCK), "{flags:?}");
+    }
+
+    /// A pipe, socket or device reads as empty, and no read blocks on a
+    /// pipe that has no writer.
+    #[cfg(unix)]
+    #[test]
+    fn a_pipe_or_device_reads_as_empty() {
+        use crate::test_readers::{make_pipe, unless_blocked_on};
+        let dir = tempfile::tempdir().unwrap();
+        let pipe = dir.path().join("pipe.rs");
+        make_pipe(&pipe);
+        for path in [pipe.as_path(), Path::new("/dev/null")] {
+            let reads = unless_blocked_on(&pipe, || {
+                (
+                    OpenFile::open(path).unwrap().is_none(),
+                    read(path).unwrap(),
+                    read_to_string(path).unwrap(),
+                    read_source(path).unwrap(),
+                )
+            })
+            .expect("a read blocked on the pipe");
+            assert_eq!(reads, (true, Vec::new(), String::new(), String::new()));
+        }
+    }
+
+    /// A file that grows while it is read is read as it was when opened.
+    #[test]
+    fn a_whole_read_stops_at_the_length_at_open() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("growing.log");
+        std::fs::write(&path, "first\n").unwrap();
+        let mut file = OpenFile::open(&path).unwrap().unwrap();
+        let mut appender = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        appender.write_all(b"second\n").unwrap();
+        assert_eq!(file.read_all().unwrap(), b"first\n");
+        assert_eq!(file.read_to_string().unwrap(), "first\n");
     }
 
     #[test]

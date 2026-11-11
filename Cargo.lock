@@ -884,6 +884,7 @@ dependencies = [
  "fastbloom",
  "ignore",
  "memchr",
+ "rustix",
  "streaming-iterator",
  "tempfile",
  "thiserror",

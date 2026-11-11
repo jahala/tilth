@@ -3,6 +3,8 @@
 //! of any size, so the same code serves a text in memory (one piece) and a
 //! file streamed from disk, which is then never held in memory.
 
+use std::borrow::Cow;
+
 use super::LineCounter;
 
 /// How many lines a view shows from each end of a text.
@@ -14,13 +16,14 @@ pub(crate) struct Shape {
 
 /// A text's first and last lines, split the way `str::lines` splits it, and
 /// its line count. The two ends never overlap: `tail` holds only lines after
-/// `head`.
+/// `head`. They keep the text's bytes as they are; invalid UTF-8 is replaced
+/// only when they are read as text.
 pub(crate) struct Ends {
     shape: Shape,
     /// The first `shape.head` lines, or all of them, line breaks included.
-    head: String,
+    head: Vec<u8>,
     /// Up to `shape.tail` lines after `head`, through the end of the text.
-    tail: String,
+    tail: Vec<u8>,
     total: usize,
 }
 
@@ -32,12 +35,16 @@ impl Ends {
         collector.finish()
     }
 
-    pub(crate) fn head_lines(&self) -> Vec<&str> {
-        self.head.lines().collect()
+    /// The first lines as text, line breaks included. The ends are cut at
+    /// line breaks and no invalid UTF-8 sequence runs through one, so the
+    /// two decoded apart read as the whole text decoded and then cut.
+    pub(crate) fn head(&self) -> Cow<'_, str> {
+        String::from_utf8_lossy(&self.head)
     }
 
-    pub(crate) fn tail_lines(&self) -> Vec<&str> {
-        self.tail.lines().collect()
+    /// The last lines as text, line breaks included.
+    pub(crate) fn tail(&self) -> Cow<'_, str> {
+        String::from_utf8_lossy(&self.tail)
     }
 
     /// The text's line count, by the rule [`LineCounter`] keeps. It equals
@@ -50,6 +57,18 @@ impl Ends {
     /// ends are all of it.
     pub(crate) fn shows_all(&self) -> bool {
         self.total <= self.shape.head + self.shape.tail
+    }
+
+    /// The bytes of the whole text when these ends are all of it, and
+    /// otherwise the ends themselves. The bytes are the ends' own, joined
+    /// in place, so the text is never held twice.
+    pub(crate) fn into_whole(self) -> Result<Vec<u8>, Self> {
+        if !self.shows_all() {
+            return Err(self);
+        }
+        let mut text = self.head;
+        text.extend_from_slice(&self.tail);
+        Ok(text)
     }
 }
 
@@ -145,8 +164,8 @@ impl EndsCollector {
         window.drain(..start_of_last_lines(&window, tail));
         Ends {
             shape: self.shape,
-            head: lossy(self.head),
-            tail: lossy(window),
+            head: self.head,
+            tail: window,
             total,
         }
     }
@@ -164,14 +183,6 @@ fn start_of_last_lines(buf: &[u8], lines: usize) -> usize {
     memchr::memrchr_iter(b'\n', buf)
         .nth(nth - 1)
         .map_or(0, |at| at + 1)
-}
-
-/// `bytes` as text, invalid UTF-8 replaced. Decoding a piece cut at a line
-/// break gives the same text as decoding the whole and cutting there, since
-/// no invalid sequence runs through a `\n`.
-fn lossy(bytes: Vec<u8>) -> String {
-    String::from_utf8(bytes)
-        .unwrap_or_else(|invalid| String::from_utf8_lossy(invalid.as_bytes()).into_owned())
 }
 
 #[cfg(test)]
@@ -226,7 +237,8 @@ mod tests {
 
     /// The ends must be `str::lines` applied to the whole decoded text: its
     /// first lines, its last lines after those, and its count, whatever the
-    /// size of the pieces the text arrives in.
+    /// size of the pieces the text arrives in. Ends that show every line
+    /// hold the text's own bytes.
     #[test]
     fn ends_match_str_lines_in_pieces_of_any_size() {
         let shapes = [
@@ -248,8 +260,18 @@ mod tests {
                         shape.head, shape.tail
                     );
                     assert_eq!(ends.total(), lines.len(), "{at}");
-                    assert_eq!(ends.head_lines(), lines[..head], "{at}");
-                    assert_eq!(ends.tail_lines(), lines[tail..], "{at}");
+                    assert_eq!(
+                        ends.head().lines().collect::<Vec<_>>(),
+                        lines[..head],
+                        "{at}"
+                    );
+                    assert_eq!(
+                        ends.tail().lines().collect::<Vec<_>>(),
+                        lines[tail..],
+                        "{at}"
+                    );
+                    let expected = (lines.len() <= shape.head + shape.tail).then(|| text.clone());
+                    assert_eq!(ends.into_whole().ok(), expected, "{at}");
                 }
             }
         }
@@ -281,8 +303,8 @@ mod tests {
         let long = "y".repeat(10_000);
         let text = format!("{long}\nmid\nmid\nmid\n{long}\n");
         let ends = collect(text.as_bytes(), Shape { head: 1, tail: 1 }, 64);
-        assert_eq!(ends.head_lines(), [long.as_str()]);
-        assert_eq!(ends.tail_lines(), [long.as_str()]);
+        assert_eq!(ends.head(), format!("{long}\n"));
+        assert_eq!(ends.tail(), format!("{long}\n"));
         assert_eq!(ends.total(), 5);
     }
 }

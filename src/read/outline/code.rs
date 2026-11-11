@@ -277,9 +277,9 @@ fn format_entry(entry: &OutlineEntry, indent: usize, lang: Lang, detail: Detail)
     format!("{prefix}{range:<12} {kind_label} {}{sig}{doc}", entry.name)
 }
 
-/// Fallback when tree-sitter grammar isn't available.
+/// Fallback when tree-sitter grammar isn't available: the unknown-type view.
 fn fallback_outline(content: &str, _max_lines: usize) -> String {
-    super::fallback::head_tail(content)
+    super::EndsView::Other.outline_of_text(content)
 }
 
 #[cfg(test)]

@@ -125,13 +125,16 @@ fn file_preview(path: &Path) -> Option<String> {
 }
 
 /// Classify by content with the read path's rule, reading only the bytes
-/// that rule looks at.
+/// that rule looks at. A pipe, socket or device reads as empty, which is
+/// not binary.
 fn is_binary_file(path: &Path) -> bool {
     use tilth_core::lang::detection::{is_binary, read_prefix, BINARY_WINDOW};
-    let Ok(file) = std::fs::File::open(path) else {
+    let Ok(Some(mut file)) = tilth_core::source::OpenFile::open(path) else {
         return false;
     };
-    read_prefix(file, BINARY_WINDOW).is_ok_and(|prefix| is_binary(&prefix))
+    file.reader()
+        .and_then(|reader| read_prefix(reader, BINARY_WINDOW))
+        .is_ok_and(|prefix| is_binary(&prefix))
 }
 
 #[cfg(test)]

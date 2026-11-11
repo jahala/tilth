@@ -181,16 +181,17 @@ pub(in crate::mcp) fn tool_read(
 // re-parses every call. Wiring a structured cache is a separate change. The param
 // is still used by the non-code fallback (read_file), so it keeps its real name.
 fn read_signature_file(path: &Path, cache: &OutlineCache) -> Result<String, TilthError> {
+    // The path says whether a file is code; its content only settles which
+    // language a `.h` is. Any other file gets its default view, streamed.
+    let FileType::Code(lang) = detect_file_type(path) else {
+        return crate::read::non_code_view(path, cache);
+    };
     // A pipe, socket or device has no fixed contents and shows as empty.
     let Some((content, byte_len)) = crate::read::read_text(path)? else {
         return Ok(crate::read::empty_view(path));
     };
+    let lang = tilth_core::lang::refine_lang(lang, path, &content);
     let line_count = u32::try_from(content.lines().count()).unwrap_or(u32::MAX);
-
-    let FileType::Code(lang) = tilth_core::lang::detect_file_type_with_content(path, &content)
-    else {
-        return crate::read::read_file(path, None, false, cache, false, None);
-    };
 
     // Build the signature header only on the code path — the non-code fallback
     // above returns the normal read and never uses it.
@@ -231,6 +232,10 @@ fn render_signature_entries(entries: &[OutlineEntry], lines: &[&str], out: &mut 
 // call. Wiring a structured cache is a separate change. The param is still used by
 // the non-code fallback (read_file), so it keeps its real name.
 fn read_stripped_file(path: &Path, cache: &OutlineCache) -> Result<String, TilthError> {
+    // Any file that is not code gets its default view, streamed.
+    if !matches!(detect_file_type(path), FileType::Code(_)) {
+        return crate::read::non_code_view(path, cache);
+    }
     // A pipe, socket or device has no fixed contents and shows as empty.
     let Some((raw, byte_len)) = crate::read::read_text(path)? else {
         return Ok(crate::read::empty_view(path));
@@ -238,10 +243,6 @@ fn read_stripped_file(path: &Path, cache: &OutlineCache) -> Result<String, Tilth
     // A non-editable view, so it reads like search does: without the mark.
     let content = tilth_core::source::strip_bom(&raw);
     let total_lines = u32::try_from(content.lines().count()).unwrap_or(u32::MAX);
-
-    if !matches!(detect_file_type(path), FileType::Code(_)) {
-        return crate::read::read_file(path, None, false, cache, false, None);
-    }
 
     let skip_lines = crate::search::strip::strip_noise(content, path, Some((1, total_lines)));
     let width = total_lines.max(1).to_string().len();
@@ -292,6 +293,40 @@ mod tests {
             for view in views {
                 assert_eq!(view, crate::read::empty_view(path));
             }
+        }
+    }
+
+    /// A file that is not code gets its default view in the signature and
+    /// stripped views. One that is not UTF-8 fails with the error reading
+    /// it to a string gives, as those views always made it fail.
+    #[test]
+    fn signature_and_stripped_views_of_a_non_code_file() {
+        use std::fmt::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("app.log");
+        let mut text = String::new();
+        for i in 0..2_000 {
+            writeln!(text, "2026-11-11T12:00:00 line {i}").unwrap();
+        }
+        std::fs::write(&log, &text).unwrap();
+        let cache = OutlineCache::new();
+        let default = crate::read::read_file(&log, None, false, &cache, false, None).unwrap();
+        assert!(default.contains("[outline]"), "{default}");
+        assert_eq!(read_signature_file(&log, &cache).unwrap(), default);
+        assert_eq!(read_stripped_file(&log, &cache).unwrap(), default);
+
+        let bad = dir.path().join("bad.log");
+        std::fs::write(&bad, b"ok\n\xff\n").unwrap();
+        let expected = TilthError::IoError {
+            path: bad.clone(),
+            source: std::fs::read_to_string(&bad).unwrap_err(),
+        }
+        .to_string();
+        for view in [
+            read_signature_file(&bad, &cache),
+            read_stripped_file(&bad, &cache),
+        ] {
+            assert_eq!(view.unwrap_err().to_string(), expected);
         }
     }
 

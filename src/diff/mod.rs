@@ -358,6 +358,8 @@ fn run_git_diff(source: &DiffSource, repo: Option<&Path>) -> Result<String, Stri
             return Err("log mode should not call run_git_diff directly".to_string());
         }
         DiffSource::Patch(path) => {
+            // A patch may come through a pipe, as `--patch <(git diff)`
+            // hands it over, so this read waits for the writer on purpose.
             let content = std::fs::read_to_string(path)
                 .map_err(|e| format!("failed to read patch file: {e}"))?;
             return Ok(content);

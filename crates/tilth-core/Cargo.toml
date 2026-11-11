@@ -53,5 +53,10 @@ thiserror = "2"
 # Bloom filter (fast SIMD-optimized impl)
 fastbloom = "0.17"
 
+# Read opens: O_NONBLOCK so a pipe with no writer cannot block the open,
+# cleared again on a regular file's handle
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+
 [dev-dependencies]
 tempfile = "3"

@@ -108,12 +108,17 @@ fn target_seen_in_scope(target: &str, scope: &Path, glob: Option<&str>) -> bool 
             }
             // Streamed through the finder's buffer, so a multi-gigabyte file
             // costs one chunk of memory, and the scan stops at the first
-            // match. A file that cannot be read counts as not naming the
-            // target, as before.
-            let Ok(file) = std::fs::File::open(entry.path()) else {
+            // match. The open never blocks, so a pipe swapped in for the
+            // file after the walk listed it reads as empty. A file that
+            // cannot be read counts as not naming the target, as before.
+            let Ok(Some(mut file)) = tilth_core::source::OpenFile::open(entry.path()) else {
                 return ignore::WalkState::Continue;
             };
-            if finder.contains(file).unwrap_or(false) {
+            if file
+                .reader()
+                .and_then(|reader| finder.contains(reader))
+                .unwrap_or(false)
+            {
                 seen.store(true, Ordering::Relaxed);
                 return ignore::WalkState::Quit;
             }
