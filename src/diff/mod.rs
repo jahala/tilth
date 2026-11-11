@@ -68,6 +68,9 @@ pub enum DiffLineKind {
 pub struct DiffSymbol {
     pub entry: tilth_core::types::OutlineEntry,
     pub identity: SymbolIdentity,
+    /// The enclosing types and modules as shown, such as
+    /// `<Foo as fmt::Display>`. Empty at top level.
+    pub parent: String,
     pub content_hash: u64,
     pub structural_hash: u64,
     /// Hash of the declaration header's tokens, so a header that is only
