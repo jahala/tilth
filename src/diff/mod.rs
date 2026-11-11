@@ -162,6 +162,9 @@ pub struct FileOverlay {
     pub removed: usize,
     pub conflicts: Vec<Conflict>,
     pub new_content: Option<String>,
+    /// A lockfile or other generated file, summarized by its line counts.
+    pub is_generated: bool,
+    pub is_binary: bool,
 }
 
 #[derive(Debug)]
@@ -381,8 +384,10 @@ fn merge_base(a: &str, b: &str, repo: Option<&Path>) -> Result<String, String> {
 /// Execute a git diff command and return raw unified diff output.
 ///
 /// Git runs inside `repo` when one is provided (the caller's checkout);
-/// otherwise in the process cwd.
-fn run_git_diff(source: &DiffSource, repo: Option<&Path>) -> Result<String, String> {
+/// otherwise in the process cwd. `sides` are `source`'s, from
+/// `resolve_sides`: an uncommitted diff compares the working tree with the
+/// old side they already name.
+fn run_git_diff(source: &DiffSource, sides: &Sides, repo: Option<&Path>) -> Result<String, String> {
     match source {
         DiffSource::Log(_) => {
             return Err("log mode should not call run_git_diff directly".to_string());
@@ -415,7 +420,10 @@ fn run_git_diff(source: &DiffSource, repo: Option<&Path>) -> Result<String, Stri
     match source {
         DiffSource::GitUncommitted => {
             // working tree vs HEAD (unstaged + staged)
-            cmd.arg(head_or_empty_tree(repo)?);
+            let Side::Rev(head) = &sides.old else {
+                return Err("an uncommitted diff compares with a revision".to_string());
+            };
+            cmd.arg(head);
         }
         DiffSource::GitStaged => {
             cmd.arg("--staged");
@@ -455,7 +463,7 @@ fn run_git_diff(source: &DiffSource, repo: Option<&Path>) -> Result<String, Stri
 
 /// Parse a patch and build one overlay per file, then match moves across
 /// files.
-fn build_overlays(raw: &str, sides: &Sides, repo: Option<&Path>) -> Vec<(FileOverlay, FileMeta)> {
+fn build_overlays(raw: &str, sides: &Sides, repo: Option<&Path>) -> Vec<FileOverlay> {
     let file_diffs = parse::parse_unified_diff(raw);
     // Each FileDiff is independent and `compute_overlay` builds its own
     // tree-sitter parsers, so no shared mutable state crosses workers.
@@ -465,18 +473,6 @@ fn build_overlays(raw: &str, sides: &Sides, repo: Option<&Path>) -> Vec<(FileOve
         .collect();
     overlay::cross_file_matching(&mut overlays);
     overlays
-        .into_iter()
-        .zip(file_diffs.iter().map(|fd| FileMeta {
-            is_generated: fd.is_generated,
-            is_binary: fd.is_binary,
-        }))
-        .collect()
-}
-
-#[derive(Debug, Clone, Copy)]
-struct FileMeta {
-    is_generated: bool,
-    is_binary: bool,
 }
 
 /// Full diff orchestrator — parse → overlay → format pipeline.
@@ -511,8 +507,8 @@ pub fn diff(
         return diff_log(range, repo, scope.as_ref(), budget);
     }
 
-    let raw = run_git_diff(source, repo)?;
     let sides = resolve_sides(source, repo)?;
+    let raw = run_git_diff(source, &sides, repo)?;
     let mut files = build_overlays(&raw, &sides, repo);
     if files.is_empty() && scope.is_none() {
         return Ok("No changes.".to_string());
@@ -524,7 +520,7 @@ pub fn diff(
     let mut detail_fn: Option<&str> = None;
     let mut detail = false;
     if let Some(spec) = &scope {
-        match spec.select(files.iter().map(|(o, _)| o))? {
+        match spec.select(files.iter())? {
             Selection::File(i) => {
                 files = vec![files.swap_remove(i)];
                 detail = true;
@@ -548,15 +544,15 @@ pub fn diff(
     }
     // Signature warnings count every selected file, before the search
     // filter narrows them.
-    let mut warnings = overlay::signature_warnings(files.iter().map(|(o, _)| o));
+    let mut warnings = overlay::signature_warnings(&files);
 
     if let Some(term) = search {
-        files.retain_mut(|(o, _)| keep_search_matches(o, term));
+        files.retain_mut(|o| keep_search_matches(o, term));
         if files.is_empty() {
             return Ok(format!("No changes matching '{term}'."));
         }
     }
-    let (overlays, meta): (Vec<FileOverlay>, Vec<FileMeta>) = files.into_iter().unzip();
+    let overlays = files;
 
     if blast {
         // Callers are counted under the caller's root, which may sit below
@@ -572,12 +568,7 @@ pub fn diff(
             None => format::format_file_detail(&overlays[0], &warnings, budget),
         }
     } else {
-        let file_meta: Vec<(&Path, bool, bool)> = overlays
-            .iter()
-            .zip(&meta)
-            .map(|(o, m)| (o.path.as_path(), m.is_generated, m.is_binary))
-            .collect();
-        format::format_overview(&overlays, &file_meta, &warnings, &label, budget)
+        format::format_overview(&overlays, &warnings, &label, budget)
     };
 
     // Conflict detection for uncommitted diffs.
@@ -921,15 +912,12 @@ fn diff_log(
             empty.clone().unwrap_or_default()
         };
         let commit_source = DiffSource::GitRef(format!("{parent}..{hash}"));
-        let raw = run_git_diff(&commit_source, repo)?;
         let sides = Sides {
             old: Side::Rev(parent),
             new: Side::Rev(hash.to_string()),
         };
-        let mut overlays: Vec<FileOverlay> = build_overlays(&raw, &sides, repo)
-            .into_iter()
-            .map(|(o, _)| o)
-            .collect();
+        let raw = run_git_diff(&commit_source, &sides, repo)?;
+        let mut overlays = build_overlays(&raw, &sides, repo);
         if let Some(spec) = scope {
             overlays.retain(|o| spec.hit(o).is_some());
             // `file:function` keeps the commits that changed the function,
@@ -997,7 +985,9 @@ mod tests {
         let injected = format!("--output={}", victim.display());
 
         std::fs::write(&victim, "keep me\n").unwrap();
-        let _ = run_git_diff(&DiffSource::GitRef(injected.clone()), Some(repo.path()));
+        let source = DiffSource::GitRef(injected.clone());
+        let sides = resolve_sides(&source, Some(repo.path())).unwrap();
+        let _ = run_git_diff(&source, &sides, Some(repo.path()));
         assert_eq!(
             std::fs::read_to_string(&victim).unwrap(),
             "keep me\n",
@@ -1712,7 +1702,8 @@ diff --git a/src/main.rs b/src/main.rs
         let dir = setup_test_repo();
         git(dir.path(), &["config", "diff.suppressBlankEmpty", "true"]);
         stage_goodbye_change(dir.path());
-        let raw = run_git_diff(&DiffSource::GitStaged, Some(dir.path())).unwrap();
+        let sides = resolve_sides(&DiffSource::GitStaged, Some(dir.path())).unwrap();
+        let raw = run_git_diff(&DiffSource::GitStaged, &sides, Some(dir.path())).unwrap();
         assert!(
             raw.lines().any(|l| l == " "),
             "blank context line must survive as a single space:\n{raw}"
@@ -1726,7 +1717,9 @@ diff --git a/src/main.rs b/src/main.rs
         let dir = setup_test_repo();
         git(dir.path(), &["config", "diff.relative", "true"]);
         stage_goodbye_change(dir.path());
-        let raw = run_git_diff(&DiffSource::GitStaged, Some(&dir.path().join("src"))).unwrap();
+        let src = dir.path().join("src");
+        let sides = resolve_sides(&DiffSource::GitStaged, Some(&src)).unwrap();
+        let raw = run_git_diff(&DiffSource::GitStaged, &sides, Some(&src)).unwrap();
         assert!(
             raw.contains("diff --git a/src/main.rs b/src/main.rs"),
             "paths must stay repo-relative when git runs in a subdirectory:\n{raw}"
@@ -2229,6 +2222,31 @@ diff --git a/src/main.rs b/src/main.rs
             out.contains("blast: `quiet` signature changed — callers not counted"),
             "{out}"
         );
+    }
+
+    /// A move keeps its owner: `A::run` gone from one file and `B::run` new
+    /// in another are a deletion and an addition, while a top-level
+    /// function that changes file is a move.
+    #[test]
+    fn a_move_across_files_keeps_the_symbol_s_owner() {
+        let dir = repo_with(&[
+            ("a.ts", "class A {\n  run() {\n    return 1;\n  }\n}\n\nfunction helper() {\n  return 2;\n}\n"),
+            ("b.ts", "class B {\n  stop() {\n    return 3;\n  }\n}\n"),
+        ]);
+        write_files(
+            dir.path(),
+            &[
+                ("a.ts", "class A {\n}\n"),
+                (
+                    "b.ts",
+                    "class B {\n  stop() {\n    return 3;\n  }\n  run() {\n    return 1;\n  }\n}\n\nfunction helper() {\n  return 2;\n}\n",
+                ),
+            ],
+        );
+        let out = diff_at(dir.path(), &DiffSource::GitUncommitted, None).unwrap();
+        assert!(out.contains("[-]      A::run"), "{out}");
+        assert!(out.contains("[+]      B::run"), "{out}");
+        assert!(out.contains("[↦]      helper"), "{out}");
     }
 
     /// Blast counts the callers under the caller's root, not under the whole

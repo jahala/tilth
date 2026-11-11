@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use tilth_core::lang::detect_file_type_with_content;
 use tilth_core::lang::outline::get_outline_entries;
@@ -38,6 +37,8 @@ pub(crate) fn compute_overlay(
         removed,
         conflicts: Vec::new(),
         new_content: None,
+        is_generated: file_diff.is_generated,
+        is_binary: file_diff.is_binary,
     };
 
     // Binary or generated files: counts only, the formatter summarizes them.
@@ -67,7 +68,8 @@ pub(crate) fn compute_overlay(
 }
 
 /// Cross-file move detection: match Deleted symbols in one file with Added
-/// symbols in another by (kind, name). Unique pairs become `Moved{old_path}`.
+/// symbols in another by kind and qualified name, so a method moves only
+/// within its own type. Unique pairs become `Moved{old_path}`.
 pub(crate) fn cross_file_matching(overlays: &mut [FileOverlay]) {
     // Collect all Deleted and Added symbols with their overlay index + change index.
     let mut deleted: HashMap<(OutlineKind, String), Vec<(usize, usize)>> = HashMap::new();
@@ -78,13 +80,13 @@ pub(crate) fn cross_file_matching(overlays: &mut [FileOverlay]) {
             match &change.change {
                 ChangeType::Deleted => {
                     deleted
-                        .entry((change.kind, change.name.clone()))
+                        .entry((change.kind, change.qualified_name()))
                         .or_default()
                         .push((oi, ci));
                 }
                 ChangeType::Added => {
                     added
-                        .entry((change.kind, change.name.clone()))
+                        .entry((change.kind, change.qualified_name()))
                         .or_default()
                         .push((oi, ci));
                 }
@@ -236,8 +238,8 @@ fn symbol_changes(path: &Path, old: &str, new: &str) -> Vec<SymbolChange> {
     let FileType::Code(lang) = detect_file_type_with_content(path, diff_side(old, new)) else {
         return Vec::new();
     };
-    let old_syms = build_diff_symbols(&get_outline_entries(old, lang), old, lang);
-    let new_syms = build_diff_symbols(&get_outline_entries(new, lang), new, lang);
+    let old_syms = build_diff_symbols(old, lang);
+    let new_syms = build_diff_symbols(new, lang);
     match_symbols(&old_syms, &new_syms)
 }
 
@@ -340,11 +342,7 @@ fn on_disk(repo: Option<&Path>, path: &Path) -> PathBuf {
 }
 
 pub(super) fn git_show(spec: &str, repo: Option<&Path>) -> Result<String, String> {
-    let mut cmd = Command::new("git");
-    if let Some(dir) = repo {
-        cmd.current_dir(dir);
-    }
-    let output = cmd
+    let output = super::git_command(repo)
         .args([
             "-c",
             "core.quotePath=false",

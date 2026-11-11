@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Range;
 
-use tilth_core::lang::outline::outline_language;
+use tilth_core::lang::outline::{outline_language, walk_top_level};
 use tilth_core::types::{Lang, OutlineEntry, OutlineKind};
 
 use super::{ChangeType, DiffSymbol, MatchConfidence, Span, SymbolChange, SymbolIdentity};
@@ -11,21 +11,36 @@ use super::{ChangeType, DiffSymbol, MatchConfidence, Span, SymbolChange, SymbolI
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Build `DiffSymbol` entries from an outline and its source content.
+/// Build the `DiffSymbol` entries of one side of a diff from its content,
+/// parsed once: the outline and the declaration headers come from the same
+/// tree.
 ///
 /// A function's signature is read from its syntax tree: the whole header
 /// before the body, however many lines it spans, keyed by its tokens. The
 /// outline's signature is display text, so keying on it would flag a
-/// header that was only re-wrapped or had a comment added.
-pub(crate) fn build_diff_symbols(
-    entries: &[OutlineEntry],
-    content: &str,
-    lang: Lang,
-) -> Vec<DiffSymbol> {
+/// header that was only re-wrapped or had a comment added. A Rust trait impl
+/// is named by its trait too (`impl From<A> for Foo`), so the impls of two
+/// traits for one type, and their methods, stay apart.
+pub(crate) fn build_diff_symbols(content: &str, lang: Lang) -> Vec<DiffSymbol> {
+    let Some(language) = outline_language(lang) else {
+        return Vec::new();
+    };
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&language).is_err() {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(content, None) else {
+        return Vec::new();
+    };
     let lines: Vec<&str> = content.lines().collect();
+    let mut entries = walk_top_level(tree.root_node(), &lines, lang);
+    let nodes = DeclarationNodes::of(tree.root_node());
+    if lang == Lang::Rust {
+        name_trait_impls(&mut entries, &nodes, content.as_bytes());
+    }
     let mut out = Vec::new();
-    build_symbols_recursive(entries, &lines, lang, "", &mut out);
-    apply_headers(&mut out, content, lang);
+    build_symbols_recursive(&entries, &lines, lang, "", &mut out);
+    apply_headers(&mut out, &nodes, content.as_bytes());
     out
 }
 
@@ -308,11 +323,18 @@ pub(crate) fn match_symbols(old: &[DiffSymbol], new: &[DiffSymbol]) -> Vec<Symbo
 // ---------------------------------------------------------------------------
 
 /// The qualifier shown for a member: its types and modules, with a Rust
-/// `impl Foo` block named by its type, so a method reads `Foo::method`.
+/// `impl Foo` block named by its type, so a method reads `Foo::method`, and
+/// a trait impl in Rust's qualified form, `<Foo as From<A>>::from`.
 fn display_parent(parent_path: &str) -> String {
     parent_path
         .split("::")
-        .map(|segment| segment.strip_prefix("impl ").unwrap_or(segment))
+        .map(|segment| match segment.strip_prefix("impl ") {
+            Some(header) => match header.split_once(" for ") {
+                Some((trait_name, ty)) => format!("<{ty} as {trait_name}>"),
+                None => header.to_string(),
+            },
+            None => segment.to_string(),
+        })
         .collect::<Vec<_>>()
         .join("::")
 }
@@ -392,54 +414,94 @@ fn text_signature_key(signature: Option<&str>) -> u64 {
     hash_string(&text.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
+/// The function and Rust impl nodes of one tree, by the row each ends on,
+/// so a symbol finds its node without scanning every node.
+struct DeclarationNodes<'t> {
+    functions: HashMap<usize, Vec<tree_sitter::Node<'t>>>,
+    impls: HashMap<usize, Vec<tree_sitter::Node<'t>>>,
+}
+
+impl<'t> DeclarationNodes<'t> {
+    fn of(root: tree_sitter::Node<'t>) -> Self {
+        let mut nodes = Self {
+            functions: HashMap::new(),
+            impls: HashMap::new(),
+        };
+        let mut cursor = root.walk();
+        loop {
+            let node = cursor.node();
+            let by_end = if FUNCTION_NODE_KINDS.contains(&node.kind()) {
+                Some(&mut nodes.functions)
+            } else if node.kind() == "impl_item" {
+                Some(&mut nodes.impls)
+            } else {
+                None
+            };
+            if let Some(map) = by_end {
+                map.entry(node.end_position().row).or_default().push(node);
+            }
+            if cursor.goto_first_child() || cursor.goto_next_sibling() {
+                continue;
+            }
+            loop {
+                if !cursor.goto_parent() {
+                    return nodes;
+                }
+                if cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// The outermost node of `by_end` for an outline entry's span. The span
+    /// runs from an `export` keyword or an attribute to the end of the
+    /// declaration, so the node ends on the last line and starts within it.
+    fn for_entry(
+        by_end: &HashMap<usize, Vec<tree_sitter::Node<'t>>>,
+        entry: &OutlineEntry,
+    ) -> Option<tree_sitter::Node<'t>> {
+        let first = (entry.start_line as usize).saturating_sub(1);
+        let last = (entry.end_line as usize).saturating_sub(1);
+        by_end
+            .get(&last)?
+            .iter()
+            .filter(|n| (first..=last).contains(&n.start_position().row))
+            .min_by_key(|n| n.start_position().row)
+            .copied()
+    }
+}
+
+/// Name each Rust impl of a trait by its trait and type, `impl From<A> for
+/// Foo`, where the outline names it by its type alone.
+fn name_trait_impls(entries: &mut [OutlineEntry], nodes: &DeclarationNodes, source: &[u8]) {
+    for entry in entries {
+        if entry.kind == OutlineKind::Module && entry.name.starts_with("impl ") {
+            let named = DeclarationNodes::for_entry(&nodes.impls, entry).and_then(|node| {
+                let text = |field| node.child_by_field_name(field)?.utf8_text(source).ok();
+                Some(format!("impl {} for {}", text("trait")?, text("type")?))
+            });
+            if let Some(name) = named {
+                entry.name = name;
+            }
+        }
+        name_trait_impls(&mut entry.children, nodes, source);
+    }
+}
+
 /// Replace each function's outline signature with its full header from the
 /// syntax tree, and key it by the header's tokens. A function whose node is
 /// not found keeps its outline signature.
-fn apply_headers(symbols: &mut [DiffSymbol], content: &str, lang: Lang) {
-    let Some(language) = outline_language(lang) else {
-        return;
-    };
-    let mut parser = tree_sitter::Parser::new();
-    if parser.set_language(&language).is_err() {
-        return;
-    }
-    let Some(tree) = parser.parse(content, None) else {
-        return;
-    };
-    let mut functions = Vec::new();
-    collect_function_nodes(tree.root_node(), &mut functions);
-
+fn apply_headers(symbols: &mut [DiffSymbol], nodes: &DeclarationNodes, source: &[u8]) {
     for symbol in symbols {
         if symbol.entry.kind != OutlineKind::Function || symbol.entry.signature.is_none() {
             continue;
         }
-        let (first, last) = (
-            (symbol.entry.start_line as usize).saturating_sub(1),
-            (symbol.entry.end_line as usize).saturating_sub(1),
-        );
-        // The outline's span runs from an `export` keyword to the end of the
-        // function, so the node ends on the last line and starts within the
-        // span. The first such node in tree order is the outermost.
-        let node = functions
-            .iter()
-            .filter(|n| {
-                n.end_position().row == last && (first..=last).contains(&n.start_position().row)
-            })
-            .min_by_key(|n| n.start_position().row);
-        if let Some(header) = node.and_then(|n| Header::of(*n, content.as_bytes())) {
+        let node = DeclarationNodes::for_entry(&nodes.functions, &symbol.entry);
+        if let Some(header) = node.and_then(|n| Header::of(n, source)) {
             symbol.entry.signature = Some(header.display);
             symbol.signature_key = header.key;
         }
-    }
-}
-
-fn collect_function_nodes<'t>(node: tree_sitter::Node<'t>, out: &mut Vec<tree_sitter::Node<'t>>) {
-    if FUNCTION_NODE_KINDS.contains(&node.kind()) {
-        out.push(node);
-    }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_function_nodes(child, out);
     }
 }
 
@@ -502,11 +564,19 @@ impl Header {
 }
 
 /// Where a function's body starts, or `None` for a declaration with none.
+/// A C++ constructor's initializer list starts its body, and so does the
+/// `end` that closes a Ruby method with an empty one.
 fn body_start(node: tree_sitter::Node) -> Option<usize> {
+    let mut cursor = node.walk();
+    let initializers = node
+        .children(&mut cursor)
+        .find(|child| child.kind() == "field_initializer_list");
+    if let Some(list) = initializers {
+        return Some(list.start_byte());
+    }
     if let Some(body) = node.child_by_field_name("body") {
         return Some(body.start_byte());
     }
-    let mut cursor = node.walk();
     let body = node.children(&mut cursor).find(|child| {
         let kind = child.kind();
         !kind.contains("comment")
@@ -515,7 +585,13 @@ fn body_start(node: tree_sitter::Node) -> Option<usize> {
                 || kind == "compound_statement"
                 || kind == "arrow_expression_clause")
     });
-    body.map(|b| b.start_byte())
+    if let Some(body) = body {
+        return Some(body.start_byte());
+    }
+    let closing_end = node
+        .child(node.child_count().checked_sub(1)?)
+        .filter(|last| last.kind() == "end" && matches!(node.kind(), "method" | "singleton_method"));
+    closing_end.map(|end| end.start_byte())
 }
 
 /// The byte ranges of the leaf tokens of `node` before `end`, without
@@ -915,14 +991,49 @@ mod tests {
         }
     }
 
-    fn changes_for(lang: Lang, old: &str, new: &str) -> Vec<SymbolChange> {
-        let symbols = |content: &str| {
-            build_diff_symbols(
-                &tilth_core::lang::outline::get_outline_entries(content, lang),
-                content,
-                lang,
-            )
+    /// Two impls of one trait for one type, `From<A>` and `From<B>`, each
+    /// define `from`. Named `Foo::from` both, they could not be told apart.
+    #[test]
+    fn trait_impls_of_one_type_keep_their_trait() {
+        let base = "struct Foo;\n\nimpl From<A> for Foo {\n    fn from(_: A) -> Foo {\n        Foo\n    }\n}\n\nimpl From<B> for Foo {\n    fn from(_: B) -> Foo {\n        Foo\n    }\n}\n\nimpl Foo {\n    fn new() -> Foo {\n        Foo\n    }\n}\n";
+        let edited = base.replacen("        Foo\n    }\n}\n\nimpl Foo", "        { Foo }\n    }\n}\n\nimpl Foo", 1);
+        let changes = changes_for(Lang::Rust, base, &edited);
+        let named = |q: &str| {
+            changes
+                .iter()
+                .find(|c| c.qualified_name() == q)
+                .unwrap_or_else(|| panic!("no {q} in {changes:#?}"))
         };
+        assert!(matches!(named("<Foo as From<A>>::from").change, ChangeType::Unchanged));
+        assert!(matches!(named("<Foo as From<B>>::from").change, ChangeType::BodyChanged));
+        assert!(matches!(named("Foo::new").change, ChangeType::Unchanged));
+        assert!(matches!(named("impl From<B> for Foo").change, ChangeType::BodyChanged));
+    }
+
+    /// A C++ constructor's initializer list and the `end` of an empty Ruby
+    /// method are not part of the signature: editing them is a body change.
+    #[test]
+    fn initializer_lists_and_a_closing_end_are_body() {
+        let cpp = "A::A(int x) : x_(x) {\n}\n";
+        let changes = changes_for(Lang::Cpp, cpp, &cpp.replace("x_(x)", "x_(x + 1)"));
+        assert!(
+            changes.iter().all(|c| !matches!(c.change, ChangeType::SignatureChanged)),
+            "{changes:#?}"
+        );
+        assert!(
+            changes.iter().any(|c| matches!(c.change, ChangeType::BodyChanged)),
+            "{changes:#?}"
+        );
+
+        let ruby = "def save\nend\n";
+        let changes = changes_for(Lang::Ruby, ruby, "def save\n  1\nend\n");
+        let save = changes.iter().find(|c| c.name == "save").unwrap();
+        assert!(matches!(save.change, ChangeType::BodyChanged), "{save:#?}");
+        assert_eq!(save.new_sig.as_deref(), Some("def save"), "{save:#?}");
+    }
+
+    fn changes_for(lang: Lang, old: &str, new: &str) -> Vec<SymbolChange> {
+        let symbols = |content: &str| build_diff_symbols(content, lang);
         match_symbols(&symbols(old), &symbols(new))
     }
 
@@ -1373,8 +1484,7 @@ mod tests {
     #[test]
     fn impl_block_parent_path() {
         let src = "impl Foo {\n    fn bar(&self) { 1 }\n}";
-        let entries = tilth_core::lang::outline::get_outline_entries(src, Lang::Rust);
-        let symbols = build_diff_symbols(&entries, src, Lang::Rust);
+        let symbols = build_diff_symbols(src, Lang::Rust);
         let bar = symbols
             .iter()
             .find(|s| s.identity.name == "bar")
@@ -1390,8 +1500,7 @@ mod tests {
     #[test]
     fn build_diff_symbols_rust() {
         let src = "fn hello() -> i32 { 42 }\nstruct Point { x: f64, y: f64 }";
-        let entries = tilth_core::lang::outline::get_outline_entries(src, Lang::Rust);
-        let symbols = build_diff_symbols(&entries, src, Lang::Rust);
+        let symbols = build_diff_symbols(src, Lang::Rust);
         assert!(symbols.len() >= 2);
         let hello = symbols.iter().find(|s| s.identity.name == "hello");
         assert!(hello.is_some());
@@ -1403,8 +1512,7 @@ mod tests {
     #[test]
     fn build_diff_symbols_impl_children() {
         let src = "impl MyStruct {\n    fn method_a(&self) { }\n    fn method_b(&self) { }\n}";
-        let entries = tilth_core::lang::outline::get_outline_entries(src, Lang::Rust);
-        let symbols = build_diff_symbols(&entries, src, Lang::Rust);
+        let symbols = build_diff_symbols(src, Lang::Rust);
         let methods: Vec<_> = symbols
             .iter()
             .filter(|s| s.identity.name == "method_a" || s.identity.name == "method_b")
@@ -1420,3 +1528,4 @@ mod tests {
         }
     }
 }
+

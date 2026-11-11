@@ -28,10 +28,8 @@ use super::{
 /// ## package-lock.json (generated, N lines changed — summarized)
 /// ```
 ///
-/// `file_meta` is parallel to `overlays`: `(path, is_generated, is_binary)`.
 pub(crate) fn format_overview(
     overlays: &[FileOverlay],
-    file_meta: &[(&Path, bool, bool)],
     warnings: &[String],
     source_label: &str,
     budget: Option<u64>,
@@ -65,18 +63,17 @@ pub(crate) fn format_overview(
         fn_added,
     );
 
-    for (i, overlay) in overlays.iter().enumerate() {
-        let (path, is_generated, is_binary) = file_meta[i];
-        let rel_path = rel(path, scope);
+    for overlay in overlays {
+        let rel_path = rel(&overlay.path, scope);
 
         let _ = writeln!(out);
 
-        if is_binary {
+        if overlay.is_binary {
             let _ = writeln!(out, "## {rel_path} (binary)");
             continue;
         }
 
-        if is_generated {
+        if overlay.is_generated {
             let changed_lines = overlay.added + overlay.removed;
             let _ = writeln!(
                 out,
@@ -521,7 +518,7 @@ mod tests {
     use crate::diff::{
         ChangeType, Conflict, DiffLine, DiffLineKind, FileOverlay, MatchConfidence, SymbolChange,
     };
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use tilth_core::types::OutlineKind;
 
     fn make_overlay(path: &str, changes: Vec<SymbolChange>) -> FileOverlay {
@@ -534,6 +531,8 @@ mod tests {
             removed: 0,
             conflicts: Vec::new(),
             new_content: None,
+            is_generated: false,
+            is_binary: false,
         }
     }
 
@@ -567,9 +566,6 @@ mod tests {
         }
     }
 
-    // Helper: build file_meta slice referencing the overlays' paths.
-    // Since lifetimes are tricky with inline vec, callers build it manually.
-
     // 1. All 6 change types produce correct markers
     #[test]
     fn test_overview_markers() {
@@ -592,9 +588,7 @@ mod tests {
             ),
         ];
         let overlay = make_overlay("src/lib.rs", changes);
-        let path = overlay.path.clone();
-        let meta: Vec<(&Path, bool, bool)> = vec![(&path, false, false)];
-        let out = format_overview(&[overlay], &meta, &[], "HEAD", None);
+        let out = format_overview(&[overlay], &[], "HEAD", None);
         assert!(out.contains("[+]"), "missing [+]:\n{out}");
         assert!(out.contains("[-]"), "missing [-]:\n{out}");
         assert!(out.contains("[~]"), "missing [~]:\n{out}");
@@ -609,9 +603,7 @@ mod tests {
         let mut change = make_change("fn_ambig", ChangeType::Added);
         change.match_confidence = MatchConfidence::Ambiguous(3);
         let overlay = make_overlay("src/lib.rs", vec![change]);
-        let path = overlay.path.clone();
-        let meta: Vec<(&Path, bool, bool)> = vec![(&path, false, false)];
-        let out = format_overview(&[overlay], &meta, &[], "HEAD", None);
+        let out = format_overview(&[overlay], &[], "HEAD", None);
         assert!(out.contains("[?→]"), "expected [?→]:\n{out}");
     }
 
@@ -619,10 +611,8 @@ mod tests {
     #[test]
     fn test_overview_warnings() {
         let overlay = make_overlay("src/lib.rs", vec![]);
-        let path = overlay.path.clone();
-        let meta: Vec<(&Path, bool, bool)> = vec![(&path, false, false)];
         let warnings = vec!["warning: foo changed in 2 locations".to_string()];
-        let out = format_overview(&[overlay], &meta, &warnings, "HEAD", None);
+        let out = format_overview(&[overlay], &warnings, "HEAD", None);
         assert!(
             out.contains("warning: foo changed"),
             "warnings not appended:\n{out}"
@@ -639,9 +629,8 @@ mod tests {
         // The counts come from the patch; a generated file has no symbols.
         overlay.added = 1;
         overlay.removed = 1;
-        let path = overlay.path.clone();
-        let meta: Vec<(&Path, bool, bool)> = vec![(&path, true, false)];
-        let out = format_overview(&[overlay], &meta, &[], "HEAD", None);
+        overlay.is_generated = true;
+        let out = format_overview(&[overlay], &[], "HEAD", None);
         assert!(out.contains("generated"), "missing 'generated':\n{out}");
         assert!(
             out.contains("lines changed"),
@@ -656,10 +645,9 @@ mod tests {
     // 5. Binary files show "(binary)"
     #[test]
     fn test_overview_binary() {
-        let overlay = make_overlay("image.png", vec![]);
-        let path = overlay.path.clone();
-        let meta: Vec<(&Path, bool, bool)> = vec![(&path, false, true)];
-        let out = format_overview(&[overlay], &meta, &[], "HEAD", None);
+        let mut overlay = make_overlay("image.png", vec![]);
+        overlay.is_binary = true;
+        let out = format_overview(&[overlay], &[], "HEAD", None);
         assert!(out.contains("(binary)"), "missing (binary):\n{out}");
     }
 
@@ -672,9 +660,7 @@ mod tests {
             make_change("fn_c", ChangeType::Deleted),
         ];
         let overlay = make_overlay("src/lib.rs", changes);
-        let path = overlay.path.clone();
-        let meta: Vec<(&Path, bool, bool)> = vec![(&path, false, false)];
-        let out = format_overview(&[overlay], &meta, &[], "HEAD", Some(5));
+        let out = format_overview(&[overlay], &[], "HEAD", Some(5));
         assert!(out.contains("truncated"), "expected truncation:\n{out}");
     }
 
@@ -686,9 +672,7 @@ mod tests {
             make_change("fn_unchanged", ChangeType::Unchanged),
         ];
         let overlay = make_overlay("src/lib.rs", changes);
-        let path = overlay.path.clone();
-        let meta: Vec<(&Path, bool, bool)> = vec![(&path, false, false)];
-        let out = format_overview(&[overlay], &meta, &[], "HEAD", None);
+        let out = format_overview(&[overlay], &[], "HEAD", None);
         assert!(out.contains("fn_changed"), "changed fn missing:\n{out}");
         assert!(
             !out.contains("fn_unchanged"),
@@ -704,10 +688,7 @@ mod tests {
             "src/b.rs",
             vec![make_change("fn_b", ChangeType::BodyChanged)],
         );
-        let path_a = overlay_a.path.clone();
-        let path_b = overlay_b.path.clone();
-        let meta: Vec<(&Path, bool, bool)> = vec![(&path_a, false, false), (&path_b, false, false)];
-        let out = format_overview(&[overlay_a, overlay_b], &meta, &[], "HEAD", None);
+        let out = format_overview(&[overlay_a, overlay_b], &[], "HEAD", None);
         assert!(out.contains("2 files"), "wrong file count:\n{out}");
         assert!(out.contains("src/a.rs"), "missing a.rs:\n{out}");
         assert!(out.contains("src/b.rs"), "missing b.rs:\n{out}");
@@ -718,9 +699,7 @@ mod tests {
     fn test_overview_signature_annotation() {
         let change = make_sig_change("process", "fn process(x: i32)", "fn process(x: i64)");
         let overlay = make_overlay("src/lib.rs", vec![change]);
-        let path = overlay.path.clone();
-        let meta: Vec<(&Path, bool, bool)> = vec![(&path, false, false)];
-        let out = format_overview(&[overlay], &meta, &[], "HEAD", None);
+        let out = format_overview(&[overlay], &[], "HEAD", None);
         assert!(out.contains("[~:sig]"), "missing sig marker:\n{out}");
         assert!(
             out.contains("fn process(x: i32)"),
