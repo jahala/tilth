@@ -17,7 +17,8 @@ const TARGET_DIRS: &[&str] = &["src", "tests", "benches", "examples"];
 
 const PERMANENT: &str = "by design: ";
 
-/// The reason of every `#[expect]` in a file, `None` where it has none.
+/// The reason of every `#[expect]` in a file, `None` where it has none or
+/// the attribute does not parse.
 #[derive(Default)]
 struct Expects {
     reasons: Vec<Option<String>>,
@@ -27,16 +28,13 @@ impl Visit<'_> for Expects {
     fn visit_attribute(&mut self, attr: &syn::Attribute) {
         if attr.path().is_ident("expect") {
             let mut reason = None;
-            // A malformed attribute does not compile, so this cannot fail on a
-            // tree that builds; if it does, the reason stays `None` and the
-            // attribute is reported.
-            let _ = attr.parse_nested_meta(|meta| {
+            let parsed = attr.parse_nested_meta(|meta| {
                 if meta.path.is_ident("reason") {
                     reason = Some(meta.value()?.parse::<syn::LitStr>()?.value());
                 }
                 Ok(())
             });
-            self.reasons.push(reason);
+            self.reasons.push(parsed.ok().and(reason));
         }
         syn::visit::visit_attribute(self, attr);
     }
@@ -94,7 +92,7 @@ fn every_expect_reason_names_an_issue_or_is_by_design() {
             match reason {
                 Some(reason) if is_valid(&reason) => {}
                 Some(reason) => wrong.push(format!("{shown}: {reason:?}")),
-                None => wrong.push(format!("{shown}: an #[expect] without a reason")),
+                None => wrong.push(format!("{shown}: an #[expect] with no readable reason")),
             }
         }
     }
