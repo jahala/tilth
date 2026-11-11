@@ -132,6 +132,11 @@ fn node_to_entry(
     lang: Lang,
     depth: usize,
 ) -> Option<OutlineEntry> {
+    // A keyword token is never an entry: Ruby's `class` keyword has the kind
+    // of the class it opens.
+    if !node.is_named() {
+        return None;
+    }
     let kind_str = node.kind();
     let start_line = node.start_position().row as u32 + 1;
     let end_line = node.end_position().row as u32 + 1;
@@ -141,6 +146,7 @@ fn node_to_entry(
         "function_declaration"
         | "function_definition"
         | "function_item"
+        | "generator_function_declaration"
         | "method_definition"
         | "method_declaration"
         | "constructor_declaration"
@@ -2118,6 +2124,37 @@ export default abstract class Fallback {}
             leaf("Fallback", Class, 8, 8),
         ];
         for lang in [Lang::TypeScript, Lang::Tsx] {
+            assert_eq!(tree(get_outline_entries(src, lang)), expected, "{lang:?}");
+        }
+    }
+
+    /// `extern "C"` written before one function, with no braces, wraps that
+    /// function alone: the function is the entry, as with a block.
+    #[test]
+    fn an_extern_c_function_without_braces_is_an_entry() {
+        use OutlineKind::Function;
+        let src = "extern \"C\" int f(void) {\n  return 1;\n}\n\nint g(void) {\n  return 2;\n}\n";
+        let expected = vec![leaf("f", Function, 1, 3), leaf("g", Function, 5, 7)];
+        assert_eq!(tree(get_outline_entries(src, Lang::Cpp)), expected);
+    }
+
+    /// A Ruby class with no body has no children: its superclass is not an
+    /// anonymous class inside it.
+    #[test]
+    fn a_ruby_class_without_a_body_has_no_children() {
+        use OutlineKind::Class;
+        let src = "class X < Y; end\n\nclass Z < Y\nend\n";
+        let expected = vec![leaf("X", Class, 1, 1), leaf("Z", Class, 3, 4)];
+        assert_eq!(tree(get_outline_entries(src, Lang::Ruby)), expected);
+    }
+
+    /// A generator function is an outline function, as a plain one is.
+    #[test]
+    fn a_generator_function_is_an_entry() {
+        use OutlineKind::Function;
+        let src = "function* gen() {\n  yield 1;\n}\nexport function* more() {\n  yield 2;\n}\n";
+        let expected = vec![leaf("gen", Function, 1, 3), leaf("more", Function, 4, 6)];
+        for lang in [Lang::JavaScript, Lang::TypeScript] {
             assert_eq!(tree(get_outline_entries(src, lang)), expected, "{lang:?}");
         }
     }

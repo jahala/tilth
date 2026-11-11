@@ -374,6 +374,7 @@ const FUNCTION_NODE_KINDS: &[&str] = &[
     "function_declaration",
     "function_definition",
     "function_item",
+    "generator_function_declaration",
     "method_definition",
     "method_declaration",
     "constructor_declaration",
@@ -888,6 +889,12 @@ mod tests {
                 "package p\n\nfunc f(a int, b int) int {\n\treturn a + b\n}\n",
                 "package p\n\nfunc f(\n\ta int,\n\tb int,\n) int {\n\treturn a + b\n}\n",
                 "package p\n\nfunc f(\n\ta int,\n\tb int64,\n) int {\n\treturn a + b\n}\n",
+            ),
+            (
+                Lang::JavaScript,
+                "function* f(a, b) {\n  yield a + b;\n}\n",
+                "function* f(\n  a,\n  b,\n) {\n  yield a + b;\n}\n",
+                "function* f(\n  a,\n  c,\n) {\n  yield a + b;\n}\n",
             ),
             (
                 Lang::Java,

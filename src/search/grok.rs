@@ -200,6 +200,11 @@ fn enrich_from_outline(
         other => other,
     })?;
     let entries = get_outline_entries(&content, lang);
+    // A definition's range opens with the decorators beside it, but its
+    // outline entry starts on its own first line, below them.
+    let start_line =
+        tilth_core::lang::treesitter::decorated_definition_line(&content, lang, start_line)
+            .unwrap_or(start_line);
     // A one-line class and its first method start on the same line; the
     // name tells them apart.
     let entry = find_named_at(&entries, start_line, &name)
@@ -1155,6 +1160,106 @@ mod tests {
                 "{spec}"
             );
             assert_eq!(target.other_def_count, 0, "{spec} has one definition");
+        }
+    }
+
+    /// A qualifier naming a package, a module or `Self`/`self`/`this` finds
+    /// the definition by its name, as grok's bare-name retry did before
+    /// #296, and an Elixir dotted module is found by its full name.
+    #[test]
+    fn grok_resolves_names_qualified_by_a_module_or_self() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(
+            tmp.path(),
+            "gin.go",
+            "package gin\n\nfunc New() int {\n\treturn 1\n}\n",
+        );
+        write_fixture(
+            tmp.path(),
+            "runner.rs",
+            "pub struct Runner;\nimpl Runner {\n    pub fn new() -> Self {\n        Runner\n    }\n    pub fn run(&self) {}\n}\n",
+        );
+        write_fixture(tmp.path(), "symbol.rs", "pub fn search() {}\n");
+        write_fixture(
+            tmp.path(),
+            "accounts.ex",
+            "defmodule MyApp.Accounts do\n  def get_user(id), do: id\nend\n",
+        );
+        for (spec, file, line) in [
+            ("gin.New", "gin.go", 3),
+            ("Self::new", "runner.rs", 3),
+            ("self.run", "runner.rs", 6),
+            ("crate::search::symbol::search", "symbol.rs", 1),
+            ("MyApp.Accounts", "accounts.ex", 1),
+            ("MyApp.Accounts.get_user", "accounts.ex", 2),
+        ] {
+            let target = grok_target(tmp.path(), spec).unwrap_or_else(|e| panic!("{spec}: {e}"));
+            assert_eq!(
+                (
+                    target.path.file_name().unwrap().to_str().unwrap(),
+                    target.start_line
+                ),
+                (file, line),
+                "{spec}"
+            );
+        }
+    }
+
+    /// grok and search mark an expanded definition in the session under one
+    /// line, so each shows the other's body as shown earlier. A definition
+    /// whose annotations, decorators or return type sit above its name line
+    /// was marked under two lines and inlined twice.
+    #[test]
+    fn grok_and_search_share_the_expansion_of_an_annotated_definition() {
+        let body: String = (0..20)
+            .map(|i| format!("        int v{i} = {i};\n"))
+            .collect();
+        let java = format!("class Svc {{\n    @Override\n    public String run() {{\n{body}        return \"x\";\n    }}\n}}\n");
+        let py_body: String = (0..20).map(|i| format!("    v{i} = {i}\n")).collect();
+        let py = format!("@app.get(\"/r\")\ndef route():\n{py_body}    return 1\n");
+        let c_body: String = (0..20).map(|i| format!("  int v{i} = {i};\n")).collect();
+        let c = format!("static int\nrun_c(void)\n{{\n{c_body}  return 0;\n}}\n");
+        for (file, fixture, query) in [
+            ("Svc.java", java.as_str(), "run"),
+            ("app.py", py.as_str(), "route"),
+            ("r.c", c.as_str(), "run_c"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            write_fixture(tmp.path(), file, fixture);
+            let bloom = BloomFilterCache::default();
+            let cache = tilth_core::cache::OutlineCache::new();
+            let search = |session: &crate::session::Session| {
+                crate::search::search_symbol_expanded(
+                    query,
+                    tmp.path(),
+                    &cache,
+                    session,
+                    &bloom,
+                    1,
+                    None,
+                    None,
+                    false,
+                    None,
+                )
+                .unwrap()
+            };
+
+            let session = crate::session::Session::default();
+            grok(query, tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
+            let out = search(&session);
+            assert!(
+                out.contains("[shown earlier]"),
+                "{file}: grok, then search: {out}"
+            );
+
+            let session = crate::session::Session::default();
+            search(&session);
+            let again = grok(query, tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
+            assert!(
+                again.body.contains("body shown earlier"),
+                "{file}: search, then grok: {}",
+                again.body
+            );
         }
     }
 

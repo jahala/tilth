@@ -75,13 +75,15 @@ pub(crate) const DEFINITION_KINDS: &[&str] = &[
     "export_statement",
 ];
 
-/// Nodes that wrap one declaration to add a modifier: `export`, Python
-/// decorators, a TS `declare`. The declaration inside is the definition. The
-/// wrapper is not a second one, and it adds no nesting.
+/// Nodes that wrap a declaration to add a modifier: `export`, Python
+/// decorators, a TS `declare`, Bash's `export`, `local` and `declare`. The
+/// declaration inside is the definition. The wrapper is not a second one,
+/// and it adds no nesting.
 pub const WRAPPER_KINDS: &[&str] = &[
     "export_statement",
     "decorated_definition",
     "ambient_declaration",
+    "declaration_command",
 ];
 
 /// Type-like nodes whose body holds members: classes, structs, traits,
@@ -158,6 +160,25 @@ pub fn decorated_definition_line(
     None
 }
 
+/// The first row of the decorators or attributes beside definition `node`
+/// (the decorators of a Python `decorated_definition`, a TypeScript
+/// member's, a Rust item's attributes), with comments between them. `None`
+/// when no decorator sits right before it.
+#[must_use]
+pub fn decorators_start(node: tree_sitter::Node) -> Option<usize> {
+    let mut first = None;
+    let mut prev = node.prev_named_sibling();
+    while let Some(sibling) = prev {
+        if DECORATOR_KINDS.contains(&sibling.kind()) {
+            first = Some(sibling.start_position().row);
+        } else if !sibling.kind().contains("comment") {
+            break;
+        }
+        prev = sibling.prev_named_sibling();
+    }
+    first
+}
+
 /// Nodes whose body opens a local scope: functions, methods, constructors,
 /// closures and accessors, across every grammar. A variable declared inside
 /// one is local, so it is not a definition.
@@ -214,9 +235,16 @@ const BINDING_KINDS: &[&str] = &[
 
 /// Whether definition `node` binds a variable local to a function: a binding
 /// kind whose nearest enclosing function or type is a function.
+///
+/// A Bash assignment is local only when `local`, `declare` or `typeset`
+/// declares it in a function (and `declare -g` makes it global): a plain
+/// `VAR=1` in a function sets a global.
 #[must_use]
-pub fn is_local_binding(node: tree_sitter::Node) -> bool {
+pub fn is_local_binding(node: tree_sitter::Node, lines: &[&str]) -> bool {
     if !BINDING_KINDS.contains(&node.kind()) {
+        return false;
+    }
+    if node.kind() == "variable_assignment" && !is_bash_local_declaration(node.parent(), lines) {
         return false;
     }
     let mut parent = node.parent();
@@ -230,6 +258,22 @@ pub fn is_local_binding(node: tree_sitter::Node) -> bool {
         parent = p.parent();
     }
     false
+}
+
+/// Whether `node` is a Bash `local`, `declare` or `typeset` command, without
+/// the `-g` that makes `declare` global.
+fn is_bash_local_declaration(node: Option<tree_sitter::Node>, lines: &[&str]) -> bool {
+    let Some(node) = node.filter(|n| n.kind() == "declaration_command") else {
+        return false;
+    };
+    let mut cursor = node.walk();
+    let mut children = node.children(&mut cursor);
+    let local = children
+        .next()
+        .is_some_and(|k| matches!(k.kind(), "local" | "declare" | "typeset"));
+    local
+        && !children
+            .any(|c| c.kind() == "word" && node_text_simple(c, lines, NodeTextMode::Full) == "-g")
 }
 
 /// C and C++ type specifiers. With a body they define a type; without one
@@ -276,8 +320,10 @@ pub const NAMESPACE_KINDS: &[&str] = &[
 
 /// Whether `node` is one of `kinds`, or the body of one: its `body` field or
 /// its `declaration_list` (`namespace geo { ... }`, `extern "C" { ... }`,
-/// `module Shop ... end`). `parent` is `node`'s parent; a caller walking down
-/// the tree passes the one it holds, since `Node::parent` walks from the root.
+/// `module Shop ... end`). A body that is itself a definition is not a
+/// container: `extern "C" int f(void) { ... }` holds the function `f`.
+/// `parent` is `node`'s parent; a caller walking down the tree passes the
+/// one it holds, since `Node::parent` walks from the root.
 #[must_use]
 pub fn is_or_body_of(
     node: tree_sitter::Node,
@@ -288,7 +334,8 @@ pub fn is_or_body_of(
         || parent.is_some_and(|p| {
             kinds.contains(&p.kind())
                 && (node.kind() == "declaration_list"
-                    || p.child_by_field_name("body") == Some(node))
+                    || (p.child_by_field_name("body") == Some(node)
+                        && !DEFINITION_KINDS.contains(&node.kind())))
         })
 }
 
@@ -553,6 +600,7 @@ pub(crate) fn definition_weight(kind: &str) -> u16 {
         "function_declaration"
         | "function_definition"
         | "function_item"
+        | "generator_function_declaration"
         | "method_definition"
         | "method_declaration"
         | "method"
@@ -694,6 +742,7 @@ mod tests {
         assert_eq!(definition_weight("abstract_class_declaration"), 100);
         assert_eq!(definition_weight("method"), 100);
         assert_eq!(definition_weight("singleton_method"), 100);
+        assert_eq!(definition_weight("generator_function_declaration"), 100);
         assert_eq!(definition_weight("class"), 100);
         // C/C++ types rank with the other languages' types.
         for kind in [

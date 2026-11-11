@@ -71,7 +71,7 @@ pub(super) fn definition_name(
         && FUNCTION_VALUE_KINDS.contains(&node.kind())
     {
         function_value_name(node, lines)
-    } else if DEFINITION_KINDS.contains(&node.kind()) && !is_local_binding(node) {
+    } else if DEFINITION_KINDS.contains(&node.kind()) && !is_local_binding(node, lines) {
         extract_definition_name(node, lines)
     } else if lang == Lang::Elixir && is_elixir_definition(node, lines) {
         extract_elixir_definition_name(node, lines)
@@ -176,16 +176,90 @@ pub fn split_qualified(name: &str) -> (Option<&str>, &str) {
         return (None, name);
     };
     let owner = head.rsplit(['.', ':']).next().unwrap_or(head);
-    let is_word = |s: &str| {
-        !s.is_empty()
-            && s.chars()
-                .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
-    };
-    if is_word(owner) && is_word(bare) && !head.ends_with(':') {
+    if is_word(owner) && is_member_name(bare) && !head.ends_with(':') {
         (Some(owner), bare)
     } else {
         (None, name)
     }
+}
+
+/// An identifier: letters, digits, `_` and `$`.
+fn is_word(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+}
+
+/// A name a member can have: an identifier, optionally led by `#` (a JS
+/// private member) or `~` (a C++ destructor), and optionally ending in `?`,
+/// `!` or `=` (Ruby's `valid?`, `save!` and `name=`).
+fn is_member_name(s: &str) -> bool {
+    let s = s.strip_prefix(['#', '~']).unwrap_or(s);
+    let s = s.strip_suffix(['?', '!', '=']).unwrap_or(s);
+    is_word(s)
+}
+
+/// Qualifiers that name the type or instance a call is written in, not a
+/// type by its name: `Self::new`, `self.run`, `this.handle`, `cls.build`.
+const SELF_QUALIFIERS: &[&str] = &["Self", "self", "this", "cls"];
+
+/// The segments of a qualified name, at every `::` and `.`:
+/// `crate::m::A::run` gives `crate`, `m`, `A`, `run`. A name
+/// [`split_qualified`] does not split is one segment.
+fn segments(name: &str) -> Vec<&str> {
+    if split_qualified(name).0.is_none() {
+        return vec![name];
+    }
+    name.split("::").flat_map(|s| s.split('.')).collect()
+}
+
+/// Whether `query` names the definition called `defined` that `owner`
+/// holds (`None` when no type or module holds it). The qualified path of
+/// the definition is its owner's segments, then its own: `MyApp.Accounts`
+/// holding `get_user` is `MyApp`, `Accounts`, `get_user`, and an Elixir
+/// `defmodule MyApp.Accounts` is `MyApp`, `Accounts`. The query names it
+/// when the two agree on every segment they both have, counted from the
+/// end, so `Accounts.get_user` and `crate::m::A::run` name `A`'s `run`.
+/// A bare query takes any owner. A qualified query needs an owner to
+/// compare, unless its qualifier is one of [`SELF_QUALIFIERS`], which
+/// stands for whatever type holds the name.
+#[must_use]
+pub fn names_definition(query: &str, defined: &str, owner: Option<&str>) -> bool {
+    let wanted = segments(query);
+    let mut path: Vec<&str> = owner.map(segments).unwrap_or_default();
+    path.extend(segments(defined));
+    if wanted.len() == 2 && SELF_QUALIFIERS.contains(&wanted[0]) {
+        return path.last() == wanted.last();
+    }
+    let shared = wanted.len().min(path.len());
+    (wanted.len() == 1 || shared >= 2)
+        && wanted[wanted.len() - shared..] == path[path.len() - shared..]
+}
+
+/// Whether `qualifier` names the module a top-level definition in `path`
+/// belongs to: the file's stem (`symbol` for `symbol.rs`, `gin` for
+/// `gin.go`), its directory (`utils` for `utils/mod.rs` or
+/// `utils/__init__.py`), or a Go file's package (`gin` in
+/// `package gin`). `gin.New`, `crate::search::symbol::search` and
+/// `os.path.join` name a function by its module, which is not an owner a
+/// definition carries.
+#[must_use]
+pub fn names_module(qualifier: &str, path: &Path, root: tree_sitter::Node, lines: &[&str]) -> bool {
+    let name_of = |p: Option<&std::ffi::OsStr>| p.and_then(|s| s.to_str()) == Some(qualifier);
+    if name_of(path.file_stem()) || name_of(path.parent().and_then(Path::file_name)) {
+        return true;
+    }
+    let mut cursor = root.walk();
+    let package = root
+        .named_children(&mut cursor)
+        .find(|c| c.kind() == "package_clause");
+    package.is_some_and(|clause| {
+        let mut cursor = clause.walk();
+        let found = clause
+            .named_children(&mut cursor)
+            .any(|n| node_text_simple(n, lines, NodeTextMode::Full) == qualifier);
+        found
+    })
 }
 
 /// A Go method's receiver type: `Context` in `func (c *Context) reset()`.
@@ -222,7 +296,15 @@ fn declarator_scope(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
         if !d.kind().ends_with("declarator") {
             return None;
         }
-        declarator = d.child_by_field_name("declarator");
+        // A reference declarator (`const T& B::name()`) holds its inner
+        // declarator as an unnamed child, not in a `declarator` field.
+        declarator = d.child_by_field_name("declarator").or_else(|| {
+            let mut cursor = d.walk();
+            let inner = d
+                .named_children(&mut cursor)
+                .find(|c| c.kind().ends_with("declarator") || c.kind() == "qualified_identifier");
+            inner
+        });
     }
     None
 }
@@ -597,6 +679,40 @@ mod tests {
             let scope = enclosing_definition_at(&p, line, &cache).unwrap();
             assert_eq!(scope.kind, "function", "line {line}");
             assert_eq!(scope.name, name, "line {line}");
+        }
+    }
+
+    #[test]
+    fn a_cpp_member_returning_a_reference_names_its_class() {
+        // `const std::string& B::name()` wraps the qualified name in a
+        // reference declarator, as `int* B::ptr()` wraps it in a pointer one.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = write(
+            tmp.path(),
+            "b.cpp",
+            "const std::string& B::name() {\n  return s;\n}\nint* B::ptr() {\n  return 0;\n}\n",
+        );
+        let cache = OutlineCache::new();
+        for (line, name) in [(2, "B.name"), (5, "B.ptr")] {
+            let scope = enclosing_definition_at(&p, line, &cache).unwrap();
+            assert_eq!(scope.name, name, "line {line}");
+        }
+    }
+
+    #[test]
+    fn split_qualified_splits_member_names_with_marks() {
+        // Ruby's `?`, `!` and `=` methods, a JS private member and a C++
+        // destructor are member names a label can carry.
+        for (name, owner, bare) in [
+            ("User.save!", Some("User"), "save!"),
+            ("Cart.valid?", Some("Cart"), "valid?"),
+            ("User.name=", Some("User"), "name="),
+            ("Counter.#count", Some("Counter"), "#count"),
+            ("Shape::~Shape", Some("Shape"), "~Shape"),
+            ("User.!", None, "User.!"),
+            ("User.#", None, "User.#"),
+        ] {
+            assert_eq!(split_qualified(name), (owner, bare), "{name}");
         }
     }
 }

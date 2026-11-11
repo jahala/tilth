@@ -77,6 +77,27 @@ fn record_visible_expansions(
     }
 }
 
+/// The line a definition's expansion is marked under in the session, which
+/// grok marks too: the first line of the definition's own node, where its
+/// outline entry starts. That is `start`, the first line of its range,
+/// unless decorators beside the node open the range (a Python decorator, a
+/// TypeScript member's, a Rust attribute).
+fn expansion_line(m: &Match, start: u32) -> u32 {
+    if start == m.line {
+        return start;
+    }
+    let decorated = || {
+        let content = tilth_core::source::read_source(&m.path).ok()?;
+        let FileType::Code(lang) =
+            tilth_core::lang::detect_file_type_with_content(&m.path, &content)
+        else {
+            return None;
+        };
+        tilth_core::lang::treesitter::decorated_definition_line(&content, lang, start)
+    };
+    decorated().unwrap_or(start)
+}
+
 /// Cap for inlined markdown section bodies in the default preview slot.
 /// Long sections get a tail "… (N more lines — pass --expand to see the full
 /// section)" so the user knows to expand for the rest.
@@ -739,12 +760,15 @@ fn format_single_match(
     let current_mtime = std::fs::metadata(&m.path)
         .ok()
         .and_then(|md| md.modified().ok());
-    let deduped = m.is_definition
-        && m.def_range.is_some()
-        && current_mtime.is_some_and(|t| session.is_expanded(&m.path, m.line, t));
-    // expand_match always prints a range containing m.line (def_range starts
-    // at m.line for definitions; the ±10 fallback for def_range: None / usages
-    // trivially contains it), so the raw "-> [line] text" preview would
+    let marked_line = m
+        .def_range
+        .filter(|_| m.is_definition && session.previous.is_some())
+        .map(|(start, _)| expansion_line(m, start));
+    let deduped = marked_line
+        .is_some_and(|line| current_mtime.is_some_and(|t| session.is_expanded(&m.path, line, t)));
+    // expand_match always prints a range containing m.line (a definition's
+    // def_range holds its name line; the ±10 fallback for def_range: None /
+    // usages trivially contains it), so the raw "-> [line] text" preview would
     // reprint m.text byte-for-byte inside the fence below. Only the
     // structural outline_context (neighboring entries' signatures, not the
     // matched line's own source) survives alongside an expansion.
@@ -815,11 +839,11 @@ fn format_single_match(
                     out.push_str(&stripped_code);
 
                     if m.is_definition && m.def_range.is_some() {
-                        if let (Some(_), Some(mtime)) = (session.previous, current_mtime) {
-                            session.staged.insert((m.path.clone(), m.line, mtime));
+                        if let (Some(line), Some(mtime)) = (marked_line, current_mtime) {
+                            session.staged.insert((m.path.clone(), line, mtime));
                             expansion = Some(Expansion {
                                 path: m.path.clone(),
-                                line: m.line,
+                                line,
                                 mtime,
                                 end: out.len(),
                             });
