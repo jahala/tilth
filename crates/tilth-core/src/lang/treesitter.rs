@@ -11,20 +11,36 @@ pub(crate) const DEFINITION_KINDS: &[&str] = &[
     "function_item",
     "method_definition",
     "method_declaration",
+    // Members declared without a body: trait and interface methods, abstract
+    // methods, TS overloads and `declare function`. Each is the declaration
+    // of its member, as a bodiless Java or C# `method_declaration` is.
+    "function_signature_item",
+    "method_signature",
+    "abstract_method_signature",
+    "function_signature",
+    "protocol_function_declaration",
     // Classes, structs & Kotlin objects
     "class_declaration",
     "class_definition",
+    "abstract_class_declaration",
     "struct_item",
+    "union_item",
+    "struct_declaration",
+    "record_declaration",
+    "annotation_type_declaration",
     "object_declaration",
+    "object_definition",
     // Interfaces & types (TS)
     "interface_declaration",
     "trait_declaration",
+    "trait_definition",
+    "protocol_declaration",
     "type_alias_declaration",
     "type_item",
     // Enums
     "enum_item",
     "enum_declaration",
-    // Variables, constants & properties (Kotlin, C#, Swift)
+    // Variables, constants & properties (Kotlin, C#, Swift, Scala)
     "lexical_declaration",
     "variable_declaration",
     "variable_assignment", // Bash top-level assignments (bash-only today; a future grammar reusing this node kind would inherit definition_weight 60)
@@ -32,11 +48,24 @@ pub(crate) const DEFINITION_KINDS: &[&str] = &[
     "const_declaration",
     "static_item",
     "property_declaration",
+    "val_definition",
+    "var_definition",
     // Rust-specific
     "trait_item",
     "impl_item",
     "mod_item",
+    "macro_definition",
+    // Namespaces and modules (C++, PHP, C#, TS, Ruby)
     "namespace_definition",
+    "namespace_declaration",
+    "file_scoped_namespace_declaration",
+    "internal_module",
+    "module",
+    // Ruby. `class` is also a JS/TS class expression, which defines its name
+    // the same way.
+    "class",
+    "method",
+    "singleton_method",
     // Python
     "decorated_definition",
     // Go
@@ -44,6 +73,122 @@ pub(crate) const DEFINITION_KINDS: &[&str] = &[
     // Exports
     "export_statement",
 ];
+
+/// Nodes that wrap one declaration to add a modifier: `export`, Python
+/// decorators, a TS `declare`. The declaration inside is the definition. The
+/// wrapper is not a second one, and it adds no nesting.
+pub const WRAPPER_KINDS: &[&str] = &[
+    "export_statement",
+    "decorated_definition",
+    "ambient_declaration",
+];
+
+/// Type-like nodes whose body holds members: classes, structs, traits,
+/// interfaces, impls, objects and modules. Their body adds no nesting of its
+/// own, and a member's enclosing scope is qualified by the nearest one.
+pub const TYPE_KINDS: &[&str] = &[
+    "class_declaration",
+    "class_definition",
+    "abstract_class_declaration",
+    "class",
+    "class_specifier",
+    "struct_specifier",
+    "union_specifier",
+    "struct_item",
+    "struct_declaration",
+    "record_declaration",
+    "impl_item",
+    "interface_declaration",
+    "trait_item",
+    "trait_declaration",
+    "trait_definition",
+    "protocol_declaration",
+    "object_declaration",
+    "object_definition",
+    "companion_object",
+    "type_declaration",
+    "enum_item",
+    "enum_declaration",
+    "module",
+    "mod_item",
+    "internal_module",
+    "namespace_definition",
+    "namespace_declaration",
+];
+
+/// Nodes whose body opens a local scope: functions, methods, constructors,
+/// closures and accessors, across every grammar. A variable declared inside
+/// one is local, so it is not a definition.
+pub const FUNCTION_KINDS: &[&str] = &[
+    "function_declaration",
+    "function_definition",
+    "function_item",
+    "method_definition",
+    "method_declaration",
+    "method",
+    "singleton_method",
+    "constructor_declaration",
+    "compact_constructor_declaration",
+    "secondary_constructor",
+    "init_declaration",
+    "deinit_declaration",
+    "arrow_function",
+    "function_expression",
+    "function",
+    "generator_function",
+    "generator_function_declaration",
+    "func_literal",
+    "closure_expression",
+    "lambda",
+    "lambda_expression",
+    "lambda_literal",
+    "anonymous_function",
+    "anonymous_method_expression",
+    "local_function_statement",
+    "accessor_declaration",
+    "getter",
+    "setter",
+    "computed_getter",
+    "computed_setter",
+    "class_static_block",
+    "static_initializer",
+    "anonymous_initializer",
+];
+
+/// Definition kinds that bind a variable, constant or property. Declared
+/// inside a function body they are locals.
+const BINDING_KINDS: &[&str] = &[
+    "lexical_declaration",
+    "variable_declaration",
+    "variable_assignment",
+    "const_item",
+    "static_item",
+    "property_declaration",
+    "val_definition",
+    "var_definition",
+    "var_spec",
+    "const_spec",
+];
+
+/// Whether definition `node` binds a variable local to a function: a binding
+/// kind whose nearest enclosing function or type is a function.
+#[must_use]
+pub fn is_local_binding(node: tree_sitter::Node) -> bool {
+    if !BINDING_KINDS.contains(&node.kind()) {
+        return false;
+    }
+    let mut parent = node.parent();
+    while let Some(p) = parent {
+        if FUNCTION_KINDS.contains(&p.kind()) {
+            return true;
+        }
+        if TYPE_KINDS.contains(&p.kind()) {
+            return false;
+        }
+        parent = p.parent();
+    }
+    false
+}
 
 /// C and C++ type specifiers. With a body they define a type; without one
 /// (`struct point *p`, `class Forward;`) they name a type defined elsewhere.
@@ -74,21 +219,35 @@ pub const PASS_THROUGH_KINDS: &[&str] = &[
     "template_declaration",
 ];
 
-/// Namespace nodes (C++, C#, PHP). A namespace is a definition with a name, but
-/// it does not nest its members the way a class does.
+/// Namespace nodes (C++, C#, PHP, Rust `mod`, TS `namespace`, Ruby and TS
+/// `module`). A namespace is a definition with a name, but it does not nest
+/// its members the way a class does. Python's root node is also a `module`;
+/// a root is never a namespace, so callers judge only nodes with a parent.
 pub const NAMESPACE_KINDS: &[&str] = &[
     "namespace_declaration",
     "namespace_definition",
     "file_scoped_namespace_declaration",
+    "mod_item",
+    "internal_module",
+    "module",
 ];
 
-/// Whether `node` is one of `kinds`, or the `declaration_list` that holds the
-/// body of one (`namespace geo { ... }`, `extern "C" { ... }`).
+/// Whether `node` is one of `kinds`, or the body of one: its `body` field or
+/// its `declaration_list` (`namespace geo { ... }`, `extern "C" { ... }`,
+/// `module Shop ... end`). `parent` is `node`'s parent; a caller walking down
+/// the tree passes the one it holds, since `Node::parent` walks from the root.
 #[must_use]
-pub fn is_or_body_of(node: tree_sitter::Node, kinds: &[&str]) -> bool {
+pub fn is_or_body_of(
+    node: tree_sitter::Node,
+    parent: Option<tree_sitter::Node>,
+    kinds: &[&str],
+) -> bool {
     kinds.contains(&node.kind())
-        || (node.kind() == "declaration_list"
-            && node.parent().is_some_and(|p| kinds.contains(&p.kind())))
+        || parent.is_some_and(|p| {
+            kinds.contains(&p.kind())
+                && (node.kind() == "declaration_list"
+                    || p.child_by_field_name("body") == Some(node))
+        })
 }
 
 /// Follow a declarator chain down to the node that holds the declared name.
@@ -183,6 +342,30 @@ pub fn extract_definition_name(node: tree_sitter::Node, lines: &[&str]) -> Optio
                         return Some(text);
                     }
                 }
+            }
+        }
+    }
+
+    // A Scala `val x = 1` binds a pattern; only a plain identifier names one
+    // symbol (`val (a, b) = ...` binds a tuple).
+    if let Some(pattern) = node.child_by_field_name("pattern") {
+        if pattern.kind() == "identifier" {
+            return Some(node_text_simple(pattern, lines, NodeTextMode::Full));
+        }
+    }
+
+    // A Kotlin `property_declaration` and a PHP `const_declaration` name their
+    // symbol in a child: a `variable_declaration` or a `const_element`, whose
+    // first named child is the name.
+    if node.kind() == "property_declaration" || node.kind() == "const_declaration" {
+        let mut cursor = node.walk();
+        let holder = node
+            .children(&mut cursor)
+            .find(|c| c.kind() == "variable_declaration" || c.kind() == "const_element");
+        if let Some(name_node) = holder.and_then(|h| h.named_child(0)) {
+            let text = node_text_simple(name_node, lines, NodeTextMode::Full);
+            if !text.is_empty() {
+                return Some(text);
             }
         }
     }
@@ -313,11 +496,21 @@ pub(crate) fn definition_weight(kind: &str) -> u16 {
         | "function_item"
         | "method_definition"
         | "method_declaration"
+        | "method"
+        | "singleton_method"
         | "class_declaration"
         | "class_definition"
+        | "abstract_class_declaration"
+        | "class"
         | "struct_item"
+        | "union_item"
+        | "struct_declaration"
+        | "record_declaration"
+        | "annotation_type_declaration"
         | "interface_declaration"
         | "trait_declaration"
+        | "trait_definition"
+        | "protocol_declaration"
         | "trait_item"
         | "enum_item"
         | "enum_declaration"
@@ -325,19 +518,33 @@ pub(crate) fn definition_weight(kind: &str) -> u16 {
         | "type_declaration"
         | "type_spec"
         | "type_alias"
-        | "decorated_definition"
         | "class_specifier"
         | "struct_specifier"
         | "union_specifier"
         | "enum_specifier"
         | "type_definition"
         | "alias_declaration" => 100,
-        "impl_item" | "object_declaration" => 90,
-        "const_item" | "const_declaration" | "const_spec" | "static_item" => 80,
-        "mod_item" | "namespace_definition" | "property_declaration" => 70,
-        "lexical_declaration" | "variable_declaration" | "var_spec" => 40,
+        "impl_item" | "object_declaration" | "object_definition" => 90,
+        "const_item"
+        | "const_declaration"
+        | "const_spec"
+        | "static_item"
+        | "macro_definition"
+        | "preproc_def"
+        | "preproc_function_def" => 80,
+        "mod_item"
+        | "namespace_definition"
+        | "namespace_declaration"
+        | "file_scoped_namespace_declaration"
+        | "internal_module"
+        | "module"
+        | "property_declaration"
+        | "val_definition"
+        | "var_definition" => 70,
         "variable_assignment" => 60,
-        "export_statement" => 30,
+        "lexical_declaration" | "variable_declaration" | "var_spec" => 40,
+        // Bodiless member declarations (trait, interface and abstract
+        // methods) rank below the bodies that implement them.
         _ => 50,
     }
 }
@@ -419,12 +626,16 @@ mod tests {
     #[test]
     fn definition_weight_covers_every_tier() {
         // 100 — primary declarations, one per source language shape
-        // (Rust function_item/enum_item, TS class_declaration/interface_declaration, Python decorated_definition).
+        // (Rust function_item/enum_item, TS class_declaration/interface_declaration,
+        // TS abstract classes, Ruby methods and classes).
         assert_eq!(definition_weight("function_item"), 100);
         assert_eq!(definition_weight("class_declaration"), 100);
         assert_eq!(definition_weight("interface_declaration"), 100);
         assert_eq!(definition_weight("enum_item"), 100);
-        assert_eq!(definition_weight("decorated_definition"), 100);
+        assert_eq!(definition_weight("abstract_class_declaration"), 100);
+        assert_eq!(definition_weight("method"), 100);
+        assert_eq!(definition_weight("singleton_method"), 100);
+        assert_eq!(definition_weight("class"), 100);
         // C/C++ types rank with the other languages' types.
         for kind in [
             "class_specifier",
@@ -455,8 +666,9 @@ mod tests {
         // 40 — plain variable declarations (JS/TS lexical_declaration, C#/Kotlin variable_declaration).
         assert_eq!(definition_weight("lexical_declaration"), 40);
         assert_eq!(definition_weight("variable_declaration"), 40);
-        // 30 — export wrapper (unwrapped recursively by extract_definition_name).
-        assert_eq!(definition_weight("export_statement"), 30);
+        // 80 — macros rank with constants.
+        assert_eq!(definition_weight("macro_definition"), 80);
+        assert_eq!(definition_weight("preproc_def"), 80);
         // 50 — unrecognized kind falls to the default tier, not 0.
         assert_eq!(definition_weight("comment"), 50);
     }

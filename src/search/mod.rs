@@ -663,7 +663,8 @@ fn format_single_match(
                         }
                     }
 
-                    let file_type = tilth_core::lang::detect_file_type(&m.path);
+                    let file_type =
+                        tilth_core::lang::detect_file_type_with_content(&m.path, &content);
                     let mut skip_lines = strip::strip_noise(&content, &m.path, m.def_range);
 
                     if let Some((def_start, def_end)) = m.def_range {
@@ -930,7 +931,7 @@ fn basename_file_outline(
 
     // Read file and generate outline
     let content = tilth_core::source::read_source(&matched_path).ok()?;
-    let file_type = tilth_core::lang::detect_file_type(&matched_path);
+    let file_type = tilth_core::lang::detect_file_type_with_content(&matched_path, &content);
     let mtime = std::fs::metadata(&matched_path)
         .and_then(|m| m.modified())
         .unwrap_or(std::time::SystemTime::UNIX_EPOCH);

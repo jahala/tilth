@@ -409,9 +409,16 @@ The biggest production-only file in the subsystem. Three layers stacked:
    `SearchResult`.
 2. **Per-language definition extraction**:
    - `find_defs_treesitter` walks the tree-sitter tree and picks
-     definitions whose name field equals the query. Uses
-     `DEFINITION_KINDS` from `lang/treesitter.rs` (about 30 node-kind
-     strings spanning every supported grammar).
+     definitions whose name field equals the query. The node kinds come
+     from `spec(lang).definition_kinds`: `DEFINITION_KINDS` in
+     `lang/treesitter.rs` for most languages, a list of their own for
+     Go, C, C++ and Elixir. The walk stops three nesting levels down, so
+     declarations nested deeper are locals. Only real nesting counts:
+     `WRAPPER_KINDS` (`export`, decorators, `declare`), namespaces and
+     modules, pass-through nodes (`#ifdef`, `extern "C"`, templates) and
+     the body of a `TYPE_KINDS` node are free. A variable declared in a
+     function body (`is_local_binding`) is never a definition. A wrapper
+     is not a definition of its own; the declaration it wraps is.
    - `find_defs_heuristic_buf` is a regex-free fallback for languages
      without grammars (Dockerfile, Make).
    - `find_defs_markdown_buf` handles ATX headings as
@@ -618,7 +625,14 @@ Make.
 `lang::treesitter::DEFINITION_KINDS` is the canonical list of
 tree-sitter node kinds tilth treats as definitions across all
 languages. It's a flat `&[&str]` slice — additions are line-noise
-edits.
+edits. Beside it, `WRAPPER_KINDS`, `TYPE_KINDS`, `NAMESPACE_KINDS`,
+`PASS_THROUGH_KINDS` and `FUNCTION_KINDS` say how definitions nest.
+
+`.h` is the one extension two languages share. `detect_file_type` reads
+it as C; `detect_file_type_with_content` (and `refine_lang`, for a
+caller that already holds the path's language) reads a header that
+holds C++ syntax as C++. Every site that parses content uses the
+content-aware form; the overview's language counts stay path-only.
 
 `lang::package_root(path)` walks up looking for known manifests
 (`Cargo.toml`, `package.json`, `pyproject.toml`, `go.mod`, etc.) and is

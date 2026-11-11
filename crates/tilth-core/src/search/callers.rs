@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use streaming_iterator::StreamingIterator;
 
 use crate::error::TilthError;
-use crate::lang::detect_file_type;
+use crate::lang::detect_file_type_with_content;
 use crate::lang::outline::outline_language;
 use crate::types::FileType;
 
@@ -92,7 +92,7 @@ pub fn find_callers_batch(
             }
 
             // Only process files with tree-sitter grammars
-            let file_type = detect_file_type(path);
+            let file_type = detect_file_type_with_content(path, &content);
             let FileType::Code(lang) = file_type else {
                 return ignore::WalkState::Continue;
             };

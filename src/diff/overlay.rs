@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use tilth_core::lang::detect_file_type;
+use tilth_core::lang::detect_file_type_with_content;
 use tilth_core::lang::outline::get_outline_entries;
 use tilth_core::types::{FileType, OutlineEntry, OutlineKind};
 
@@ -173,7 +173,7 @@ pub(crate) fn detect_conflicts(path: &Path, repo: Option<&Path>) -> Vec<Conflict
                 let theirs = lines[sep + 1..e].join("\n");
 
                 // Find enclosing function via outline.
-                let ft = detect_file_type(path);
+                let ft = detect_file_type_with_content(path, &content);
                 let enclosing_fn = if let FileType::Code(lang) = ft {
                     let entries = get_outline_entries(&content, lang);
                     find_enclosing_function(&entries, (start + 1) as u32)
@@ -225,7 +225,7 @@ fn compute_modified(file_diff: &FileDiff, source: &DiffSource, repo: Option<&Pat
         };
     };
 
-    let ft = detect_file_type(path);
+    let ft = detect_file_type_with_content(path, diff_side(&old_content, &new_content));
     let (symbol_changes, attributed_hunks) = if let FileType::Code(lang) = ft {
         let old_entries = get_outline_entries(&old_content, lang);
         let new_entries = get_outline_entries(&new_content, lang);
@@ -321,7 +321,7 @@ fn compute_renamed(file_diff: &FileDiff, source: &DiffSource, repo: Option<&Path
         };
     };
 
-    let ft = detect_file_type(path);
+    let ft = detect_file_type_with_content(path, diff_side(&old_content, &new_content));
     let (symbol_changes, attributed_hunks) = if let FileType::Code(lang) = ft {
         let old_entries = get_outline_entries(&old_content, lang);
         let new_entries = get_outline_entries(&new_content, lang);
@@ -461,8 +461,18 @@ pub(super) fn git_show(spec: &str, repo: Option<&Path>) -> Result<String, String
     }
 }
 
+/// The side of a diff that decides a file's language: the new content, or the
+/// old when the file was deleted.
+fn diff_side<'a>(old_content: &'a str, new_content: &'a str) -> &'a str {
+    if new_content.is_empty() {
+        old_content
+    } else {
+        new_content
+    }
+}
+
 fn get_entries_for_path(path: &Path, content: &str) -> Vec<OutlineEntry> {
-    match detect_file_type(path) {
+    match detect_file_type_with_content(path, content) {
         FileType::Code(lang) => get_outline_entries(content, lang),
         _ => Vec::new(),
     }

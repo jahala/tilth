@@ -73,6 +73,35 @@ pub fn is_elixir_definition(node: tree_sitter::Node, lines: &[&str]) -> bool {
     ELIXIR_DEFINITION_TARGETS.contains(&kw.as_str())
 }
 
+/// Whether `node` is an Elixir container (`defmodule`, `defprotocol`,
+/// `defimpl`) or the `do` block of one, given its `parent`. A container groups
+/// definitions the way a namespace does, so a module nested in a module adds
+/// no nesting.
+#[must_use]
+pub fn is_elixir_container(
+    node: tree_sitter::Node,
+    parent: Option<tree_sitter::Node>,
+    lines: &[&str],
+) -> bool {
+    let call = if node.kind() == "do_block" {
+        match parent {
+            Some(p) => p,
+            None => return false,
+        }
+    } else {
+        node
+    };
+    if call.kind() != "call" {
+        return false;
+    }
+    call.child_by_field_name("target").is_some_and(|t| {
+        matches!(
+            node_text_simple(t, lines, NodeTextMode::Full).as_str(),
+            "defmodule" | "defprotocol" | "defimpl"
+        )
+    })
+}
+
 /// Extract the defined name from an Elixir definition `call` node.
 ///
 /// - `defmodule Foo.Bar do...end` → `"Foo.Bar"`

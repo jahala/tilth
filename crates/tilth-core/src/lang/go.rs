@@ -70,11 +70,13 @@ const GO_STDLIB_ROOTS: &[&str] = &[
 /// Go definition node kinds. A `type`, `const` or `var` declaration has no
 /// name of its own: each name sits on a spec inside it, and a grouped block
 /// (`const ( ... )`) holds one spec per member. The specs are therefore the
-/// definitions. Function-local declarations sit deeper than the definition
-/// walker descends, so only package-level ones count.
+/// definitions, as is each method an interface declares. Function-local
+/// declarations sit deeper than the definition walker descends, so only
+/// package-level ones count.
 const GO_DEFINITION_KINDS: &[&str] = &[
     "function_declaration",
     "method_declaration",
+    "method_elem",
     "type_spec",
     "type_alias",
     "const_spec",

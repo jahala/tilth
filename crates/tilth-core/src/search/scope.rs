@@ -9,28 +9,8 @@ use std::path::Path;
 use crate::cache::OutlineCache;
 use crate::lang::elixir::{extract_elixir_definition_name, is_elixir_definition};
 use crate::lang::treesitter::{
-    extract_definition_name, node_text_simple, NodeTextMode, DEFINITION_KINDS,
+    extract_definition_name, node_text_simple, NodeTextMode, DEFINITION_KINDS, TYPE_KINDS,
 };
-
-/// Type-like node kinds that can enclose a function definition.
-const TYPE_KINDS: &[&str] = &[
-    "class_declaration",
-    "class_definition",
-    "class_specifier",
-    "struct_specifier",
-    "union_specifier",
-    "struct_item",
-    "impl_item",
-    "interface_declaration",
-    "trait_item",
-    "trait_declaration",
-    "type_declaration",
-    "enum_item",
-    "enum_declaration",
-    "module",
-    "mod_item",
-    "namespace_definition",
-];
 
 /// Resolved enclosing-definition context for a (file, line). Used by the
 /// search formatter to annotate usages with their containing scope.
@@ -138,19 +118,38 @@ fn kind_label(node: tree_sitter::Node, lines: &[&str], lang: crate::types::Lang)
         | "function_item"
         | "method_definition"
         | "method_declaration"
+        | "method"
+        | "singleton_method"
+        | "function_signature_item"
+        | "method_signature"
+        | "abstract_method_signature"
+        | "function_signature"
+        | "protocol_function_declaration"
         | "decorated_definition" => "function",
-        "class_declaration" | "class_definition" => "class",
-        "struct_item" => "struct",
+        "class_declaration"
+        | "class_definition"
+        | "abstract_class_declaration"
+        | "class"
+        | "record_declaration"
+        | "annotation_type_declaration" => "class",
+        "struct_item" | "struct_declaration" | "union_item" => "struct",
         "interface_declaration" => "interface",
-        "trait_declaration" | "trait_item" => "trait",
+        "trait_declaration" | "trait_item" | "trait_definition" => "trait",
+        "protocol_declaration" => "protocol",
         "type_alias_declaration" | "type_item" | "type_declaration" => "type",
         "enum_item" | "enum_declaration" => "enum",
-        "lexical_declaration" | "variable_declaration" => "variable",
-        "const_item" | "const_declaration" => "const",
+        "lexical_declaration" | "variable_declaration" | "var_definition" => "variable",
+        "const_item" | "const_declaration" | "val_definition" => "const",
         "static_item" => "static",
         "property_declaration" => "property",
-        "mod_item" | "namespace_definition" => "module",
-        "object_declaration" => "object",
+        "mod_item"
+        | "namespace_definition"
+        | "namespace_declaration"
+        | "file_scoped_namespace_declaration"
+        | "internal_module"
+        | "module" => "module",
+        "macro_definition" => "macro",
+        "object_declaration" | "object_definition" => "object",
         "impl_item" => "impl",
         "export_statement" => "export",
         "call" if lang == crate::types::Lang::Elixir => elixir_kind_label(node, lines),

@@ -46,8 +46,8 @@ pub use imports::{
     extract_imports, is_external, is_import_line, resolve_related_files_with_content, Import,
 };
 pub use index::bloom::BloomFilterCache;
-pub use lang::detect_file_type;
 pub use lang::outline::{extract_import_source, get_outline_entries};
+pub use lang::{detect_file_type, detect_file_type_with_content};
 pub use search::callers::{find_callers_batch, CallerMatch};
 pub use search::deps::{analyze_deps, Dependent, DepsResult, LocalDep};
 pub use test_structure::{test_entries, TestEntry, TestKind};

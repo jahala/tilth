@@ -14,6 +14,7 @@ are shared with the `tilth` binary and carry no stability promise.
 | Item | What it does |
 |---|---|
 | `detect_file_type(&Path) -> FileType` | The file's kind by extension or name; `FileType::Code(Lang)` for code. |
+| `detect_file_type_with_content(&Path, &str) -> FileType` | The same, settled by content where the path is ambiguous: a `.h` header that holds C++ syntax is C++. Use it before parsing. |
 | `Lang`, `FileType` | The languages tilth parses and the file kinds it outlines. |
 | `get_outline_entries(&str, Lang) -> Vec<OutlineEntry>` | Definitions with kind, name, line range, signature and children. |
 | `OutlineEntry`, `OutlineKind` | The shape of an outline. A JS/TS export clause gives one `Export` entry per specifier, named as exported, with `local_name` set where it renames. |

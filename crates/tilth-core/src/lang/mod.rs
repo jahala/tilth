@@ -93,6 +93,30 @@ pub fn detect_file_type(path: &Path) -> FileType {
     }
 }
 
+/// Detect a file's type from its path and content: [`detect_file_type`],
+/// with a code language settled by [`refine_lang`]. Use this wherever the
+/// content is parsed.
+#[must_use]
+pub fn detect_file_type_with_content(path: &Path, content: &str) -> FileType {
+    match detect_file_type(path) {
+        FileType::Code(lang) => FileType::Code(refine_lang(lang, path, content)),
+        other => other,
+    }
+}
+
+/// Settle the language the path gave `path` by its content. The path decides
+/// every case but `.h`, which C and C++ share: a header that holds C++ syntax
+/// is C++, any other is C.
+#[must_use]
+pub fn refine_lang(lang: Lang, path: &Path, content: &str) -> Lang {
+    if lang == Lang::C && path.extension().is_some_and(|e| e == "h") && cpp::has_cpp_syntax(content)
+    {
+        Lang::Cpp
+    } else {
+        lang
+    }
+}
+
 fn file_type_from_name(path: &Path) -> FileType {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return FileType::Other;
@@ -127,5 +151,62 @@ pub fn package_root(path: &Path) -> Option<&Path> {
             }
         }
         dir = dir.parent()?;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn header(content: &str) -> FileType {
+        detect_file_type_with_content(Path::new("x.h"), content)
+    }
+
+    #[test]
+    fn a_header_holding_cpp_syntax_is_cpp() {
+        for src in [
+            "class Widget {\n};\n",
+            "class EXPORT Widget : public Base {\n};\n",
+            "namespace geo {\nint area();\n}\n",
+            "namespace {\nint hidden;\n}\n",
+            "template <typename T> T id(T x);\n",
+            "struct S {\n public:\n  int x;\n};\n",
+            "int geo::area() { return 1; }\n",
+            "#ifdef __cplusplus\nextern \"C\" {\n#endif\nint f(void);\n",
+        ] {
+            assert_eq!(header(src), FileType::Code(Lang::Cpp), "{src:?}");
+        }
+    }
+
+    #[test]
+    fn a_header_without_cpp_syntax_stays_c() {
+        for src in [
+            crate::lang::c::C_DEFINITIONS_FIXTURE,
+            // C++ words in comments, strings and as plain C identifiers.
+            "/* class Widget { namespace x { template <T> */\nint f(void);\n",
+            "// std::vector<int> and class Foo {\nint g(void);\n",
+            "const char *s = \"namespace x { a::b }\";\n",
+            "struct list *new, *class;\nint private;\n",
+            "extern int count;\n",
+        ] {
+            assert_eq!(header(src), FileType::Code(Lang::C), "{src:?}");
+        }
+    }
+
+    #[test]
+    fn only_headers_are_judged_by_content() {
+        let cpp = "class Widget {\n};\n";
+        assert_eq!(
+            detect_file_type_with_content(Path::new("x.c"), cpp),
+            FileType::Code(Lang::C)
+        );
+        assert_eq!(
+            detect_file_type_with_content(Path::new("x.hpp"), "int f(void);\n"),
+            FileType::Code(Lang::Cpp)
+        );
+        assert_eq!(
+            detect_file_type_with_content(Path::new("x.rs"), cpp),
+            FileType::Code(Lang::Rust)
+        );
     }
 }
