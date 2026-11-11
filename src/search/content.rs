@@ -193,6 +193,7 @@ fn search_capped(
         matches: all_matches,
         total_found: total,
         definitions: 0,
+        code_definitions: 0,
         usages: total,
         facet_totals: FacetTotals::default(),
         skipped_large: super::sorted(skipped_large),

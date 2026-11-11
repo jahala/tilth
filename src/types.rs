@@ -89,6 +89,9 @@ pub struct SearchResult {
     pub matches: Vec<Match>,
     pub total_found: usize,
     pub definitions: usize,
+    /// The definitions in code files: `definitions` without the Markdown
+    /// headings that name the query.
+    pub code_definitions: usize,
     pub usages: usize,
     /// Pre-cap subfacet counts. Computed in `symbol::search` by faceting the
     /// merged set before truncation; used by the renderer to print
