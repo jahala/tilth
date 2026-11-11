@@ -24,18 +24,9 @@ pub enum ViewMode {
     Outline,
     Signature,
     Keys,
-    // Reserved/roadmap: planned head+tail view mode, not yet wired.
-    #[expect(dead_code, reason = "reserved variant, never constructed yet")]
-    HeadTail,
     Empty,
     Generated,
     Minified,
-    // Reserved/roadmap: binary file view variant, not yet wired.
-    #[expect(dead_code, reason = "reserved variant, never constructed yet")]
-    Binary,
-    // Reserved/roadmap: error view variant, not yet wired.
-    #[expect(dead_code, reason = "reserved variant, never constructed yet")]
-    Error,
     Section,
     Stripped,
 }
@@ -47,12 +38,9 @@ impl std::fmt::Display for ViewMode {
             Self::Outline => write!(f, "outline"),
             Self::Signature => write!(f, "signature"),
             Self::Keys => write!(f, "keys"),
-            Self::HeadTail => write!(f, "head+tail"),
             Self::Empty => write!(f, "empty"),
             Self::Generated => write!(f, "generated — skipped"),
             Self::Minified => write!(f, "minified — skipped"),
-            Self::Binary => write!(f, "skipped"),
-            Self::Error => write!(f, "error"),
             Self::Section => write!(f, "section"),
             Self::Stripped => write!(f, "stripped"),
         }

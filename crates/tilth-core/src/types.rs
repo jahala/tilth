@@ -94,10 +94,6 @@ pub enum OutlineKind {
     // Property is constructed in lang/outline.rs (property_declaration nodes).
     Property,
     Module,
-    // Reserved/roadmap: no tree-sitter grammar currently emits TestSuite nodes.
-    TestSuite,
-    // Reserved/roadmap: no tree-sitter grammar currently emits TestCase nodes.
-    TestCase,
 }
 
 /// Detect test files by path patterns.

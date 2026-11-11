@@ -243,8 +243,6 @@ fn format_entry(entry: &OutlineEntry, indent: usize, lang: Lang, detail: Detail)
             }
         }
         OutlineKind::Import => "import",
-        OutlineKind::TestSuite => "suite",
-        OutlineKind::TestCase => "test",
     };
 
     // An export clause renders as written, once for all its specifiers.
