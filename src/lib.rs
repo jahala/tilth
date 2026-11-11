@@ -329,11 +329,17 @@ pub fn run_deps(
     path: &Path,
     scope: &Path,
     budget_tokens: Option<u64>,
+    full: bool,
 ) -> Result<String, TilthError> {
     let bloom = tilth_core::BloomFilterCache::new();
     let result = tilth_core::analyze_deps(path, scope, &bloom)?;
     let budget_usize = budget_tokens.map(|b| b as usize);
-    Ok(search::deps::format_deps(&result, scope, budget_usize))
+    Ok(search::deps::format_deps(
+        &result,
+        scope,
+        budget_usize,
+        full,
+    ))
 }
 
 /// Grok a symbol: return def + doc + callees + callers + siblings + tests in one call.
@@ -424,6 +430,7 @@ fn run_inner(
                 if !related.is_empty() {
                     let hints: Vec<String> = related
                         .iter()
+                        .take(read::RELATED_HINT_LIMIT)
                         .filter_map(|p| p.strip_prefix(scope).ok().or(Some(p.as_path())))
                         .map(|p| p.display().to_string())
                         .collect();
@@ -539,8 +546,8 @@ fn run_query_expanded(
 /// Only called for search query types — FilePath/Glob are handled before this.
 /// `full_search` is the parsed `--full` flag. It is named apart from
 /// `run_inner`'s `full`, which means full-*file* display: this one raises the
-/// match cap and the walker's early-quit thresholds and expands nothing,
-/// which is exactly what `--full --expand=0` asks for.
+/// match cap and expands nothing, which is exactly what `--full --expand=0`
+/// asks for.
 fn run_query_basic(
     query_type: &QueryType,
     scope: &Path,

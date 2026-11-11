@@ -463,31 +463,43 @@ fn compute_blast(overlays: &[FileOverlay], repo: Option<&Path>) -> Vec<String> {
     };
     let bloom = tilth_core::index::bloom::BloomFilterCache::new();
 
-    match tilth_core::find_callers_batch(
+    // Stops at the same bound as a write's blast radius, so a diff stays
+    // fast on a huge tree; the count then says it is a lower bound.
+    let per_file = tilth_core::find_callers_batch(
         &sig_changed,
         &scope,
         &bloom,
         None,
-        tilth_core::search::callers::BATCH_EARLY_QUIT,
-    ) {
-        Ok(matches) => {
+        Some(crate::search::blast::BLAST_STOP_AFTER),
+        |sites| {
             let mut counts: std::collections::HashMap<String, usize> =
                 std::collections::HashMap::new();
-            for (target, _) in &matches {
-                *counts.entry(target.clone()).or_default() += 1;
+            for (target, _) in sites {
+                *counts.entry(target).or_default() += 1;
             }
             counts
-                .into_iter()
-                .map(|(name, count)| {
-                    format!(
-                        "blast: `{name}` signature changed — {count} caller{} may need updating",
-                        if count == 1 { "" } else { "s" }
-                    )
-                })
-                .collect()
+        },
+    );
+    let Ok(walk) = per_file else {
+        return Vec::new();
+    };
+    // Sorted by name so the lines come out in the same order every run.
+    let at_least = if walk.reached_bound { "at least " } else { "" };
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for file in walk.per_file {
+        for (target, n) in file {
+            *counts.entry(target).or_default() += n;
         }
-        Err(_) => Vec::new(),
     }
+    counts
+        .into_iter()
+        .map(|(name, count)| {
+            format!(
+                "blast: `{name}` signature changed — {at_least}{count} caller{} may need updating",
+                if count == 1 { "" } else { "s" }
+            )
+        })
+        .collect()
 }
 
 /// Log mode pipeline: run per-commit diffs and format as commit summaries.
@@ -797,6 +809,54 @@ mod tests {
             result.contains("[~:sig]"),
             "expected [~:sig] marker in:\n{result}"
         );
+    }
+
+    /// The blast line of a diff that changes `hello`'s signature, in a repo
+    /// where `files` more files call `hello` three times each (and `main`
+    /// calls it once).
+    fn hello_blast_line(files: usize) -> String {
+        let dir = setup_test_repo();
+        let calls = "fn caller() {\n    hello();\n    hello();\n    hello();\n}\n";
+        for i in 0..files {
+            fs::write(dir.path().join(format!("src/c{i:02}.rs")), calls).unwrap();
+        }
+        git(dir.path(), &["add", "-A"]);
+        git(dir.path(), &["commit", "-m", "callers"]);
+        let main_rs = dir.path().join("src/main.rs");
+        let content = fs::read_to_string(&main_rs).unwrap();
+        fs::write(
+            &main_rs,
+            content.replace("fn hello() {", "fn hello(n: u8) {"),
+        )
+        .unwrap();
+
+        let out = diff(
+            &DiffSource::GitUncommitted,
+            Some(dir.path()),
+            None,
+            None,
+            true,
+            0,
+            None,
+        )
+        .unwrap();
+        out.lines()
+            .find(|l| l.contains("blast: `hello`"))
+            .unwrap_or_else(|| panic!("no blast line in:\n{out}"))
+            .to_string()
+    }
+
+    #[test]
+    fn diff_blast_under_the_bound_gives_the_exact_count() {
+        let line = hello_blast_line(4);
+        assert!(line.ends_with("— 13 callers may need updating"), "{line}");
+    }
+
+    #[test]
+    fn diff_blast_that_hits_the_bound_says_at_least() {
+        // 40 × 3 + 1 = 121 calls, past the bound the walk stops at.
+        let line = hello_blast_line(40);
+        assert!(line.contains("— at least "), "{line}");
     }
 
     // 6. test_file_detail_scope

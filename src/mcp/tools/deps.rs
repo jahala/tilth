@@ -32,6 +32,7 @@ pub(in crate::mcp) fn tool_deps(
         &deps_result,
         &scope,
         budget,
+        false,
     ));
     Ok(output)
 }

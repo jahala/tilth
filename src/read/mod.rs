@@ -16,6 +16,9 @@ use tilth_core::source::{strip_bom, strip_bom_bytes};
 use tilth_core::types::FileType;
 
 pub(crate) const TOKEN_THRESHOLD: u64 = 6_000;
+/// How many of a file's local imports the "Related:" hint under an outlined
+/// read names, in import order.
+pub(crate) const RELATED_HINT_LIMIT: usize = 8;
 /// Minimum compression ratio required to prefer the outline over full content.
 /// If `outline_tokens >= full_tokens * OUTLINE_MIN_COMPRESSION / 100`, the
 /// outline saves too few tokens to be worth the information loss, so the full
