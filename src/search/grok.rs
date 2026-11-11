@@ -394,6 +394,10 @@ pub struct GrokResult {
     pub body: String,
     pub callees_internal: Vec<ResolvedCallee>,
     pub callees_external: Vec<String>,
+    /// Callees no parsed file defines whose name an imported file over the
+    /// size limit holds, with that file. Neither internal nor extern: the
+    /// file was not parsed.
+    pub callees_unparsed: Vec<(String, PathBuf)>,
     pub callers: Vec<CallerMatch>,
     pub siblings: Vec<SiblingEntry>,
     pub tests: Vec<TestMatch>,
@@ -434,11 +438,17 @@ pub fn grok(
     let resolved = resolve_callees(&callee_names, &target.path, &content, bloom);
 
     let resolved_names: HashSet<&str> = resolved.iter().map(|c| c.name.as_str()).collect();
-    let externals: Vec<String> = callee_names
+    let unresolved = callee_names
         .iter()
-        .filter(|n| !resolved_names.contains(n.as_str()))
-        .cloned()
-        .collect();
+        .filter(|n| !resolved_names.contains(n.as_str()));
+    let oversized = oversized_imports(&target.path, &content);
+    let (mut unparsed, mut externals) = (Vec::new(), Vec::new());
+    for name in unresolved {
+        match oversized_holder(&oversized, name) {
+            Some(file) => unparsed.push((name.clone(), file)),
+            None => externals.push(name.clone()),
+        }
+    }
 
     // The target's path may differ from canonical form (symlinks, `../` segments).
     // The walker hands us canonical absolute paths in match/callee results; we
@@ -537,6 +547,9 @@ pub fn grok(
     let mut callees_external = externals;
     callees_external.truncate(caps.max_callees);
 
+    let mut callees_unparsed = unparsed;
+    callees_unparsed.truncate(caps.max_callees);
+
     let mut callers = prod_callers;
     callers.truncate(caps.max_callers);
 
@@ -580,6 +593,7 @@ pub fn grok(
             <= WRAPPER_MAX_BODY_LINES
         && total_callees_internal == 1
         && total_callees_external == 0
+        && callees_unparsed.is_empty()
     {
         // `lone_internal_callee` is the pre-cap single callee, so it is `Some`
         // here whatever `caps.max_callees` is. The `start_line > 0` guard skips a
@@ -622,6 +636,7 @@ pub fn grok(
         body,
         callees_internal,
         callees_external,
+        callees_unparsed,
         callers,
         siblings,
         tests,
@@ -633,6 +648,28 @@ pub fn grok(
         delegate_body,
         skipped_large: walk.skipped_large,
     })
+}
+
+/// The files `path` imports that are over the size limit. Callee
+/// resolution skips them, so a callee they define resolves nowhere.
+fn oversized_imports(path: &Path, content: &str) -> Vec<PathBuf> {
+    tilth_core::imports::resolve_related_files_with_content(path, content)
+        .into_iter()
+        .filter(|p| fs::metadata(p).is_ok_and(|m| m.len() > tilth_core::source::MAX_FILE_SIZE))
+        .collect()
+}
+
+/// The first of `files` whose text holds `name` as a word.
+fn oversized_holder(files: &[PathBuf], name: &str) -> Option<PathBuf> {
+    if files.is_empty() {
+        return None;
+    }
+    let pattern = format!(r"\b{}\b", regex_syntax::escape(name));
+    let matcher = grep_regex::RegexMatcher::new(&pattern).ok()?;
+    files
+        .iter()
+        .find(|f| crate::search::oversized_holds(f, &matcher))
+        .cloned()
 }
 
 /// Slice the target's source body out of `content`. Caps at `max_lines` total
@@ -799,12 +836,21 @@ pub fn format_grok(result: &GrokResult, scope: &Path) -> String {
     }
 
     // Callees
-    if !result.callees_internal.is_empty() || !result.callees_external.is_empty() {
+    if !result.callees_internal.is_empty()
+        || !result.callees_external.is_empty()
+        || !result.callees_unparsed.is_empty()
+    {
         let internal_count = result.total_callees_internal;
         let external_count = result.total_callees_external;
+        let unparsed_count = result.callees_unparsed.len();
+        let unparsed_label = if unparsed_count > 0 {
+            format!(", {unparsed_count} not parsed")
+        } else {
+            String::new()
+        };
         let _ = writeln!(
             out,
-            "\n## callees ({internal_count} internal, {external_count} extern)"
+            "\n## callees ({internal_count} internal, {external_count} extern{unparsed_label})"
         );
         // Group internal callees by file so the agent sees the cross-file
         // dependency structure at a glance. BTreeMap keeps file order stable.
@@ -824,6 +870,14 @@ pub fn format_grok(result: &GrokResult, scope: &Path) -> String {
                     c.name, c.start_line, c.end_line, sig
                 );
             }
+        }
+        for (name, file) in &result.callees_unparsed {
+            let _ = writeln!(
+                out,
+                "{name:<20} {}, over {}, not parsed",
+                display_rel(file, scope),
+                tilth_core::source::max_file_size_label()
+            );
         }
         for ext in &result.callees_external {
             let _ = writeln!(out, "{ext:<20} extern");
@@ -1863,6 +1917,7 @@ pub fn target() {
             body: String::new(),
             callees_internal: Vec::new(),
             callees_external: Vec::new(),
+            callees_unparsed: Vec::new(),
             callers: Vec::new(),
             siblings: Vec::new(),
             tests: Vec::new(),
@@ -1896,6 +1951,7 @@ pub fn target() {
             body: String::new(),
             callees_internal: Vec::new(),
             callees_external: Vec::new(),
+            callees_unparsed: Vec::new(),
             callers: Vec::new(),
             siblings: vec![SiblingEntry {
                 name: "peer".into(),
@@ -2576,5 +2632,41 @@ impl OutlineCache {
             ("test_support/worker.py", "def caller():\n    target()\n"),
             ("test_main.py", "def test_target():\n    target()\n"),
         ]);
+    }
+
+    /// A callee defined in an imported file over the size limit was listed
+    /// as "extern", which says it lives outside the repository. The file
+    /// was skipped, not searched, so the callee now names it.
+    #[test]
+    fn a_callee_in_an_imported_file_over_the_size_limit_is_not_extern() {
+        let tmp = tempfile::tempdir().unwrap();
+        let limit = usize::try_from(tilth_core::source::MAX_FILE_SIZE).unwrap();
+        let filler = "// padding line to push the file over the size limit\n";
+        let pad = filler.repeat(limit / filler.len() + 1);
+        write_fixture(
+            tmp.path(),
+            "big.js",
+            &format!("export function bigHelper(x) {{ return x; }}\n{pad}"),
+        );
+        write_fixture(tmp.path(), "small.js", "export function small(x) { return x; }\n");
+        write_fixture(
+            tmp.path(),
+            "a.js",
+            "import { bigHelper } from './big';\nimport { small } from './small';\n\
+             export function target() {\n  return bigHelper(small(1)) + outside(2);\n}\n",
+        );
+        let bloom = BloomFilterCache::default();
+        let session = crate::session::Session::default();
+        let result = grok("target", tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
+        let rendered = format_grok(&result, tmp.path());
+        assert!(
+            rendered.contains("## callees (1 internal, 1 extern, 1 not parsed)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("bigHelper            big.js, over 500 KB, not parsed"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("outside              extern"), "{rendered}");
     }
 }
