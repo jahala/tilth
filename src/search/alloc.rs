@@ -10,16 +10,19 @@ use std::fmt::Write;
 
 use crate::types::estimate_tokens;
 
+use super::Expansion;
+
 /// One match block in assembled search output: its information value and its
 /// byte range `start..end`. `body_start` is where the block's expanded source
 /// begins, or `end` when it has none. Over budget, a block can keep
 /// `start..body_start` and lose its expansion.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct Block {
+#[derive(Debug)]
+pub(super) struct Block {
     pub value: i64,
     pub start: usize,
     pub body_start: usize,
     pub end: usize,
+    pub expansion: Option<Expansion>,
 }
 
 /// What survives of one block.
@@ -93,8 +96,9 @@ fn body_omitted_line(tokens: u64) -> String {
 /// most relevant matches survive whichever facet they landed in, and a match
 /// whose expansion alone overruns the budget still shows where it is. Byte
 /// ranges come from `String::len()` snapshots taken during assembly, so every
-/// slice lands on a char boundary.
-pub(crate) fn fit_to_budget(body: &str, blocks: &[Block], budget_tokens: u64) -> String {
+/// slice lands on a char boundary. Surviving expansion offsets are rebased
+/// to the returned text; omitted expansions are cleared.
+pub(super) fn fit_to_budget(body: &str, blocks: &mut [Block], budget_tokens: u64) -> String {
     // Invariant the slicing below relies on: blocks are ascending, non-overlapping,
     // within `body`, and on char boundaries. They come from `String::len()`
     // snapshots taken during assembly; assert it in debug so a future regression in
@@ -103,7 +107,7 @@ pub(crate) fn fit_to_budget(body: &str, blocks: &[Block], budget_tokens: u64) ->
     #[cfg(debug_assertions)]
     {
         let mut prev_end = 0usize;
-        for b in blocks {
+        for b in blocks.iter() {
             debug_assert!(b.start >= prev_end, "blocks overlap or are out of order");
             debug_assert!(
                 b.start <= b.body_start && b.body_start <= b.end,
@@ -154,16 +158,25 @@ pub(crate) fn fit_to_budget(body: &str, blocks: &[Block], budget_tokens: u64) ->
     let mut out = String::with_capacity(body.len());
     let mut cursor = 0usize;
     let mut dropped = 0usize;
-    for (b, fit) in blocks.iter().zip(&fit) {
+    for (b, fit) in blocks.iter_mut().zip(&fit) {
         out.push_str(&body[cursor..b.start]); // structural gap before this block
         match fit {
-            Fit::Whole => out.push_str(&body[b.start..b.end]),
+            Fit::Whole => {
+                if let Some(expansion) = &mut b.expansion {
+                    expansion.end = out.len() + (expansion.end - b.start);
+                }
+                out.push_str(&body[b.start..b.end]);
+            }
             Fit::WithoutBody => {
+                b.expansion = None;
                 out.push_str(&body[b.start..b.body_start]);
                 let omitted = estimate_tokens((b.end - b.body_start) as u64);
                 out.push_str(&body_omitted_line(omitted));
             }
-            Fit::Dropped => dropped += 1,
+            Fit::Dropped => {
+                b.expansion = None;
+                dropped += 1;
+            }
         }
         cursor = b.end;
     }
@@ -209,6 +222,7 @@ mod tests {
             start,
             body_start: end,
             end,
+            expansion: None,
         }
     }
 
@@ -268,8 +282,8 @@ mod tests {
     #[test]
     fn fit_to_budget_under_budget_is_byte_identical() {
         let body = "HEADER\n## a\nbody-a\n## b\nbody-b".to_string();
-        let blocks = [block(1, 7, 20), block(2, 20, body.len())];
-        assert_eq!(fit_to_budget(&body, &blocks, 100_000), body);
+        let mut blocks = [block(1, 7, 20), block(2, 20, body.len())];
+        assert_eq!(fit_to_budget(&body, &mut blocks, 100_000), body);
     }
 
     #[test]
@@ -283,11 +297,11 @@ mod tests {
         let a_end = a_start + high.len();
         let b_start = body.find(&low).unwrap();
         let b_end = b_start + low.len();
-        let blocks = [block(10, a_start, a_end), block(1, b_start, b_end)];
+        let mut blocks = [block(10, a_start, a_end), block(1, b_start, b_end)];
 
         // body ~408 bytes (~102 tokens); structural ~8 bytes (~2 tokens); each
         // block ~50 tokens. Budget 55 → fits structural + one block.
-        let out = fit_to_budget(&body, &blocks, 55);
+        let out = fit_to_budget(&body, &mut blocks, 55);
         assert!(
             out.starts_with("HEADER"),
             "structural header must survive: {out}"
@@ -312,9 +326,9 @@ mod tests {
         let header = "H".repeat(400); // ~100 tokens of structural bytes
         let body = format!("{header}## x\nbody-x");
         let blk_start = body.find("body-x").unwrap();
-        let blocks = [block(1, blk_start, body.len())];
+        let mut blocks = [block(1, blk_start, body.len())];
         // Budget 10 tokens « structural ~100 tokens.
-        let out = fit_to_budget(&body, &blocks, 10);
+        let out = fit_to_budget(&body, &mut blocks, 10);
         assert_eq!(
             out, body,
             "structural-over-budget must pass the body through unchanged"
