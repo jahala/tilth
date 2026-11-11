@@ -44,10 +44,9 @@ fn callee_is_call(node: &tree_sitter::Node) -> bool {
 /// Whether a Rust call site is test code. Rust says so in the source — a
 /// `#[test]` or `#[<path>::test]` function, a `#[cfg(test)]` module — or by
 /// putting the file under a crate's `tests` directory, and none of that is
-/// visible to `is_test_file`, which knows only the `.test.` / `.spec.` /
-/// `__tests__/` filename conventions Rust never uses. `scope` is the search
-/// root the path is judged against, so a checkout that happens to sit under
-/// some `tests/` is not read as all tests.
+/// visible to `is_test_file`, which checks filename conventions rather than
+/// Rust syntax. `scope` is the search root the path is judged against, so a
+/// checkout that happens to sit under some `tests/` is not read as all tests.
 fn rust_test_site(node: &tree_sitter::Node, content: &[u8], path: &Path, scope: &Path) -> bool {
     let relative = path.strip_prefix(scope).unwrap_or(path);
     if relative.components().any(|c| c.as_os_str() == "tests") {
