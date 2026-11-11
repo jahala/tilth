@@ -96,6 +96,7 @@ pub fn detect_file_type(path: &Path) -> FileType {
 /// Detect a file's type from its path and content: [`detect_file_type`],
 /// with a code language settled by [`refine_lang`]. Use this wherever the
 /// content is parsed.
+#[must_use]
 pub fn detect_file_type_with_content(path: &Path, content: &str) -> FileType {
     match detect_file_type(path) {
         FileType::Code(lang) => FileType::Code(refine_lang(lang, path, content)),
