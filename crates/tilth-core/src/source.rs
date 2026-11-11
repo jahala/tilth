@@ -15,9 +15,12 @@ use std::path::Path;
 const BOM: &str = "\u{feff}";
 
 /// Files larger than this are not parsed or searched: symbol, content and
-/// regex search, callers, callees, deps and the parse cache all skip them.
-/// The one limit for all of them. Search names a skipped file that holds the
-/// query, so a skip is never silent there.
+/// regex search, callers, callees, deps and the parse cache all skip them,
+/// and a read outlines them with at most 100 entries. The one limit for all
+/// of them; only Go's same-package callee scan, which parses up to 20
+/// sibling files per call, keeps a tighter bound. Search, callers, grok and
+/// deps name a skipped file that holds the query, so a skip is never silent
+/// there.
 pub const MAX_FILE_SIZE: u64 = 500_000;
 
 /// `MAX_FILE_SIZE` as people read it, for notes that name the limit.

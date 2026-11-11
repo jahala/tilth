@@ -24,7 +24,6 @@ pub(crate) const RELATED_HINT_LIMIT: usize = 8;
 /// outline saves too few tokens to be worth the information loss, so the full
 /// file is returned instead. Integer arithmetic: 80 means 80%.
 const OUTLINE_MIN_COMPRESSION: u64 = 80;
-const FILE_SIZE_CAP: u64 = 500_000; // 500KB
 
 /// Max file size for `full=true` reads. Files above this threshold get a
 /// warning header + outline instead of raw content, preventing multi-megabyte
@@ -205,7 +204,9 @@ pub fn read_file(
     let file_type = detect_file_type_with_content(path, &content);
     let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
 
-    let capped = byte_len > FILE_SIZE_CAP;
+    // Over the size limit search and the parse cache skip, the outline
+    // lists at most `outline::OUTLINE_CAP` entries.
+    let capped = byte_len > tilth_core::source::MAX_FILE_SIZE;
 
     // The outline parses the file without its byte-order mark, as search
     // does; the full view above prints the bytes as they are, because its
