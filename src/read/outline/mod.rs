@@ -68,7 +68,13 @@ pub fn fit(outline: &str, names: Option<String>, room: u64) -> String {
     }
     let compacted = names.is_some();
     let lines_text = names.unwrap_or_else(|| outline.to_string());
-    let is_entry = |line: &str| line.trim_start().starts_with('[');
+    // A view without `[n]` entries (head and tail, a log, test structure)
+    // is counted in lines.
+    let has_entries = lines_text
+        .lines()
+        .any(|l| l.trim_start().starts_with('['));
+    let is_entry = |line: &str| !has_entries || line.trim_start().starts_with('[');
+    let unit = if has_entries { "entries" } else { "lines" };
     let total = lines_text.lines().filter(|l| is_entry(l)).count();
     let note = |shown: usize| {
         let mut parts = Vec::new();
@@ -76,7 +82,7 @@ pub fn fit(outline: &str, names: Option<String>, room: u64) -> String {
             parts.push("signatures and docs left out".to_string());
         }
         if shown < total {
-            parts.push(format!("{shown} of {total} entries shown"));
+            parts.push(format!("{shown} of {total} {unit} shown"));
         }
         format!(
             "\n\n> outline cut to fit the budget: {}. Read a range with section, \
@@ -132,6 +138,25 @@ fn with_omission_note(outline: String, max_lines: usize) -> String {
 mod tests {
     use super::with_omission_note;
     use std::fmt::Write as _;
+
+    /// A head-and-tail view, a log or a key list has no `[n]` entries, so
+    /// the fit note said "outline cut to fit the budget: ." with nothing
+    /// after it. It counts lines for such a view.
+    #[test]
+    fn fit_note_counts_lines_when_the_view_has_no_entries() {
+        let view = (0..400).fold(String::new(), |mut s, i| {
+            let _ = writeln!(s, "log line {i} with some text in it");
+            s
+        });
+        let cut = super::fit(&view, None, 200);
+        assert!(!cut.contains("budget: ."), "{cut}");
+        let shown = cut.lines().filter(|l| l.starts_with("log line")).count();
+        assert!(
+            cut.contains(&format!("{shown} of 400 lines shown")),
+            "{}",
+            &cut[cut.len().saturating_sub(200)..]
+        );
+    }
 
     #[test]
     fn note_appended_when_at_cap() {
