@@ -77,6 +77,27 @@ fn record_visible_expansions(
     }
 }
 
+/// The line a definition's expansion is marked under in the session, which
+/// grok marks too: the first line of the definition's own node, where its
+/// outline entry starts. That is `start`, the first line of its range,
+/// unless decorators beside the node open the range (a Python decorator, a
+/// TypeScript member's, a Rust attribute).
+fn expansion_line(m: &Match, start: u32) -> u32 {
+    if start == m.line {
+        return start;
+    }
+    let decorated = || {
+        let content = tilth_core::source::read_source(&m.path).ok()?;
+        let FileType::Code(lang) =
+            tilth_core::lang::detect_file_type_with_content(&m.path, &content)
+        else {
+            return None;
+        };
+        tilth_core::lang::treesitter::decorated_definition_line(&content, lang, start)
+    };
+    decorated().unwrap_or(start)
+}
+
 /// Cap for inlined markdown section bodies in the default preview slot.
 /// Long sections get a tail "… (N more lines — pass --expand to see the full
 /// section)" so the user knows to expand for the rest.
@@ -133,7 +154,17 @@ pub(crate) fn sorted(list: std::sync::Mutex<Vec<PathBuf>>) -> Vec<PathBuf> {
 /// although they contain the query. Empty when there are none.
 fn skipped_large_note(result: &SearchResult) -> String {
     let mut note = other_owners_note(result);
-    note.push_str(&skipped_files_note(&result.skipped_large, &result.scope));
+    // A qualified query's big files are those that hold its bare name,
+    // which a definition of it carries.
+    let held: &[&str] = match tilth_core::search::scope::split_qualified(&result.query) {
+        (Some(_), name) => &[name],
+        (None, _) => &[],
+    };
+    note.push_str(&skipped_files_note(
+        &result.skipped_large,
+        &result.scope,
+        held,
+    ));
     note
 }
 
@@ -144,7 +175,10 @@ fn other_owners_note(result: &SearchResult) -> String {
     let (Some(owner), name) = tilth_core::search::scope::split_qualified(&result.query) else {
         return String::new();
     };
-    if result.other_owners.is_empty() {
+    // Only free definitions of the name: the qualifier is no type that holds
+    // the wrong one (`res` in `res.send` is a variable), so there is no
+    // owner to correct.
+    if result.other_owners.iter().all(|o| o.owner.is_none()) {
         return String::new();
     }
     format!(
@@ -186,8 +220,11 @@ pub(crate) fn owner_candidates(
 }
 
 /// The note that names files a walk skipped for size although they contain
-/// the query, relative to `scope`. Empty when there are none.
-pub(crate) fn skipped_files_note(skipped: &[PathBuf], scope: &Path) -> String {
+/// the query, relative to `scope`. Empty when there are none. `held` lists
+/// the names the walk looked for in them when that is not the query itself:
+/// the bare name of a qualified query, or each name of a multi-target one.
+/// Each file holds at least one of them.
+pub(crate) fn skipped_files_note(skipped: &[PathBuf], scope: &Path, held: &[&str]) -> String {
     const SHOWN: usize = 5;
     if skipped.is_empty() {
         return String::new();
@@ -196,9 +233,15 @@ pub(crate) fn skipped_files_note(skipped: &[PathBuf], scope: &Path) -> String {
     if skipped.len() > SHOWN {
         names.push(format!("and {} more", skipped.len() - SHOWN));
     }
+    let held = if held.is_empty() {
+        "the query".to_string()
+    } else {
+        let quoted: Vec<String> = held.iter().map(|h| format!("`{h}`")).collect();
+        quoted.join(" or ")
+    };
     let (count, verb) = match skipped.len() {
-        1 => ("1 file".to_string(), "contains the query and was"),
-        n => (format!("{n} files"), "contain the query and were"),
+        1 => ("1 file".to_string(), format!("contains {held} and was")),
+        n => (format!("{n} files"), format!("contain {held} and were")),
     };
     format!(
         "\n\n> {count} over {} {verb} not searched: {}",
@@ -739,12 +782,15 @@ fn format_single_match(
     let current_mtime = std::fs::metadata(&m.path)
         .ok()
         .and_then(|md| md.modified().ok());
-    let deduped = m.is_definition
-        && m.def_range.is_some()
-        && current_mtime.is_some_and(|t| session.is_expanded(&m.path, m.line, t));
-    // expand_match always prints a range containing m.line (def_range starts
-    // at m.line for definitions; the ±10 fallback for def_range: None / usages
-    // trivially contains it), so the raw "-> [line] text" preview would
+    let marked_line = m
+        .def_range
+        .filter(|_| m.is_definition && session.previous.is_some())
+        .map(|(start, _)| expansion_line(m, start));
+    let deduped = marked_line
+        .is_some_and(|line| current_mtime.is_some_and(|t| session.is_expanded(&m.path, line, t)));
+    // expand_match always prints a range containing m.line (a definition's
+    // def_range holds its name line; the ±10 fallback for def_range: None /
+    // usages trivially contains it), so the raw "-> [line] text" preview would
     // reprint m.text byte-for-byte inside the fence below. Only the
     // structural outline_context (neighboring entries' signatures, not the
     // matched line's own source) survives alongside an expansion.
@@ -815,11 +861,11 @@ fn format_single_match(
                     out.push_str(&stripped_code);
 
                     if m.is_definition && m.def_range.is_some() {
-                        if let (Some(_), Some(mtime)) = (session.previous, current_mtime) {
-                            session.staged.insert((m.path.clone(), m.line, mtime));
+                        if let (Some(line), Some(mtime)) = (marked_line, current_mtime) {
+                            session.staged.insert((m.path.clone(), line, mtime));
                             expansion = Some(Expansion {
                                 path: m.path.clone(),
-                                line: m.line,
+                                line,
                                 mtime,
                                 end: out.len(),
                             });
@@ -1429,8 +1475,7 @@ fn flush_gap_marker(kept: &mut Vec<String>, consecutive_skipped: &mut u32) {
 
 /// Get cached outline string for a file. Returns None for non-code or huge files.
 fn get_outline_str(path: &std::path::Path, cache: &OutlineCache) -> Option<std::sync::Arc<str>> {
-    let file_type = tilth_core::lang::detect_file_type(path);
-    if !matches!(file_type, FileType::Code(_)) {
+    if !matches!(tilth_core::lang::detect_file_type(path), FileType::Code(_)) {
         return None;
     }
     let meta = std::fs::metadata(path).ok()?;
@@ -1438,10 +1483,12 @@ fn get_outline_str(path: &std::path::Path, cache: &OutlineCache) -> Option<std::
     if meta.len() > tilth_core::source::MAX_FILE_SIZE {
         return None;
     }
+    // The cache is shared with read and map, so the language comes from the
+    // content as theirs does: a `.h` holding C++ is C++.
     Some(cache.get_or_compute(path, mtime, || {
         let content = tilth_core::source::read_source(path).unwrap_or_default();
-        let buf = content.as_bytes();
-        read::outline::generate(path, file_type, &content, buf, false)
+        let file_type = tilth_core::lang::detect_file_type_with_content(path, &content);
+        read::outline::generate(path, file_type, &content, content.as_bytes(), false)
     }))
 }
 
@@ -2733,5 +2780,79 @@ mod tests {
             );
             assert!(!out.contains("other_big.rs"), "{out}");
         }
+    }
+
+    /// The outline cache is shared by read, search and map, keyed by path
+    /// and mtime. Search's outline context read a `.h` by its path alone,
+    /// as C, so the outline cached for a C++ header depended on which tool
+    /// reached it first.
+    #[test]
+    fn search_outline_context_reads_a_cpp_header_as_cpp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("shape.h");
+        std::fs::write(
+            &path,
+            "#pragma once\nclass Shape {\n public:\n  int area() const { return 0; }\n  int sides() { return 4; }\n};\n",
+        )
+        .unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        let file_type = tilth_core::lang::detect_file_type_with_content(&path, &content);
+        assert_eq!(file_type, FileType::Code(tilth_core::types::Lang::Cpp));
+        let expected =
+            read::outline::generate(&path, file_type, &content, content.as_bytes(), false);
+        let cache = OutlineCache::new();
+        assert_eq!(
+            get_outline_str(&path, &cache).as_deref(),
+            Some(expected.as_str())
+        );
+    }
+
+    /// A qualified query's notes say what they know. A big file was named as
+    /// holding "the query" when it held only the bare name, and dotted text
+    /// such as `res.send` got "No `send` is defined in `res`" when nothing
+    /// but free definitions of `send` exist: `res` is a variable, not an
+    /// owner. The owner note stays for a qualifier that names the wrong type.
+    #[test]
+    fn a_qualified_query_notes_only_what_holds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let limit = usize::try_from(tilth_core::source::MAX_FILE_SIZE).unwrap();
+        let filler = "// padding line to push the file over the size limit\n";
+        let pad = filler.repeat(limit / filler.len() + 1);
+        std::fs::write(tmp.path().join("big.rs"), format!("{pad}fn run() {{}}\n")).unwrap();
+        std::fs::write(
+            tmp.path().join("m.rs"),
+            "pub struct A;\nimpl A {\n    pub fn run(&self) {}\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("response.js"),
+            "var send = require('send');\nfunction reply(res) {\n  res.send('ok');\n}\n",
+        )
+        .unwrap();
+        let cache = OutlineCache::new();
+
+        let out = search_symbol("B::run", tmp.path(), &cache, None, false).unwrap();
+        assert!(out.contains("not searched: big.rs"), "{out}");
+        assert!(out.contains("contains `run` and was"), "{out}");
+        assert!(out.contains("No `run` is defined in `B`"), "{out}");
+
+        let out = search_symbol("res.send", tmp.path(), &cache, None, false).unwrap();
+        assert!(out.contains("response.js:3"), "{out}");
+        assert!(!out.contains("is defined in"), "{out}");
+
+        // A multi-target walk looks for each target's bare name, once.
+        let bloom = tilth_core::index::bloom::BloomFilterCache::new();
+        let out = callers::search_callers_multi_expanded(
+            &["A.run", "start", "B::run"],
+            tmp.path(),
+            &bloom,
+            0,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(out.contains("not searched: big.rs"), "{out}");
+        assert!(out.contains("contains `run` or `start` and was"), "{out}");
     }
 }

@@ -430,20 +430,33 @@ The biggest production-only file in the subsystem. Three layers stacked:
      Go, C, C++ and Elixir. The walk stops three nesting levels down, so
      declarations nested deeper are locals. Only real nesting counts:
      `WRAPPER_KINDS` (`export`, decorators, `declare`), namespaces and
-     modules, pass-through nodes (`#ifdef`, `extern "C"`, templates) and
-     the body of a `TYPE_KINDS` node are free. A variable declared in a
-     function body (`is_local_binding`) is never a definition. A wrapper
-     is not a definition of its own; the declaration it wraps is. A
-     definition's line is the line of its name, so decorators above it
-     sit in its range and its name line is not also a usage.
+     modules, pass-through nodes (`#ifdef`, `extern "C"`, templates),
+     a statement at the top of a file that defines nothing (`if`, `try`,
+     `with`), and the body of a `TYPE_KINDS` node are free (Python's root
+     `module` is no type). A variable declared in a function body
+     (`is_local_binding`) is never a definition; in Bash only `local`,
+     `declare` and `typeset` make one local, and a flag with `g` in it
+     (`-g`, `-gA`) makes it global. A wrapper is not a
+     definition of its own; the declaration it wraps is. A definition's
+     line is the line of its name, and its range opens with the
+     decorators or attributes beside it (`treesitter::decorators_start`),
+     so its name line is not also a usage and an expanded result shows
+     its decorators. Each name of `const a = 1, b = 2` is a definition.
    - A qualified query (`B::run`, `B.run`, `crate::m::B::run`) is split
      by `scope::split_qualified` into an owner and a bare name. Its
-     definitions are those of the bare name whose
-     `scope::definition_owner` is that owner: the enclosing type, the
-     type of a Rust `impl`, a Go receiver, or the class in a C++
-     out-of-line declarator. Its usages are the qualified text itself.
-     When the owner holds none, the definitions other owners hold come
-     back in `other_owners`, and search and grok name them.
+     definitions are those of the bare name that
+     `scope::names_definition` matches: the query's segments agree,
+     from the end, with the definition's owner (`scope::definition_owner`:
+     the enclosing type, the type of a Rust `impl`, a Go receiver, or the
+     class in a C++ out-of-line declarator) followed by its own name, so
+     an Elixir `defmodule MyApp.Accounts` or a Ruby `class Admin::User`
+     is found by its full name. `Self`, `self`, `this` and `cls` match
+     any owner, and never a definition with none. A top-level definition also matches when the qualifier
+     names its module (`scope::names_module`: the file's stem, its
+     directory, or a Go package clause), as in `gin.New`. Its usages are
+     the qualified text itself. When nothing matches, the definitions
+     other owners hold come back in `other_owners`; grok lists them, and
+     search notes them when one of them has an owner.
    - `find_defs_heuristic_buf` is a regex-free fallback for languages
      without grammars (Dockerfile, Make).
    - `find_defs_markdown_buf` handles ATX headings as
@@ -540,14 +553,19 @@ machinery:
   text names a target, and callers, grok and deps name them in a note. Each caller is annotated with its enclosing scope via
   `scope::walk_to_enclosing_definition` so the user sees
   `[caller: foo]` instead of just a line number. The label is the
-  nearest enclosing definition that is not a local variable, qualified
-  by its owner (`Service.run`, `Context.reset`): a call in
-  `const result = target()` inside `outer` is labelled `outer`. The 2nd
-  hop looks for the bare names of these labels. A call names a method
-  without its type, so a method name that more than one type defines
-  (`callers::definition_owners`) cannot be traced by name: its sites
-  are counted on one line (`__init__: 21 call sites, not attributed (52
-  types define it)`) and left out of the functions affected. When the walk returns
+  nearest enclosing definition that is not a variable declared in a
+  function (`binds_in_function`), qualified by its owner (`Service.run`,
+  `Context.reset`): a call in `const result = target()` inside `outer`
+  is labelled `outer`. A label passed back as a target is looked up by
+  its bare name, and the header says the receiver's type is not
+  checked. The 2nd hop looks for the bare names of these labels. A call
+  names a method without its type, so a method name that more than one
+  type defines cannot be traced by name; `find_callers_and_owners`
+  finds the sites and those types in one walk and one parse. Its sites
+  are counted on one line (`__init__: 21 call sites, not
+  attributed (52 types define it)`) and left out of the functions
+  affected. When one type defines it, its sites are counted, and the
+  affected total says method calls were matched by name. When the walk returns
   empty, a small `target_seen_in_scope` helper in the binary does a
   literal scan so `no_callers_message` can distinguish typo from
   "real symbol with no direct callers" (indirect dispatch, dead code,
@@ -727,8 +745,11 @@ edits. Beside it, `WRAPPER_KINDS`, `TYPE_KINDS`, `NAMESPACE_KINDS`,
 `.h` is the one extension two languages share. `detect_file_type` reads
 it as C; `detect_file_type_with_content` (and `refine_lang`, for a
 caller that already holds the path's language) reads a header that
-holds C++ syntax as C++. Every site that parses content uses the
-content-aware form; the overview's language counts stay path-only.
+holds C++ syntax as C++. An `extern "C" { ... }` block alone does not
+count: portable C headers guard one for C++ includers. Every site that
+parses content uses the content-aware form, including each side of a
+structural diff and every outline stored in the shared `OutlineCache`;
+the overview's language counts stay path-only.
 
 `lang::package_root(path)` walks up looking for known manifests
 (`Cargo.toml`, `package.json`, `pyproject.toml`, `go.mod`, etc.) and is

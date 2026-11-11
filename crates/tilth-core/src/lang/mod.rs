@@ -172,7 +172,6 @@ mod tests {
             "template <typename T> T id(T x);\n",
             "struct S {\n public:\n  int x;\n};\n",
             "int geo::area() { return 1; }\n",
-            "#ifdef __cplusplus\nextern \"C\" {\n#endif\nint f(void);\n",
         ] {
             assert_eq!(header(src), FileType::Code(Lang::Cpp), "{src:?}");
         }
@@ -188,6 +187,13 @@ mod tests {
             "const char *s = \"namespace x { a::b }\";\n",
             "struct list *new, *class;\nint private;\n",
             "extern int count;\n",
+            // A portable C header guards `extern "C"` for C++ includers; the
+            // rest of it is C, and C identifiers such as `new` must stay C.
+            "#ifdef __cplusplus\nextern \"C\" {\n#endif\nint f(void);\nstruct node *new;\n",
+            "extern \"C\" {\nint f(void);\n}\n",
+            // Each attribute in a C23 attribute list.
+            "[[gnu::unused, gnu::cold]] int g(void);\n",
+            "[[deprecated, gnu::cold]] int h(void);\n",
         ] {
             assert_eq!(header(src), FileType::Code(Lang::C), "{src:?}");
         }
