@@ -116,8 +116,11 @@ pub fn refuse_file_scope(raw: &Path, resolved: &Path, hint: FileScopeHint) -> Re
 /// so `src/serach` suggests `src/search` and `read` suggests `src/read`.
 /// With nothing close, it names that nearest existing parent. Suggested
 /// paths stay in the caller's frame: a relative scope gets relative paths.
+/// The scan runs only when that parent lies inside `project` (the CLI's
+/// working directory, or the MCP call's root) or inside a checkout;
+/// anywhere else, the hint names the parent alone.
 #[must_use]
-pub fn missing_scope_hint(raw: &Path, resolved: &Path) -> String {
+pub fn missing_scope_hint(raw: &Path, resolved: &Path, project: &Path) -> String {
     let Some(wanted) = resolved
         .file_name()
         .map(|n| n.to_string_lossy().to_lowercase())
@@ -143,7 +146,21 @@ pub fn missing_scope_hint(raw: &Path, resolved: &Path) -> String {
     }
     let base = dir_or_cwd(base);
 
-    let close = close_directories(&base, &wanted);
+    // Scan for close names only inside a project: the caller's own, or the
+    // checkout the scope points into. Anywhere else the nearest parent can
+    // be `/` or a mount point, where listing directories is slow or, on a
+    // stale network mount, blocks.
+    let in_project = base.canonicalize().is_ok_and(|base| {
+        project
+            .canonicalize()
+            .is_ok_and(|project| base.starts_with(project))
+            || in_a_checkout(&base)
+    });
+    let close = if in_project {
+        close_directories(&base, &wanted)
+    } else {
+        Vec::new()
+    };
     if close.is_empty() {
         return format!(
             "The nearest existing directory is \"{}\".",
@@ -155,6 +172,15 @@ pub fn missing_scope_hint(raw: &Path, resolved: &Path) -> String {
         .map(|rel| format!("\"{}\"", raw_base.join(rel).display()))
         .collect();
     format!("Did you mean {}?", named.join(" or "))
+}
+
+/// Is `dir` inside a checkout: below a directory, other than the
+/// filesystem root, that holds `.git` or a package manifest?
+fn in_a_checkout(dir: &Path) -> bool {
+    let below_root = |d: &Path| d.parent().is_some();
+    dir.ancestors()
+        .any(|d| below_root(d) && d.join(".git").exists())
+        || tilth_core::lang::package_root(dir).is_some_and(below_root)
 }
 
 /// Directories under `base` (relative to it) whose name is within a small
@@ -722,7 +748,11 @@ mod tests {
     #[test]
     fn missing_scope_hint_names_a_close_sibling() {
         let dir = dir_tree();
-        let hint = missing_scope_hint(Path::new("src/serach"), &dir.path().join("src/serach"));
+        let hint = missing_scope_hint(
+            Path::new("src/serach"),
+            &dir.path().join("src/serach"),
+            dir.path(),
+        );
         assert_eq!(hint, "Did you mean \"src/search\"?");
     }
 
@@ -730,7 +760,7 @@ mod tests {
     #[test]
     fn missing_scope_hint_finds_the_name_deeper() {
         let dir = dir_tree();
-        let hint = missing_scope_hint(Path::new("read"), &dir.path().join("read"));
+        let hint = missing_scope_hint(Path::new("read"), &dir.path().join("read"), dir.path());
         assert_eq!(hint, "Did you mean \"src/read\"?");
     }
 
@@ -739,12 +769,46 @@ mod tests {
     fn missing_scope_hint_falls_back_to_the_nearest_parent() {
         let dir = dir_tree();
         let raw = dir.path().join("src/zzqqxx/deeper");
-        let hint = missing_scope_hint(&raw, &raw);
+        let hint = missing_scope_hint(&raw, &raw, dir.path());
         let src = dir.path().join("src");
         assert_eq!(
             hint,
             format!("The nearest existing directory is \"{}\".", src.display())
         );
+    }
+
+    /// The close-name scan stays inside the project. A scope whose nearest
+    /// existing parent is above it (`/`, `/Users`, a mount point) used to
+    /// list up to 2,000 directories there, and a stale network mount can
+    /// block that. Such a hint names the nearest directory and scans nothing.
+    #[test]
+    fn missing_scope_hint_does_not_scan_above_the_project() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for d in ["src/search", "docs"] {
+            std::fs::create_dir_all(dir.path().join(d)).unwrap();
+        }
+        let project = dir.path().join("src");
+        let raw = dir.path().join("dosc");
+        let hint = missing_scope_hint(&raw, &raw, &project);
+        assert_eq!(
+            hint,
+            format!(
+                "The nearest existing directory is \"{}\".",
+                dir.path().display()
+            )
+        );
+    }
+
+    /// An absolute scope into another checkout still gets the close name.
+    #[test]
+    fn missing_scope_hint_scans_the_checkout_the_scope_points_into() {
+        let dir = dir_tree();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        let raw = dir.path().join("dosc");
+        let hint = missing_scope_hint(&raw, &raw, elsewhere.path());
+        let docs = dir.path().join("docs");
+        assert_eq!(hint, format!("Did you mean \"{}\"?", docs.display()));
     }
 
     /// 15 files, each carrying one instance of every query shape that reaches

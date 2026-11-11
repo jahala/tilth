@@ -194,6 +194,10 @@ Per call, a `scope` that does not exist falls back to the caller's
 `root` with a warning that carries the same hint, so a typo still
 finds the answer and the next call can narrow. The CLI refuses a
 missing `--scope` with that hint instead of answering "0 matches".
+The hint lists directories for close names only inside the project (the
+CLI's working directory or the call's `root`) or a checkout (a `.git` or
+package manifest above it); above those, such as at `/` or a mount
+point, it names the nearest existing directory and lists nothing.
 
 The request loop (`mcp.rs:139-219`) parses each line as JSON and hands
 off to `handle_request`, which switches on `method`. The handler

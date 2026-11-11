@@ -146,7 +146,11 @@ fn resolve_scope_at(
         //
         // Both answers name the directory the caller probably meant
         // (`missing_scope_hint`), the same hint the CLI's refusal carries.
-        let hint = crate::missing_scope_hint(&raw, &resolved);
+        let project = root
+            .filter(|r| r.is_absolute())
+            .or(cwd)
+            .unwrap_or(std::path::Path::new("."));
+        let hint = crate::missing_scope_hint(&raw, &resolved, project);
         return match root {
             Some(r) if r.is_absolute() => Ok((
                 r.to_path_buf(),
@@ -320,6 +324,8 @@ mod tests {
     fn resolve_scope_missing_dir_no_root_error_suggests_the_close_directory() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("src/search")).unwrap();
+        // A checkout: the hint scans for close names only inside one.
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
         let typo = tmp.path().join("src/serach");
         let args = serde_json::json!({ "scope": typo.to_str().unwrap() });
         let err = resolve_scope(&args, None, Glob).unwrap_err();

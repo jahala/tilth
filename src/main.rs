@@ -425,7 +425,7 @@ fn cli_scope(raw: PathBuf, hint: FileScopeHint) -> Result<PathBuf, String> {
         return Err(format!(
             "scope \"{}\" is not a valid directory. {}",
             raw.display(),
-            tilth::missing_scope_hint(&raw, &scope)
+            tilth::missing_scope_hint(&raw, &scope, Path::new("."))
         ));
     }
     Ok(scope)
@@ -671,6 +671,8 @@ mod tests {
     fn cli_scope_refuses_a_missing_directory() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("binding")).unwrap();
+        // A checkout: the hint scans for close names only inside one.
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
         let err = cli_scope(dir.path().join("bindng"), FileScopeHint::Glob).unwrap_err();
         assert!(
             err.contains("is not a valid directory") && err.contains("binding\"?"),
