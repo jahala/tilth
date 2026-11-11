@@ -1213,13 +1213,18 @@ mod tests {
     /// was marked under two lines and inlined twice.
     #[test]
     fn grok_and_search_share_the_expansion_of_an_annotated_definition() {
-        let body: String = (0..20)
-            .map(|i| format!("        int v{i} = {i};\n"))
-            .collect();
+        // Twenty lines in each body, past the length grok degrades on repeat.
+        let lines = |indent: &str, end: &str| -> String {
+            (0..20).fold(String::new(), |mut out, i| {
+                let _ = writeln!(out, "{indent}v{i} = {i}{end}");
+                out
+            })
+        };
+        let body = lines("        int ", ";");
         let java = format!("class Svc {{\n    @Override\n    public String run() {{\n{body}        return \"x\";\n    }}\n}}\n");
-        let py_body: String = (0..20).map(|i| format!("    v{i} = {i}\n")).collect();
+        let py_body = lines("    ", "");
         let py = format!("@app.get(\"/r\")\ndef route():\n{py_body}    return 1\n");
-        let c_body: String = (0..20).map(|i| format!("  int v{i} = {i};\n")).collect();
+        let c_body = lines("  int ", ";");
         let c = format!("static int\nrun_c(void)\n{{\n{c_body}  return 0;\n}}\n");
         for (file, fixture, query) in [
             ("Svc.java", java.as_str(), "run"),

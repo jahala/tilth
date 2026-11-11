@@ -2568,7 +2568,7 @@ impl Runner {
     }
 
     /// The decorators or attributes beside a definition are part of its
-    /// range, so an expanded result shows them (a FastAPI route's path is in
+    /// range, so an expanded result shows them (a `FastAPI` route's path is in
     /// its decorator). The match stays on the line that names it.
     #[test]
     fn decorators_beside_a_definition_are_in_its_range() {
