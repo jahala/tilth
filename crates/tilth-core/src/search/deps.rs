@@ -133,7 +133,7 @@ pub fn analyze_deps(
     // The files that import this one. What their import statements name
     // is what other files use, so past the cap those names are searched
     // first.
-    let direct = importers_of(&[path.clone()], scope, &|_| true, false)?;
+    let direct = importers_of(std::slice::from_ref(path), scope, &|_| true, false)?;
     let (searched, unsearched) = choose_names(all_names, &direct);
 
     // ── Phase 2: Forward dependencies ────────────────────────────────────────
@@ -328,7 +328,10 @@ fn with_reexport_importers(
     let mut out = Vec::new();
     let mut barrels = Vec::new();
     for importer in direct {
-        let canonical = importer.path.canonicalize().unwrap_or(importer.path.clone());
+        let canonical = importer
+            .path
+            .canonicalize()
+            .unwrap_or(importer.path.clone());
         if !seen.insert(canonical.clone()) {
             continue;
         }
@@ -342,7 +345,10 @@ fn with_reexport_importers(
         let found = importers_of(&barrels, scope, &names_one, true)?;
         barrels = Vec::new();
         for importer in found {
-            let canonical = importer.path.canonicalize().unwrap_or(importer.path.clone());
+            let canonical = importer
+                .path
+                .canonicalize()
+                .unwrap_or(importer.path.clone());
             if !seen.insert(canonical.clone()) {
                 continue;
             }
@@ -508,7 +514,11 @@ fn module_stems(path: &Path) -> Vec<String> {
     };
     let mut stems = vec![stem.to_string()];
     if matches!(stem, "index" | "__init__" | "mod") {
-        if let Some(dir) = path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) {
+        if let Some(dir) = path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+        {
             stems.push(dir.to_string());
         }
     }
@@ -728,10 +738,21 @@ mod tests {
     fn an_export_used_under_its_alias_has_dependents() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
-        write(&root, "plan.ts", "function readPlan() { return 1; }\nexport { readPlan as parsePlan };\n");
-        write(&root, "use.ts", "import { parsePlan } from \"./plan\";\nparsePlan();\n");
+        write(
+            &root,
+            "plan.ts",
+            "function readPlan() { return 1; }\nexport { readPlan as parsePlan };\n",
+        );
+        write(
+            &root,
+            "use.ts",
+            "import { parsePlan } from \"./plan\";\nparsePlan();\n",
+        );
         let found = dependents_of(&root, "plan.ts");
-        assert_eq!(found, [("use.ts".to_string(), vec!["parsePlan".to_string()], None)]);
+        assert_eq!(
+            found,
+            [("use.ts".to_string(), vec!["parsePlan".to_string()], None)]
+        );
     }
 
     /// A re-export is a use of the module it names (#271): a barrel that
@@ -742,7 +763,11 @@ mod tests {
         let root = tmp.path().canonicalize().unwrap();
         write(&root, "y.ts", "export const y = 1;\n");
         write(&root, "z.ts", "export const z = 1;\n");
-        write(&root, "index.ts", "export { y } from \"./y\";\nimport { z } from \"./z\";\n");
+        write(
+            &root,
+            "index.ts",
+            "export { y } from \"./y\";\nimport { z } from \"./z\";\n",
+        );
         let bloom = crate::index::bloom::BloomFilterCache::new();
         let result = analyze_deps(&root.join("index.ts"), &root, &bloom).unwrap();
         let local: Vec<&Path> = result.uses_local.iter().map(|d| d.path.as_path()).collect();
@@ -761,17 +786,37 @@ mod tests {
         write(&root, "src/pkg/__init__.py", "");
         write(&root, "src/pkg/sub/mod.py", "class Thing:\n    pass\n");
         write(&root, "src/pkg/sub/__init__.py", "from .mod import Thing\n");
-        write(&root, "src/pkg/direct.py", "from pkg.sub.mod import Thing\n\nx: Thing = None\n");
-        write(&root, "src/pkg/caller.py", "from pkg.sub.mod import Thing\n\ndef make():\n    return Thing()\n");
-        write(&root, "tests/test_barrel.py", "from pkg.sub import Thing\n\ndef test_thing():\n    assert Thing\n");
+        write(
+            &root,
+            "src/pkg/direct.py",
+            "from pkg.sub.mod import Thing\n\nx: Thing = None\n",
+        );
+        write(
+            &root,
+            "src/pkg/caller.py",
+            "from pkg.sub.mod import Thing\n\ndef make():\n    return Thing()\n",
+        );
+        write(
+            &root,
+            "tests/test_barrel.py",
+            "from pkg.sub import Thing\n\ndef test_thing():\n    assert Thing\n",
+        );
         // Imports the package for something else: no dependent.
-        write(&root, "tests/test_other.py", "from pkg.sub import Other\n\ndef test_other():\n    assert Other\n");
+        write(
+            &root,
+            "tests/test_other.py",
+            "from pkg.sub import Other\n\ndef test_other():\n    assert Other\n",
+        );
         let found = dependents_of(&root, "src/pkg/sub/mod.py");
         assert_eq!(
             found,
             [
                 ("src/pkg/sub/__init__.py".to_string(), vec![], None),
-                ("src/pkg/caller.py".to_string(), vec!["Thing".to_string()], None),
+                (
+                    "src/pkg/caller.py".to_string(),
+                    vec!["Thing".to_string()],
+                    None
+                ),
                 ("src/pkg/direct.py".to_string(), vec![], None),
                 (
                     "tests/test_barrel.py".to_string(),
@@ -788,12 +833,32 @@ mod tests {
     fn ts_importers_through_a_barrel_are_dependents() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
-        write(&root, "src/service.ts", "export function serve() { return 1; }\n");
+        write(
+            &root,
+            "src/service.ts",
+            "export function serve() { return 1; }\n",
+        );
         write(&root, "src/index.ts", "export * from \"./service\";\n");
-        write(&root, "src/barrel2.ts", "export { serve } from \"./service\";\n");
-        write(&root, "c.ts", "import { serve } from \"./src\";\nexport const s = serve;\n");
-        write(&root, "d.ts", "import { serve } from \"./src/barrel2\";\nconst handler = serve;\n");
-        write(&root, "e.ts", "import { other } from \"./src\";\nother();\n");
+        write(
+            &root,
+            "src/barrel2.ts",
+            "export { serve } from \"./service\";\n",
+        );
+        write(
+            &root,
+            "c.ts",
+            "import { serve } from \"./src\";\nexport const s = serve;\n",
+        );
+        write(
+            &root,
+            "d.ts",
+            "import { serve } from \"./src/barrel2\";\nconst handler = serve;\n",
+        );
+        write(
+            &root,
+            "e.ts",
+            "import { other } from \"./src\";\nother();\n",
+        );
         let found = dependents_of(&root, "src/service.ts");
         assert_eq!(
             found,
@@ -801,7 +866,11 @@ mod tests {
                 ("src/barrel2.ts".to_string(), vec![], None),
                 ("src/index.ts".to_string(), vec![], None),
                 ("c.ts".to_string(), vec![], Some("src/index.ts".to_string())),
-                ("d.ts".to_string(), vec![], Some("src/barrel2.ts".to_string())),
+                (
+                    "d.ts".to_string(),
+                    vec![],
+                    Some("src/barrel2.ts".to_string())
+                ),
             ]
         );
     }
@@ -815,17 +884,31 @@ mod tests {
         let root = tmp.path().canonicalize().unwrap();
         let mut target = String::from("def run():\n    pass\n");
         for i in 0..MAX_EXPORTED_SYMBOLS + 4 {
-            let _ = write!(target, "\ndef a_rather_long_helper_name_{i:02}():\n    pass\n");
+            let _ = write!(
+                target,
+                "\ndef a_rather_long_helper_name_{i:02}():\n    pass\n"
+            );
         }
         write(&root, "lib.py", &target);
-        write(&root, "app.py", "from lib import run\n\ndef main():\n    run()\n");
+        write(
+            &root,
+            "app.py",
+            "from lib import run\n\ndef main():\n    run()\n",
+        );
         let bloom = crate::index::bloom::BloomFilterCache::new();
         let result = analyze_deps(&root.join("lib.py"), &root, &bloom).unwrap();
         assert_eq!(result.exported_count, MAX_EXPORTED_SYMBOLS + 5);
         assert_eq!(result.unsearched.len(), 5, "{:?}", result.unsearched);
         assert!(!result.unsearched.contains(&"run".to_string()));
-        let app = result.used_by.iter().find(|d| d.path.ends_with("app.py")).unwrap();
-        assert_eq!(app.symbols.iter().map(|s| s.1.as_str()).collect::<Vec<_>>(), ["run"]);
+        let app = result
+            .used_by
+            .iter()
+            .find(|d| d.path.ends_with("app.py"))
+            .unwrap();
+        assert_eq!(
+            app.symbols.iter().map(|s| s.1.as_str()).collect::<Vec<_>>(),
+            ["run"]
+        );
     }
 
     #[test]

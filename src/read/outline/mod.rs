@@ -90,13 +90,15 @@ pub fn fit(outline: &str, names: Option<String>, room: u64) -> String {
     let mut bytes = vec![0usize];
     let mut entries = vec![0usize];
     for line in &lines {
-        let joined = if bytes.len() == 1 { 0 } else { 1 };
+        let joined = usize::from(bytes.len() != 1);
         bytes.push(bytes[bytes.len() - 1] + line.len() + joined);
         entries.push(entries[entries.len() - 1] + usize::from(is_entry(line)));
     }
     let keep = (0..=lines.len())
         .rev()
-        .find(|&k| crate::types::estimate_tokens((bytes[k] + note(entries[k]).len()) as u64) <= room)
+        .find(|&k| {
+            crate::types::estimate_tokens((bytes[k] + note(entries[k]).len()) as u64) <= room
+        })
         .unwrap_or(0);
     format!("{}{}", lines[..keep].join("\n"), note(entries[keep]))
 }

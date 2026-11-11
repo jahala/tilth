@@ -238,7 +238,10 @@ pub fn read_file(
         Some(b) if !fits(&view) => {
             let room = b.saturating_sub(estimate_tokens(header.len() as u64 + 2));
             let names = outline::names_only(path, file_type, strip_bom(&content), capped);
-            Ok(format!("{header}\n\n{}", outline::fit(&outline, names, room)))
+            Ok(format!(
+                "{header}\n\n{}",
+                outline::fit(&outline, names, room)
+            ))
         }
         _ => Ok(view),
     }
@@ -1369,7 +1372,12 @@ mod tests {
         for name in ["first", "second", "third"] {
             writeln!(src, "/** {} */", "Documented at length. ".repeat(6)).unwrap();
             let params: Vec<String> = (0..12).map(|i| format!("argument_{i}: string")).collect();
-            writeln!(src, "export function {name}({}): void {{", params.join(", ")).unwrap();
+            writeln!(
+                src,
+                "export function {name}({}): void {{",
+                params.join(", ")
+            )
+            .unwrap();
             src.push_str(&"  const filler = 'x'.repeat(100);\n".repeat(300));
             src.push_str("}\n");
         }
@@ -1378,7 +1386,10 @@ mod tests {
         let cache = OutlineCache::new();
         let budget = 150;
         let unbudgeted = read_file(&path, None, false, &cache, false, None).unwrap();
-        assert!(estimate_tokens(unbudgeted.len() as u64) > budget, "{unbudgeted}");
+        assert!(
+            estimate_tokens(unbudgeted.len() as u64) > budget,
+            "{unbudgeted}"
+        );
 
         let out = read_file(&path, None, false, &cache, false, Some(budget)).unwrap();
         for name in ["fn first", "fn second", "fn third"] {
@@ -1411,7 +1422,9 @@ mod tests {
         assert!(!out.contains("function_number_59"), "{out}");
         let shown = out.lines().filter(|l| l.starts_with('[')).count();
         assert!(
-            out.contains(&format!("signatures and docs left out; {shown} of 60 entries shown")),
+            out.contains(&format!(
+                "signatures and docs left out; {shown} of 60 entries shown"
+            )),
             "{out}"
         );
         assert!(estimate_tokens(out.len() as u64) <= budget, "{out}");

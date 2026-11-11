@@ -146,7 +146,9 @@ struct FileEntry {
 fn extract_symbol_names(outline: &str) -> Vec<String> {
     let mut names = Vec::new();
     for line in outline.lines() {
-        let trimmed = line.trim();
+        // The doc comment after `  // ` is prose: a kind word in it
+        // (`a trait that ...`) is no symbol.
+        let trimmed = line.split("  // ").next().unwrap_or(line).trim();
         // Skip import lines and empty lines
         if trimmed.starts_with('[') {
             // Find the symbol name after kind keywords
@@ -252,6 +254,14 @@ mod tests {
             symbols: None,
             tokens,
         }
+    }
+
+    /// A doc that names a kind (`fn`, `struct`) put a word of the doc in
+    /// the map in place of the symbol.
+    #[test]
+    fn a_doc_naming_a_kind_is_not_read_as_the_symbol() {
+        let outline = "[71-151]     trait Flag  // A flag, as a struct or fn that parses\n[1-2]        fn plain";
+        assert_eq!(extract_symbol_names(outline), ["Flag", "plain"]);
     }
 
     #[test]

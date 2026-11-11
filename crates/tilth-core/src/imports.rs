@@ -167,7 +167,7 @@ fn statement_query(lang: Lang) -> Option<&'static tree_sitter::Query> {
         LazyLock::new(|| Mutex::new(HashMap::new()));
 
     let pattern = match lang {
-        Lang::Go | Lang::Scala | Lang::Java => "(import_declaration) @statement",
+        Lang::Go | Lang::Scala | Lang::Java | Lang::Swift => "(import_declaration) @statement",
         Lang::Rust => "(use_declaration) @statement",
         Lang::Python => {
             "[(import_statement) (import_from_statement) (future_import_statement)] @statement"
@@ -179,7 +179,6 @@ fn statement_query(lang: Lang) -> Option<&'static tree_sitter::Query> {
         Lang::Kotlin => "(import) @statement",
         Lang::Php => "(namespace_use_declaration) @statement",
         Lang::CSharp => "(using_directive) @statement",
-        Lang::Swift => "(import_declaration) @statement",
         _ => return None,
     };
     let mut compiled = COMPILED
@@ -505,16 +504,10 @@ fn php_use(node: tree_sitter::Node, src: &str, out: &mut Vec<(String, u32)>) {
             .find(|c| c.kind() == "namespace_name");
         found.map(|p| compact(p, src))
     };
-    let clauses: Vec<tree_sitter::Node> = match node.child_by_field_name("body") {
-        Some(group) => {
-            let mut cursor = group.walk();
-            group.named_children(&mut cursor).collect()
-        }
-        None => {
-            let mut cursor = node.walk();
-            node.named_children(&mut cursor).collect()
-        }
-    };
+    // A group's clauses sit in its body; plain clauses on the statement.
+    let holder = node.child_by_field_name("body").unwrap_or(node);
+    let mut cursor = holder.walk();
+    let clauses: Vec<tree_sitter::Node> = holder.named_children(&mut cursor).collect();
     for clause in clauses {
         if clause.kind() != "namespace_use_clause" {
             continue;
@@ -948,8 +941,12 @@ mod tests {
             sources(csharp, Lang::CSharp),
             ["System", "Newtonsoft.Json", "System.Math", "Inner.Thing"]
         );
-        let swift = "import Foundation\nimport struct Foo.Bar\n@testable import MyApp\nclass A {}\n";
-        assert_eq!(sources(swift, Lang::Swift), ["Foundation", "Foo.Bar", "MyApp"]);
+        let swift =
+            "import Foundation\nimport struct Foo.Bar\n@testable import MyApp\nclass A {}\n";
+        assert_eq!(
+            sources(swift, Lang::Swift),
+            ["Foundation", "Foo.Bar", "MyApp"]
+        );
     }
 
     /// A re-export imports the module it names. Matching only `import`, a

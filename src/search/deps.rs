@@ -346,13 +346,19 @@ mod tests {
             target: PathBuf::from("/r/lib.py"),
             uses_local: Vec::new(),
             uses_external: Vec::new(),
-            used_by: vec![dependent("a.py", None), dependent("b.py", Some("pkg/__init__.py"))],
+            used_by: vec![
+                dependent("a.py", None),
+                dependent("b.py", Some("pkg/__init__.py")),
+            ],
             skipped_large: Vec::new(),
             exported_count: 27,
             unsearched: vec!["get_dependant".to_string(), "x_y".to_string()],
         };
         let out = format_deps(&result, Path::new("/r"), None, false);
-        assert!(out.contains("\na.py:3                         imports it\n"), "{out}");
+        assert!(
+            out.contains("\na.py:3                         imports it\n"),
+            "{out}"
+        );
         assert!(
             out.contains("\nb.py:3                         imports it through pkg/__init__.py"),
             "{out}"

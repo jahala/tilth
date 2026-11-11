@@ -409,22 +409,46 @@ fn collect_children(
 
 /// A function's signature: its name, parameters and return type, on one
 /// line. A signature written across lines reads from its first line to
-/// where its body starts, each line trimmed and joined.
+/// where its body starts, each line trimmed and joined, without its
+/// comments.
 fn extract_signature(node: tree_sitter::Node, lines: &[&str]) -> String {
     let header = header_lines(node, lines);
     if header.len() > 1 {
-        return join_signature_lines(&header);
+        return elide_middle(&join_signature_lines(&header));
     }
     first_line_signature(node, lines)
 }
 
-/// The non-blank lines of a function's header, trimmed: from the line it
-/// starts on to where its body starts, or to its end when it has no body
-/// (an abstract or interface method). Empty when the header fits on its
-/// first line.
-fn header_lines<'a>(node: tree_sitter::Node, lines: &[&'a str]) -> Vec<&'a str> {
+/// Longest signature an outline prints whole. A one-line signature past it
+/// is cut at its end; a joined one loses its middle and keeps its end,
+/// which holds the return type. fastapi's `APIRouter.get` header runs to
+/// 14,000 characters of documented parameters.
+const MAX_SIGNATURE: usize = 120;
+
+/// `signature` with its middle replaced by `…` when it is longer than
+/// `MAX_SIGNATURE`: three quarters of the room for its start, the rest for
+/// its end.
+fn elide_middle(signature: &str) -> String {
+    if signature.len() <= MAX_SIGNATURE {
+        return signature.to_string();
+    }
+    let head = signature.floor_char_boundary(MAX_SIGNATURE * 3 / 4);
+    let tail = signature.ceil_char_boundary(signature.len() - MAX_SIGNATURE / 4);
+    format!(
+        "{} … {}",
+        signature[..head].trim_end(),
+        signature[tail..].trim_start()
+    )
+}
+
+/// The non-blank lines of a function's header, trimmed and without its
+/// comments: from the line it starts on to where its body starts, or to
+/// its end when it has no body (an abstract or interface method). Empty
+/// when the header fits on its first line.
+fn header_lines(node: tree_sitter::Node, lines: &[&str]) -> Vec<String> {
     let start_row = node.start_position().row;
-    let end = match function_body(node) {
+    let body = function_body(node);
+    let end = match body {
         Some(body) => body.start_position(),
         // An Elixir `def f(x), do: …` is a call whose keyword body is
         // read by `first_line_signature`.
@@ -434,20 +458,63 @@ fn header_lines<'a>(node: tree_sitter::Node, lines: &[&'a str]) -> Vec<&'a str> 
     if end.row == start_row {
         return Vec::new();
     }
+    let mut comments = Vec::new();
+    header_comments(node, body, &mut comments);
     let mut out = Vec::new();
-    for row in start_row..=end.row.min(lines.len().saturating_sub(1)) {
-        let line = lines[row];
-        let line = if row == end.row {
-            line.get(..end.column).unwrap_or(line)
+    let last = end.row.min(lines.len().saturating_sub(1));
+    for (row, &line) in lines.iter().enumerate().take(last + 1).skip(start_row) {
+        let to = if row == end.row {
+            end.column.min(line.len())
         } else {
-            line
+            line.len()
         };
-        let line = line.trim();
-        if !line.is_empty() && !line.starts_with("//") {
-            out.push(line);
+        let mut text = String::new();
+        let mut from = 0;
+        for comment in &comments {
+            let (c_start, c_end) = (comment.start_position(), comment.end_position());
+            if row < c_start.row || row > c_end.row {
+                continue;
+            }
+            let cut_from = if row == c_start.row {
+                c_start.column
+            } else {
+                0
+            };
+            let cut_to = if row == c_end.row {
+                c_end.column
+            } else {
+                line.len()
+            };
+            text.push_str(line.get(from..cut_from.min(to)).unwrap_or(""));
+            from = cut_to.max(from);
+        }
+        text.push_str(line.get(from.min(to)..to).unwrap_or(""));
+        let text = text.trim();
+        if !text.is_empty() {
+            out.push(text.to_string());
         }
     }
     out
+}
+
+/// The comment nodes inside a function's header, in source order: every
+/// descendant of `node` outside `body` whose kind is a comment.
+fn header_comments<'t>(
+    node: tree_sitter::Node<'t>,
+    body: Option<tree_sitter::Node<'t>>,
+    out: &mut Vec<tree_sitter::Node<'t>>,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if Some(child) == body {
+            continue;
+        }
+        if child.kind().contains("comment") {
+            out.push(child);
+        } else {
+            header_comments(child, body, out);
+        }
+    }
 }
 
 /// The node a function's body starts at: its `body` field, or the child
@@ -468,7 +535,7 @@ fn function_body(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
 /// trailing comma a formatter puts before a closing bracket dropped, so a
 /// signature reads the same however it is wrapped. A trailing `{`, the
 /// Python `:` and a Rust `where` clause's last comma go too.
-fn join_signature_lines(header: &[&str]) -> String {
+fn join_signature_lines(header: &[String]) -> String {
     let mut out = String::new();
     for part in header {
         let closes = part.starts_with([')', ']', '>', '}']);
@@ -518,8 +585,8 @@ fn first_line_signature(node: tree_sitter::Node, lines: &[&str]) -> String {
             return line[..pos].trim().to_string();
         }
         // Full first line, truncated
-        if line.len() > 120 {
-            format!("{}...", crate::types::truncate_str(line, 117))
+        if line.len() > MAX_SIGNATURE {
+            format!("{}...", crate::types::truncate_str(line, MAX_SIGNATURE - 3))
         } else {
             line.to_string()
         }
@@ -1712,7 +1779,8 @@ mod doc_comment_tests {
             ),
             Some("Doc of f. More.".to_string())
         );
-        let grouped = "package p\n\nconst (\n\tA = 1 // trails A\n\t// B is documented.\n\tB = 2\n)\n";
+        let grouped =
+            "package p\n\nconst (\n\tA = 1 // trails A\n\t// B is documented.\n\tB = 2\n)\n";
         let entries = get_outline_entries(grouped, Lang::Go);
         let b = entries.iter().find(|e| e.name == "B").expect("B");
         assert_eq!(b.doc.as_deref(), Some("B is documented."));
@@ -1723,6 +1791,7 @@ mod doc_comment_tests {
 mod signature_tests {
     use super::get_outline_entries;
     use crate::types::Lang;
+    use std::fmt::Write as _;
 
     fn signature_of(src: &str, lang: Lang, name: &str) -> Option<String> {
         fn find(entries: &[crate::types::OutlineEntry], name: &str) -> Option<String> {
@@ -1756,7 +1825,8 @@ mod signature_tests {
             signature_of(python, Lang::Python, "handler").as_deref(),
             Some("def handler(request, retries: int = 3) -> int")
         );
-        let go = "package p\n\nfunc Serve(\n\taddr string,\n\tport int,\n) error {\n\treturn nil\n}\n";
+        let go =
+            "package p\n\nfunc Serve(\n\taddr string,\n\tport int,\n) error {\n\treturn nil\n}\n";
         assert_eq!(
             signature_of(go, Lang::Go, "Serve").as_deref(),
             Some("func Serve(addr string, port int) error")
@@ -1766,11 +1836,37 @@ mod signature_tests {
             signature_of(ts, Lang::TypeScript, "load").as_deref(),
             Some("export async function load(path: string, opts: Options): Promise<void>")
         );
+        let commented =
+            "def handler(  # noqa: N802\n    request,  # the request\n) -> int:\n    return 1\n";
+        assert_eq!(
+            signature_of(commented, Lang::Python, "handler").as_deref(),
+            Some("def handler(request) -> int")
+        );
         let java = "interface Store {\n  void save(\n      String key,\n      byte[] value);\n}\n";
         assert_eq!(
             signature_of(java, Lang::Java, "save").as_deref(),
             Some("void save(String key, byte[] value)")
         );
+    }
+
+    /// A wrapped signature longer than `MAX_SIGNATURE` keeps its
+    /// start and its end, with the return type. Whole, fastapi's
+    /// `APIRouter.get` printed 14,000 characters in every outline.
+    #[test]
+    fn a_very_long_signature_keeps_its_start_and_return_type() {
+        let mut params = String::new();
+        for i in 0..40 {
+            let _ = writeln!(params, "    argument_{i}: str = None,");
+        }
+        let python = format!("def handler(\n{params}) -> Response:\n    return 1\n");
+        let sig = signature_of(&python, Lang::Python, "handler").unwrap();
+        assert!(sig.len() <= super::MAX_SIGNATURE + 8, "{sig}");
+        assert!(
+            sig.starts_with("def handler(argument_0: str = None, "),
+            "{sig}"
+        );
+        assert!(sig.contains(" … "), "{sig}");
+        assert!(sig.ends_with("_39: str = None) -> Response"), "{sig}");
     }
 
     /// A signature that fits on its line reads as it did: to its brace,
