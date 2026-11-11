@@ -862,6 +862,11 @@ pub fn format_grok(result: &GrokResult, scope: &Path) -> String {
         for ext in &result.callees_external {
             let _ = writeln!(out, "{ext:<20} extern");
         }
+        let shown = result.callees_internal.len() + result.callees_external.len();
+        let total = internal_count + external_count;
+        if shown < total {
+            let _ = writeln!(out, "... and {} more", total - shown);
+        }
         for file in &result.callees_maybe_in {
             let _ = writeln!(
                 out,
@@ -869,11 +874,6 @@ pub fn format_grok(result: &GrokResult, scope: &Path) -> String {
                 display_rel(file, scope),
                 tilth_core::source::max_file_size_label()
             );
-        }
-        let shown = result.callees_internal.len() + result.callees_external.len();
-        let total = internal_count + external_count;
-        if shown < total {
-            let _ = writeln!(out, "... and {} more", total - shown);
         }
     }
 
@@ -2756,10 +2756,10 @@ impl OutlineCache {
         ]);
     }
 
-    /// A callee defined in an imported file over the size limit shows as
-    /// extern, because resolution does not parse that file. The callees
-    /// block says so once per such file. It does not pin a callee on the
-    /// file: a common name such as `log` is in any big bundle.
+    /// Every unresolved callee whose name a big imported file held was
+    /// pinned on that file, so `log` was "defined" in `big.js`. Callees
+    /// stay extern, and the block names once each big imported file that
+    /// holds one of their names: they may be defined there.
     #[test]
     fn an_imported_file_over_the_size_limit_is_named_under_the_callees() {
         let tmp = tempfile::tempdir().unwrap();
