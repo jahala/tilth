@@ -2,7 +2,7 @@
 //! found with one parallel walk, a bloom and byte pre-filter, and a
 //! tree-sitter pass over the files that survive.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -11,6 +11,7 @@ use streaming_iterator::StreamingIterator;
 
 use crate::error::TilthError;
 use crate::lang::outline::outline_language;
+use crate::lang::treesitter::is_bodiless_declaration;
 use crate::lang::{detect_file_type, detect_file_type_with_content};
 use crate::types::FileType;
 
@@ -174,6 +175,122 @@ where
     })
 }
 
+/// The types that define each of `names` under `scope`: for each name, the
+/// distinct owners (see [`super::scope::definition_owner`]) of its
+/// definitions, the same owners caller labels carry. A definition with no
+/// owner, such as a plain function, adds none, and neither does a member
+/// declared without a body (a trait or interface method): a call through
+/// it runs an implementor's body, whose type is counted. Names no type
+/// defines are left out.
+///
+/// A call site names a method without its type (`x.run()`), so a name that
+/// several types define cannot be traced to one of them by name alone.
+/// Files over the size cap are not parsed, as in [`find_callers_batch`].
+// The std hasher is part of the signature, as in `find_callers_batch`.
+#[allow(clippy::implicit_hasher)]
+pub fn definition_owners(
+    names: &HashSet<String>,
+    scope: &Path,
+    bloom: &crate::index::bloom::BloomFilterCache,
+    glob: Option<&str>,
+) -> Result<HashMap<String, BTreeSet<String>>, TilthError> {
+    let found: Mutex<HashMap<String, BTreeSet<String>>> = Mutex::new(HashMap::new());
+    if names.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let walker = super::walk::walker(scope, glob)?;
+
+    walker.run(|| {
+        let found = &found;
+        Box::new(move |entry| {
+            let Ok(entry) = entry else {
+                return ignore::WalkState::Continue;
+            };
+            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+                return ignore::WalkState::Continue;
+            }
+            let path = entry.path();
+            let Some((content, _mtime)) = super::bloom_walk::read_with_bloom_check(
+                path,
+                names,
+                bloom,
+                crate::source::MAX_FILE_SIZE,
+            ) else {
+                return ignore::WalkState::Continue;
+            };
+            if !names
+                .iter()
+                .any(|n| memchr::memmem::find(content.as_bytes(), n.as_bytes()).is_some())
+            {
+                return ignore::WalkState::Continue;
+            }
+            let FileType::Code(lang) = detect_file_type_with_content(path, &content) else {
+                return ignore::WalkState::Continue;
+            };
+            let Some(ts_lang) = outline_language(lang) else {
+                return ignore::WalkState::Continue;
+            };
+            let owners = owners_in_file(&content, names, &ts_lang, lang);
+            if !owners.is_empty() {
+                let mut found = found
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                for (name, owner) in owners {
+                    found.entry(name).or_default().insert(owner);
+                }
+            }
+            ignore::WalkState::Continue
+        })
+    });
+
+    Ok(found
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner))
+}
+
+/// The (name, owner) pair of each owned definition of one of `names` in a
+/// file's content.
+fn owners_in_file(
+    content: &str,
+    names: &HashSet<String>,
+    ts_lang: &tree_sitter::Language,
+    lang: crate::types::Lang,
+) -> Vec<(String, String)> {
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(ts_lang).is_err() {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(content, None) else {
+        return Vec::new();
+    };
+    let lines: Vec<&str> = content.lines().collect();
+    let mut owners = Vec::new();
+    let mut cursor = tree.walk();
+    loop {
+        let node = cursor.node();
+        if let Some(name) = super::scope::definition_name(node, &lines, lang) {
+            if names.contains(&name) && !is_bodiless_declaration(node) {
+                if let Some(owner) = super::scope::definition_owner(node, &lines, lang) {
+                    owners.push((name, owner));
+                }
+            }
+        }
+        if cursor.goto_first_child() || cursor.goto_next_sibling() {
+            continue;
+        }
+        let mut done = true;
+        while cursor.goto_parent() {
+            if cursor.goto_next_sibling() {
+                done = false;
+                break;
+            }
+        }
+        if done {
+            return owners;
+        }
+    }
+}
+
 /// Is `path` a code file the walk would parse, over the size cap, whose text
 /// holds one of `targets`?
 fn oversized_code_holding(path: &Path, targets: &HashSet<String>) -> bool {
@@ -323,6 +440,28 @@ fn find_enclosing_function(
 mod tests {
     use super::*;
 
+    /// Each name maps to the types whose definitions of it a caller label
+    /// would name. A plain function of the same name adds no type, and
+    /// neither does a trait method declared without a body.
+    #[test]
+    fn definition_owners_lists_the_types_that_define_a_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("m.rs"),
+            "struct A;\nstruct B;\nimpl A { fn new() -> A { A } }\n\
+             impl B { fn new() -> B { B } fn only() {} }\nfn new() {}\nfn free() {}\n\
+             trait Run { fn only(&self); }\n",
+        )
+        .unwrap();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let names: HashSet<String> = ["new", "only", "free"].map(String::from).into();
+        let owners = definition_owners(&names, dir.path(), &bloom, None).unwrap();
+        let of = |n: &str| owners.get(n).map(|o| o.iter().cloned().collect::<Vec<_>>());
+        assert_eq!(of("new"), Some(vec!["A".to_string(), "B".to_string()]));
+        assert_eq!(of("only"), Some(vec!["B".to_string()]));
+        assert_eq!(of("free"), None);
+    }
+
     /// The bloom pre-filter must never hide a file that holds a call site. A
     /// quote inside a triple-quoted string, or an apostrophe in a `#` comment,
     /// once made the scanner read the rest of the file as a string, so the
@@ -359,6 +498,127 @@ mod tests {
             .map(String::as_str)
             .collect();
         assert_eq!(callers, ["comment_caller", "docstring_caller"]);
+    }
+
+    /// Each `(line, label)` of the call sites of `target` in `file`.
+    fn caller_labels(file: &str, source: &str, target: &str) -> Vec<(u32, String)> {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(file), source).unwrap();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let targets: HashSet<String> = std::iter::once(target.to_string()).collect();
+        let found = find_callers_batch(&targets, dir.path(), &bloom, None, None, |sites| {
+            sites
+                .into_iter()
+                .map(|(_, m)| (m.line, m.calling_function))
+                .collect::<Vec<_>>()
+        })
+        .unwrap();
+        let mut labels: Vec<(u32, String)> = found.per_file.into_iter().flatten().collect();
+        labels.sort();
+        labels
+    }
+
+    fn labels(pairs: &[(u32, &str)]) -> Vec<(u32, String)> {
+        pairs.iter().map(|&(l, s)| (l, s.to_string())).collect()
+    }
+
+    /// A call in a local variable's initializer is made by the function that
+    /// declares the variable, so it carries that function's name. A
+    /// top-level binding has no function around it and keeps its own name.
+    #[test]
+    fn a_call_in_a_local_initializer_is_labelled_by_its_function() {
+        let ts = "function target() { return 1; }\n\
+                  function outer() {\n\
+                  \x20 const result = target();\n\
+                  \x20 let other = target(), more = 2;\n\
+                  \x20 var legacy = target();\n\
+                  \x20 function nested() { const result = target(); return result; }\n\
+                  }\n\
+                  class Service {\n\
+                  \x20 run() { const result = target(); return result; }\n\
+                  }\n\
+                  function* generate() { const value = target(); yield value; }\n\
+                  const topLevel = target();\n";
+        assert_eq!(
+            caller_labels("calls.ts", ts, "target"),
+            labels(&[
+                (3, "outer"),
+                (4, "outer"),
+                (5, "outer"),
+                (6, "nested"),
+                (9, "Service.run"),
+                (11, "generate"),
+                (12, "topLevel"),
+            ])
+        );
+
+        let rust = "fn rust_target() -> u32 { 1 }\n\
+                    fn rust_outer() -> u32 {\n\
+                    \x20   const LOCAL: u32 = rust_target();\n\
+                    \x20   static S: u32 = rust_target();\n\
+                    \x20   LOCAL + S\n\
+                    }\n\
+                    const TOP: u32 = rust_target();\n";
+        assert_eq!(
+            caller_labels("lib.rs", rust, "rust_target"),
+            labels(&[(3, "rust_outer"), (4, "rust_outer"), (7, "TOP")])
+        );
+
+        // A function value is labelled by its own name or the name it is
+        // bound to; an anonymous callback belongs to what is around it.
+        let js = "res.send = function send(body) {\n\
+                    var file = target(body);\n\
+                  };\n\
+                  app.handle = function (req) {\n\
+                    const out = target(req);\n\
+                  };\n\
+                  function outer() {\n\
+                    const cb = () => target();\n\
+                    [1].map(function () { const v = target(); });\n\
+                  }\n\
+                  const api = { load: function () { const v = target(); } };\n\
+                  describe('x', () => { const app = target(); });\n";
+        assert_eq!(
+            caller_labels("lib.js", js, "target"),
+            labels(&[
+                (2, "send"),
+                (5, "handle"),
+                (8, "cb"),
+                (9, "outer"),
+                (11, "load"),
+                (12, "<top-level>"),
+            ])
+        );
+
+        let bash = "target() { echo hi; }\nouter() {\n  value=$(target)\n  echo \"$value\"\n}\n";
+        assert_eq!(
+            caller_labels("run.sh", bash, "target"),
+            labels(&[(3, "outer")])
+        );
+    }
+
+    /// A method's label names the type it belongs to, however the language
+    /// attaches it: a Rust `impl` block, a Go receiver, or a C++ definition
+    /// outside its class.
+    #[test]
+    fn a_method_label_names_its_type() {
+        let rust = "struct A;\nimpl A {\n    fn run(&self) { go(); }\n}\n\
+                    impl<T> Wrap<T> {\n    fn run(&self) { go(); }\n}\n";
+        assert_eq!(
+            caller_labels("m.rs", rust, "go"),
+            labels(&[(3, "A.run"), (6, "Wrap.run")])
+        );
+
+        let go = "package p\n\ntype Context struct{}\n\n\
+                  func (c *Context) reset() { work() }\n\n\
+                  func (r JSON) Render() error { work(); return nil }\n";
+        assert_eq!(
+            caller_labels("ctx.go", go, "work"),
+            labels(&[(5, "Context.reset"), (7, "JSON.Render")])
+        );
+
+        let cpp = "struct B { int run(); };\nint B::run() { return go(); }\n";
+        assert_eq!(caller_labels("b.cpp", cpp, "go"), labels(&[(2, "B.run")]));
     }
 
     /// `reached_bound` is set exactly when the walk found `stop_after` sites,

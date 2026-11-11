@@ -13,13 +13,14 @@ use tilth_core::lang::treesitter::{
 };
 
 use crate::search::rank;
-use crate::types::{Match, SearchResult};
+use crate::types::{Match, OtherOwner, SearchResult};
 use grep_regex::RegexMatcher;
 use grep_searcher::sinks::UTF8;
 use grep_searcher::Searcher;
 use tilth_core::error::TilthError;
 use tilth_core::lang::detect_file_type_with_content;
 use tilth_core::lang::outline::{heading_text, outline_language, parse_markdown};
+use tilth_core::search::scope::{definition_owner, split_qualified};
 use tilth_core::types::FileType;
 
 const MAX_MATCHES: usize = 10;
@@ -74,6 +75,24 @@ pub fn search(
     search_capped(query, scope, context, glob, max_matches, max_matches)
 }
 
+/// What a symbol query asks for. A qualified query (`B::run`, `B.run`) asks
+/// for the definitions of `name` that `owner` holds, and for the usages of
+/// its literal text; a bare query has no owner, and `name` is the query.
+#[derive(Clone, Copy)]
+struct Wanted<'a> {
+    query: &'a str,
+    name: &'a str,
+    owner: Option<&'a str>,
+}
+
+fn word_matcher(query: &str, text: &str) -> Result<RegexMatcher, TilthError> {
+    let word_pattern = format!(r"\b{}\b", regex_syntax::escape(text));
+    RegexMatcher::new(&word_pattern).map_err(|e| TilthError::InvalidQuery {
+        query: query.to_string(),
+        reason: e.to_string(),
+    })
+}
+
 /// The display cap and the collection bound are the same number in
 /// production. They are separate parameters so a test can raise one without
 /// the other and show that the bound leaves the result untouched.
@@ -85,23 +104,36 @@ fn search_capped(
     max_matches: usize,
     keep: usize,
 ) -> Result<SearchResult, TilthError> {
-    let word_pattern = format!(r"\b{}\b", regex_syntax::escape(query));
-    let matcher = RegexMatcher::new(&word_pattern).map_err(|e| TilthError::InvalidQuery {
-        query: query.to_string(),
-        reason: e.to_string(),
-    })?;
+    let (owner, name) = split_qualified(query);
+    let wanted = Wanted { query, name, owner };
+    let matcher = word_matcher(query, query)?;
+    // A file may define `name` without spelling the qualified text, so a
+    // file skipped for size is reported when it holds the bare name.
+    let name_matcher = match owner {
+        Some(_) => Some(word_matcher(query, name)?),
+        None => None,
+    };
+    let matchers = Matchers {
+        usage: &matcher,
+        name: name_matcher.as_ref().unwrap_or(&matcher),
+    };
 
     // One clock for the per-file bound and the final sort, so both rank by
     // the same scores.
     let now = SystemTime::now();
-    let walked = walk(query, &matcher, scope, context, glob, now, keep)?;
+    let walked = walk(wanted, matchers, scope, context, glob, now, keep)?;
 
     let definitions: usize = walked.per_file.iter().map(|f| f.definitions).sum();
     let total: usize = walked.per_file.iter().map(|f| f.total).sum();
     let mut merged = walked.kept;
     let mut skipped_large = walked.skipped_large;
     skipped_large.sort();
-    display_order(&mut merged, query, scope, context, now);
+    let mut other_owners = walked.other_owners;
+    if definitions > 0 {
+        other_owners.clear();
+    }
+    other_owners.sort();
+    display_order(&mut merged, name, scope, context, now);
 
     let file_facets: Vec<super::facets::FileFacets> =
         walked.per_file.into_iter().map(|f| f.facets).collect();
@@ -118,6 +150,7 @@ fn search_capped(
         usages: total - definitions,
         facet_totals,
         skipped_large,
+        other_owners,
     })
 }
 
@@ -134,13 +167,32 @@ struct Walked {
     per_file: Vec<FileCount>,
     /// Files skipped for size although they hold the query.
     skipped_large: Vec<PathBuf>,
+    /// Definitions of a qualified query's name that other owners hold.
+    other_owners: Vec<OtherOwner>,
+}
+
+/// The two patterns a symbol search scans for: the query's text, whose
+/// occurrences are its usages, and the bare name its definitions carry. They
+/// are the same for a bare query.
+#[derive(Clone, Copy)]
+struct Matchers<'a> {
+    usage: &'a RegexMatcher,
+    name: &'a RegexMatcher,
 }
 
 /// What one file adds to a symbol search.
 enum Scan {
-    Matches(Vec<Match>),
+    Matches(FileDefs),
     /// Over the size cap, and the query occurs in it.
     TooLarge,
+}
+
+/// The matches found in one file, definitions first, and the definitions
+/// of a qualified query's name that another owner holds.
+#[derive(Default)]
+struct FileDefs {
+    matches: Vec<Match>,
+    others: Vec<OtherOwner>,
 }
 
 /// Walk `scope` once and collect the definitions and usages of `query`.
@@ -150,8 +202,8 @@ enum Scan {
 /// order is total across files, since it ends on path and line, so what is
 /// kept does not depend on the order files arrive in.
 fn walk(
-    query: &str,
-    matcher: &RegexMatcher,
+    wanted: Wanted,
+    matchers: Matchers,
     scope: &Path,
     context: Option<&Path>,
     glob: Option<&str>,
@@ -162,6 +214,7 @@ fn walk(
         kept: Vec::new(),
         per_file: Vec::new(),
         skipped_large: Vec::new(),
+        other_owners: Vec::new(),
     });
 
     let walker = tilth_core::search::walk::walker(scope, glob)?;
@@ -179,9 +232,11 @@ fn walk(
             }
 
             let path = entry.path();
-            let mut file_matches = match matches_in_file(path, query, matcher) {
-                Scan::Matches(m) if !m.is_empty() => m,
-                Scan::Matches(_) => return ignore::WalkState::Continue,
+            let (mut file_matches, others) = match matches_in_file(path, wanted, matchers) {
+                Scan::Matches(found) if found.matches.is_empty() && found.others.is_empty() => {
+                    return ignore::WalkState::Continue
+                }
+                Scan::Matches(found) => (found.matches, found.others),
                 Scan::TooLarge => {
                     found
                         .lock()
@@ -197,16 +252,17 @@ fn walk(
                 definitions: file_matches.iter().filter(|m| m.is_definition).count(),
                 facets: super::facets::count_file(path, &file_matches),
             };
-            display_order(&mut file_matches, query, scope, context, now);
+            display_order(&mut file_matches, wanted.name, scope, context, now);
             file_matches.truncate(keep);
 
             let mut found = found
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             found.kept.extend(file_matches);
-            display_order(&mut found.kept, query, scope, context, now);
+            display_order(&mut found.kept, wanted.name, scope, context, now);
             found.kept.truncate(keep);
             found.per_file.push(count);
+            found.other_owners.extend(others);
 
             ignore::WalkState::Continue
         })
@@ -224,8 +280,9 @@ fn walk(
 /// `memchr::memmem` (SIMD), then reuses the buffer for both the tree-sitter
 /// definition pass and the word-boundary usage pass. Definitions fall back
 /// to a keyword heuristic for code without a grammar.
-fn matches_in_file(path: &Path, query: &str, matcher: &RegexMatcher) -> Scan {
-    let none = || Scan::Matches(Vec::new());
+fn matches_in_file(path: &Path, wanted: Wanted, matchers: Matchers) -> Scan {
+    let none = || Scan::Matches(FileDefs::default());
+    let query = wanted.query;
     // Skip files that look minified by filename — `.min.js`, `app-min.css`.
     if path
         .file_name()
@@ -240,7 +297,7 @@ fn matches_in_file(path: &Path, query: &str, matcher: &RegexMatcher) -> Scan {
     let file_size = match std::fs::metadata(path) {
         Ok(meta) => {
             if meta.len() > tilth_core::source::MAX_FILE_SIZE {
-                if super::oversized_holds(path, |b| super::has_match(matcher, b)) {
+                if super::oversized_holds(path, |b| super::has_match(matchers.name, b)) {
                     return Scan::TooLarge;
                 }
                 return none();
@@ -256,8 +313,8 @@ fn matches_in_file(path: &Path, query: &str, matcher: &RegexMatcher) -> Scan {
     let bytes = tilth_core::source::strip_bom_bytes(&raw);
 
     // Fast byte check — a word-boundary usage or a definition both need the
-    // symbol's bytes somewhere in the file.
-    if memchr::memmem::find(bytes, query.as_bytes()).is_none() {
+    // name's bytes somewhere in the file.
+    if memchr::memmem::find(bytes, wanted.name.as_bytes()).is_none() {
         return none();
     }
 
@@ -270,15 +327,18 @@ fn matches_in_file(path: &Path, query: &str, matcher: &RegexMatcher) -> Scan {
 
     let (file_lines, mtime) = file_metadata(path);
 
-    let mut matches = match std::str::from_utf8(bytes) {
-        Ok(content) => definitions_in(path, query, content, file_lines, mtime),
-        Err(_) => Vec::new(),
+    let FileDefs {
+        mut matches,
+        others,
+    } = match std::str::from_utf8(bytes) {
+        Ok(content) => definitions_in(path, wanted, content, file_lines, mtime),
+        Err(_) => FileDefs::default(),
     };
     let def_count = matches.len();
 
     let mut searcher = Searcher::new();
     let _ = searcher.search_slice(
-        matcher,
+        matchers.usage,
         bytes,
         UTF8(|line_num, line| {
             let line_num = line_num as u32;
@@ -302,17 +362,17 @@ fn matches_in_file(path: &Path, query: &str, matcher: &RegexMatcher) -> Scan {
         }),
     );
 
-    Scan::Matches(matches)
+    Scan::Matches(FileDefs { matches, others })
 }
 
 /// The definitions of `query` in one file's content.
 fn definitions_in(
     path: &Path,
-    query: &str,
+    wanted: Wanted,
     content: &str,
     file_lines: u32,
     mtime: SystemTime,
-) -> Vec<Match> {
+) -> FileDefs {
     // Try tree-sitter structural detection
     let file_type = detect_file_type_with_content(path, content);
     let lang = match file_type {
@@ -323,8 +383,12 @@ fn definitions_in(
     let ts_language = lang.and_then(outline_language);
 
     if let Some(ref ts_lang) = ts_language {
-        return find_defs_treesitter(path, query, ts_lang, lang, content, file_lines, mtime);
+        return find_defs_treesitter(path, wanted, ts_lang, lang, content, file_lines, mtime);
     }
+
+    // Without a syntax tree no definition has a known owner, so the query is
+    // matched as written.
+    let query = wanted.query;
 
     // Per-file-type fallback dispatch. The semantics of "definition"
     // differ by file kind, so handle them separately:
@@ -345,10 +409,14 @@ fn definitions_in(
     //   (A future patch could treat top-level config keys matching
     //   the query as soft definitions, but that's ambiguous enough
     //   to skip for now.)
-    match file_type {
+    let matches = match file_type {
         FileType::Code(_) => find_defs_heuristic_buf(path, query, content, file_lines, mtime),
         FileType::Markdown => find_defs_markdown_buf(path, query, content, file_lines, mtime),
         _ => Vec::new(),
+    };
+    FileDefs {
+        matches,
+        others: Vec::new(),
     }
 }
 
@@ -356,31 +424,31 @@ fn definitions_in(
 /// Accepts pre-read content — no redundant file read.
 fn find_defs_treesitter(
     path: &Path,
-    query: &str,
+    wanted: Wanted,
     ts_lang: &tree_sitter::Language,
     lang: Option<tilth_core::types::Lang>,
     content: &str,
     file_lines: u32,
     mtime: SystemTime,
-) -> Vec<Match> {
+) -> FileDefs {
     let mut parser = tree_sitter::Parser::new();
     if parser.set_language(ts_lang).is_err() {
-        return Vec::new();
+        return FileDefs::default();
     }
 
     let Some(tree) = parser.parse(content, None) else {
-        return Vec::new();
+        return FileDefs::default();
     };
 
     let lines: Vec<&str> = content.lines().collect();
     let root = tree.root_node();
-    let mut defs = Vec::new();
+    let mut found = FileDefs::default();
 
     walk_for_definitions(
-        root, None, query, path, &lines, file_lines, mtime, &mut defs, lang, 0, None,
+        root, None, wanted, path, &lines, file_lines, mtime, &mut found, lang, 0, None,
     );
 
-    defs
+    found
 }
 
 /// Recursively walk AST nodes looking for definitions of the queried symbol.
@@ -395,12 +463,12 @@ fn find_defs_treesitter(
 fn walk_for_definitions(
     node: tree_sitter::Node,
     parent: Option<tree_sitter::Node>,
-    query: &str,
+    wanted: Wanted,
     path: &Path,
     lines: &[&str],
     file_lines: u32,
     mtime: SystemTime,
-    defs: &mut Vec<Match>,
+    found: &mut FileDefs,
     lang: Option<tilth_core::types::Lang>,
     depth: usize,
     wrapper_start: Option<usize>,
@@ -426,12 +494,12 @@ fn walk_for_definitions(
             walk_for_definitions(
                 child,
                 Some(node),
-                query,
+                wanted,
                 path,
                 lines,
                 file_lines,
                 mtime,
-                defs,
+                found,
                 lang,
                 depth,
                 start,
@@ -455,15 +523,17 @@ fn walk_for_definitions(
         None => (DEFAULT_DEF_KINDS, &DEFAULT_DEFS),
     };
 
+    let query = wanted.name;
     if def_kinds.contains(&kind) {
         // Check if this node defines the queried symbol
-        if defines_name(node, lines, query, def_ops) && !is_local_binding(node) {
-            let line_num = node.start_position().row as u32 + 1;
-            let line_text = lines
-                .get(node.start_position().row)
-                .unwrap_or(&"")
-                .trim_end();
-            defs.push(Match {
+        if defines_name(node, lines, query, def_ops)
+            && !is_local_binding(node)
+            && owned_as_wanted(node, lines, lang, wanted, path, found)
+        {
+            let row = name_row(node);
+            let line_num = row as u32 + 1;
+            let line_text = lines.get(row).unwrap_or(&"").trim_end();
+            found.matches.push(Match {
                 path: path.to_path_buf(),
                 line: line_num,
                 text: line_text.to_string(),
@@ -479,8 +549,10 @@ fn walk_for_definitions(
         }
 
         // Impl/interface detection: surface `impl Trait for Type` and
-        // `class X implements Interface` blocks when searching for the trait/interface.
-        if kind == "impl_item" {
+        // `class X implements Interface` blocks when searching for the
+        // trait/interface. A qualified query names a member, not a trait.
+        let bare = wanted.owner.is_none();
+        if bare && kind == "impl_item" {
             if let Some(trait_name) = extract_impl_trait(node, lines) {
                 if trait_name == query {
                     let impl_type =
@@ -490,7 +562,7 @@ fn walk_for_definitions(
                         .get(node.start_position().row)
                         .unwrap_or(&"")
                         .trim_end();
-                    defs.push(Match {
+                    found.matches.push(Match {
                         path: path.to_path_buf(),
                         line: line_num,
                         text: line_text.to_string(),
@@ -505,20 +577,20 @@ fn walk_for_definitions(
                     });
                 }
             }
-        } else if matches!(
-            kind,
-            "class_declaration" | "class_definition" | "abstract_class_declaration"
-        ) {
+        } else if bare
+            && matches!(
+                kind,
+                "class_declaration" | "class_definition" | "abstract_class_declaration"
+            )
+        {
             let interfaces = extract_implemented_interfaces(node, lines);
             if interfaces.iter().any(|i| i == query) {
                 let class_name = extract_definition_name(node, lines)
                     .unwrap_or_else(|| "<anonymous>".to_string());
-                let line_num = node.start_position().row as u32 + 1;
-                let line_text = lines
-                    .get(node.start_position().row)
-                    .unwrap_or(&"")
-                    .trim_end();
-                defs.push(Match {
+                let row = name_row(node);
+                let line_num = row as u32 + 1;
+                let line_text = lines.get(row).unwrap_or(&"").trim_end();
+                found.matches.push(Match {
                     path: path.to_path_buf(),
                     line: line_num,
                     text: line_text.to_string(),
@@ -537,13 +609,13 @@ fn walk_for_definitions(
         // Elixir: definitions are `call` nodes — check separately. Name and
         // weight come from `spec(Elixir).definitions` via `def_ops`.
         if let Some(name) = (def_ops.extract_name)(node, lines) {
-            if name == query {
+            if name == query && owned_as_wanted(node, lines, lang, wanted, path, found) {
                 let line_num = node.start_position().row as u32 + 1;
                 let line_text = lines
                     .get(node.start_position().row)
                     .unwrap_or(&"")
                     .trim_end();
-                defs.push(Match {
+                found.matches.push(Match {
                     path: path.to_path_buf(),
                     line: line_num,
                     text: line_text.to_string(),
@@ -575,12 +647,12 @@ fn walk_for_definitions(
         walk_for_definitions(
             child,
             Some(node),
-            query,
+            wanted,
             path,
             lines,
             file_lines,
             mtime,
-            defs,
+            found,
             lang,
             child_depth,
             None,
@@ -609,6 +681,42 @@ fn adds_nesting(
         || (lang == Some(tilth_core::types::Lang::Elixir)
             && is_elixir_container(node, Some(parent), lines));
     !free
+}
+
+/// Whether definition `node` has the owner a qualified query asks for. A bare
+/// query takes any owner. A definition another owner holds is recorded in
+/// `found.others`, so a search that matches none can say where the name is.
+fn owned_as_wanted(
+    node: tree_sitter::Node,
+    lines: &[&str],
+    lang: Option<tilth_core::types::Lang>,
+    wanted: Wanted,
+    path: &Path,
+    found: &mut FileDefs,
+) -> bool {
+    let Some(want) = wanted.owner else {
+        return true;
+    };
+    let owner = lang.and_then(|l| definition_owner(node, lines, l));
+    if owner.as_deref() == Some(want) {
+        return true;
+    }
+    found.others.push(OtherOwner {
+        path: path.to_path_buf(),
+        line: name_row(node) as u32 + 1,
+        owner,
+    });
+    false
+}
+
+/// The row of a definition's name: below its first row when decorators or
+/// annotations open the node (`@Injectable()` above `class Service`). A
+/// definition with no name field is found on its first row.
+fn name_row(node: tree_sitter::Node) -> usize {
+    ["name", "identifier", "declarator"]
+        .iter()
+        .find_map(|field| node.child_by_field_name(field))
+        .map_or(node.start_position().row, |n| n.start_position().row)
 }
 
 /// Whether definition `node` binds the name `query`. Most definitions bind
@@ -858,6 +966,24 @@ mod tests {
     use std::path::PathBuf;
     use std::time::SystemTime;
 
+    /// The definitions of bare `name` the tree-sitter walker finds in `code`.
+    fn ts_defs(
+        path: &Path,
+        name: &str,
+        ts_lang: &tree_sitter::Language,
+        lang: Option<tilth_core::types::Lang>,
+        code: &str,
+        file_lines: u32,
+        mtime: SystemTime,
+    ) -> Vec<Match> {
+        let wanted = Wanted {
+            query: name,
+            name,
+            owner: None,
+        };
+        find_defs_treesitter(path, wanted, ts_lang, lang, code, file_lines, mtime).matches
+    }
+
     #[test]
     fn rust_definitions_detected() {
         let code = r#"pub fn hello(name: &str) -> String {
@@ -878,7 +1004,7 @@ pub(crate) fn dispatch_tool(tool: &str) -> Result<String, String> {
         let ts_lang =
             tilth_core::lang::outline::outline_language(tilth_core::types::Lang::Rust).unwrap();
 
-        let defs = find_defs_treesitter(
+        let defs = ts_defs(
             std::path::Path::new("test.rs"),
             "hello",
             &ts_lang,
@@ -891,7 +1017,7 @@ pub(crate) fn dispatch_tool(tool: &str) -> Result<String, String> {
         assert!(defs[0].is_definition);
         assert!(defs[0].def_range.is_some());
 
-        let defs = find_defs_treesitter(
+        let defs = ts_defs(
             std::path::Path::new("test.rs"),
             "Foo",
             &ts_lang,
@@ -902,7 +1028,7 @@ pub(crate) fn dispatch_tool(tool: &str) -> Result<String, String> {
         );
         assert!(!defs.is_empty(), "should find 'Foo' definition");
 
-        let defs = find_defs_treesitter(
+        let defs = ts_defs(
             std::path::Path::new("test.rs"),
             "dispatch_tool",
             &ts_lang,
@@ -927,7 +1053,7 @@ const unexported = "hello";
                 .unwrap();
         let lines = code.lines().count() as u32;
 
-        let defs = find_defs_treesitter(
+        let defs = ts_defs(
             std::path::Path::new("test.ts"),
             "UNTAGGED_REQUESTS_SQL",
             &ts_lang,
@@ -944,7 +1070,7 @@ const unexported = "hello";
         assert!(defs[0].def_range.is_some());
 
         // Non-exported const also detected
-        let defs = find_defs_treesitter(
+        let defs = ts_defs(
             std::path::Path::new("test.ts"),
             "unexported",
             &ts_lang,
@@ -962,7 +1088,7 @@ const unexported = "hello";
         let ts_lang =
             tilth_core::lang::outline::outline_language(tilth_core::types::Lang::Elixir).unwrap();
         let lines = code.lines().count() as u32;
-        find_defs_treesitter(
+        ts_defs(
             std::path::Path::new("test.ex"),
             name,
             &ts_lang,
@@ -1536,7 +1662,7 @@ Body to end.
     fn go_find(code: &str, name: &str) -> Vec<Match> {
         let ts_lang =
             tilth_core::lang::outline::outline_language(tilth_core::types::Lang::Go).unwrap();
-        find_defs_treesitter(
+        ts_defs(
             std::path::Path::new("main.go"),
             name,
             &ts_lang,
@@ -1733,7 +1859,7 @@ func run() {
         let ts_lang =
             tilth_core::lang::outline::outline_language(tilth_core::types::Lang::Cpp).unwrap();
         for (name, line) in [("~Shape", 5), ("operator==", 7)] {
-            let defs = find_defs_treesitter(
+            let defs = ts_defs(
                 std::path::Path::new("shapes.cpp"),
                 name,
                 &ts_lang,
@@ -2085,6 +2211,160 @@ pub trait Speak {
 
         let php = "<?php\nclass Config {\n  const VERSION = 1;\n}\n";
         assert_definitions("c.php", php, &[("VERSION", &[3])]);
+    }
+
+    /// Search `fixture`, written to `file`, for `query` and return the line
+    /// of every definition found, sorted, with the result. Every definition
+    /// must carry the bare name, whatever qualifies the query.
+    fn qualified_search(file: &str, fixture: &str, query: &str) -> (Vec<u32>, SearchResult) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(file), fixture).expect("write fixture");
+        let result = search(query, dir.path(), None, None, false).expect("search");
+        let bare = tilth_core::search::scope::split_qualified(query).1;
+        let mut lines: Vec<u32> = result
+            .matches
+            .iter()
+            .filter(|m| m.is_definition)
+            .inspect(|m| assert_eq!(m.def_name.as_deref(), Some(bare), "{query} def_name"))
+            .map(|m| m.line)
+            .collect();
+        lines.sort_unstable();
+        (lines, result)
+    }
+
+    const RUST_TWO_RUNS: &str = "pub struct A;
+pub struct B;
+
+impl A {
+    pub fn run(&self) -> u8 {
+        1
+    }
+}
+
+impl B {
+    pub fn run(&self) -> u8 {
+        2
+    }
+}
+
+pub fn use_them(a: &A, b: &B) -> u8 {
+    a.run() + B::run(b)
+}
+";
+
+    #[test]
+    fn a_qualified_name_finds_the_definition_its_owner_holds() {
+        let cases: &[(&str, &str, &str, &[u32])] = &[
+            ("m.rs", RUST_TWO_RUNS, "B::run", &[11]),
+            ("m.rs", RUST_TWO_RUNS, "B.run", &[11]),
+            ("m.rs", RUST_TWO_RUNS, "crate::m::A::run", &[5]),
+            (
+                "q.ts",
+                "class Target { foo() { return 1; } }\nclass Other { foo() { return 2; } }\n",
+                "Other.foo",
+                &[2],
+            ),
+            (
+                "ctx.go",
+                "package gin\n\ntype Context struct{}\n\nfunc (c *Context) reset() {}\n\n\
+                 func (r JSON) Render() error { return nil }\n\nfunc (r XML) Render() error { return nil }\n",
+                "XML.Render",
+                &[9],
+            ),
+            (
+                "ctx.go",
+                "package gin\n\ntype Context struct{}\n\nfunc (c *Context) reset() {}\n",
+                "Context.reset",
+                &[5],
+            ),
+            (
+                "store.py",
+                "class Store:\n    def get(self, key):\n        return key\n\n\
+                 class Cache:\n    @property\n    def get(self):\n        return 1\n",
+                "Cache.get",
+                &[7],
+            ),
+            (
+                "a.cpp",
+                "struct A { int run(); };\nstruct B { int run(); };\n\
+                 int A::run() { return 1; }\nint B::run() { return 2; }\n",
+                "B::run",
+                &[4],
+            ),
+            (
+                "shop.ex",
+                "defmodule Shop do\n  def run, do: 1\nend\ndefmodule Cart do\n  def run, do: 2\nend\n",
+                "Cart.run",
+                &[5],
+            ),
+        ];
+        for (file, fixture, query, expected) in cases {
+            let (lines, result) = qualified_search(file, fixture, query);
+            assert_eq!(lines, expected.to_vec(), "{file}: definitions of {query}");
+            assert!(result.other_owners.is_empty(), "{query}: {result:?}");
+        }
+    }
+
+    /// The literal text of a qualified name is still a usage of it.
+    #[test]
+    fn a_qualified_name_keeps_its_literal_usages() {
+        let (lines, result) = qualified_search("m.rs", RUST_TWO_RUNS, "B::run");
+        assert_eq!(lines, [11]);
+        let usages: Vec<u32> = result
+            .matches
+            .iter()
+            .filter(|m| !m.is_definition)
+            .map(|m| m.line)
+            .collect();
+        assert_eq!(usages, [17]);
+    }
+
+    /// When no definition of the name has the owner asked for, the result
+    /// says where the name is defined, so the next query can name one.
+    #[test]
+    fn a_qualified_name_with_no_such_owner_lists_the_owners_found() {
+        let (lines, result) = qualified_search("m.rs", RUST_TWO_RUNS, "Gamma::run");
+        assert_eq!(lines, Vec::<u32>::new());
+        let found: Vec<(Option<&str>, u32)> = result
+            .other_owners
+            .iter()
+            .map(|o| (o.owner.as_deref(), o.line))
+            .collect();
+        assert_eq!(found, [(Some("A"), 5), (Some("B"), 11)]);
+
+        // Dotted text that names no definition stays a literal search.
+        let py = "import os\n\ndef cache(key):\n    return os.path.join(\"c\", key)\n";
+        let (lines, result) = qualified_search("c.py", py, "os.path.join");
+        assert_eq!(lines, Vec::<u32>::new());
+        assert_eq!(result.other_owners, Vec::new());
+        assert_eq!(result.total_found, 1);
+    }
+
+    /// A decorated definition is one match, on the line that names it: the
+    /// decorators above it are part of its range, and its name line is not
+    /// a second, usage match.
+    #[test]
+    fn a_decorated_definition_is_found_on_its_name_line() {
+        let ts =
+            "@Injectable()\nclass Service {\n  @First()\n  method() {\n    return 1;\n  }\n}\n";
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("service.ts"), ts).expect("write");
+        let result = search("Service", dir.path(), None, None, false).expect("search");
+        assert_eq!(result.matches.len(), 1, "{result:?}");
+        let m = &result.matches[0];
+        assert_eq!(
+            (m.line, m.is_definition, m.def_range),
+            (2, true, Some((1, 7)))
+        );
+
+        let java = "class S {\n  @Override\n  public void run() {}\n}\n";
+        assert_definitions("S.java", java, &[("run", &[3])]);
+    }
+
+    #[test]
+    fn a_generator_function_is_a_definition() {
+        let js = "function* generate() {\n  yield 1;\n}\n";
+        assert_definitions("g.js", js, &[("generate", &[1])]);
     }
 
     #[test]

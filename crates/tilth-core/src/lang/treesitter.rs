@@ -11,6 +11,7 @@ pub(crate) const DEFINITION_KINDS: &[&str] = &[
     "function_item",
     "method_definition",
     "method_declaration",
+    "generator_function_declaration",
     // Members declared without a body: trait and interface methods, abstract
     // methods, TS overloads and `declare function`. Each is the declaration
     // of its member, as a bodiless Java or C# `method_declaration` is.
@@ -115,6 +116,47 @@ pub const TYPE_KINDS: &[&str] = &[
     "namespace_definition",
     "namespace_declaration",
 ];
+
+/// Nodes that decorate the definition after them and sit beside it in the
+/// tree: Python and TypeScript-member decorators, Rust attributes. (A Java
+/// annotation or a TypeScript class decorator is inside its declaration.)
+const DECORATOR_KINDS: &[&str] = &["decorator", "attribute_item"];
+
+/// When `line` (1-based) holds a decorator or attribute, the line the
+/// definition it decorates starts on. A decorator line belongs to its
+/// definition, though the definition's own node may start below it. `None`
+/// when the line holds no decorator or the file does not parse.
+#[must_use]
+pub fn decorated_definition_line(
+    content: &str,
+    lang: crate::types::Lang,
+    line: u32,
+) -> Option<u32> {
+    let row = (line as usize).checked_sub(1)?;
+    let text = content.lines().nth(row)?;
+    let column = text.len() - text.trim_start().len();
+    let language = crate::lang::outline::outline_language(lang)?;
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&language).ok()?;
+    let tree = parser.parse(content, None)?;
+    let point = tree_sitter::Point { row, column };
+    let mut node = tree.root_node().descendant_for_point_range(point, point);
+    while let Some(n) = node {
+        if DECORATOR_KINDS.contains(&n.kind()) {
+            let mut next = n.next_named_sibling();
+            while let Some(sibling) = next {
+                if DECORATOR_KINDS.contains(&sibling.kind()) || sibling.kind().contains("comment") {
+                    next = sibling.next_named_sibling();
+                } else {
+                    break;
+                }
+            }
+            return next.map(|d| d.start_position().row as u32 + 1);
+        }
+        node = n.parent();
+    }
+    None
+}
 
 /// Nodes whose body opens a local scope: functions, methods, constructors,
 /// closures and accessors, across every grammar. A variable declared inside
@@ -294,6 +336,23 @@ fn name_text(node: tree_sitter::Node, lines: &[&str]) -> String {
         }
     }
     node_text_simple(node, lines, NodeTextMode::Full)
+}
+
+/// A member declared without a body: a trait or interface method, an
+/// abstract method, a TS overload or `declare function`, or a bodiless Java
+/// or C# `method_declaration`. It names a member but holds no code a call
+/// could run.
+#[must_use]
+pub fn is_bodiless_declaration(node: tree_sitter::Node) -> bool {
+    match node.kind() {
+        "function_signature_item"
+        | "method_signature"
+        | "abstract_method_signature"
+        | "function_signature"
+        | "protocol_function_declaration" => true,
+        "method_declaration" => node.child_by_field_name("body").is_none(),
+        _ => false,
+    }
 }
 
 /// Extract the name defined by a tree-sitter definition node.
