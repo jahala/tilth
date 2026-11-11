@@ -543,7 +543,15 @@ machinery:
   queries against the same language stay separated.
 - **Deps** (`deps.rs`, both crates) — `analyze_deps` (`tilth-core`)
   is what `tilth_deps` runs. Returns a `DepsResult` with `Uses` (local
-  + external) and every dependent in `Used by`. `format_deps` (binary)
+  + external) and every dependent in `Used by`. A dependent calls one
+  of the file's names (at most `MAX_EXPORTED_SYMBOLS`, chosen by what
+  other files import by name, then by length; the rest are named in
+  the result), or imports the file: a walk resolves the imports of
+  every file whose text names the file's module, then follows the
+  files that re-export it (`index.ts`, `__init__.py`, `export … from`)
+  to their importers. Python absolute imports resolve against the
+  importer's directories up to the project root, and their `src/`.
+  `format_deps` (binary)
   does the human output: it lists the first 15 dependents, or all of
   them with `--full`, and says how many it left out, under a budget
   too. The external-dep stdlib
@@ -595,9 +603,13 @@ gateway. The decision tree, in order:
    override.
 9. **Below the token threshold or `--full`** → return full content
    (with `format::hashlines` if `edit_mode`, plain `number_lines`
-   otherwise).
+   otherwise). Without `--full`, a full view over the caller's budget
+   goes on to the outline instead.
 10. **Otherwise** → `outline::generate` per `FileType`, cached in
-    `OutlineCache::get_or_compute`.
+    `OutlineCache::get_or_compute`. An outline over the budget is cut
+    by `outline::fit`: a code outline drops its signatures and docs
+    first (`outline::names_only`), so every symbol stays listed, then
+    whole entries from the end, and a closing line says which.
 
 The `outline/` submodule dispatches on `FileType`:
 

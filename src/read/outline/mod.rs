@@ -41,6 +41,68 @@ pub fn generate(
     with_omission_note(outline, max_lines)
 }
 
+/// The outline of a code file with names alone, no signatures or docs,
+/// for a budget the full outline does not fit. `None` for any other file,
+/// and for a test file, whose outline is its test structure.
+pub fn names_only(path: &Path, file_type: FileType, content: &str, capped: bool) -> Option<String> {
+    let FileType::Code(lang) = file_type else {
+        return None;
+    };
+    if tilth_core::types::is_test_file(path) {
+        return None;
+    }
+    let max_lines = if capped { OUTLINE_CAP } else { usize::MAX };
+    let outline = code::outline_with(content, lang, max_lines, code::Detail::Names);
+    Some(with_omission_note(outline, max_lines))
+}
+
+/// `outline` cut to fit in `room` tokens, with a closing line that says
+/// what was left out. First the signatures and docs go, by switching to
+/// `names` (the same outline with names alone) when there is one, so every
+/// symbol stays listed; then whole entries from the end, counted. Cut at
+/// the budget mid-entry, the outline hid its trailing symbols and said
+/// only how many tokens it left out.
+pub fn fit(outline: &str, names: Option<String>, room: u64) -> String {
+    if crate::types::estimate_tokens(outline.len() as u64) <= room {
+        return outline.to_string();
+    }
+    let compacted = names.is_some();
+    let lines_text = names.unwrap_or_else(|| outline.to_string());
+    let is_entry = |line: &str| line.trim_start().starts_with('[');
+    let total = lines_text.lines().filter(|l| is_entry(l)).count();
+    let note = |shown: usize| {
+        let mut parts = Vec::new();
+        if compacted {
+            parts.push("signatures and docs left out".to_string());
+        }
+        if shown < total {
+            parts.push(format!("{shown} of {total} entries shown"));
+        }
+        format!(
+            "\n\n> outline cut to fit the budget: {}. Read a range with section, \
+             or search a name.",
+            parts.join("; ")
+        )
+    };
+    let lines: Vec<&str> = lines_text.lines().collect();
+    // Bytes and entries of the first k lines, so each cut is measured
+    // without joining: the note's count changes with the cut.
+    let mut bytes = vec![0usize];
+    let mut entries = vec![0usize];
+    for line in &lines {
+        let joined = usize::from(bytes.len() != 1);
+        bytes.push(bytes[bytes.len() - 1] + line.len() + joined);
+        entries.push(entries[entries.len() - 1] + usize::from(is_entry(line)));
+    }
+    let keep = (0..=lines.len())
+        .rev()
+        .find(|&k| {
+            crate::types::estimate_tokens((bytes[k] + note(entries[k]).len()) as u64) <= room
+        })
+        .unwrap_or(0);
+    format!("{}{}", lines[..keep].join("\n"), note(entries[keep]))
+}
+
 /// Append a note when the outline likely hit `max_lines` and more symbols
 /// exist below. Without this note, agents read the outline as exhaustive
 /// and miss symbols below the cap.

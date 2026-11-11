@@ -50,12 +50,19 @@ pub(crate) fn count_lines(buf: &[u8]) -> u32 {
 }
 
 /// Main entry point for read mode. Routes through the decision tree.
+///
+/// `budget` is the caller's token budget for the whole response. A file
+/// whose full view does not fit it gets its outline instead, and an
+/// outline that does not fit is cut to fit, saying what it left out. With
+/// `full` or a `section`, the content is what was asked for, and the
+/// caller's budget cut applies to it as before.
 pub fn read_file(
     path: &Path,
     section: Option<&str>,
     full: bool,
     cache: &OutlineCache,
     edit_mode: bool,
+    budget: Option<u64>,
 ) -> Result<String, TilthError> {
     let meta = match fs::metadata(path) {
         Ok(m) => m,
@@ -183,9 +190,15 @@ pub fn read_file(
         }
     };
 
-    // Full mode or small file → return full content (skip smart view)
+    // Full mode or small file → return full content (skip smart view),
+    // unless the full view overflows the budget: cut there, it showed the
+    // first functions and hid the rest.
+    let fits = |view: &str| budget.is_none_or(|b| estimate_tokens(view.len() as u64) <= b);
     if full || tokens <= TOKEN_THRESHOLD {
-        return Ok(full_view());
+        let view = full_view();
+        if full || fits(&view) {
+            return Ok(view);
+        }
     }
 
     // Large file → smart view by file type
@@ -209,10 +222,15 @@ pub fn read_file(
 
     // OGATE: if the outline is not meaningfully smaller than the full file,
     // return the full file — same token cost with less information is strictly
-    // worse and forces the caller to do a second read.
+    // worse and forces the caller to do a second read. Only when the full view
+    // fits the budget, though: cut to fit, it would show the first lines and
+    // hide everything after them, where the outline below names them all.
     let outline_tokens = estimate_tokens(outline.len() as u64);
     if outline_tokens >= tokens * OUTLINE_MIN_COMPRESSION / 100 {
-        return Ok(full_view());
+        let view = full_view();
+        if fits(&view) {
+            return Ok(view);
+        }
     }
 
     let mode = match file_type {
@@ -220,7 +238,18 @@ pub fn read_file(
         _ => ViewMode::Outline,
     };
     let header = format::file_header(path, byte_len, line_count, mode);
-    Ok(format!("{header}\n\n{outline}"))
+    let view = format!("{header}\n\n{outline}");
+    match budget {
+        Some(b) if !fits(&view) => {
+            let room = b.saturating_sub(estimate_tokens(header.len() as u64 + 2));
+            let names = outline::names_only(path, file_type, strip_bom(&content), capped);
+            Ok(format!(
+                "{header}\n\n{}",
+                outline::fit(&outline, names, room)
+            ))
+        }
+        _ => Ok(view),
+    }
 }
 
 /// Would this file produce an outline (rather than full content) in default read mode?
@@ -774,7 +803,7 @@ mod tests {
         std::env::set_var("TILTH_FULL_SIZE_CAP", "100");
 
         let cache = OutlineCache::new();
-        let result = read_file(&path, None, true, &cache, false).unwrap();
+        let result = read_file(&path, None, true, &cache, false, None).unwrap();
 
         // Should contain the warning, not the full file content
         assert!(
@@ -1152,6 +1181,44 @@ mod tests {
     // OGATE: "never-worse outline gate" — if the outline barely compresses
     // (outline_tokens >= 80% of full-file tokens), return full content instead.
     #[test]
+    fn ogate_flat_file_over_the_budget_gets_its_outline_cut_to_fit() {
+        use std::fmt::Write as _;
+        // The same flat file as the OGATE test below, read under a budget its
+        // full view cannot fit. Falling back to the full view and cutting it
+        // there showed the first few functions and hid the rest. The outline
+        // path keeps every name it can and says what it left out.
+        let mut src = String::new();
+        for i in 0..2000 {
+            writeln!(src, "pub fn flat_{i}() {{}}").unwrap();
+        }
+        let path = write_temp("tilth_ogate_flat_budget.rs", &src);
+
+        let cache = OutlineCache::new();
+        let budget = 3_000;
+        let result = read_file(&path, None, false, &cache, false, Some(budget)).unwrap();
+
+        assert!(
+            !result.contains("[full]"),
+            "an over-budget flat file must not fall back to a cut full view: {}",
+            result.lines().next().unwrap_or("")
+        );
+        assert!(
+            result.contains("[outline]") && result.contains("of 2000 entries shown"),
+            "the outline must say how many of the functions it names: {result}"
+        );
+        assert!(
+            result.contains("fn flat_100"),
+            "the outline must name far more than the first few functions"
+        );
+        assert!(
+            estimate_tokens(result.len() as u64) <= budget,
+            "output must fit the budget"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn ogate_flat_file_returns_full_when_outline_barely_compresses() {
         use std::fmt::Write as _;
         // A file of empty-body one-liner fns. The signature IS essentially the
@@ -1175,7 +1242,7 @@ mod tests {
         let path = write_temp("tilth_ogate_flat.rs", &src);
 
         let cache = OutlineCache::new();
-        let result = read_file(&path, None, false, &cache, false).unwrap();
+        let result = read_file(&path, None, false, &cache, false, None).unwrap();
 
         // Gate fired → full view. The header tag records the decision directly
         // (an outline would read `[outline]`), and the trailing fn's body braces
@@ -1219,7 +1286,7 @@ mod tests {
         let path = write_temp("tilth_ogate_heavy.rs", &src);
 
         let cache = OutlineCache::new();
-        let result = read_file(&path, None, false, &cache, false).unwrap();
+        let result = read_file(&path, None, false, &cache, false, None).unwrap();
 
         // Gate must NOT have fired: the output should be an outline, not full content.
         // An outline shows signatures but omits the body.
@@ -1253,7 +1320,7 @@ mod tests {
         ] {
             let path = dir.path().join("f.txt");
             std::fs::write(&path, content).unwrap();
-            let full = read_file(&path, None, true, &cache, false).unwrap();
+            let full = read_file(&path, None, true, &cache, false, None).unwrap();
             assert!(
                 full.contains(&format!("({lines} lines")),
                 "{content:?} should read as {lines} lines: {full}"
@@ -1303,8 +1370,106 @@ mod tests {
         let path = dir.path().join("a.py");
         std::fs::write(&path, "\u{feff}import os\n").unwrap();
         let cache = OutlineCache::new();
-        let out = read_file(&path, None, true, &cache, true).unwrap();
+        let out = read_file(&path, None, true, &cache, true, None).unwrap();
         let hash = format::line_hash("\u{feff}import os".as_bytes());
         assert!(out.contains(&format!("1:{hash:03x}|")), "{out}");
+    }
+
+    /// A file under the outline threshold but over the budget was read in
+    /// full and cut at the budget, so it showed `entry_0`'s body and hid
+    /// `entry_1` to `entry_7`. Its outline fits, and lists all eight.
+    #[test]
+    fn a_budget_the_full_file_overflows_gets_the_outline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("medium.rs");
+        let mut src = String::new();
+        for i in 0..8 {
+            writeln!(src, "pub fn entry_{i}() {{").unwrap();
+            src.push_str(&"    let body_only_marker = 123456789;\n".repeat(30));
+            src.push_str("}\n\n");
+        }
+        assert!(estimate_tokens(src.len() as u64) < TOKEN_THRESHOLD);
+        std::fs::write(&path, &src).unwrap();
+        let cache = OutlineCache::new();
+        let unbudgeted = read_file(&path, None, false, &cache, false, None).unwrap();
+        assert!(unbudgeted.contains("[full]"), "{unbudgeted}");
+
+        let out = read_file(&path, None, false, &cache, false, Some(500)).unwrap();
+        assert!(out.contains("[outline]"), "{out}");
+        assert!(out.contains("fn entry_7"), "{out}");
+        assert!(!out.contains("body_only_marker"), "{out}");
+        assert!(estimate_tokens(out.len() as u64) <= 500, "{out}");
+        // Asked for in full, the file is what was asked for.
+        let full = read_file(&path, None, true, &cache, false, Some(500)).unwrap();
+        assert!(full.contains("[full]"), "{full}");
+    }
+
+    /// An outline over the budget was cut mid-entry, so `third` was gone
+    /// and the note gave only a token count. Signatures and docs go first,
+    /// every name stays, and the note says so.
+    #[test]
+    fn an_outline_over_the_budget_keeps_every_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("service.ts");
+        let mut src = String::new();
+        for name in ["first", "second", "third"] {
+            writeln!(src, "/** {} */", "Documented at length. ".repeat(6)).unwrap();
+            let params: Vec<String> = (0..12).map(|i| format!("argument_{i}: string")).collect();
+            writeln!(
+                src,
+                "export function {name}({}): void {{",
+                params.join(", ")
+            )
+            .unwrap();
+            src.push_str(&"  const filler = 'x'.repeat(100);\n".repeat(300));
+            src.push_str("}\n");
+        }
+        assert!(estimate_tokens(src.len() as u64) > TOKEN_THRESHOLD);
+        std::fs::write(&path, &src).unwrap();
+        let cache = OutlineCache::new();
+        let budget = 150;
+        let unbudgeted = read_file(&path, None, false, &cache, false, None).unwrap();
+        assert!(
+            estimate_tokens(unbudgeted.len() as u64) > budget,
+            "{unbudgeted}"
+        );
+
+        let out = read_file(&path, None, false, &cache, false, Some(budget)).unwrap();
+        for name in ["fn first", "fn second", "fn third"] {
+            assert!(out.contains(name), "{name} missing:\n{out}");
+        }
+        assert!(!out.contains("argument_0"), "{out}");
+        assert!(out.contains("signatures and docs left out"), "{out}");
+        assert!(!out.contains("entries shown"), "{out}");
+        assert!(estimate_tokens(out.len() as u64) <= budget, "{out}");
+    }
+
+    /// When even the names do not fit, whole entries go from the end, and
+    /// the note counts them.
+    #[test]
+    fn an_outline_cut_by_entries_counts_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("many.rs");
+        let mut src = String::new();
+        for i in 0..60 {
+            writeln!(src, "pub fn function_number_{i}() {{").unwrap();
+            src.push_str(&"    let filler = 1234567890;\n".repeat(20));
+            src.push_str("}\n");
+        }
+        assert!(estimate_tokens(src.len() as u64) > TOKEN_THRESHOLD);
+        std::fs::write(&path, &src).unwrap();
+        let cache = OutlineCache::new();
+        let budget = 200;
+        let out = read_file(&path, None, false, &cache, false, Some(budget)).unwrap();
+        assert!(out.contains("fn function_number_0\n"), "{out}");
+        assert!(!out.contains("function_number_59"), "{out}");
+        let shown = out.lines().filter(|l| l.starts_with('[')).count();
+        assert!(
+            out.contains(&format!(
+                "signatures and docs left out; {shown} of 60 entries shown"
+            )),
+            "{out}"
+        );
+        assert!(estimate_tokens(out.len() as u64) <= budget, "{out}");
     }
 }

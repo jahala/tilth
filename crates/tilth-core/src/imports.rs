@@ -42,22 +42,28 @@ pub fn resolve_related_files_with_content(file_path: &Path, content: &str) -> Ve
 /// imports.
 #[must_use]
 pub fn resolve_imports(file_path: &Path, lang: Lang, imports: &[Import]) -> Vec<PathBuf> {
-    let Some(dir) = file_path.parent() else {
-        return Vec::new();
-    };
-
     let mut results = Vec::new();
     for import in imports {
-        if is_external(&import.source, lang) {
-            continue;
-        }
-        if let Some(path) = resolve(dir, &import.source, lang) {
+        if let Some(path) = resolve_import(file_path, lang, import) {
             if !results.contains(&path) {
                 results.push(path);
             }
         }
     }
     results
+}
+
+/// The local file one import of the file at `file_path` names, if it
+/// resolves to one. A Python absolute import (`from pkg.mod import x`) is
+/// local when `pkg/mod.py` sits under a directory above the importer, up
+/// to its project root; `is_external` cannot tell that without the disk.
+#[must_use]
+pub fn resolve_import(file_path: &Path, lang: Lang, import: &Import) -> Option<PathBuf> {
+    let dir = file_path.parent()?;
+    if is_external(&import.source, lang) && lang != Lang::Python {
+        return None;
+    }
+    resolve(dir, &import.source, lang)
 }
 
 /// One module an import statement names.
@@ -82,9 +88,11 @@ pub struct Import {
 
 /// Every module `content` imports, one [`Import`] per module, in source order.
 ///
-/// In Go, Rust, Python, JavaScript, TypeScript, Scala, Elixir, Java and
-/// Kotlin, statements come from the syntax tree, so an import-shaped line
-/// inside a string is not one and an alias is not part of a source. In C,
+/// In Go, Rust, Python, JavaScript, TypeScript, Scala, Elixir, Java,
+/// Kotlin, PHP, C# and Swift, statements come from the syntax tree, so an
+/// import-shaped line inside a string is not one and an alias is not part
+/// of a source. A JavaScript or TypeScript re-export (`export … from "m"`)
+/// imports `m` too. In C,
 /// C++ and Bash, where an import is one line naming one file, each line
 /// `is_import_line` accepts gives one import, its source read by
 /// `extract_import_source`. A statement that does not spell its module
@@ -159,14 +167,18 @@ fn statement_query(lang: Lang) -> Option<&'static tree_sitter::Query> {
         LazyLock::new(|| Mutex::new(HashMap::new()));
 
     let pattern = match lang {
-        Lang::Go | Lang::Scala | Lang::Java => "(import_declaration) @statement",
+        Lang::Go | Lang::Scala | Lang::Java | Lang::Swift => "(import_declaration) @statement",
         Lang::Rust => "(use_declaration) @statement",
         Lang::Python => {
             "[(import_statement) (import_from_statement) (future_import_statement)] @statement"
         }
-        Lang::TypeScript | Lang::Tsx | Lang::JavaScript => "(import_statement) @statement",
+        Lang::TypeScript | Lang::Tsx | Lang::JavaScript => {
+            "[(import_statement) (export_statement source: (_))] @statement"
+        }
         Lang::Elixir => "(call target: (identifier)) @statement",
         Lang::Kotlin => "(import) @statement",
+        Lang::Php => "(namespace_use_declaration) @statement",
+        Lang::CSharp => "(using_directive) @statement",
         _ => return None,
     };
     let mut compiled = COMPILED
@@ -200,6 +212,9 @@ fn reads_statements_from_tree(lang: Lang) -> bool {
             | Lang::Elixir
             | Lang::Java
             | Lang::Kotlin
+            | Lang::Php
+            | Lang::CSharp
+            | Lang::Swift
     )
 }
 
@@ -252,6 +267,13 @@ fn statement_modules(node: tree_sitter::Node, src: &str, lang: Lang) -> Option<V
         (Lang::Python, "future_import_statement") => {
             out.push(("__future__".to_string(), line_of(node)));
         }
+        (Lang::TypeScript | Lang::Tsx | Lang::JavaScript, "export_statement") => {
+            // Only a re-export names a module: `export { x } from "m"`,
+            // `export * from "m"`, `export * as ns from "m"`.
+            if let Some(source) = node.child_by_field_name("source") {
+                out.push((unquote(source, src), line_of(source)));
+            }
+        }
         (Lang::TypeScript | Lang::Tsx | Lang::JavaScript, "import_statement") => {
             // `import x from "m"` and `import "m"` carry the source on the
             // statement; `import x = require("m")` on its require clause.
@@ -271,6 +293,17 @@ fn statement_modules(node: tree_sitter::Node, src: &str, lang: Lang) -> Option<V
             dotted_import(node, src, &mut out);
         }
         (Lang::Elixir, "call") => elixir_directive(node, src, &mut out)?,
+        (Lang::Php, "namespace_use_declaration") => php_use(node, src, &mut out),
+        (Lang::CSharp, "using_directive") => csharp_using(node, src, &mut out),
+        (Lang::Swift, "import_declaration") => {
+            let mut cursor = node.walk();
+            let path = node
+                .named_children(&mut cursor)
+                .find(|c| c.kind() == "identifier");
+            if let Some(path) = path {
+                out.push((compact(path, src), line_of(path)));
+            }
+        }
         _ => return None,
     }
     Some(out)
@@ -448,6 +481,61 @@ fn elixir_directive(
         _ => out.push((compact(first, src), line_of(first))),
     }
     Some(())
+}
+
+/// PHP: `use A\B;`, `use A\B as C, D\E;` and the group `use A\{B, C as D};`,
+/// one module per clause, its alias left out. A group's members sit under
+/// its prefix. `use function` and `use const` import a function or a
+/// constant by its qualified name, which is read the same way.
+fn php_use(node: tree_sitter::Node, src: &str, out: &mut Vec<(String, u32)>) {
+    fn clause_name(clause: tree_sitter::Node) -> Option<tree_sitter::Node> {
+        let mut cursor = clause.walk();
+        let found = clause
+            .named_children(&mut cursor)
+            .find(|c| matches!(c.kind(), "qualified_name" | "name"));
+        // `use A\B as C`: the alias is a `name` too, after the module.
+        found.filter(|n| clause.child_by_field_name("alias") != Some(*n))
+    }
+
+    let prefix = {
+        let mut cursor = node.walk();
+        let found = node
+            .named_children(&mut cursor)
+            .find(|c| c.kind() == "namespace_name");
+        found.map(|p| compact(p, src))
+    };
+    // A group's clauses sit in its body; plain clauses on the statement.
+    let holder = node.child_by_field_name("body").unwrap_or(node);
+    let mut cursor = holder.walk();
+    let clauses: Vec<tree_sitter::Node> = holder.named_children(&mut cursor).collect();
+    for clause in clauses {
+        if clause.kind() != "namespace_use_clause" {
+            continue;
+        }
+        let Some(name) = clause_name(clause) else {
+            continue;
+        };
+        let name = compact(name, src);
+        let name = name.trim_start_matches('\\');
+        let source = match &prefix {
+            Some(prefix) => join_path(prefix.trim_start_matches('\\'), name, "\\"),
+            None => name.to_string(),
+        };
+        out.push((source, line_of(clause)));
+    }
+}
+
+/// C#: `using A.B;`, `using static A.B;` and the alias `using X = A.B;`
+/// name the namespace or type `A.B`.
+fn csharp_using(node: tree_sitter::Node, src: &str, out: &mut Vec<(String, u32)>) {
+    let alias = node.child_by_field_name("name");
+    let mut cursor = node.walk();
+    let target = node
+        .named_children(&mut cursor)
+        .find(|c| Some(*c) != alias && !c.kind().ends_with("comment"));
+    if let Some(target) = target {
+        out.push((compact(target, src), line_of(target)));
+    }
 }
 
 fn text<'a>(node: tree_sitter::Node, src: &'a str) -> &'a str {
@@ -656,7 +744,7 @@ fn resolve_js(dir: &Path, source: &str) -> Option<PathBuf> {
 fn resolve_python(dir: &Path, source: &str) -> Option<PathBuf> {
     let dots = source.bytes().take_while(|&b| b == b'.').count();
     if dots == 0 {
-        return None;
+        return resolve_python_absolute(dir, source);
     }
     // Each dot beyond the first goes up one directory.
     let mut base = dir.to_path_buf();
@@ -677,6 +765,40 @@ fn resolve_python(dir: &Path, source: &str) -> Option<PathBuf> {
     let as_pkg = base.join(&rel).join("__init__.py");
     if as_pkg.exists() {
         return Some(as_pkg);
+    }
+    None
+}
+
+/// `a.b.c` as Python finds it from a file in `dir`: `a/b/c.py` or
+/// `a/b/c/__init__.py` under `dir` or a directory above it, or under that
+/// directory's `src/` (the src layout). The nearest directory wins, as the
+/// importer's own directory comes first on Python's path. The search stops
+/// at the project root: the first directory holding `.git`,
+/// `pyproject.toml`, `setup.py` or `setup.cfg`.
+fn resolve_python_absolute(dir: &Path, source: &str) -> Option<PathBuf> {
+    const ROOT_MARKERS: [&str; 4] = [".git", "pyproject.toml", "setup.py", "setup.cfg"];
+    let mut parts = source.split('.');
+    let first = parts.next().filter(|p| !p.is_empty())?;
+    let rel: PathBuf = source.split('.').collect();
+    for ancestor in dir.ancestors() {
+        for base in [ancestor.to_path_buf(), ancestor.join("src")] {
+            // One stat rules out most bases: the top-level package or module.
+            let top = base.join(first);
+            if !top.is_dir() && !top.with_extension("py").is_file() {
+                continue;
+            }
+            let as_file = base.join(&rel).with_extension("py");
+            if as_file.is_file() {
+                return Some(as_file);
+            }
+            let as_pkg = base.join(&rel).join("__init__.py");
+            if as_pkg.is_file() {
+                return Some(as_pkg);
+            }
+        }
+        if ROOT_MARKERS.iter().any(|m| ancestor.join(m).exists()) {
+            break;
+        }
     }
     None
 }
@@ -723,6 +845,9 @@ mod tests {
             Lang::Elixir,
             Lang::Java,
             Lang::Kotlin,
+            Lang::Php,
+            Lang::CSharp,
+            Lang::Swift,
         ] {
             assert!(reads_statements_from_tree(lang), "{lang:?}");
             assert!(statement_query(lang).is_some(), "{lang:?}");
@@ -793,6 +918,57 @@ mod tests {
         let content = "import {\n  first,\n  second,\n} from \"./util\";\n";
         let related = resolve_related_files_with_content(&tmp.path().join("main.ts"), content);
         assert_eq!(related, [tmp.path().join("util.ts")]);
+    }
+
+    /// PHP, C# and Swift statements come from the tree: a PHP group names
+    /// each member under its prefix, and no alias is part of a source. Read
+    /// off the line, the group was `App\\Models\\` and the alias stayed on.
+    #[test]
+    fn php_csharp_and_swift_imports_name_each_module_without_aliases() {
+        let php = "<?php\nuse App\\Models\\{User, Post as P};\nuse Foo\\Bar as Baz, Qux;\nuse function Foo\\helper;\n$s = 'use Not\\Real;';\nclass A {}\n";
+        assert_eq!(
+            sources(php, Lang::Php),
+            [
+                "App\\Models\\User",
+                "App\\Models\\Post",
+                "Foo\\Bar",
+                "Qux",
+                "Foo\\helper"
+            ]
+        );
+        let csharp = "using System;\nusing Json = Newtonsoft.Json;\nusing static System.Math;\nnamespace N {\n  using Inner.Thing;\n  class A {}\n}\n";
+        assert_eq!(
+            sources(csharp, Lang::CSharp),
+            ["System", "Newtonsoft.Json", "System.Math", "Inner.Thing"]
+        );
+        let swift =
+            "import Foundation\nimport struct Foo.Bar\n@testable import MyApp\nclass A {}\n";
+        assert_eq!(
+            sources(swift, Lang::Swift),
+            ["Foundation", "Foo.Bar", "MyApp"]
+        );
+    }
+
+    /// A re-export imports the module it names. Matching only `import`, a
+    /// barrel that re-exports had no imports at all.
+    #[test]
+    fn js_re_exports_are_imports() {
+        let ts = "export { y } from \"./y\";\nexport * from './all';\nexport * as ns from \"./ns\";\nimport { z } from \"./z\";\nexport { local };\nexport const k = 1;\n";
+        for lang in [Lang::TypeScript, Lang::Tsx, Lang::JavaScript] {
+            assert_eq!(
+                sources(ts, lang),
+                ["./y", "./all", "./ns", "./z"],
+                "{lang:?}"
+            );
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("y.ts"), "").unwrap();
+        fs::write(tmp.path().join("z.ts"), "").unwrap();
+        let related = resolve_related_files_with_content(
+            &tmp.path().join("index.ts"),
+            "export { y } from \"./y\";\nimport { z } from \"./z\";\n",
+        );
+        assert_eq!(related, [tmp.path().join("y.ts"), tmp.path().join("z.ts")]);
     }
 
     #[test]

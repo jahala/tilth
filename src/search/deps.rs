@@ -56,14 +56,7 @@ pub fn format_deps(result: &DepsResult, scope: &Path, budget: Option<usize>, ful
     let used_by_section = format_used_by(&prod_deps, scope, "## Used by");
     let used_by_tests_section = format_used_by(&test_deps, scope, "## Used by (tests)");
 
-    let barrel_note = if result.exported_count > MAX_EXPORTED_SYMBOLS {
-        format!(
-            "\n\n> ({} of {} exports shown — barrel file detected)",
-            result.searched_count, result.exported_count
-        )
-    } else {
-        String::new()
-    };
+    let unsearched = unsearched_note(result);
 
     // Full output
     let full_output = assemble(&[
@@ -73,7 +66,7 @@ pub fn format_deps(result: &DepsResult, scope: &Path, budget: Option<usize>, ful
         &used_by_section,
         &used_by_tests_section,
         &unlisted_dependents(dep_count, listed),
-        &barrel_note,
+        &unsearched,
     ]);
     let full_tokens = crate::types::estimate_tokens(full_output.len() as u64) as usize;
 
@@ -88,7 +81,7 @@ pub fn format_deps(result: &DepsResult, scope: &Path, budget: Option<usize>, ful
                 &uses_external_section,
                 &prod_deps,
                 dep_count,
-                &barrel_note,
+                &unsearched,
                 scope,
                 b,
             )
@@ -100,6 +93,31 @@ pub fn format_deps(result: &DepsResult, scope: &Path, budget: Option<usize>, ful
 
     let token_est = crate::types::estimate_tokens(output.len() as u64);
     format!("{output}\n\n[~{token_est} tokens]")
+}
+
+/// The note that names what the call-site search left out, or nothing when
+/// it searched every name. Importers are found whatever the cap.
+fn unsearched_note(result: &DepsResult) -> String {
+    /// Left-out names spelled out before the rest are counted.
+    const NAMED: usize = 10;
+    let left_out = &result.unsearched;
+    if left_out.is_empty() {
+        return String::new();
+    }
+    let mut named = left_out
+        .iter()
+        .take(NAMED)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if left_out.len() > NAMED {
+        let _ = write!(named, " and {} more", left_out.len() - NAMED);
+    }
+    format!(
+        "> Callers searched for {MAX_EXPORTED_SYMBOLS} of {} names: first the ones other \
+         files import by name, then the longest. Not searched: {named}.",
+        result.exported_count
+    )
 }
 
 /// The line that counts dependents left out of the listing, or nothing when
@@ -183,10 +201,25 @@ fn format_used_by(deps: &[&Dependent], scope: &Path, heading: &str) -> String {
             .map(|(caller, (line, syms))| (caller, line, syms))
             .collect();
         callers.sort_unstable_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(b.0)));
-        for (caller, line, syms) in callers {
+        for (caller, line, syms) in &callers {
             let loc = format!("{rel}:{line}");
             let joined = syms.join(", ");
             let _ = write!(out, "\n{loc:<30} {caller:<20} \u{2192} {joined}");
+        }
+        // A file that imports the target without calling it.
+        if callers.is_empty() {
+            if let Some(line) = dep.import_lines.first() {
+                let loc = format!("{rel}:{line}");
+                match &dep.via {
+                    Some(via) => {
+                        let via = via.strip_prefix(scope).unwrap_or(via).display();
+                        let _ = write!(out, "\n{loc:<30} imports it through {via}");
+                    }
+                    None => {
+                        let _ = write!(out, "\n{loc:<30} imports it");
+                    }
+                }
+            }
         }
     }
     out
@@ -200,7 +233,7 @@ fn apply_budget_truncation(
     uses_external_full: &str,
     prod_deps: &[&Dependent],
     total_dependents: usize,
-    barrel_note: &str,
+    unsearched: &str,
     scope: &Path,
     budget: usize,
 ) -> String {
@@ -231,7 +264,7 @@ fn apply_budget_truncation(
             uses_external_full,
             &prod_listed,
             &prod_unlisted,
-            barrel_note,
+            unsearched,
         ],
         // Level 1: no used-by entries at all
         vec![
@@ -239,10 +272,10 @@ fn apply_budget_truncation(
             uses_local_full,
             uses_external_full,
             &none_listed,
-            barrel_note,
+            unsearched,
         ],
         // Level 2: external as count only
-        vec![header, uses_local_full, &none_listed, barrel_note],
+        vec![header, uses_local_full, &none_listed, unsearched],
         // Level 3: local as paths only (no symbols)
         vec![header, &local_paths_only, &none_listed],
         // Level 4: header only
@@ -283,6 +316,8 @@ mod tests {
                 path: PathBuf::from(format!("/r/user{i:02}.ts")),
                 symbols: vec![(format!("user{i}"), "libFn".to_string(), 2)],
                 is_test: i >= 15,
+                import_lines: vec![1],
+                via: None,
             })
             .collect();
         DepsResult {
@@ -292,8 +327,47 @@ mod tests {
             used_by,
             skipped_large: Vec::new(),
             exported_count: 1,
-            searched_count: 1,
+            unsearched: Vec::new(),
         }
+    }
+
+    /// A dependent that imports the target without calling it had no line,
+    /// and the old note claimed a barrel file for any file with many names.
+    #[test]
+    fn importers_and_unsearched_names_are_shown() {
+        let dependent = |name: &str, via: Option<&str>| Dependent {
+            path: PathBuf::from(format!("/r/{name}")),
+            symbols: Vec::new(),
+            is_test: false,
+            import_lines: vec![3],
+            via: via.map(|v| PathBuf::from(format!("/r/{v}"))),
+        };
+        let result = DepsResult {
+            target: PathBuf::from("/r/lib.py"),
+            uses_local: Vec::new(),
+            uses_external: Vec::new(),
+            used_by: vec![
+                dependent("a.py", None),
+                dependent("b.py", Some("pkg/__init__.py")),
+            ],
+            skipped_large: Vec::new(),
+            exported_count: 27,
+            unsearched: vec!["get_dependant".to_string(), "x_y".to_string()],
+        };
+        let out = format_deps(&result, Path::new("/r"), None, false);
+        assert!(
+            out.contains("\na.py:3                         imports it\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("\nb.py:3                         imports it through pkg/__init__.py"),
+            "{out}"
+        );
+        assert!(
+            out.contains("> Callers searched for 25 of 27 names: first the ones other files import by name, then the longest. Not searched: get_dependant, x_y."),
+            "{out}"
+        );
+        assert!(!out.contains("barrel file detected"), "{out}");
     }
 
     fn listed(out: &str) -> usize {

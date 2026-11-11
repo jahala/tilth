@@ -2,10 +2,26 @@ use tilth_core::imports::{imports_in_tree, Import};
 use tilth_core::lang::outline::{extract_import_source, outline_language, walk_top_level};
 use tilth_core::types::{Lang, OutlineEntry, OutlineKind};
 
+/// What each outline entry shows besides its line range, kind and name.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Detail {
+    /// The signature and doc comment too.
+    Full,
+    /// The name alone, one line per entry: the outline that fits a tight
+    /// budget with every symbol still on it.
+    Names,
+}
+
 /// Generate a code outline using tree-sitter. Walks top-level AST nodes,
 /// emitting signatures without bodies.
 #[must_use]
 pub fn outline(content: &str, lang: Lang, max_lines: usize) -> String {
+    outline_with(content, lang, max_lines, Detail::Full)
+}
+
+/// [`outline`] with the entries' `detail`.
+#[must_use]
+pub fn outline_with(content: &str, lang: Lang, max_lines: usize, detail: Detail) -> String {
     let Some(language) = outline_language(lang) else {
         return fallback_outline(content, max_lines);
     };
@@ -24,7 +40,7 @@ pub fn outline(content: &str, lang: Lang, max_lines: usize) -> String {
     let entries = walk_top_level(root, &lines, lang);
     let imports = imports_in_tree(root, content, lang);
 
-    format_entries(&entries, &imports, max_lines, lang)
+    format_entries(&entries, &imports, max_lines, lang, detail)
 }
 
 /// Format outline entries into the spec'd output format.
@@ -33,6 +49,7 @@ fn format_entries(
     imports: &[Import],
     max_lines: usize,
     lang: Lang,
+    detail: Detail,
 ) -> String {
     let mut out = Vec::new();
     let mut import_groups: Vec<&OutlineEntry> = Vec::new();
@@ -81,26 +98,26 @@ fn format_entries(
         // Flatten namespace modules — hoist their children to top level
         // so classes inside namespaces show their methods at indent 1.
         if entry.kind == OutlineKind::Module && !entry.children.is_empty() {
-            out.push(format_entry(entry, 0, lang));
+            out.push(format_entry(entry, 0, lang, detail));
             for child in &entry.children {
                 if out.len() >= max_lines {
                     break;
                 }
-                out.push(format_entry(child, 1, lang));
+                out.push(format_entry(child, 1, lang, detail));
                 for grandchild in &child.children {
                     if out.len() >= max_lines {
                         break;
                     }
-                    out.push(format_entry(grandchild, 2, lang));
+                    out.push(format_entry(grandchild, 2, lang, detail));
                 }
             }
         } else {
-            out.push(format_entry(entry, 0, lang));
+            out.push(format_entry(entry, 0, lang, detail));
             for child in &entry.children {
                 if out.len() >= max_lines {
                     break;
                 }
-                out.push(format_entry(child, 1, lang));
+                out.push(format_entry(child, 1, lang, detail));
             }
         }
     }
@@ -178,7 +195,7 @@ fn format_imports(
 }
 
 /// Format a single outline entry with optional indentation.
-fn format_entry(entry: &OutlineEntry, indent: usize, lang: Lang) -> String {
+fn format_entry(entry: &OutlineEntry, indent: usize, lang: Lang, detail: Detail) -> String {
     let prefix = "  ".repeat(indent);
     let range = if entry.start_line == entry.end_line {
         format!("[{}]", entry.start_line)
@@ -234,6 +251,10 @@ fn format_entry(entry: &OutlineEntry, indent: usize, lang: Lang) -> String {
     if let (OutlineKind::Export, Some(clause)) = (entry.kind, &entry.signature) {
         let rest = clause.strip_prefix("export ").unwrap_or(clause);
         return format!("{prefix}{range:<12} export {rest}");
+    }
+
+    if detail == Detail::Names {
+        return format!("{prefix}{range:<12} {kind_label} {}", entry.name);
     }
 
     let sig = match &entry.signature {
@@ -332,6 +353,43 @@ type UserId = String
         assert!(
             outline_python.contains("[1-]   imports: os, json, a.b\n"),
             "{outline_python}"
+        );
+    }
+
+    /// A Python `from` import is an import: the summary names its module.
+    /// The outline gave the statement no entry, so the summary skipped it.
+    #[test]
+    fn import_summary_names_python_from_imports() {
+        let python = "import os\nfrom collections import OrderedDict\nfrom .local import helper\nfrom __future__ import annotations\n\ndef f():\n    pass\n";
+        let rendered = outline(python, Lang::Python, 1000);
+        assert!(
+            rendered.contains("[1-]   imports: os, collections, .local, __future__\n"),
+            "{rendered}"
+        );
+    }
+
+    /// PHP, C# and Swift summaries name each module a statement imports,
+    /// without its alias. Read off the statement's text, a PHP group was its
+    /// bare prefix and an alias stayed on the source.
+    #[test]
+    fn import_summary_reads_php_csharp_and_swift_from_the_tree() {
+        let php = "<?php\nuse App\\Models\\{User, Post};\nuse Foo\\Bar as Baz;\n\nclass A {}\n";
+        let rendered = outline(php, Lang::Php, 1000);
+        assert!(
+            rendered.contains("imports: App\\Models\\User, App\\Models\\Post, Foo\\Bar\n"),
+            "{rendered}"
+        );
+        let csharp = "using System;\nusing Json = Newtonsoft.Json;\n\nclass A {}\n";
+        let rendered = outline(csharp, Lang::CSharp, 1000);
+        assert!(
+            rendered.contains("imports: System, Newtonsoft.Json\n"),
+            "{rendered}"
+        );
+        let swift = "import Foundation\nimport struct Foo.Bar\n\nclass A {}\n";
+        let rendered = outline(swift, Lang::Swift, 1000);
+        assert!(
+            rendered.contains("imports: Foundation, Foo.Bar\n"),
+            "{rendered}"
         );
     }
 

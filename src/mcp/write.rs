@@ -147,7 +147,7 @@ mod tests {
             });
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
             while std::time::Instant::now() < deadline {
-                let _ = crate::read::read_file(&p, None, true, &cache, false);
+                let _ = crate::read::read_file(&p, None, true, &cache, false, None);
             }
             stop.store(true, Ordering::Relaxed);
         });

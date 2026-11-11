@@ -14,9 +14,9 @@ use super::{ChangeType, DiffSymbol, MatchConfidence, Span, SymbolChange, SymbolI
 /// Build `DiffSymbol` entries from an outline and its source content.
 ///
 /// A function's signature is read from its syntax tree: the whole header
-/// before the body, however many lines it spans. The outline keeps only the
-/// first line, which misses a change on a later line and flags a header that
-/// was only re-wrapped.
+/// before the body, however many lines it spans, keyed by its tokens. The
+/// outline's signature is display text, so keying on it would flag a
+/// header that was only re-wrapped or had a comment added.
 pub(crate) fn build_diff_symbols(
     entries: &[OutlineEntry],
     content: &str,
