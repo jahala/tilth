@@ -125,16 +125,22 @@ fn file_preview(path: &Path) -> Option<String> {
 }
 
 /// Classify by content the way the read path does: a null byte in the first
-/// 512 bytes marks binary.
+/// [`BINARY_WINDOW`](tilth_core::lang::detection::BINARY_WINDOW) bytes marks
+/// binary.
 fn is_binary_file(path: &Path) -> bool {
     use std::io::Read;
+    use tilth_core::lang::detection::BINARY_WINDOW;
     let Ok(file) = std::fs::File::open(path) else {
         return false;
     };
-    // A bare read() may legally return fewer than 512 bytes before EOF;
+    // A bare read() may legally return fewer bytes than asked before EOF;
     // take + read_to_end retries until the cap or EOF, guaranteeing the window.
-    let mut head = Vec::with_capacity(512);
-    if file.take(512).read_to_end(&mut head).is_err() {
+    let mut head = Vec::with_capacity(BINARY_WINDOW);
+    if file
+        .take(BINARY_WINDOW as u64)
+        .read_to_end(&mut head)
+        .is_err()
+    {
         return false;
     }
     tilth_core::lang::detection::is_binary(&head)

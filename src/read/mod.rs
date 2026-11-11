@@ -2,9 +2,8 @@ pub mod outline;
 
 use std::fmt::Write;
 use std::fs;
+use std::io::Read;
 use std::path::Path;
-
-use memmap2::Mmap;
 
 use crate::format;
 use crate::types::{estimate_tokens, ViewMode};
@@ -92,7 +91,7 @@ pub fn read_file(
 
     let byte_len = meta.len();
 
-    // Empty check before mmap — mmap on 0-byte file may fail on some platforms
+    // An empty file prints its header only.
     if byte_len == 0 {
         return Ok(format::file_header(path, 0, 0, ViewMode::Empty));
     }
@@ -102,21 +101,26 @@ pub fn read_file(
         return read_ranges(path, &[range], edit_mode);
     }
 
-    // Binary detection
-    let file = fs::File::open(path).map_err(|e| TilthError::IoError {
+    let io_error = |source| TilthError::IoError {
         path: path.to_path_buf(),
-        source: e,
-    })?;
-    let mmap = unsafe { Mmap::map(&file) }.map_err(|e| TilthError::IoError {
-        path: path.to_path_buf(),
-        source: e,
-    })?;
-    let buf = &mmap[..];
+        source,
+    };
+    let mut file = fs::File::open(path).map_err(io_error)?;
+    let mut bytes = Vec::with_capacity(byte_len as usize);
 
-    if tilth_core::lang::detection::is_binary(buf) {
+    // Binary detection reads only the head, so a large binary costs one
+    // small read, not the whole file.
+    let window = tilth_core::lang::detection::BINARY_WINDOW as u64;
+    (&mut file)
+        .take(window)
+        .read_to_end(&mut bytes)
+        .map_err(io_error)?;
+    if tilth_core::lang::detection::is_binary(&bytes) {
         let mime = mime_from_ext(path);
         return Ok(format::binary_header(path, byte_len, mime));
     }
+    file.read_to_end(&mut bytes).map_err(io_error)?;
+    let buf = &bytes[..];
 
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
@@ -465,7 +469,7 @@ struct Block {
 
 /// Read one or more line ranges from a file. Each range is "start-end"
 /// (e.g. "45-89") or a heading anchor (e.g. "## Architecture") for
-/// markdown files. Mmaps the file once and emits a single `[section]`
+/// markdown files. Reads the file once and emits a single `[section]`
 /// header followed by the formatted blocks; when more than one range is
 /// requested, each block is preceded by a `─── lines X-Y ───` delimiter.
 ///
@@ -553,15 +557,11 @@ fn collect_blocks(
         });
     }
 
-    let file = fs::File::open(path).map_err(|e| TilthError::IoError {
+    let bytes = fs::read(path).map_err(|e| TilthError::IoError {
         path: path.to_path_buf(),
         source: e,
     })?;
-    let mmap = unsafe { Mmap::map(&file) }.map_err(|e| TilthError::IoError {
-        path: path.to_path_buf(),
-        source: e,
-    })?;
-    let buf = &mmap[..];
+    let buf = &bytes[..];
 
     // `line_offsets[i]` is the byte where line `i + 1` starts. A final
     // newline leaves a trailing offset at `buf.len()` that starts no line,

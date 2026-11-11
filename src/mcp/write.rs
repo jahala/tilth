@@ -5,10 +5,8 @@
 //! (regular file *or* dangling symlink), so there is no TOCTOU window and no
 //! silent clobber. Pass `overwrite = true` to replace an existing file. The
 //! replacement writes a sibling temp file and renames it over the target, so
-//! the original inode is never truncated: a concurrent reader holding an
-//! `Mmap` of it keeps a valid mapping instead of faulting with SIGBUS when
-//! the file shrinks under it. Readers see either the whole old file or the
-//! whole new one, never a prefix.
+//! the original inode is never truncated. Readers see either the whole old
+//! file or the whole new one, never a prefix.
 //!
 //! The rewrite refuses to follow symlinks (live or dangling): on Unix an
 //! `O_NOFOLLOW` open probes the target first, so the kernel returns `ELOOP`
@@ -125,10 +123,11 @@ fn open_append(path: &Path) -> std::io::Result<fs::File> {
 mod tests {
     use super::*;
 
-    /// Reader/writer race for [`overwrite_never_faults_an_mmap_reader`]. Runs
-    /// in a re-executed child because the fault it guards against kills the
-    /// process rather than failing an assertion.
-    fn mmap_race_body() {
+    /// `tilth_read` runs while `tilth_write` replaces the same file. The
+    /// rename swaps the whole file in one step, so every read in the race
+    /// finds a file at the path and returns it.
+    #[test]
+    fn overwrite_never_fails_a_concurrent_read() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let dir = tempfile::tempdir().unwrap();
@@ -142,57 +141,23 @@ mod tests {
         std::thread::scope(|s| {
             s.spawn(|| {
                 while !stop.load(Ordering::Relaxed) {
-                    let _ = write_overwrite(&p, &content, true);
+                    write_overwrite(&p, &content, true).unwrap();
                 }
             });
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-            while std::time::Instant::now() < deadline {
-                let _ = crate::read::read_file(&p, None, true, &cache, false, None);
+            for _ in 0..500 {
+                let read = crate::read::read_file(&p, None, true, &cache, false, None);
+                if let Err(e) = read {
+                    stop.store(true, Ordering::Relaxed);
+                    panic!("a read during a concurrent overwrite failed: {e}");
+                }
             }
             stop.store(true, Ordering::Relaxed);
         });
     }
 
-    /// `tilth_read` holds an `Mmap` of a file while `tilth_write` replaces it.
-    /// An in-place `O_TRUNC` rewrite shrinks the inode under the live mapping,
-    /// so the reader's next page touch faults with SIGBUS and takes the whole
-    /// MCP process down. Replacing by rename leaves the reader's inode intact.
-    ///
-    /// The fault is a signal, not a panic, so the race runs in a re-executed
-    /// child of this test binary and the parent asserts on its exit status.
-    #[test]
-    fn overwrite_never_faults_an_mmap_reader() {
-        const CHILD_ENV: &str = "TILTH_MMAP_RACE_CHILD";
-        if std::env::var_os(CHILD_ENV).is_some() {
-            mmap_race_body();
-            return;
-        }
-        let out = std::process::Command::new(
-            std::env::current_exe().expect("test binary path is readable"),
-        )
-        .args([
-            "mcp::write::tests::overwrite_never_faults_an_mmap_reader",
-            "--exact",
-        ])
-        .env(CHILD_ENV, "1")
-        .output()
-        .expect("re-exec of the test binary");
-        assert!(
-            out.status.success(),
-            "a concurrent overwrite faulted an mmap reader: {}",
-            out.status
-        );
-        // A filter that matches nothing also exits 0, which would make this
-        // test pass without ever running the race.
-        assert!(
-            String::from_utf8_lossy(&out.stdout).contains("1 passed"),
-            "the child ran no test — the name filter matched nothing"
-        );
-    }
-
     /// A concurrent reader must never observe a half-written file. The
     /// in-place `O_TRUNC` rewrite this replaced exposed a zero-length window
-    /// on every overwrite — the same window that faults an mmap reader.
+    /// on every overwrite.
     /// Setup writes go through the atomic primitive so any partial read the
     /// assertion catches can only come from `write_overwrite` itself.
     #[test]

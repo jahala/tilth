@@ -1,8 +1,12 @@
-/// Any null byte in the first 512 bytes → binary.
+/// How many leading bytes [`is_binary`] looks at. A caller that only needs
+/// the binary verdict can read this many bytes and no more.
+pub const BINARY_WINDOW: usize = 512;
+
+/// Any null byte in the first [`BINARY_WINDOW`] bytes → binary.
 /// Uses memchr for the scan — single SIMD pass, no branching.
 #[must_use]
 pub fn is_binary(buf: &[u8]) -> bool {
-    let window = &buf[..buf.len().min(512)];
+    let window = &buf[..buf.len().min(BINARY_WINDOW)];
     memchr::memchr(0, window).is_some()
 }
 

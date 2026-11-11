@@ -862,7 +862,6 @@ dependencies = [
  "ignore",
  "libc",
  "memchr",
- "memmap2",
  "percent-encoding",
  "rayon",
  "regex-syntax",

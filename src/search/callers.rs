@@ -84,8 +84,7 @@ fn collect_sites(
 /// single-symbol `search_callers_expanded` path to distinguish "typo,
 /// doesn't exist" from "real symbol with no direct callers" (indirect
 /// dispatch, dead code, framework registration, …) when the caller walk
-/// returned zero matches. mmap is lazy, so the scan only pages in regions
-/// that contain the needle prefix.
+/// returned zero matches.
 fn target_seen_in_scope(target: &str, scope: &Path, glob: Option<&str>) -> bool {
     let Ok(walker) = tilth_core::search::walk::walker(scope, glob) else {
         return false;
@@ -105,14 +104,10 @@ fn target_seen_in_scope(target: &str, scope: &Path, glob: Option<&str>) -> bool 
             if !entry.file_type().is_some_and(|ft| ft.is_file()) {
                 return ignore::WalkState::Continue;
             }
-            let path = entry.path();
-            let Ok(file) = std::fs::File::open(path) else {
+            let Ok(bytes) = std::fs::read(entry.path()) else {
                 return ignore::WalkState::Continue;
             };
-            let Ok(mmap) = (unsafe { memmap2::Mmap::map(&file) }) else {
-                return ignore::WalkState::Continue;
-            };
-            if memchr::memmem::find(&mmap, needle).is_some() {
+            if memchr::memmem::find(&bytes, needle).is_some() {
                 seen.store(true, Ordering::Relaxed);
                 return ignore::WalkState::Quit;
             }

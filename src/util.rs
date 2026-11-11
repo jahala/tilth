@@ -31,8 +31,8 @@ pub(crate) fn atomic_write_bytes_if_unchanged(
 /// Write `bytes` to `path` atomically: write to a temp file in the same
 /// directory, preserve the original file's permissions (if it exists), then
 /// rename into place. A crash mid-write leaves the original intact, and a
-/// reader holding an mmap of the original keeps a valid mapping — the inode is
-/// replaced, never truncated.
+/// concurrent reader sees the whole old file or the whole new one: the inode
+/// is replaced, never truncated.
 ///
 /// The temp name is qualified with the process ID and a process-wide counter
 /// so concurrent or batched writes in the same directory can't collide.

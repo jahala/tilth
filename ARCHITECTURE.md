@@ -545,7 +545,7 @@ machinery:
   (`callers::definition_owners`) cannot be traced by name: its sites
   are counted on one line (`__init__: 21 call sites, not attributed (52
   types define it)`) and left out of the functions affected. When the walk returns
-  empty, a small `target_seen_in_scope` helper in the binary does an mmap-based
+  empty, a small `target_seen_in_scope` helper in the binary does a
   literal scan so `no_callers_message` can distinguish typo from
   "real symbol with no direct callers" (indirect dispatch, dead code,
   framework registration).
@@ -608,8 +608,10 @@ gateway. The decision tree, in order:
    header followed by per-block `─── lines X-Y ───` delimiters and are
    emitted in user-supplied order — overlap is honored verbatim, no
    coalescing. Returns the verbatim slice regardless of file size.
-5. **mmap + binary check** — `is_binary` looks for null bytes in the
-   first 512 bytes via `memchr`. Binary files emit just a header.
+5. **Binary check, then read** — `is_binary` looks for null bytes in
+   the first 512 bytes via `memchr`, and only those bytes are read
+   first. Binary files emit just a header; any other file is then read
+   whole.
 6. **Generated** — by name (`Cargo.lock`, `package-lock.json`, etc.) or
    content marker (`@generated`, `DO NOT EDIT`, `auto-generated`,
    etc.).
