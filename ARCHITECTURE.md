@@ -566,20 +566,24 @@ machinery:
   other files import by name, then by length; the rest are named in
   the result), or imports the file: a walk resolves the imports of
   every file whose text names the file's module, then follows the
-  files that re-export it (`index.ts`, `__init__.py`, `export … from`)
-  to their importers. Python absolute imports resolve against the
-  importer's directories up to the project root, and their `src/`.
-  `format_deps` (binary)
+  files that re-export it (`index.ts`, `__init__.py`, `export … from`,
+  `export * from` at any depth) to their importers. Python absolute
+  imports resolve where Python 3 looks: the importer's directories that
+  are not packages, up to the project root, and their `src/`; without a
+  root, only the nearest. `from pkg import mod` resolves to the
+  submodule `pkg/mod.py` when there is one. `format_deps` (binary)
   does the human output: it lists the first 15 dependents, or all of
   them with `--full`, and says how many it left out, under a budget
-  too. The external-dep stdlib
+  too, and how many were found by a call alone. The external-dep stdlib
   heuristic (`is_stdlib`) is per-language; module-path validation
   (`is_valid_module_path`) avoids treating relative paths as packages.
 - **Blast** (`blast.rs`) — symbol-level blast radius, printed after
   every edit-mode write that touches a definition and counted by
   `tilth_diff --blast`. A write must stay fast on any tree, so both
   walks stop at `BLAST_STOP_AFTER` (50) call sites, and a count that
-  reached the bound reads "at least N".
+  reached the bound reads "at least N". A touched symbol the walk found
+  no call for by then reads "callers not counted". A write's own file
+  is no part of its blast radius, so its own calls raise the bound.
 
 ### Glob (`glob.rs`)
 
