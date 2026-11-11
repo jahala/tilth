@@ -18,8 +18,10 @@ pub(crate) fn parse_unified_diff(raw: &str) -> Vec<FileDiff> {
     let mut is_binary = false;
     let mut hunks: Vec<Hunk> = Vec::new();
 
-    // Per-hunk state.
+    // Per-hunk state: the hunk, and the old and new number of its next line.
     let mut current_hunk: Option<Hunk> = None;
+    let mut old_line: u32 = 0;
+    let mut new_line: u32 = 0;
 
     // Commit the current in-progress file (if any) to `results`.
     macro_rules! flush_file {
@@ -110,6 +112,8 @@ pub(crate) fn parse_unified_diff(raw: &str) -> Vec<FileDiff> {
             // Parse `@@ -old_start[,old_count] +new_start[,new_count] @@`
             // Skip malformed hunks where the start line cannot be parsed.
             if let Some((old_start, old_count, new_start, new_count)) = parse_hunk_header(rest) {
+                old_line = old_start;
+                new_line = new_start;
                 current_hunk = Some(Hunk {
                     old_start,
                     old_count,
@@ -123,21 +127,25 @@ pub(crate) fn parse_unified_diff(raw: &str) -> Vec<FileDiff> {
 
         // ── Diff content lines ───────────────────────────────────────────────
         if let Some(hunk) = current_hunk.as_mut() {
+            // A removed line carries its old-file number, any other line its
+            // new-file number.
+            let mut push = |kind, line, content: &str| {
+                hunk.lines.push(DiffLine {
+                    kind,
+                    line,
+                    content: content.to_owned(),
+                });
+            };
             if let Some(content) = line.strip_prefix('+') {
-                hunk.lines.push(DiffLine {
-                    kind: DiffLineKind::Added,
-                    content: content.to_owned(),
-                });
+                push(DiffLineKind::Added, new_line, content);
+                new_line += 1;
             } else if let Some(content) = line.strip_prefix('-') {
-                hunk.lines.push(DiffLine {
-                    kind: DiffLineKind::Removed,
-                    content: content.to_owned(),
-                });
+                push(DiffLineKind::Removed, old_line, content);
+                old_line += 1;
             } else if let Some(content) = line.strip_prefix(' ') {
-                hunk.lines.push(DiffLine {
-                    kind: DiffLineKind::Context,
-                    content: content.to_owned(),
-                });
+                push(DiffLineKind::Context, new_line, content);
+                old_line += 1;
+                new_line += 1;
             } else if line.starts_with('\\') {
                 // `\ No newline at end of file` — skip silently.
             }
@@ -368,6 +376,41 @@ diff --git a/foo.rs b/foo.rs
         assert_eq!(f.hunks[0].old_count, 3);
         assert_eq!(f.hunks[1].old_start, 10);
         assert_eq!(f.hunks[1].old_count, 3);
+    }
+
+    // ── 7b. Line numbers ──────────────────────────────────────────────────────
+    #[test]
+    fn lines_carry_their_file_line_numbers() {
+        use DiffLineKind::{Added, Context, Removed};
+        let raw = "\
+diff --git a/foo.rs b/foo.rs
+--- a/foo.rs
++++ b/foo.rs
+@@ -10,4 +20,4 @@
+ ctx
+-old1
+-old2
++new1
++new2
+ ctx
+";
+        let diffs = parse_unified_diff(raw);
+        let numbered: Vec<(DiffLineKind, u32)> = diffs[0].hunks[0]
+            .lines
+            .iter()
+            .map(|l| (l.kind, l.line))
+            .collect();
+        assert_eq!(
+            numbered,
+            vec![
+                (Context, 20),
+                (Removed, 11),
+                (Removed, 12),
+                (Added, 21),
+                (Added, 22),
+                (Context, 23),
+            ]
+        );
     }
 
     // ── 8. Empty input ────────────────────────────────────────────────────────
