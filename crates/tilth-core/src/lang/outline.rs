@@ -656,9 +656,10 @@ fn first_identifier_text(node: tree_sitter::Node, lines: &[&str]) -> Option<Stri
 /// comments directly above that one, line after line. Line comments (`//`,
 /// `///`, `#`) are one node per line, so a doc written in them is several
 /// comments; reading only the nearest kept a doc's last line alone. Each
-/// comment starts its own line and touches the one below it, the nearest
-/// touching `node`: a blank line, or a comment that trails code, ends the
-/// doc, and one right before `node` documents something else.
+/// comment starts its own line, so one that trails the statement before
+/// `node` is no doc. The comments above the nearest touch the one below
+/// them: a blank line ends the doc. The nearest may sit a blank line above
+/// `node`, as a JSDoc block does in many codebases (express, for one).
 fn extract_doc(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
     let is_comment = |n: tree_sitter::Node| {
         let kind = n.kind();
@@ -684,7 +685,7 @@ fn extract_doc(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
     };
     let nearest = node
         .prev_sibling()
-        .filter(|p| is_comment(*p) && starts_its_line(*p) && touches(*p, node))?;
+        .filter(|p| is_comment(*p) && starts_its_line(*p))?;
     let mut block = vec![nearest];
     let mut top = nearest;
     while let Some(above) = top.prev_sibling() {
@@ -1792,27 +1793,29 @@ mod doc_comment_tests {
         assert_eq!(b.doc.as_deref(), Some("B is documented."));
     }
 
-    /// The nearest comment is a doc only when it sits on its own lines,
-    /// directly above the definition. A comment trailing the statement
-    /// before, or one a blank line away, documents something else.
+    /// A comment that trails the statement before a definition documents
+    /// that statement. A comment on its own lines a blank line above stays
+    /// the doc, the way a JSDoc block above a function often sits.
     #[test]
-    fn a_trailing_or_detached_comment_is_no_doc() {
+    fn a_comment_trailing_code_is_no_doc() {
         let entries = get_outline_entries(
-            "TIMEOUT = 3  # seconds\ndef fetch():\n    return TIMEOUT\n\n# Section: helpers\n\ndef helper():\n    return 1\n",
+            "TIMEOUT = 3  # seconds\ndef fetch():\n    return TIMEOUT\n",
             Lang::Python,
         );
-        let doc = |name: &str| {
-            entries
-                .iter()
-                .find(|e| e.name == name)
-                .and_then(|e| e.doc.clone())
-        };
-        assert_eq!(doc("fetch"), None);
-        assert_eq!(doc("helper"), None);
-        assert_eq!(first_doc("// note\n\nfn f() {}\n", Lang::Rust), None);
+        assert_eq!(
+            entries.iter().find(|e| e.name == "fetch").unwrap().doc,
+            None
+        );
         assert_eq!(
             first_doc("int x = 1; /* x */\nint f(void) { return 0; }\n", Lang::C),
             None
+        );
+        assert_eq!(
+            first_doc(
+                "/**\n * Create an app.\n */\n\nfunction createApp() {}\n",
+                Lang::JavaScript
+            ),
+            Some("Create an app.".to_string())
         );
     }
 }
