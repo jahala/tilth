@@ -10,6 +10,9 @@ readme = "README.md"
 keywords = ["tree-sitter", "code-search", "outline", "developer-tools"]
 categories = ["development-tools", "parser-implementations"]
 
+[lints]
+workspace = true
+
 [features]
 # Source fixtures the tilth binary's tests share with this crate's tests.
 # Enabled only by tilth's dev-dependency, so it never reaches a release build.
@@ -17,9 +20,9 @@ test-fixtures = []
 
 [dependencies]
 # Tree-sitter (AST outlines)
-tree-sitter = "0.27"
+tree-sitter = { workspace = true }
 tree-sitter-language = "0.1"
-streaming-iterator = "0.1"
+streaming-iterator = { workspace = true }
 tree-sitter-rust = "0.24"
 tree-sitter-javascript = "0.25"
 tree-sitter-typescript = "0.23"
@@ -39,13 +42,13 @@ tree-sitter-bash = "0.25.1"
 tree-sitter-md = "0.5"
 
 # The shared directory walker (ripgrep's ignore rules)
-ignore = "0.4"
+ignore = { workspace = true }
 
 # Byte scanning (SIMD-accelerated)
-memchr = "2"
+memchr = { workspace = true }
 
 # Concurrent cache
-dashmap = "6"
+dashmap = { workspace = true }
 
 # Error types
 thiserror = "2"
@@ -59,4 +62,4 @@ fastbloom = "0.17"
 rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { workspace = true }

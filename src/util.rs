@@ -55,12 +55,17 @@ fn write_via_temp(
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     let tmp = dir.join(format!(".tilth-tmp.{}.{n}", std::process::id()));
+    // Every remove of `tmp` below is cleanup on a path that already failed
+    // or was refused. The caller needs that outcome, not a second error from
+    // the cleanup, and at worst one dot-named temp file stays behind.
     std::fs::write(&tmp, bytes).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })?;
     // Preserve original file permissions so the rename doesn't widen or strip
-    // the mode. Ignore errors — target may not exist yet or platform may not
-    // support it; the write already succeeded.
+    // the mode. A target that does not exist yet has none to keep. The temp
+    // file is ours, so setting its mode fails only on a filesystem without
+    // Unix modes (FAT, some network mounts), where there is no mode to keep
+    // either; the write goes ahead.
     if let Ok(meta) = std::fs::metadata(path) {
         let _ = std::fs::set_permissions(&tmp, meta.permissions());
     }
@@ -82,6 +87,10 @@ fn write_via_temp(
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "by design: tests read the files they check directly"
+)]
 mod tests {
     use super::*;
 

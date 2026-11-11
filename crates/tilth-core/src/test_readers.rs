@@ -56,6 +56,10 @@ impl Read for ThenFail {
 /// Make a named pipe at `path`. Nothing writes to it, so opening it for
 /// reading in the usual blocking way waits forever.
 #[cfg(unix)]
+#[expect(
+    clippy::expect_used,
+    reason = "by design: a test helper, where a panic is the test failure"
+)]
 pub fn make_pipe(path: &std::path::Path) {
     let made = std::process::Command::new("mkfifo")
         .arg(path)

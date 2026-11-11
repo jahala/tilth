@@ -56,6 +56,10 @@ pub(in crate::mcp) fn tool_diff(args: &Value) -> Result<String, String> {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "by design: tests read the files they check directly"
+)]
 mod tests {
     use super::*;
     use std::path::Path;

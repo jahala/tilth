@@ -86,13 +86,13 @@ impl StdlibRule {
     /// Returns `true` if `source` names a standard-library module under this rule.
     pub(crate) fn matches(&self, source: &str) -> bool {
         match self {
-            StdlibRule::None => false,
-            StdlibRule::Prefixes(prefixes) => prefixes.iter().any(|p| source.starts_with(p)),
-            StdlibRule::PythonSegment(set) => {
+            Self::None => false,
+            Self::Prefixes(prefixes) => prefixes.iter().any(|p| source.starts_with(p)),
+            Self::PythonSegment(set) => {
                 let first = source.split('.').next().unwrap_or("");
                 set.contains(&first)
             }
-            StdlibRule::GoRoots(set) => set.contains(&source.split('/').next().unwrap_or(source)),
+            Self::GoRoots(set) => set.contains(&source.split('/').next().unwrap_or(source)),
         }
     }
 }

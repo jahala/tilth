@@ -126,6 +126,10 @@ fn push_entries(
 }
 
 /// Convert a tree-sitter node to an `OutlineEntry` based on its kind.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one name extractor replaces the per-kind branches in #310"
+)]
 fn node_to_entry(
     node: tree_sitter::Node,
     lines: &[&str],
@@ -1936,7 +1940,7 @@ mod outline_tree_tests {
 
     /// `(name, kind, start_line, end_line, children)` for an entry tree.
     #[derive(Debug, PartialEq)]
-    struct Node(String, OutlineKind, u32, u32, Vec<Node>);
+    struct Node(String, OutlineKind, u32, u32, Vec<Self>);
 
     fn tree(entries: Vec<OutlineEntry>) -> Vec<Node> {
         entries

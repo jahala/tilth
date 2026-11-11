@@ -44,12 +44,11 @@ impl<'a> Ends<'a> {
         let text = text.as_bytes();
         let total = count_lines(text) as usize;
         let (_, tail) = shape.split(total);
-        let head_end = match shape.head.checked_sub(1) {
-            Some(last) => memchr::memchr_iter(b'\n', text)
+        let head_end = shape.head.checked_sub(1).map_or(0, |last| {
+            memchr::memchr_iter(b'\n', text)
                 .nth(last)
-                .map_or(text.len(), |at| at + 1),
-            None => 0,
-        };
+                .map_or(text.len(), |at| at + 1)
+        });
         let (head, rest) = text.split_at(head_end);
         Self {
             shape,

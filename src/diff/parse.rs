@@ -4,6 +4,7 @@ use super::{DiffLine, DiffLineKind, FileDiff, FileStatus, Hunk};
 use tilth_core::lang::detection::is_generated_by_name;
 
 /// Parse `git diff --no-color` unified diff output into a list of `FileDiff`s.
+#[expect(clippy::too_many_lines, reason = "the diff model is rebuilt in #312")]
 pub(crate) fn parse_unified_diff(raw: &str) -> Vec<FileDiff> {
     if raw.is_empty() {
         return Vec::new();
@@ -216,11 +217,9 @@ fn parse_hunk_header(rest: &str) -> Option<(u32, u32, u32, u32)> {
     // `rest` is everything after the opening `@@ `, e.g.:
     //   `-3,7 +3,8 @@ fn foo()`
     // Find the closing `@@` to isolate the range part.
-    let range_part = if let Some(pos) = rest.find(" @@") {
-        &rest[..pos]
-    } else {
-        rest.trim_end_matches('@').trim()
-    };
+    let range_part = rest
+        .find(" @@")
+        .map_or_else(|| rest.trim_end_matches('@').trim(), |pos| &rest[..pos]);
 
     let mut parts = range_part.split_whitespace();
     let old_spec = parts.next()?;

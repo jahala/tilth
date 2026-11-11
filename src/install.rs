@@ -3,6 +3,8 @@ use std::path::PathBuf;
 
 use serde_json::{json, Value};
 
+use crate::diag;
+
 // Supported MCP hosts and their config locations.
 //
 // Paths verified from official docs (2025):
@@ -92,12 +94,18 @@ pub fn run(host: &str, edit: bool) -> Result<(), String> {
     }
 
     if edit {
-        eprintln!("✓ tilth (edit mode) added to {}", host_info.path.display());
+        diag::emit(format_args!(
+            "✓ tilth (edit mode) added to {}",
+            host_info.path.display()
+        ));
     } else {
-        eprintln!("✓ tilth added to {}", host_info.path.display());
+        diag::emit(format_args!(
+            "✓ tilth added to {}",
+            host_info.path.display()
+        ));
     }
     if let Some(note) = host_info.note {
-        eprintln!("  {note}");
+        diag::emit(format_args!("  {note}"));
     }
     Ok(())
 }
@@ -109,6 +117,10 @@ fn atomic_write(path: &std::path::Path, content: &str) -> Result<(), String> {
         .map_err(|e| format!("failed to write {}: {e}", path.display()))
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "by design: a host's own config file, at a path tilth names, never a walked one"
+)]
 fn write_json_config(host_info: &HostInfo, edit: bool) -> Result<(), String> {
     let servers_key = match host_info.format {
         ConfigFormat::Json { servers_key } | ConfigFormat::JsonLocal { servers_key } => servers_key,
@@ -130,13 +142,17 @@ fn write_json_config(host_info: &HostInfo, edit: bool) -> Result<(), String> {
         tilth_server_entry(edit, &host_info.format),
     )?;
 
-    let out =
-        serde_json::to_string_pretty(&config).expect("serde_json::Value is always serializable");
-    atomic_write(&host_info.path, &out)?;
+    // `{:#}` is serde_json's pretty printer, the same one `to_string_pretty`
+    // uses, without its impossible error.
+    atomic_write(&host_info.path, &format!("{config:#}"))?;
     Ok(())
 }
 
 /// Writes a `[mcp_servers.tilth]` section into a TOML config file.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "by design: a host's own config file, at a path tilth names, never a walked one"
+)]
 fn write_toml_config(host_info: &HostInfo, edit: bool) -> Result<(), String> {
     let (command, args) = tilth_command_and_args(edit);
 
@@ -300,6 +316,10 @@ struct HostInfo {
     note: Option<&'static str>,
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "by design: one match arm per supported host; its length is the host table"
+)]
 fn resolve_host(host: &str) -> Result<HostInfo, String> {
     let home = home_dir()?;
 

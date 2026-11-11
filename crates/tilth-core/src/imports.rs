@@ -1,6 +1,7 @@
 //! Imports as data, one per module a statement names, and their resolution
 //! to local file paths (the MCP layer's related-file hint, deps, callees).
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
@@ -228,16 +229,17 @@ fn statement_query(lang: Lang) -> Option<&'static tree_sitter::Query> {
     let mut compiled = COMPILED
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(&query) = compiled.get(&lang) {
-        return Some(query);
+    match compiled.entry(lang) {
+        Entry::Occupied(e) => Some(*e.get()),
+        Entry::Vacant(e) => {
+            let language = crate::lang::outline::outline_language(lang)?;
+            // One query per language at most, so leaking it to get a
+            // `'static` borrow is bounded, and matching then runs without
+            // the lock.
+            let query = Box::leak(Box::new(tree_sitter::Query::new(&language, pattern).ok()?));
+            Some(*e.insert(query))
+        }
     }
-    let language = crate::lang::outline::outline_language(lang)?;
-    // One query per language at most, so leaking it to get a `'static`
-    // borrow is bounded, and matching then runs without the lock.
-    let query: &'static tree_sitter::Query =
-        Box::leak(Box::new(tree_sitter::Query::new(&language, pattern).ok()?));
-    compiled.insert(lang, query);
-    Some(query)
 }
 
 /// Languages whose import statements are read from the syntax tree: one
@@ -570,10 +572,10 @@ fn php_use(node: tree_sitter::Node, src: &str, out: &mut Vec<(String, u32)>) {
         };
         let name = compact(name, src);
         let name = name.trim_start_matches('\\');
-        let source = match &prefix {
-            Some(prefix) => join_path(prefix.trim_start_matches('\\'), name, "\\"),
-            None => name.to_string(),
-        };
+        let source = prefix.as_deref().map_or_else(
+            || name.to_string(),
+            |prefix| join_path(prefix.trim_start_matches('\\'), name, "\\"),
+        );
         out.push((source, line_of(clause)));
     }
 }
@@ -896,6 +898,10 @@ fn resolve_bash(dir: &Path, source: &str) -> Option<PathBuf> {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "by design: tests read the files they check directly"
+)]
 mod tests {
     use super::*;
     use std::fs;

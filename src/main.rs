@@ -6,12 +6,16 @@ use std::process;
 
 use clap::{CommandFactory, Parser};
 use clap_complete::Shell;
-use tilth::FileScopeHint;
+use tilth::{diag, FileScopeHint};
 
 /// tilth — Tree-sitter indexed lookups, smart code reading for AI agents.
 /// One tool replaces `read_file`, grep, glob, `ast_grep`, and find.
 #[derive(Parser)]
 #[command(name = "tilth", version, about)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "by design: clap derives the CLI from this struct, one bool per on/off flag"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -64,6 +68,10 @@ struct Cli {
 
     /// Enable edit mode: hashline output + tilth_write tool.
     #[arg(long)]
+    #[expect(
+        clippy::doc_markdown,
+        reason = "by design: clap prints this comment as --help text, where backticks would show"
+    )]
     edit: bool,
 
     /// Disable project fingerprint in MCP init.
@@ -111,6 +119,10 @@ enum Command {
 
         /// Enable edit mode (hashline output + tilth_write tool).
         #[arg(long)]
+        #[expect(
+            clippy::doc_markdown,
+            reason = "by design: clap prints this comment as --help text, where backticks would show"
+        )]
         edit: bool,
     },
     /// Show structural diff with function-level change summaries.
@@ -175,6 +187,10 @@ enum Command {
     },
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "config and root handling move out of here in #307"
+)]
 fn main() {
     let cli = Cli::parse();
 
@@ -196,15 +212,20 @@ fn main() {
         match cmd {
             Command::Install { ref host, edit } => {
                 if let Err(e) = tilth::install::run(host, edit) {
-                    eprintln!("install error: {e}");
+                    diag::emit(format_args!("install error: {e}"));
                     process::exit(1);
                 }
             }
             Command::Overview => {
-                let cwd = std::env::current_dir().unwrap_or_default();
+                let cwd = std::env::current_dir().unwrap_or_else(|e| {
+                    diag::emit(format_args!(
+                        "overview error: cannot read the current directory: {e}"
+                    ));
+                    process::exit(1);
+                });
                 let output = tilth::overview::fingerprint(&cwd);
                 if output.is_empty() {
-                    eprintln!("No project fingerprint could be generated.");
+                    diag::emit(format_args!("No project fingerprint could be generated."));
                     process::exit(1);
                 }
                 write_stdout(&output);
@@ -215,11 +236,11 @@ fn main() {
                 full,
             } => {
                 let scope =
-                    cli_scope(scope, FileScopeHint::Directory).unwrap_or_else(|e| usage_exit(&e));
+                    cli_scope(&scope, FileScopeHint::Directory).unwrap_or_else(|e| usage_exit(&e));
                 match tilth::run_grok(&target, &scope, full) {
-                    Ok(output) => emit_output(&output, io::stdout().is_terminal()),
+                    Ok(output) => emit_output(&output, stdout_is_terminal()),
                     Err(e) => {
-                        eprintln!("grok error: {e}");
+                        diag::emit(format_args!("grok error: {e}"));
                         process::exit(e.exit_code());
                     }
                 }
@@ -248,7 +269,7 @@ fn main() {
                 ) {
                     Ok(s) => s,
                     Err(e) => {
-                        eprintln!("diff error: {e}");
+                        diag::emit(format_args!("diff error: {e}"));
                         process::exit(1);
                     }
                 };
@@ -262,9 +283,9 @@ fn main() {
                     expand,
                     budget_opt,
                 ) {
-                    Ok(output) => emit_output(&output, io::stdout().is_terminal()),
+                    Ok(output) => emit_output(&output, stdout_is_terminal()),
                     Err(e) => {
-                        eprintln!("diff error: {e}");
+                        diag::emit(format_args!("diff error: {e}"));
                         process::exit(1);
                     }
                 }
@@ -284,32 +305,32 @@ fn main() {
         let mcp_scope = if cli.scope.as_os_str() == "." {
             None
         } else {
-            Some(cli_scope(cli.scope, FileScopeHint::Directory).unwrap_or_else(|e| usage_exit(&e)))
+            Some(cli_scope(&cli.scope, FileScopeHint::Directory).unwrap_or_else(|e| usage_exit(&e)))
         };
         if let Err(e) = tilth::mcp::run(cli.edit, mcp_scope.as_deref()) {
-            eprintln!("mcp error: {e}");
+            diag::emit(format_args!("mcp error: {e}"));
             process::exit(1);
         }
         return;
     }
 
-    let is_tty = io::stdout().is_terminal();
+    let is_tty = stdout_is_terminal();
 
     // Map mode
     if cli.map {
         let cache = tilth_core::cache::OutlineCache::new();
         let scope =
-            cli_scope(cli.scope, FileScopeHint::Directory).unwrap_or_else(|e| usage_exit(&e));
+            cli_scope(&cli.scope, FileScopeHint::Directory).unwrap_or_else(|e| usage_exit(&e));
         let output = tilth::map::generate(&scope, 3, cli.budget, &cache);
         emit_output(&output, is_tty);
         return;
     }
 
     // CLI mode: single query
-    let query = if let Some(q) = cli.query {
-        q
-    } else {
-        eprintln!("usage: tilth <query> [--scope DIR] [--section N-M] [--budget N]");
+    let Some(query) = cli.query else {
+        diag::emit(format_args!(
+            "usage: tilth <query> [--scope DIR] [--section N-M] [--budget N]"
+        ));
         process::exit(3);
     };
 
@@ -320,7 +341,7 @@ fn main() {
     } else {
         FileScopeHint::Glob
     };
-    let scope = cli_scope(cli.scope, hint).unwrap_or_else(|e| usage_exit(&e));
+    let scope = cli_scope(&cli.scope, hint).unwrap_or_else(|e| usage_exit(&e));
 
     // When piped (not a TTY), force full output — scripts expect raw content.
     // This promotion exists for FilePath queries (return full file instead of
@@ -363,11 +384,11 @@ fn main() {
             if scope_path.exists() {
                 scope_path
             } else {
-                let cwd_path = std::env::current_dir().unwrap_or_default().join(&query);
-                if cwd_path.exists() {
-                    cwd_path
-                } else {
-                    scope_path // fall back, let analyze_deps report the error
+                // An unreadable working directory offers no second place to
+                // look, so the scope path stands and analyze_deps reports it.
+                match std::env::current_dir().map(|cwd| cwd.join(&query)) {
+                    Ok(cwd_path) if cwd_path.exists() => cwd_path,
+                    _ => scope_path,
                 }
             }
         };
@@ -420,14 +441,14 @@ fn main() {
 /// directories named. It used to walk nothing and answer "0 matches" with
 /// exit 0, which read as a real result. The MCP tools fall back to `root`
 /// with the same hint instead, because there a typo still finds the answer.
-fn cli_scope(raw: PathBuf, hint: FileScopeHint) -> Result<PathBuf, String> {
-    let scope = raw.canonicalize().unwrap_or_else(|_| raw.clone());
-    tilth::refuse_file_scope(&raw, &scope, hint)?;
+fn cli_scope(raw: &Path, hint: FileScopeHint) -> Result<PathBuf, String> {
+    let scope = raw.canonicalize().unwrap_or_else(|_| raw.to_path_buf());
+    tilth::refuse_file_scope(raw, &scope, hint)?;
     if !scope.is_dir() {
         return Err(format!(
             "scope \"{}\" is not a valid directory. {}",
             raw.display(),
-            tilth::missing_scope_hint(&raw, &scope)
+            tilth::missing_scope_hint(raw, &scope)
         ));
     }
     Ok(scope)
@@ -435,7 +456,7 @@ fn cli_scope(raw: PathBuf, hint: FileScopeHint) -> Result<PathBuf, String> {
 
 /// Report a usage error and exit with the invalid-input code.
 fn usage_exit(msg: &str) -> ! {
-    eprintln!("{msg}");
+    diag::emit(format_args!("{msg}"));
     process::exit(3);
 }
 
@@ -452,16 +473,15 @@ fn emit_result(
                     "query": query,
                     "output": output,
                 });
-                write_stdout(
-                    &serde_json::to_string_pretty(&json)
-                        .expect("serde_json::Value is always serializable"),
-                );
+                // `{:#}` is serde_json's pretty printer, the same one
+                // `to_string_pretty` uses, without its impossible error.
+                write_stdout(&format!("{json:#}"));
             } else {
                 emit_output(&output, is_tty);
             }
         }
         Err(e) => {
-            eprintln!("{e}");
+            diag::emit(format_args!("{e}"));
             process::exit(e.exit_code());
         }
     }
@@ -480,8 +500,14 @@ fn emit_output(output: &str, is_tty: bool) {
             .spawn()
         {
             if let Some(ref mut stdin) = child.stdin.take() {
+                // Quitting the pager before the end closes this pipe; the
+                // person has seen what they wanted, so a failed write is no
+                // error.
                 let _ = stdin.write_all(output.as_bytes());
             }
+            // Waiting only keeps the prompt from returning under the pager.
+            // If the wait fails, the pager has already gone and the output
+            // was shown; there is nothing left to do.
             let _ = child.wait();
             return;
         }
@@ -496,13 +522,29 @@ fn emit_output(output: &str, is_tty: bool) {
 /// there instead and aborted with exit 134. Any other write failure, such
 /// as a full disk, is reported and exits 1.
 fn write_stdout(output: &str) {
-    if let Err(e) = write_output(&mut io::stdout().lock(), output) {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "by design: this is the CLI's one stdout sink"
+    )]
+    let stdout = io::stdout();
+    if let Err(e) = write_output(&mut stdout.lock(), output) {
         if e.kind() == io::ErrorKind::BrokenPipe {
             process::exit(0);
         }
-        let _ = writeln!(io::stderr(), "output error: {e}");
+        diag::emit(format_args!("output error: {e}"));
         process::exit(1);
     }
+}
+
+/// Whether results go to a terminal, which decides the pager and the default
+/// view. It reads stdout's kind and writes nothing.
+fn stdout_is_terminal() -> bool {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "by design: a query on stdout; writes go through write_stdout"
+    )]
+    let stdout = io::stdout();
+    stdout.is_terminal()
 }
 
 /// Conventional CLI output ends with a newline so the next shell prompt
@@ -570,7 +612,7 @@ fn compute_expand(cli_expand: Option<usize>, cli_full: bool) -> usize {
     /// `--budget` already bounds output, but `expand=usize::MAX` makes tilth
     /// compute the expanded source for every match before truncating —
     /// wasted parsing + rendering on pathological queries. 50 is well above
-    /// any practical "show me everything that matters" case (MAX_MATCHES is
+    /// any practical "show me everything that matters" case (`MAX_MATCHES` is
     /// 10 for symbol search anyway).
     const FULL_EXPAND_CAP: usize = 50;
     match (cli_expand, cli_full) {
@@ -608,7 +650,7 @@ mod tests {
     }
 
     /// Pin the regression that 16212fc was authored to prevent: a piped
-    /// invocation (where `main` sets `full = !is_tty = true` for FilePath
+    /// invocation (where `main` sets `full = !is_tty = true` for `FilePath`
     /// queries) must still receive `expand=0` here. `compute_expand` only
     /// sees the parsed `cli.full`, never the piped-derived bool — so a
     /// future refactor that conflates the two would have to change this
@@ -673,7 +715,7 @@ mod tests {
     fn cli_scope_refuses_a_missing_directory() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("binding")).unwrap();
-        let err = cli_scope(dir.path().join("bindng"), FileScopeHint::Glob).unwrap_err();
+        let err = cli_scope(&dir.path().join("bindng"), FileScopeHint::Glob).unwrap_err();
         assert!(
             err.contains("is not a valid directory") && err.contains("binding\"?"),
             "unexpected refusal: {err}"
@@ -687,12 +729,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("x.py");
         std::fs::write(&file, "").unwrap();
-        let err = cli_scope(file, FileScopeHint::Glob).unwrap_err();
+        let err = cli_scope(&file, FileScopeHint::Glob).unwrap_err();
         assert!(
             err.contains("is a file") && err.contains("glob to its name (\"x.py\")"),
             "unexpected refusal: {err}"
         );
-        let ok = cli_scope(dir.path().to_path_buf(), FileScopeHint::Glob).unwrap();
+        let ok = cli_scope(dir.path(), FileScopeHint::Glob).unwrap();
         assert_eq!(ok, dir.path().canonicalize().unwrap());
     }
 }

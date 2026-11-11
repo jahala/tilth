@@ -3,12 +3,13 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+use crate::format::fmt_tokens;
 use crate::types::estimate_tokens;
 
 #[derive(Debug, Default)]
 struct DirNode {
     children_files: Vec<(String, u64)>, // (name, bytes)
-    children_dirs: std::collections::BTreeMap<String, Box<DirNode>>,
+    children_dirs: std::collections::BTreeMap<String, Box<Self>>,
     file_count: u64,
     total_bytes: u64,
 }
@@ -29,49 +30,36 @@ impl DirNode {
     }
 }
 
-/// Compact human token count, matching `map.rs::fmt_tokens`'s k/M scale and rounding.
-fn fmt_tokens(t: u64) -> String {
-    #[allow(clippy::cast_precision_loss)] // display-only; mantissa loss is fine for summaries
-    let f = t as f64;
-    if f >= 999_950.0 {
-        format!("~{:.1}M tokens", f / 1_000_000.0)
-    } else if t >= 1000 {
-        format!("~{:.1}k tokens", f / 1_000.0)
-    } else {
-        format!("~{t} tokens")
-    }
-}
-
 fn render_dir(name: &str, node: &DirNode, prefix: &str, out: &mut String, is_root: bool) {
     let total_tokens = estimate_tokens(node.total_bytes);
     if is_root {
         let _ = writeln!(
             out,
-            "{name}/      {tok}   {n} files",
+            "{name}/      ~{tok} tokens   {n} files",
             tok = fmt_tokens(total_tokens),
             n = node.file_count
         );
     }
 
-    let mut entries: Vec<(bool, String, u64, Option<&DirNode>)> = Vec::new();
+    // A directory entry carries its node; a file entry has none.
+    let mut entries: Vec<(String, u64, Option<&DirNode>)> = Vec::new();
     for (n, b) in &node.children_files {
-        entries.push((false, n.clone(), *b, None));
+        entries.push((n.clone(), *b, None));
     }
     for (n, child) in &node.children_dirs {
-        entries.push((true, n.clone(), child.total_bytes, Some(child.as_ref())));
+        entries.push((n.clone(), child.total_bytes, Some(child.as_ref())));
     }
-    entries.sort_by(|a, b| a.1.cmp(&b.1));
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
 
     let n = entries.len();
-    for (i, (is_dir, name, bytes, child)) in entries.iter().enumerate() {
+    for (i, (name, bytes, child)) in entries.iter().enumerate() {
         let last = i == n - 1;
         let connector = if last { "└── " } else { "├── " };
         let child_prefix = if last { "    " } else { "│   " };
-        if *is_dir {
-            let child = child.expect("dir entry has node");
+        if let Some(child) = child {
             let _ = writeln!(
                 out,
-                "{prefix}{connector}{name}/      {tok}   {fc} files",
+                "{prefix}{connector}{name}/      ~{tok} tokens   {fc} files",
                 tok = fmt_tokens(estimate_tokens(*bytes)),
                 fc = child.file_count
             );
@@ -80,7 +68,7 @@ fn render_dir(name: &str, node: &DirNode, prefix: &str, out: &mut String, is_roo
         } else {
             let _ = writeln!(
                 out,
-                "{prefix}{connector}{name}      {tok}",
+                "{prefix}{connector}{name}      ~{tok} tokens",
                 tok = fmt_tokens(estimate_tokens(*bytes))
             );
         }
@@ -132,7 +120,7 @@ mod tests {
         let out = render_tree(&scope, &files);
         let expected = fmt_tokens(estimate_tokens(4000) + estimate_tokens(8000));
         assert!(
-            out.contains(&format!("src/      {expected}")),
+            out.contains(&format!("src/      ~{expected} tokens")),
             "dir rollup should equal sum of child tokens: {out}"
         );
     }

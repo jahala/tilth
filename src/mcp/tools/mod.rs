@@ -175,10 +175,7 @@ pub(super) fn resolve_read_path(
 }
 
 pub(super) fn apply_budget(output: &str, budget: Option<u64>) -> String {
-    match budget {
-        Some(b) => crate::budget::apply(output, b),
-        None => crate::budget::apply(output, crate::budget::DEFAULT_BUDGET),
-    }
+    crate::budget::apply(output, budget.unwrap_or(crate::budget::DEFAULT_BUDGET))
 }
 
 #[cfg(test)]
