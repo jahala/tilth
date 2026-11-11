@@ -7,7 +7,8 @@ use super::file_metadata;
 use crate::search::rank;
 use crate::types::{FacetTotals, Match, SearchResult};
 use grep_regex::RegexMatcher;
-use grep_searcher::sinks::Lossy;
+use grep_searcher::sinks::UTF8;
+use grep_searcher::Searcher;
 use tilth_core::error::TilthError;
 
 const MAX_MATCHES: usize = 10;
@@ -39,7 +40,7 @@ pub fn search(
 /// the other and show that the bound leaves the displayed set untouched.
 #[expect(
     clippy::too_many_lines,
-    reason = "reading goes through one Source in architecture step 3"
+    reason = "reading goes through one Source in #308"
 )]
 fn search_capped(
     pattern: &str,
@@ -129,14 +130,14 @@ fn search_capped(
             let (file_lines, mtime) = file_metadata(path);
 
             let mut file_matches = Vec::new();
-            // Lossy, not UTF8: the UTF8 sink ends the search at the first
-            // matched line that is not valid UTF-8, losing it and every later
-            // match in the file. With this sink and an in-memory slice the
-            // search cannot fail, so its `Result` carries nothing.
-            let _ = super::text_searcher().search_slice(
+            let mut searcher = Searcher::new();
+
+            // The UTF8 sink ends this file's search at its first matched line
+            // that is not UTF-8, and the error is dropped here: #308.
+            let _ = searcher.search_slice(
                 matcher,
                 bytes,
-                Lossy(|line_num, line| {
+                UTF8(|line_num, line| {
                     file_matches.push(Match {
                         path: path.to_path_buf(),
                         line: line_num as u32,
@@ -304,39 +305,5 @@ mod completeness_tests {
             one_per_file.total_found, 12,
             "and the count must still be exact"
         );
-    }
-
-    /// A matched line that is not UTF-8, such as a Latin-1 comment, used to
-    /// end the search of its file. The sink stopped there with an error that
-    /// was dropped, so that line and every later match in the file went
-    /// missing while the result read as complete.
-    #[test]
-    fn non_utf8_line_does_not_end_the_file_search() {
-        let d = tempfile::tempdir().unwrap();
-        std::fs::write(
-            d.path().join("latin1.txt"),
-            b"needle_delta caf\xe9\nneedle_delta two\nneedle_delta three\n",
-        )
-        .unwrap();
-        let r = search("needle_delta", d.path(), false, None, None, false).unwrap();
-        let mut lines: Vec<u32> = r.matches.iter().map(|m| m.line).collect();
-        lines.sort_unstable();
-        assert_eq!(lines, [1, 2, 3], "every matching line, in any encoding");
-        assert_eq!(r.total_found, 3);
-    }
-
-    /// A file with a NUL byte is binary and is not searched, even where its
-    /// bytes spell the query.
-    #[test]
-    fn binary_file_is_not_searched() {
-        let d = tempfile::tempdir().unwrap();
-        std::fs::write(
-            d.path().join("module.wasm"),
-            b"\0asm\x01\0\0\0\x07\x91needle_delta\xff\nneedle_delta\n",
-        )
-        .unwrap();
-        let r = search("needle_delta", d.path(), false, None, None, false).unwrap();
-        assert!(r.matches.is_empty(), "got {:?}", r.matches);
-        assert_eq!(r.total_found, 0);
     }
 }

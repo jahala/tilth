@@ -128,7 +128,7 @@ fn push_entries(
 /// Convert a tree-sitter node to an `OutlineEntry` based on its kind.
 #[expect(
     clippy::too_many_lines,
-    reason = "one name extractor replaces the per-kind branches in architecture step 5"
+    reason = "one name extractor replaces the per-kind branches in #310"
 )]
 fn node_to_entry(
     node: tree_sitter::Node,

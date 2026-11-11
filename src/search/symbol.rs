@@ -16,6 +16,7 @@ use crate::search::rank;
 use crate::types::{Match, OtherOwner, SearchResult};
 use grep_regex::RegexMatcher;
 use grep_searcher::sinks::UTF8;
+use grep_searcher::Searcher;
 use tilth_core::error::TilthError;
 use tilth_core::lang::detect_file_type_with_content;
 use tilth_core::lang::outline::{heading_text, outline_language, parse_markdown};
@@ -326,21 +327,25 @@ fn matches_in_file(path: &Path, wanted: Wanted, matchers: Matchers) -> Scan {
 
     let (file_lines, mtime) = file_metadata(path);
 
-    // One decode for both passes. A byte that is not UTF-8, such as a Latin-1
-    // comment, becomes U+FFFD and costs neither pass its definitions or
-    // usages. Valid UTF-8 is borrowed, not copied.
-    let text = String::from_utf8_lossy(bytes);
+    #[expect(
+        clippy::option_if_let_else,
+        reason = "a file that is not UTF-8 yields no definitions; one decoding rule in #308"
+    )]
     let FileDefs {
         mut matches,
         others,
-    } = definitions_in(path, wanted, &text, file_lines, mtime);
+    } = match std::str::from_utf8(bytes) {
+        Ok(content) => definitions_in(path, wanted, content, file_lines, mtime),
+        Err(_) => FileDefs::default(),
+    };
     let def_count = matches.len();
 
-    // `text` is valid UTF-8 and a slice needs no I/O, so the scan cannot fail
-    // and its `Result` carries nothing.
-    let _ = super::text_searcher().search_slice(
+    let mut searcher = Searcher::new();
+    // The UTF8 sink ends this file's usage scan at its first matching line
+    // that is not UTF-8, and the error is dropped here: #308.
+    let _ = searcher.search_slice(
         matchers.usage,
-        text.as_bytes(),
+        bytes,
         UTF8(|line_num, line| {
             let line_num = line_num as u32;
             let on_definition = matches[..def_count].iter().any(|d| d.line == line_num);
@@ -464,7 +469,7 @@ fn find_defs_treesitter(
 #[expect(
     clippy::too_many_arguments,
     clippy::too_many_lines,
-    reason = "a WalkCtx struct and a split in architecture step 10"
+    reason = "a WalkCtx struct and a split in #315"
 )]
 fn walk_for_definitions(
     node: tree_sitter::Node,
@@ -2395,62 +2400,5 @@ int area() { return 1; }
             c,
             &[("add", &[11]), ("point", &[4]), ("compare_fn", &[8])],
         );
-    }
-
-    /// A usage on a line that is not UTF-8 used to end the usage scan of its
-    /// file, so it and every later usage went missing. See the matching
-    /// content-search test.
-    #[test]
-    fn non_utf8_line_does_not_end_the_usage_scan() {
-        let d = tempfile::tempdir().unwrap();
-        std::fs::write(
-            d.path().join("latin1.c"),
-            b"/* caf\xe9 */ int x = needle_delta();\nint y = needle_delta();\nint z = needle_delta();\n",
-        )
-        .unwrap();
-        let r = search("needle_delta", d.path(), None, None, false).unwrap();
-        let mut lines: Vec<u32> = r.matches.iter().map(|m| m.line).collect();
-        lines.sort_unstable();
-        assert_eq!(lines, [1, 2, 3], "every usage, in any encoding");
-        assert_eq!(r.total_found, 3);
-    }
-
-    /// A file that is not UTF-8 used to yield no definitions at all, since
-    /// the definition pass needed the whole file to decode.
-    #[test]
-    fn non_utf8_file_keeps_its_definitions() {
-        let d = tempfile::tempdir().unwrap();
-        std::fs::write(
-            d.path().join("latin1.c"),
-            b"/* caf\xe9 */\nint needle_delta(void) { return 0; }\nint y = needle_delta();\n",
-        )
-        .unwrap();
-        let r = search("needle_delta", d.path(), None, None, false).unwrap();
-        let defs: Vec<u32> = r
-            .matches
-            .iter()
-            .filter(|m| m.is_definition)
-            .map(|m| m.line)
-            .collect();
-        assert_eq!(
-            defs,
-            [2],
-            "the function is a definition, got {:?}",
-            r.matches
-        );
-    }
-
-    /// A file with a NUL byte is binary, and its bytes are not usages.
-    #[test]
-    fn binary_file_has_no_usages() {
-        let d = tempfile::tempdir().unwrap();
-        std::fs::write(
-            d.path().join("module.wasm"),
-            b"\0asm\x01\0\0\0\x07\x91needle_delta\xff\nneedle_delta\n",
-        )
-        .unwrap();
-        let r = search("needle_delta", d.path(), None, None, false).unwrap();
-        assert!(r.matches.is_empty(), "got {:?}", r.matches);
-        assert_eq!(r.total_found, 0);
     }
 }

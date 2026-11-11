@@ -90,10 +90,7 @@ enum EditResult {
 /// 4. Splice replacements
 /// 5. Write file
 /// 6. Return hashlined context around edit sites
-#[expect(
-    clippy::too_many_lines,
-    reason = "split by responsibility in architecture step 10"
-)]
+#[expect(clippy::too_many_lines, reason = "split by responsibility in #315")]
 fn apply_edits(path: &Path, edits: &[Edit]) -> Result<EditResult, TilthError> {
     if edits.is_empty() {
         return Ok(EditResult::Applied {

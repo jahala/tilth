@@ -284,7 +284,7 @@ struct Hop2 {
 /// check reflects the true hop-1 breadth rather than the display-capped one.
 #[expect(
     clippy::too_many_lines,
-    reason = "renderers become functions of a result model in architecture step 6"
+    reason = "renderers become functions of a result model in #311"
 )]
 fn write_second_hop_impact(
     output: &mut String,

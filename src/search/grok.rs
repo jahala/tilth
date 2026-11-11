@@ -421,10 +421,7 @@ pub struct GrokResult {
 /// callees walk happen against the live filesystem — they each carry their own
 /// TOCTOU window, but stitching them into one bundle is bounded by the call
 /// duration and acceptable for an interactive code-intelligence tool.
-#[expect(
-    clippy::too_many_lines,
-    reason = "split by responsibility in architecture step 10"
-)]
+#[expect(clippy::too_many_lines, reason = "split by responsibility in #315")]
 pub fn grok(
     target_spec: &str,
     scope: &Path,
@@ -741,7 +738,7 @@ fn slice_body(content: &str, start_line: u32, end_line: u32, max_lines: usize) -
 #[must_use]
 #[expect(
     clippy::too_many_lines,
-    reason = "renderers become functions of a result model in architecture step 6"
+    reason = "renderers become functions of a result model in #311"
 )]
 pub fn format_grok(result: &GrokResult, scope: &Path) -> String {
     let mut out = String::new();

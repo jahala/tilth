@@ -71,10 +71,7 @@ pub struct Dependent {
 /// Phase 1: Extract exported symbols from the outline.
 /// Phase 2: Forward dependencies — what this file uses.
 /// Phase 3: Reverse dependencies — what uses this file.
-#[expect(
-    clippy::too_many_lines,
-    reason = "split by responsibility in architecture step 10"
-)]
+#[expect(clippy::too_many_lines, reason = "split by responsibility in #315")]
 pub fn analyze_deps(
     path: &Path,
     scope: &Path,

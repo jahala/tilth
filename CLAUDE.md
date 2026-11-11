@@ -115,7 +115,7 @@ cargo publish --dry-run -p tilth-core  # the library packages on its own
 python3 scripts/check/output_parity.py --base OLD --new NEW --repos <fixture repos>  # byte-for-byte output parity of two tilth builds
 ```
 
-Lints live in `[workspace.lints]` in the root `Cargo.toml` (pedantic, a nursery subset, and restrictions on unwrap, expect, print and unsafe); `clippy.toml` exempts tests. An exception is an item-level `#[expect(lint, reason = "...")]`, never a crate-wide `allow`. Results go to stdout through `write_stdout` (CLI) or the MCP transport; diagnostics go through `diag`.
+Lints live in `[workspace.lints]` in the root `Cargo.toml` (pedantic, a nursery subset, and restrictions on unwrap, expect, print and unsafe); `clippy.toml` exempts tests. An exception is an `#[expect(lint, reason = "...")]` on the item or statement it excuses, never an `allow`: `allow_attributes` fails the build. A temporary exception's reason names its tracking issue, as in `reason = "split by responsibility in #315"`. Results go to stdout through `write_stdout` (CLI) or the MCP transport's writer, and diagnostics through `diag::emit`; `clippy.toml` forbids `std::io::stdout` and `std::io::stderr` everywhere else.
 
 CI runs `fmt --all --check`, `clippy --workspace --all-targets -D warnings`, `cargo test --workspace` and the tilth-core publish dry-run on every push/PR.
 

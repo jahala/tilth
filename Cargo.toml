@@ -54,7 +54,11 @@ needless_collect = "warn"
 option_if_let_else = "warn"
 
 # Restrictions. clippy.toml exempts tests from the unwrap, expect, print and
-# dbg lints.
+# dbg lints. An exception is an #[expect] with a reason on the item or
+# statement it excuses, which fails once its violation is gone;
+# allow_attributes forbids #[allow].
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
 undocumented_unsafe_blocks = "warn"
 unwrap_used = "warn"
 expect_used = "warn"

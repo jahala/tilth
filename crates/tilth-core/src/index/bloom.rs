@@ -169,10 +169,7 @@ impl<'a> IdentifierIter<'a> {
 impl<'a> Iterator for IdentifierIter<'a> {
     type Item = &'a str;
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "split by responsibility in architecture step 10"
-    )]
+    #[expect(clippy::too_many_lines, reason = "split by responsibility in #315")]
     fn next(&mut self) -> Option<&'a str> {
         let bytes = self.bytes;
         let len = bytes.len();

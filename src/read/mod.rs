@@ -58,7 +58,7 @@ pub(crate) fn count_lines(buf: &[u8]) -> u32 {
 /// caller's budget cut applies to it as before.
 #[expect(
     clippy::too_many_lines,
-    reason = "reading goes through one Source in architecture step 3"
+    reason = "reading goes through one Source in #308"
 )]
 pub fn read_file(
     path: &Path,

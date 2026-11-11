@@ -85,6 +85,10 @@ pub fn run(edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
 
     let services = Services::new(edit_mode);
     let stdin = io::stdin();
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the MCP transport's one stdout writer, for JSON-RPC only"
+    )]
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
 

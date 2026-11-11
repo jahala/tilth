@@ -31,10 +31,7 @@ pub fn fingerprint(root: &Path) -> String {
     result.unwrap_or_default()
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "split by responsibility in architecture step 10"
-)]
+#[expect(clippy::too_many_lines, reason = "split by responsibility in #315")]
 fn fingerprint_inner(root: &Path) -> String {
     let mut lines: Vec<String> = Vec::new();
 
@@ -298,10 +295,7 @@ fn walk_files(root: &Path) -> WalkResult {
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "a WalkCtx struct in architecture step 10"
-)]
+#[expect(clippy::too_many_arguments, reason = "a WalkCtx struct in #315")]
 fn walk_dir(
     dir: &Path,
     root: &Path,

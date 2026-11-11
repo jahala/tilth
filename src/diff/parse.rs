@@ -4,10 +4,7 @@ use super::{DiffLine, DiffLineKind, FileDiff, FileStatus, Hunk};
 use tilth_core::lang::detection::is_generated_by_name;
 
 /// Parse `git diff --no-color` unified diff output into a list of `FileDiff`s.
-#[expect(
-    clippy::too_many_lines,
-    reason = "the diff model is rebuilt in architecture step 7"
-)]
+#[expect(clippy::too_many_lines, reason = "the diff model is rebuilt in #312")]
 pub(crate) fn parse_unified_diff(raw: &str) -> Vec<FileDiff> {
     if raw.is_empty() {
         return Vec::new();

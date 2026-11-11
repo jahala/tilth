@@ -187,7 +187,7 @@ enum Command {
 
 #[expect(
     clippy::too_many_lines,
-    reason = "architecture step 2 moves config and root handling out of here"
+    reason = "config and root handling move out of here in #307"
 )]
 fn main() {
     let cli = Cli::parse();
@@ -236,7 +236,7 @@ fn main() {
                 let scope =
                     cli_scope(&scope, FileScopeHint::Directory).unwrap_or_else(|e| usage_exit(&e));
                 match tilth::run_grok(&target, &scope, full) {
-                    Ok(output) => emit_output(&output, io::stdout().is_terminal()),
+                    Ok(output) => emit_output(&output, stdout_is_terminal()),
                     Err(e) => {
                         diag::emit(format_args!("grok error: {e}"));
                         process::exit(e.exit_code());
@@ -281,7 +281,7 @@ fn main() {
                     expand,
                     budget_opt,
                 ) {
-                    Ok(output) => emit_output(&output, io::stdout().is_terminal()),
+                    Ok(output) => emit_output(&output, stdout_is_terminal()),
                     Err(e) => {
                         diag::emit(format_args!("diff error: {e}"));
                         process::exit(1);
@@ -312,7 +312,7 @@ fn main() {
         return;
     }
 
-    let is_tty = io::stdout().is_terminal();
+    let is_tty = stdout_is_terminal();
 
     // Map mode
     if cli.map {
@@ -520,13 +520,29 @@ fn emit_output(output: &str, is_tty: bool) {
 /// there instead and aborted with exit 134. Any other write failure, such
 /// as a full disk, is reported and exits 1.
 fn write_stdout(output: &str) {
-    if let Err(e) = write_output(&mut io::stdout().lock(), output) {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "this is the CLI's one stdout sink"
+    )]
+    let stdout = io::stdout();
+    if let Err(e) = write_output(&mut stdout.lock(), output) {
         if e.kind() == io::ErrorKind::BrokenPipe {
             process::exit(0);
         }
         diag::emit(format_args!("output error: {e}"));
         process::exit(1);
     }
+}
+
+/// Whether results go to a terminal, which decides the pager and the default
+/// view. It reads stdout's kind and writes nothing.
+fn stdout_is_terminal() -> bool {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a query on stdout; writes go through write_stdout"
+    )]
+    let stdout = io::stdout();
+    stdout.is_terminal()
 }
 
 /// Conventional CLI output ends with a newline so the next shell prompt

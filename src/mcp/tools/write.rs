@@ -214,10 +214,7 @@ fn resolved_display(path: &Path) -> String {
         .to_string()
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "split by responsibility in architecture step 10"
-)]
+#[expect(clippy::too_many_lines, reason = "split by responsibility in #315")]
 pub(in crate::mcp) fn tool_write(
     args: &Value,
     session: &Session,

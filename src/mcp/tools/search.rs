@@ -9,10 +9,7 @@ use tilth_core::index::bloom::BloomFilterCache;
 
 use super::{apply_budget, resolve_scope};
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "split by responsibility in architecture step 10"
-)]
+#[expect(clippy::too_many_lines, reason = "split by responsibility in #315")]
 pub(in crate::mcp) fn tool_search(
     args: &Value,
     cache: &OutlineCache,

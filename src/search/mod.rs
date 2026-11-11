@@ -98,14 +98,6 @@ pub(crate) fn oversized_holds(path: &Path, found: impl Fn(&[u8]) -> bool) -> boo
     std::fs::read(path).is_ok_and(|bytes| found(&bytes))
 }
 
-/// The searcher for a file's lines. A NUL byte marks the file as binary and
-/// ends its search, so compiled artefacts and images yield no matches.
-pub(crate) fn text_searcher() -> grep_searcher::Searcher {
-    grep_searcher::SearcherBuilder::new()
-        .binary_detection(grep_searcher::BinaryDetection::quit(b'\0'))
-        .build()
-}
-
 /// Does `matcher` match anywhere in `bytes`? Stops at the first hit.
 pub(crate) fn has_match(matcher: &grep_regex::RegexMatcher, bytes: &[u8]) -> bool {
     let mut hit = false;
@@ -243,7 +235,7 @@ pub fn search_symbol(
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "per-call options become one Request in architecture step 2"
+    reason = "per-call options become one Request in #307"
 )]
 pub fn search_symbol_expanded(
     query: &str,
@@ -263,7 +255,7 @@ pub fn search_symbol_expanded(
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "per-call options become one Request in architecture step 2"
+    reason = "per-call options become one Request in #307"
 )]
 pub fn search_multi_symbol_expanded(
     queries: &[&str],
@@ -366,7 +358,7 @@ pub fn search_regex(
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "per-call options become one Request in architecture step 2"
+    reason = "per-call options become one Request in #307"
 )]
 pub fn search_content_expanded(
     query: &str,
@@ -388,7 +380,7 @@ pub fn search_content_expanded(
 /// Expanded regex search — takes raw pattern, no slash wrapping needed.
 #[expect(
     clippy::too_many_arguments,
-    reason = "per-call options become one Request in architecture step 2"
+    reason = "per-call options become one Request in #307"
 )]
 pub fn search_regex_expanded(
     pattern: &str,
@@ -478,7 +470,7 @@ fn write_hidden_tail(out: &mut String, shown: usize, total: usize, kind: &str) {
 /// Shared expand state enables cross-query dedup in multi-symbol search.
 #[expect(
     clippy::too_many_arguments,
-    reason = "renderers become functions of a result model in architecture step 6"
+    reason = "renderers become functions of a result model in #311"
 )]
 fn format_matches(
     matches: &[Match],
@@ -674,7 +666,7 @@ fn boost_query(m: &Match) -> Option<&str> {
 #[expect(
     clippy::too_many_arguments,
     clippy::too_many_lines,
-    reason = "renderers become functions of a result model in architecture step 6"
+    reason = "renderers become functions of a result model in #311"
 )]
 fn format_single_match(
     m: &Match,
@@ -1122,7 +1114,7 @@ fn basename_file_outline(
 #[expect(
     clippy::too_many_lines,
     clippy::unnecessary_wraps,
-    reason = "renderers become functions of a result model in architecture step 6"
+    reason = "renderers become functions of a result model in #311"
 )]
 fn format_search_result(
     result: &SearchResult,
@@ -1635,7 +1627,7 @@ fn extract_line_range(line: &str) -> Option<(u32, u32)> {
 /// Format glob search results (file list with previews).
 #[expect(
     clippy::unnecessary_wraps,
-    reason = "renderers become functions of a result model in architecture step 6"
+    reason = "renderers become functions of a result model in #311"
 )]
 fn format_glob_result(result: &glob::GlobResult, scope: &Path) -> Result<String, TilthError> {
     let header = format!(

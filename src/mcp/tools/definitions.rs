@@ -2,7 +2,7 @@ use serde_json::Value;
 
 #[expect(
     clippy::too_many_lines,
-    reason = "one schema per tool, split per tool in architecture step 10"
+    reason = "one schema per tool, split per tool in #315"
 )]
 pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
     let read_desc = if edit_mode {
