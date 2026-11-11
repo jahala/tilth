@@ -756,36 +756,62 @@ single tool each.
 1. **Resolve source** (`resolve_source`) — `DiffSource` is a
    six-armed enum: `GitUncommitted` (default), `GitStaged`, `GitRef`
    (any rev or rev range), `Files(a, b)` (file-to-file), `Patch(path)`
-   (read a `.patch` file), `Log(range)` (per-commit summaries).
+   (read a `.patch` file), `Log(range)` (per-commit summaries). For a git
+   source, every git command and working-tree read then runs at the
+   repository top (`git rev-parse --show-toplevel`), because git prints
+   paths from there.
 2. **`run_git_diff`** shells out to `git diff` with the right args
-   (or reads the patch file).
-3. **`parse::parse_unified_diff`** turns the raw text into
-   `Vec<FileDiff>` — header, hunks, lines.
-4. **`overlay::compute_overlay`** combines each `FileDiff` with the
-   on-disk source to produce a `FileOverlay` — a structural view of
-   changed *symbols* with confidence scores
-   (`MatchConfidence::High/Medium/Low/None`).
-5. **`overlay::cross_file_matching`** detects symbols moved between
+   (or reads the patch file). Before the first commit, `HEAD` is the
+   empty tree.
+3. **`resolve_sides`** decides where each side reads file content from
+   (`Side`: a revision, the index, the working tree, a file). It is the
+   one place that knows what a range means: `a..b` compares `a` with `b`,
+   `a...b` compares their merge base with `b`, a bare revision compares
+   it with the working tree.
+4. **`parse::parse_unified_diff`** turns the raw text into
+   `Vec<FileDiff>` — header, hunks, and lines numbered in the old file
+   (removed lines) or the new file (the rest).
+5. **`overlay::compute_overlay`** reads both sides of each `FileDiff`,
+   outlines them and matches their symbols (`matching::match_symbols`:
+   identity, then structural hash, then fuzzy similarity). Members are
+   qualified by their type (`A::run`), so same-named methods stay apart.
+   A function's signature is its whole header from the syntax tree,
+   compared by tokens, so a re-wrapped header is not a signature change
+   and a change on its third line is one. Each patch line goes to the
+   innermost changed symbol that holds it; lines outside every changed
+   symbol, and all lines of a non-code file, stay in `other_lines`. The
+   overlay's `+N/−M` counts come from the patch itself.
+6. **`overlay::cross_file_matching`** detects symbols moved between
    files.
-6. **`overlay::signature_warnings`** flags signature changes that
-   might break callers.
-7. **Search filter** (`filter_by_search`) — narrows to symbols/files
+7. **Scope** (`ScopeSpec`) — a `--scope` resolves against `root` (or the
+   cwd) to a path from the repository top. A changed file at that path
+   (or at its path before a rename) gives the file detail; a directory
+   gives the overview of the changed files under it; a trailing part of
+   a path (`main.rs`) must name one changed file. An existing path with
+   no changes says so; anything else is an error.
+8. **`overlay::signature_warnings`** flags a signature changed in several
+   files.
+9. **Search filter** (`keep_search_matches`) — narrows to symbols/files
    matching a substring, if `--search` was passed.
-8. **Blast radius** (`compute_blast`) — for each signature-changed
-   symbol, list of impacted files, gated on `--blast`.
-9. **Format** — dispatched by scope shape: `format::format_overview`
-   (no scope), `format::format_file_detail` (single file scope), or
-   `format::format_function_detail` (`file:fn` scope). Marker line
-   prefixes are `[+]`/`[-]`/`[~]`/`[~:sig]`; the overview header is
-   budgeted via `budget::apply`.
-10. **Conflict detection** — only on `DiffSource::GitUncommitted`,
+10. **Blast radius** (`compute_blast`) — for each signature-changed
+    symbol, count its callers, gated on `--blast`.
+11. **Format** — `format::format_overview` (no scope, or a directory),
+    `format::format_file_detail` (one file) or
+    `format::format_function_detail` (`file:fn`, where `fn` may be
+    qualified as `Type::fn`). Marker line prefixes are
+    `[+]`/`[-]`/`[~]`/`[~:sig]`; output is budgeted via `budget::apply`.
+12. **Conflict detection** — only on `DiffSource::GitUncommitted`,
     `overlay::detect_conflicts` scans each affected file for git
     merge-conflict markers and `format::format_conflicts` appends the
     findings to the output.
 
+Matching walks hash maps, so `match_symbols` sorts its result by file
+position; the same diff prints the same bytes every run.
+
 `diff_log(range, scope, budget)` is a separate pipeline for `--log
-HEAD~5..HEAD` summaries — runs `git log --pretty + git show` per commit
-and emits a structural change list per commit.
+HEAD~5..HEAD` summaries — runs `git log`, then diffs each commit against
+its first parent (a root commit against the empty tree) and emits a
+structural change list per commit.
 
 ### Edit (`src/edit.rs`)
 
