@@ -309,7 +309,10 @@ ladder, in priority order:
    regex when it's actually a path.
 2. **Glob** — contains `*`, `?`, `{`, or `[` and no spaces. The
    no-spaces guard distinguishes real globs from content like
-   `import { X }`.
+   `import { X }`. A query in this shape that also uses syntax no file
+   glob needs (`|`, a leading `^`, `.*` between name characters as in
+   `Searcher.*Builder`, a `+` or `{n}` quantifier, a backslash escape)
+   is a `Regex` instead (`is_regex_shaped`).
 3. **Path** — starts with `./` or `../`, or contains `/` without
    spaces. If the resolved path exists, returns `FilePath`; otherwise
    `Fallthrough` so the symbol/content cascades still get a shot.
