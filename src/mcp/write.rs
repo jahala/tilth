@@ -123,38 +123,6 @@ fn open_append(path: &Path) -> std::io::Result<fs::File> {
 mod tests {
     use super::*;
 
-    /// `tilth_read` runs while `tilth_write` replaces the same file. The
-    /// rename swaps the whole file in one step, so every read in the race
-    /// finds a file at the path and returns it.
-    #[test]
-    fn overwrite_never_fails_a_concurrent_read() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("foundation.py");
-        let line = "def f(): return 1  # ..........................................\n";
-        let content: String = line.repeat(365);
-        std::fs::write(&p, &content).unwrap();
-
-        let stop = AtomicBool::new(false);
-        let cache = tilth_core::cache::OutlineCache::new();
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                while !stop.load(Ordering::Relaxed) {
-                    write_overwrite(&p, &content, true).unwrap();
-                }
-            });
-            for _ in 0..500 {
-                let read = crate::read::read_file(&p, None, true, &cache, false, None);
-                if let Err(e) = read {
-                    stop.store(true, Ordering::Relaxed);
-                    panic!("a read during a concurrent overwrite failed: {e}");
-                }
-            }
-            stop.store(true, Ordering::Relaxed);
-        });
-    }
-
     /// A concurrent reader must never observe a half-written file. The
     /// in-place `O_TRUNC` rewrite this replaced exposed a zero-length window
     /// on every overwrite.

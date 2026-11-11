@@ -104,10 +104,13 @@ fn target_seen_in_scope(target: &str, scope: &Path, glob: Option<&str>) -> bool 
             if !entry.file_type().is_some_and(|ft| ft.is_file()) {
                 return ignore::WalkState::Continue;
             }
-            let Ok(bytes) = std::fs::read(entry.path()) else {
+            // Streamed in bounded chunks, so a multi-gigabyte file costs one
+            // chunk of memory, and the scan stops at the first match. A file
+            // that cannot be read counts as not naming the target, as before.
+            let Ok(file) = std::fs::File::open(entry.path()) else {
                 return ignore::WalkState::Continue;
             };
-            if memchr::memmem::find(&bytes, needle).is_some() {
+            if tilth_core::source::stream_contains(file, needle).unwrap_or(false) {
                 seen.store(true, Ordering::Relaxed);
                 return ignore::WalkState::Quit;
             }

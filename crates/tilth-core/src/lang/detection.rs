@@ -1,6 +1,36 @@
-/// How many leading bytes [`is_binary`] looks at. A caller that only needs
-/// the binary verdict can read this many bytes and no more.
+use std::io::{self, Read};
+
+/// How many leading bytes [`is_binary`] looks at.
 pub const BINARY_WINDOW: usize = 512;
+
+/// How many leading bytes [`is_generated_by_content`] scans for markers.
+pub const GENERATED_WINDOW: usize = 512;
+
+/// How many leading bytes [`is_minified_by_content`] samples.
+pub const MINIFIED_SAMPLE: usize = 2048;
+
+/// The most any content check in this module reads. A caller that needs
+/// only these verdicts reads this many leading bytes ([`read_head`]) and
+/// decides without reading the rest of the file.
+pub const HEAD_WINDOW: usize = MINIFIED_SAMPLE;
+
+const _: () = assert!(
+    HEAD_WINDOW >= BINARY_WINDOW && HEAD_WINDOW >= GENERATED_WINDOW,
+    "HEAD_WINDOW must cover every content check"
+);
+
+/// The first [`HEAD_WINDOW`] bytes of `reader`, or all of it if shorter. A
+/// bare `read` may return fewer bytes than asked before the end, so this
+/// keeps reading until the window is full or the input ends.
+///
+/// # Errors
+///
+/// Returns the reader's I/O error.
+pub fn read_head(reader: impl Read) -> io::Result<Vec<u8>> {
+    let mut head = Vec::with_capacity(HEAD_WINDOW);
+    reader.take(HEAD_WINDOW as u64).read_to_end(&mut head)?;
+    Ok(head)
+}
 
 /// Any null byte in the first [`BINARY_WINDOW`] bytes → binary.
 /// Uses memchr for the scan — single SIMD pass, no branching.
@@ -42,10 +72,10 @@ const GENERATED_MARKERS: &[&[u8]] = &[
     b"Automatically generated",
 ];
 
-/// Scan first 512 bytes for generated-file markers using SIMD memmem.
+/// Scan the first [`GENERATED_WINDOW`] bytes for generated-file markers.
 #[must_use]
 pub fn is_generated_by_content(buf: &[u8]) -> bool {
-    let window = &buf[..buf.len().min(512)];
+    let window = &buf[..buf.len().min(GENERATED_WINDOW)];
     GENERATED_MARKERS
         .iter()
         .any(|m| memchr::memmem::find(window, m).is_some())
@@ -84,7 +114,8 @@ pub fn is_minified_by_name(name: &str) -> bool {
     false
 }
 
-/// Heuristic: does this content look minified? Samples first 2KB and counts
+/// Heuristic: does this content look minified? Samples the first
+/// [`MINIFIED_SAMPLE`] bytes and counts
 /// newlines. Real source code is line-oriented; minified bundles cram
 /// thousands of bytes onto a single line.
 ///
@@ -96,7 +127,7 @@ pub fn is_minified_by_name(name: &str) -> bool {
 /// flag legitimate single-block license headers and compact one-line JSON.
 #[must_use]
 pub fn is_minified_by_content(buf: &[u8]) -> bool {
-    let sample = &buf[..buf.len().min(2048)];
+    let sample = &buf[..buf.len().min(MINIFIED_SAMPLE)];
     let newlines = memchr::memchr_iter(b'\n', sample).count();
     newlines < 2
 }

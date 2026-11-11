@@ -124,26 +124,13 @@ fn file_preview(path: &Path) -> Option<String> {
     Some(format!("~{tokens} tokens"))
 }
 
-/// Classify by content the way the read path does: a null byte in the first
-/// [`BINARY_WINDOW`](tilth_core::lang::detection::BINARY_WINDOW) bytes marks
-/// binary.
+/// Classify by content the way the read path does, from the same head.
 fn is_binary_file(path: &Path) -> bool {
-    use std::io::Read;
-    use tilth_core::lang::detection::BINARY_WINDOW;
+    use tilth_core::lang::detection::{is_binary, read_head};
     let Ok(file) = std::fs::File::open(path) else {
         return false;
     };
-    // A bare read() may legally return fewer bytes than asked before EOF;
-    // take + read_to_end retries until the cap or EOF, guaranteeing the window.
-    let mut head = Vec::with_capacity(BINARY_WINDOW);
-    if file
-        .take(BINARY_WINDOW as u64)
-        .read_to_end(&mut head)
-        .is_err()
-    {
-        return false;
-    }
-    tilth_core::lang::detection::is_binary(&head)
+    read_head(file).is_ok_and(|head| is_binary(&head))
 }
 
 #[cfg(test)]

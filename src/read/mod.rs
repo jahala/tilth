@@ -10,6 +10,7 @@ use crate::types::{estimate_tokens, ViewMode};
 use tilth_core::cache::OutlineCache;
 use tilth_core::error::TilthError;
 use tilth_core::lang::detect_file_type_with_content;
+use tilth_core::lang::detection;
 use tilth_core::lang::outline::{heading_level, heading_text, parse_markdown};
 use tilth_core::source::{strip_bom, strip_bom_bytes};
 use tilth_core::types::FileType;
@@ -43,9 +44,50 @@ pub(crate) fn full_read_size_cap() -> u64 {
 /// line longer than it is, and let a section past the last line succeed
 /// with an empty body.
 pub(crate) fn count_lines(buf: &[u8]) -> u32 {
-    let newlines = memchr::memchr_iter(b'\n', buf).count();
-    let unterminated = usize::from(buf.last().is_some_and(|&b| b != b'\n'));
-    u32::try_from(newlines + unterminated).unwrap_or(u32::MAX)
+    let mut counter = LineCounter::default();
+    counter.feed(buf);
+    counter.lines()
+}
+
+/// [`count_lines`] over input that arrives in pieces: feed it the bytes in
+/// order, then ask for [`lines`](Self::lines). One home for the rule, whether
+/// the file is in memory or streamed.
+#[derive(Default)]
+pub(crate) struct LineCounter {
+    newlines: usize,
+    last: Option<u8>,
+}
+
+impl LineCounter {
+    pub(crate) fn feed(&mut self, chunk: &[u8]) {
+        self.newlines += memchr::memchr_iter(b'\n', chunk).count();
+        if let Some(&last) = chunk.last() {
+            self.last = Some(last);
+        }
+    }
+
+    pub(crate) fn lines(&self) -> u32 {
+        let unterminated = usize::from(self.last.is_some_and(|b| b != b'\n'));
+        u32::try_from(self.newlines + unterminated).unwrap_or(u32::MAX)
+    }
+}
+
+/// The line count of a file whose first bytes are `head` and the rest of
+/// which `rest` yields. The rest is read in bounded chunks and dropped, so a
+/// view that only needs the count never holds the file in memory.
+fn count_lines_streaming(head: &[u8], mut rest: impl Read) -> std::io::Result<u32> {
+    const CHUNK: usize = 64 * 1024;
+    let mut counter = LineCounter::default();
+    counter.feed(head);
+    let mut buf = vec![0u8; CHUNK];
+    loop {
+        match rest.read(&mut buf) {
+            Ok(0) => return Ok(counter.lines()),
+            Ok(n) => counter.feed(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Main entry point for read mode. Routes through the decision tree.
@@ -106,50 +148,46 @@ pub fn read_file(
         source,
     };
     let mut file = fs::File::open(path).map_err(io_error)?;
-    let mut bytes = Vec::with_capacity(byte_len as usize);
+    // The size of the file this handle reads, so the checks below describe
+    // that file even if it was replaced after the metadata call above.
+    let byte_len = file.metadata().map_err(io_error)?.len();
 
-    // Binary detection reads only the head, so a large binary costs one
-    // small read, not the whole file.
-    let window = tilth_core::lang::detection::BINARY_WINDOW as u64;
-    (&mut file)
-        .take(window)
-        .read_to_end(&mut bytes)
-        .map_err(io_error)?;
-    if tilth_core::lang::detection::is_binary(&bytes) {
+    // The binary, generated and minified checks look only at the head. A
+    // file they settle costs that small read plus a streamed line count, so
+    // a multi-gigabyte binary or bundle is never held in memory.
+    let head = detection::read_head(&mut file).map_err(io_error)?;
+    if detection::is_binary(&head) {
         let mime = mime_from_ext(path);
         return Ok(format::binary_header(path, byte_len, mime));
     }
-    file.read_to_end(&mut bytes).map_err(io_error)?;
-    let buf = &bytes[..];
 
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-
-    // Generated
-    if tilth_core::lang::detection::is_generated_by_name(name)
-        || tilth_core::lang::detection::is_generated_by_content(buf)
-    {
-        let line_count = count_lines(buf);
-        return Ok(format::file_header(
-            path,
-            byte_len,
-            line_count,
-            ViewMode::Generated,
-        ));
+    // Minified: the filename convention or, for big files, the newline
+    // density of the head.
+    let header_only =
+        if detection::is_generated_by_name(name) || detection::is_generated_by_content(&head) {
+            Some(ViewMode::Generated)
+        } else if detection::is_minified_by_name(name)
+            || (byte_len >= detection::MINIFIED_CHECK_THRESHOLD
+                && detection::is_minified_by_content(&head))
+        {
+            Some(ViewMode::Minified)
+        } else {
+            None
+        };
+    if let Some(mode) = header_only {
+        let line_count = count_lines_streaming(&head, &mut file).map_err(io_error)?;
+        return Ok(format::file_header(path, byte_len, line_count, mode));
     }
 
-    // Minified — filename convention or, for big files, newline-density heuristic.
-    if tilth_core::lang::detection::is_minified_by_name(name)
-        || (byte_len >= tilth_core::lang::detection::MINIFIED_CHECK_THRESHOLD
-            && tilth_core::lang::detection::is_minified_by_content(buf))
-    {
-        let line_count = count_lines(buf);
-        return Ok(format::file_header(
-            path,
-            byte_len,
-            line_count,
-            ViewMode::Minified,
-        ));
-    }
+    let mut bytes = head;
+    let rest = usize::try_from(byte_len)
+        .unwrap_or(0)
+        .saturating_sub(bytes.len());
+    bytes.reserve(rest);
+    file.read_to_end(&mut bytes).map_err(io_error)?;
+    let byte_len = bytes.len() as u64;
+    let buf = &bytes[..];
 
     let tokens = estimate_tokens(byte_len);
     let content = String::from_utf8_lossy(buf);
@@ -453,11 +491,18 @@ fn resolve_range(buf: &[u8], range: &str) -> Result<(usize, usize), TilthError> 
             }
         })
     } else {
-        parse_range(range).ok_or_else(|| TilthError::InvalidQuery {
-            query: range.to_string(),
-            reason: "expected format: \"start-end\" (e.g. \"45-89\") or heading (e.g. \"## Architecture\")".into(),
-        })
+        line_range(range)
     }
+}
+
+/// A `"start-end"` range, or the error that names the accepted forms.
+fn line_range(range: &str) -> Result<(usize, usize), TilthError> {
+    parse_range(range).ok_or_else(|| TilthError::InvalidQuery {
+        query: range.to_string(),
+        reason:
+            "expected format: \"start-end\" (e.g. \"45-89\") or heading (e.g. \"## Architecture\")"
+                .into(),
+    })
 }
 
 /// One resolved range, ready to format.
@@ -557,10 +602,22 @@ fn collect_blocks(
         });
     }
 
-    let bytes = fs::read(path).map_err(|e| TilthError::IoError {
+    let io_error = |source| TilthError::IoError {
         path: path.to_path_buf(),
-        source: e,
-    })?;
+        source,
+    };
+    // A heading anchor needs the whole text to find its section. Line ranges
+    // do not, so they stream: a few lines of a huge log cost those lines.
+    if ranges.iter().all(|range| !range.starts_with('#')) {
+        let file = fs::File::open(path).map_err(io_error)?;
+        return stream_line_blocks(std::io::BufReader::new(file), ranges, edit_mode).map_err(|e| {
+            match e {
+                StreamError::Io(source) => io_error(source),
+                StreamError::Range(e) => e,
+            }
+        });
+    }
+    let bytes = fs::read(path).map_err(io_error)?;
     let buf = &bytes[..];
 
     // `line_offsets[i]` is the byte where line `i + 1` starts. A final
@@ -608,6 +665,78 @@ fn collect_blocks(
         });
     }
 
+    Ok((blocks, total_bytes, total_lines))
+}
+
+/// Why [`stream_line_blocks`] failed: reading, or a range the file cannot
+/// serve.
+enum StreamError {
+    Io(std::io::Error),
+    Range(TilthError),
+}
+
+/// [`collect_blocks`] for line ranges only, reading the file one line at a
+/// time and keeping only the lines a range asks for. Ranges are honoured in
+/// the order given, and an invalid range fails the call with the same error,
+/// in the same order, as the in-memory path.
+fn stream_line_blocks(
+    mut reader: impl std::io::BufRead,
+    ranges: &[&str],
+    edit_mode: bool,
+) -> Result<(Vec<Block>, u64, u32), StreamError> {
+    let parsed: Vec<Result<(usize, usize), TilthError>> =
+        ranges.iter().map(|range| line_range(range)).collect();
+    let mut selected: Vec<Vec<u8>> = vec![Vec::new(); ranges.len()];
+
+    // Each `read_until` chunk is one line, a final unterminated one
+    // included, so `total` counts lines the way `count_lines` does.
+    let mut total = 0usize;
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if reader
+            .read_until(b'\n', &mut line)
+            .map_err(StreamError::Io)?
+            == 0
+        {
+            break;
+        }
+        total += 1;
+        for (range, kept) in parsed.iter().zip(&mut selected) {
+            if let Ok((start, end)) = range {
+                if (*start..=*end).contains(&total) {
+                    kept.extend_from_slice(&line);
+                }
+            }
+        }
+    }
+
+    let mut blocks = Vec::with_capacity(ranges.len());
+    let mut total_bytes: u64 = 0;
+    let mut total_lines: u32 = 0;
+    for ((range, parsed), kept) in ranges.iter().zip(parsed).zip(selected) {
+        let (start, end) = parsed.map_err(StreamError::Range)?;
+        if start > total {
+            return Err(StreamError::Range(TilthError::InvalidQuery {
+                query: (*range).to_string(),
+                reason: format!("starts past the end of the file, which has {total} lines"),
+            }));
+        }
+        let end = end.min(total);
+        let text = String::from_utf8_lossy(&kept);
+        total_bytes += text.len() as u64;
+        total_lines += (end - (start - 1)) as u32;
+        let formatted = if edit_mode {
+            format::hashlines(&text, start as u32)
+        } else {
+            format::number_lines(&text, start as u32)
+        };
+        blocks.push(Block {
+            start,
+            end,
+            text: formatted,
+        });
+    }
     Ok((blocks, total_bytes, total_lines))
 }
 
@@ -1330,6 +1459,68 @@ mod tests {
                 all.contains(&format!("({lines} lines")),
                 "{content:?} section should cover {lines} lines: {all}"
             );
+        }
+    }
+
+    /// Line ranges are read by streaming the file. The slices must be the
+    /// file's own lines, in the order asked, overlapping ranges included,
+    /// with a final line that has no newline kept as it is.
+    #[test]
+    fn streamed_line_ranges_return_the_files_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("five.txt");
+        std::fs::write(&path, "one\ntwo\nthree\nfour\nfive").unwrap();
+
+        let out = read_ranges(&path, &["4-9", "2-3", "3-4"], false).unwrap();
+        let bodies: Vec<&str> = out.split("─── lines").skip(1).map(str::trim_end).collect();
+        assert_eq!(bodies.len(), 3, "{out}");
+        assert!(
+            bodies[0].contains("4  four") && bodies[0].contains("5  five"),
+            "{out}"
+        );
+        assert!(
+            bodies[1].contains("2  two") && bodies[1].contains("3  three"),
+            "{out}"
+        );
+        assert!(
+            bodies[2].contains("3  three") && bodies[2].contains("4  four"),
+            "{out}"
+        );
+        assert!(
+            !bodies[1].contains("four"),
+            "a range keeps only its own lines: {out}"
+        );
+
+        let err = read_ranges(&path, &["2-3", "x-y"], false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("x-y") && err.contains("start-end"), "{err}");
+        let err = read_ranges(&path, &["6-7", "x-y"], false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("6-7") && err.contains("5 lines"),
+            "the first bad range is named: {err}"
+        );
+    }
+
+    /// A file shown by its header alone (generated or minified) gets its line
+    /// count from a streamed pass, which must agree with `count_lines`.
+    #[test]
+    fn a_header_only_view_counts_lines_like_count_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = OutlineCache::new();
+        let mut minified = "x".repeat(150_000);
+        minified.push_str("\nend");
+        for (name, content) in [
+            ("package-lock.json", "{\n  \"a\": 1\n}\n".to_string()),
+            ("bundle.js", minified),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, &content).unwrap();
+            let out = read_file(&path, None, false, &cache, false, None).unwrap();
+            let lines = count_lines(content.as_bytes());
+            assert!(out.contains(&format!("{lines} lines")), "{name}: {out}");
         }
     }
 
