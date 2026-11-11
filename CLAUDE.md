@@ -90,6 +90,7 @@ src/
   overview.rs          Project fingerprint for MCP initialization (manifest, languages, modules, deps, git). Instant orientation without a tool call.
   timeout.rs           Per-request wall-clock timeout for sync tool calls — worker thread + bounded channel, tracks abandoned threads on expiry.
   util.rs              atomic_write_bytes() — shared by edit.rs and install.rs.
+  diag.rs              The one stderr sink: error(), warn(), info(). Nothing else prints to stderr.
   types.rs             Binary-only types (QueryType, ViewMode, Match, SearchResult, FacetTotals) and estimate_tokens().
 npm/                   npm wrapper — postinstall downloads binary, run.js proxies to it.
 scripts/fixtures/      setup_repos.py clones four real-world repos at pinned commits (README examples, speed table, parity checks).
@@ -113,6 +114,8 @@ cargo install --path .       # install to ~/.cargo/bin/tilth
 cargo publish --dry-run -p tilth-core  # the library packages on its own
 python3 scripts/check/output_parity.py --base OLD --new NEW --repos <fixture repos>  # byte-for-byte output parity of two tilth builds
 ```
+
+Lints live in `[workspace.lints]` in the root `Cargo.toml` (pedantic, a nursery subset, and restrictions on unwrap, expect, print and unsafe); `clippy.toml` exempts tests. An exception is an item-level `#[expect(lint, reason = "...")]`, never a crate-wide `allow`. Results go to stdout through `write_stdout` (CLI) or the MCP transport; diagnostics go through `diag`.
 
 CI runs `fmt --all --check`, `clippy --workspace --all-targets -D warnings`, `cargo test --workspace` and the tilth-core publish dry-run on every push/PR.
 

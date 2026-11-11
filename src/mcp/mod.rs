@@ -5,6 +5,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::diag;
 use crate::session::Session;
 use crate::timeout::{self, spawn_with_timeout, SpawnFailure, ThreadTracker};
 use tilth_core::cache::OutlineCache;
@@ -80,18 +81,7 @@ const EDIT_MODE_EXTRA: &str = include_str!("../../prompts/mcp-edit.md");
 pub fn run(edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
     let scope_is_explicit = scope.is_some();
 
-    // Resolve the project root and chdir to it.
-    // Priority: explicit --scope > MCP roots (handled later) > package_root(cwd) > cwd
-    if let Some(s) = scope {
-        if s.is_dir() {
-            let _ = std::env::set_current_dir(s);
-        }
-    } else {
-        let cwd = std::env::current_dir().unwrap_or_default();
-        if let Some(root) = tilth_core::lang::package_root(&cwd) {
-            let _ = std::env::set_current_dir(root);
-        }
-    }
+    enter_project_root(scope)?;
 
     let services = Services::new(edit_mode);
     let stdin = io::stdin();
@@ -125,11 +115,17 @@ pub fn run(edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
                 // Only apply roots on success and if --scope was NOT explicitly provided
                 if let Some(root_path) = extract_root_from_response(&msg) {
                     if roots_handoff_allowed(scope_is_explicit, tool_dispatched) {
-                        let _ = std::env::set_current_dir(&root_path);
+                        if let Err(e) = std::env::set_current_dir(&root_path) {
+                            diag::warn(&format!(
+                                "tilth: warning: cannot enter the client's root {}: {e}; \
+                                 searches keep resolving against the launch directory.",
+                                root_path.display()
+                            ));
+                        }
                     } else if !scope_is_explicit {
-                        eprintln!(
+                        diag::warn(
                             "tilth: warning: ignoring roots/list response that arrived after \
-                             tools started; searches keep resolving against the launch directory."
+                             tools started; searches keep resolving against the launch directory.",
                         );
                     }
                 }
@@ -184,6 +180,40 @@ pub fn run(edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Resolve the project root and chdir to it.
+/// Priority: explicit `--scope` > MCP roots (handled later) >
+/// `package_root(cwd)` > cwd.
+/// A scope that cannot be entered is an error; a failure to find or enter
+/// the project root is reported and the server starts where it was launched.
+fn enter_project_root(scope: Option<&Path>) -> io::Result<()> {
+    if let Some(s) = scope {
+        if s.is_dir() {
+            std::env::set_current_dir(s).map_err(|e| {
+                io::Error::new(e.kind(), format!("cannot enter scope {}: {e}", s.display()))
+            })?;
+        }
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => {
+                if let Some(root) = tilth_core::lang::package_root(&cwd) {
+                    if let Err(e) = std::env::set_current_dir(root) {
+                        diag::warn(&format!(
+                            "tilth: warning: cannot enter the project root {}: {e}; \
+                             searches resolve against the launch directory.",
+                            root.display()
+                        ));
+                    }
+                }
+            }
+            Err(e) => diag::warn(&format!(
+                "tilth: warning: cannot read the current directory: {e}; \
+                 relative paths will not resolve. Pass --scope or use absolute paths."
+            )),
+        }
+    }
     Ok(())
 }
 
@@ -253,8 +283,16 @@ fn handle_request(req: &JsonRpcRequest, services: &Services) -> JsonRpcResponse 
             let overview = if std::env::var("TILTH_NO_OVERVIEW").is_ok() {
                 String::new()
             } else {
-                let cwd = std::env::current_dir().unwrap_or_default();
-                crate::overview::fingerprint(&cwd)
+                match std::env::current_dir() {
+                    Ok(cwd) => crate::overview::fingerprint(&cwd),
+                    Err(e) => {
+                        diag::warn(&format!(
+                            "tilth: warning: no project overview: \
+                             cannot read the current directory: {e}"
+                        ));
+                        String::new()
+                    }
+                }
             };
             let instructions = if edit_mode {
                 if overview.is_empty() {

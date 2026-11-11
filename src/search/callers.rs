@@ -41,6 +41,10 @@ struct TargetSites {
 /// the order files arrive in. Only `keep` sites per target are held at once,
 /// which keeps memory flat on a large tree: each site holds its file's text.
 /// Also returns the code files skipped for size that hold a target.
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "the merge loop uses the lock for its whole body, which ends the closure"
+)]
 fn collect_sites(
     targets: &HashSet<String>,
     scope: &Path,
@@ -109,6 +113,12 @@ fn target_seen_in_scope(target: &str, scope: &Path, glob: Option<&str>) -> bool 
             let Ok(file) = std::fs::File::open(path) else {
                 return ignore::WalkState::Continue;
             };
+            // SAFETY: a mapping is sound only while no process truncates or
+            // writes the file. tilth's own writes replace a file by rename
+            // (`util::atomic_write_bytes`), so they leave this inode alone.
+            // Another process writing the file in place is not ruled out: the
+            // mapping lives only for one substring scan, which narrows that
+            // window but does not close it.
             let Ok(mmap) = (unsafe { memmap2::Mmap::map(&file) }) else {
                 return ignore::WalkState::Continue;
             };
@@ -272,6 +282,10 @@ struct Hop2 {
 /// `all_caller_names` must be the target's unique direct-caller names
 /// collected BEFORE `sorted_callers` truncation, so the fan-out threshold
 /// check reflects the true hop-1 breadth rather than the display-capped one.
+#[expect(
+    clippy::too_many_lines,
+    reason = "renderers become functions of a result model in architecture step 6"
+)]
 fn write_second_hop_impact(
     output: &mut String,
     all_caller_names: &HashSet<String>,

@@ -1,21 +1,6 @@
-#![warn(clippy::pedantic)]
-#![allow(
-    clippy::cast_possible_truncation,  // line numbers as u32, token counts — we target 64-bit
-    clippy::cast_sign_loss,            // same
-    clippy::cast_possible_wrap,        // u32→i32 for tree-sitter APIs
-    clippy::module_name_repetitions,   // Rust naming conventions
-    clippy::similar_names,             // common in parser/search code
-    clippy::too_many_lines,            // crate-wide to cover find_definitions in src/search/symbol.rs;
-                                       // narrow to a per-function allow once a refactor shrinks that file
-    clippy::too_many_arguments,        // internal recursive AST walker
-    clippy::unnecessary_wraps,         // Result return for API consistency
-    clippy::struct_excessive_bools,    // CLI struct derives clap
-    clippy::missing_errors_doc,        // internal pub(crate) fns don't need error docs
-    clippy::missing_panics_doc,        // same
-)]
-
 pub(crate) mod budget;
 pub(crate) mod classify;
+pub mod diag;
 pub mod diff;
 pub(crate) mod edit;
 pub(crate) mod edit_parse_check;
@@ -281,6 +266,10 @@ pub fn run_full(
 /// `cli.full || !is_tty`). `cli_full` is the *parsed* `--full` flag and
 /// alone gates the search match-cap bump; piped invocation must not raise
 /// the cap (see `piped_invocation_does_not_auto_expand` pin).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "per-call options become one Request in architecture step 2"
+)]
 pub fn run_expanded(
     query: &str,
     scope: &Path,
@@ -358,6 +347,10 @@ pub fn run_grok(target_spec: &str, scope: &Path, full: bool) -> Result<String, T
     Ok(search::grok::format_grok(&result, scope))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "per-call options become one Request in architecture step 2"
+)]
 fn run_inner(
     query: &str,
     scope: &Path,

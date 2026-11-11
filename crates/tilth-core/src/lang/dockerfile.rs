@@ -2,7 +2,7 @@
 
 use crate::lang::spec::{LangSpec, StdlibRule, DEFAULT_DEFS, DEFAULT_DEF_KINDS};
 
-pub(crate) const SPEC: LangSpec = LangSpec {
+pub const SPEC: LangSpec = LangSpec {
     display: "Docker",
     extensions: &[],
     filenames: &["Dockerfile", "Containerfile"],

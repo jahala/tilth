@@ -8,12 +8,12 @@ use tilth_core::lang::outline::get_outline_entries;
 use tilth_core::search::callers::find_callers_batch;
 use tilth_core::types::{is_test_file, FileType, OutlineEntry, OutlineKind};
 
-pub(crate) struct TouchedSymbol {
+pub struct TouchedSymbol {
     name: String,
 }
 
 /// Returns symbols whose definitions overlap the given edit ranges.
-pub(crate) fn touched_symbols(edits: &[Edit], entries: &[OutlineEntry]) -> Vec<TouchedSymbol> {
+pub fn touched_symbols(edits: &[Edit], entries: &[OutlineEntry]) -> Vec<TouchedSymbol> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut result: Vec<TouchedSymbol> = Vec::new();
 
@@ -62,7 +62,7 @@ fn collect_touched(
 /// Returns a formatted string describing external callers of any definitions
 /// touched by the edits. Returns `None` if no definitions were touched or no
 /// external callers exist.
-pub(crate) fn blast_radius(
+pub fn blast_radius(
     path: &Path,
     edits: &[Edit],
     scope: &Path,
@@ -128,7 +128,7 @@ pub(crate) fn blast_radius(
 /// Call sites after which a blast walk stops. Blast runs on every write
 /// that touches a definition, so it must stay fast on a huge tree; past
 /// this many sites its counts are labelled lower bounds.
-pub(crate) const BLAST_STOP_AFTER: usize = 50;
+pub const BLAST_STOP_AFTER: usize = 50;
 
 /// `n` as a count, prefixed "at least" when the walk stopped early.
 fn lower_bound(n: usize, partial: bool) -> String {

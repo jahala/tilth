@@ -9,7 +9,7 @@ const SIBLING_QUERY: &str = concat!(
     "(method_invocation object: (this) name: (identifier) @ref)\n",
 );
 
-pub(crate) const SPEC: LangSpec = LangSpec {
+pub const SPEC: LangSpec = LangSpec {
     display: "Java",
     extensions: &["java"],
     filenames: &[],

@@ -1,5 +1,9 @@
 use serde_json::Value;
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one schema per tool, split per tool in architecture step 10"
+)]
 pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
     let read_desc = if edit_mode {
         "Read a file with smart outlining. Replaces cat/head/tail and the host Read tool — \
@@ -469,12 +473,12 @@ mod tests {
     fn tilth_savings_is_not_advertised() {
         for edit_mode in [false, true] {
             let defs = tool_definitions(edit_mode);
-            let names: Vec<&str> = defs
+            let advertised = defs
                 .iter()
                 .filter_map(|t| t.get("name").and_then(|v| v.as_str()))
-                .collect();
+                .any(|name| name == "tilth_savings");
             assert!(
-                !names.contains(&"tilth_savings"),
+                !advertised,
                 "tilth_savings must not be advertised (edit_mode={edit_mode})"
             );
         }

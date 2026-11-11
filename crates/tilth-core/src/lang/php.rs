@@ -11,7 +11,7 @@ const CALLEE_QUERY: &str = concat!(
     "(scoped_call_expression name: (name) @callee)\n",
 );
 
-pub(crate) const SPEC: LangSpec = LangSpec {
+pub const SPEC: LangSpec = LangSpec {
     display: "PHP",
     extensions: &["php", "phtml"],
     filenames: &[],

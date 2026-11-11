@@ -4,7 +4,7 @@ use crate::lang::spec::{LangSpec, StdlibRule, DEFAULT_DEFS, DEFAULT_DEF_KINDS};
 
 const CALLEE_QUERY: &str = "(call method: (identifier) @callee)\n";
 
-pub(crate) const SPEC: LangSpec = LangSpec {
+pub const SPEC: LangSpec = LangSpec {
     display: "Ruby",
     extensions: &["rb"],
     filenames: &["Vagrantfile", "Rakefile"],

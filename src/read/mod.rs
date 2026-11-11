@@ -15,10 +15,10 @@ use tilth_core::lang::outline::{heading_level, heading_text, parse_markdown};
 use tilth_core::source::{strip_bom, strip_bom_bytes};
 use tilth_core::types::FileType;
 
-pub(crate) const TOKEN_THRESHOLD: u64 = 6_000;
+pub const TOKEN_THRESHOLD: u64 = 6_000;
 /// How many of a file's local imports the "Related:" hint under an outlined
 /// read names, in import order.
-pub(crate) const RELATED_HINT_LIMIT: usize = 8;
+pub const RELATED_HINT_LIMIT: usize = 8;
 /// Minimum compression ratio required to prefer the outline over full content.
 /// If `outline_tokens >= full_tokens * OUTLINE_MIN_COMPRESSION / 100`, the
 /// outline saves too few tokens to be worth the information loss, so the full
@@ -31,7 +31,7 @@ const FILE_SIZE_CAP: u64 = 500_000; // 500KB
 /// responses that cause MCP client timeouts. Grok shares this cap to bound
 /// its lossy decode + outline parse of code files.
 /// Override with `TILTH_FULL_SIZE_CAP` env var (bytes). Default: 2MB.
-pub(crate) fn full_read_size_cap() -> u64 {
+pub fn full_read_size_cap() -> u64 {
     std::env::var("TILTH_FULL_SIZE_CAP")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -43,7 +43,7 @@ pub(crate) fn full_read_size_cap() -> u64 {
 /// many lines as newlines. Counting newlines + 1 made every such file one
 /// line longer than it is, and let a section past the last line succeed
 /// with an empty body.
-pub(crate) fn count_lines(buf: &[u8]) -> u32 {
+pub fn count_lines(buf: &[u8]) -> u32 {
     let newlines = memchr::memchr_iter(b'\n', buf).count();
     let unterminated = usize::from(buf.last().is_some_and(|&b| b != b'\n'));
     u32::try_from(newlines + unterminated).unwrap_or(u32::MAX)
@@ -56,6 +56,10 @@ pub(crate) fn count_lines(buf: &[u8]) -> u32 {
 /// outline that does not fit is cut to fit, saying what it left out. With
 /// `full` or a `section`, the content is what was asked for, and the
 /// caller's budget cut applies to it as before.
+#[expect(
+    clippy::too_many_lines,
+    reason = "reading goes through one Source in architecture step 3"
+)]
 pub fn read_file(
     path: &Path,
     section: Option<&str>,
@@ -107,6 +111,11 @@ pub fn read_file(
         path: path.to_path_buf(),
         source: e,
     })?;
+    // SAFETY: a mapping is sound only while no process truncates or writes
+    // the file. tilth's own writes replace a file by rename
+    // (`util::atomic_write_bytes`), so they leave this mapping's inode alone.
+    // Another process writing the file in place is not ruled out: the mapping
+    // lives only for this call, which narrows that window but does not close it.
     let mmap = unsafe { Mmap::map(&file) }.map_err(|e| TilthError::IoError {
         path: path.to_path_buf(),
         source: e,
@@ -157,9 +166,15 @@ pub fn read_file(
     if full && byte_len > cap {
         let file_type = detect_file_type_with_content(path, &content);
         let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        #[allow(clippy::cast_precision_loss)] // cap and file sizes fit in f64 mantissa for display
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "display only; file sizes fit the f64 mantissa"
+        )]
         let cap_mb = cap as f64 / 1_000_000.0;
-        #[allow(clippy::cast_precision_loss)]
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "display only; file sizes fit the f64 mantissa"
+        )]
         let file_mb = byte_len as f64 / 1_000_000.0;
 
         let outline = cache.get_or_compute(path, mtime, || {
@@ -291,7 +306,6 @@ fn resolve_heading(buf: &[u8], heading: &str) -> Option<(usize, usize)> {
     let tree = parse_markdown(content)?;
     let lines: Vec<&str> = content.lines().collect();
 
-    #[allow(clippy::cast_possible_truncation)]
     let level = query_level as u8;
     find_section(tree.root_node(), &lines, level, query_text)
 }
@@ -557,6 +571,11 @@ fn collect_blocks(
         path: path.to_path_buf(),
         source: e,
     })?;
+    // SAFETY: a mapping is sound only while no process truncates or writes
+    // the file. tilth's own writes replace a file by rename
+    // (`util::atomic_write_bytes`), so they leave this mapping's inode alone.
+    // Another process writing the file in place is not ruled out: the mapping
+    // lives only for this call, which narrows that window but does not close it.
     let mmap = unsafe { Mmap::map(&file) }.map_err(|e| TilthError::IoError {
         path: path.to_path_buf(),
         source: e,
@@ -642,13 +661,9 @@ fn list_directory(path: &Path) -> Result<String, TilthError> {
         let suffix = match ft {
             Some(t) if t.is_dir() => "/".to_string(),
             Some(t) if t.is_symlink() => " →".to_string(),
-            _ => match meta {
-                Some(m) => {
-                    let tokens = estimate_tokens(m.len());
-                    format!("  ({tokens} tokens)")
-                }
-                None => String::new(),
-            },
+            _ => meta.map_or_else(String::new, |m| {
+                format!("  ({} tokens)", estimate_tokens(m.len()))
+            }),
         };
         entries.push(format!("  {name}{suffix}"));
     }
@@ -697,7 +712,7 @@ fn edit_distance(a: &str, b: &str) -> usize {
 }
 
 /// Guess MIME type from extension for binary file headers.
-pub(crate) fn mime_from_ext(path: &Path) -> &'static str {
+pub fn mime_from_ext(path: &Path) -> &'static str {
     match path.extension().and_then(|e| e.to_str()) {
         Some("png") => "image/png",
         Some("jpg" | "jpeg") => "image/jpeg",

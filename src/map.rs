@@ -32,7 +32,7 @@ pub fn generate(scope: &Path, depth: usize, budget: Option<u64>, cache: &Outline
             continue;
         }
 
-        let parent = rel.parent().unwrap_or(Path::new("")).to_path_buf();
+        let parent = rel.parent().map_or_else(PathBuf::new, Path::to_path_buf);
         let name = rel
             .file_name()
             .and_then(|n| n.to_str())
@@ -123,7 +123,10 @@ fn compute_dir_totals(tree: &BTreeMap<PathBuf, Vec<FileEntry>>) -> BTreeMap<Path
 /// that would round to `"1000.0k"` under `{:.1}` formatting roll cleanly into
 /// the M tier (`"1.0M"`) instead of producing four-digit k labels.
 fn fmt_tokens(n: u64) -> String {
-    #[allow(clippy::cast_precision_loss)] // display-only; mantissa loss is fine for summaries
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "display only, rounded to one decimal"
+    )]
     let f = n as f64;
     if f >= 999_950.0 {
         format!("{:.1}M", f / 1_000_000.0)

@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Whether a guarded write reached the target, or refused because the target
 /// no longer held the content the caller verified.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum WriteOutcome {
+pub enum WriteOutcome {
     Written,
     Stale,
 }
@@ -20,7 +20,7 @@ pub(crate) enum WriteOutcome {
 /// one read plus one rename rather than the caller's whole verify-and-compute
 /// pass. That window is not zero: this narrows cross-process lost updates, it
 /// does not eliminate them.
-pub(crate) fn atomic_write_bytes_if_unchanged(
+pub fn atomic_write_bytes_if_unchanged(
     path: &Path,
     bytes: &[u8],
     expected: &[u8],
@@ -36,7 +36,7 @@ pub(crate) fn atomic_write_bytes_if_unchanged(
 ///
 /// The temp name is qualified with the process ID and a process-wide counter
 /// so concurrent or batched writes in the same directory can't collide.
-pub(crate) fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     write_via_temp(path, bytes, None).map(drop)
 }
 
@@ -55,12 +55,17 @@ fn write_via_temp(
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     let tmp = dir.join(format!(".tilth-tmp.{}.{n}", std::process::id()));
+    // Every remove of `tmp` below is cleanup on a path that already failed
+    // or was refused. The caller needs that outcome, not a second error from
+    // the cleanup, and at worst one dot-named temp file stays behind.
     std::fs::write(&tmp, bytes).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })?;
     // Preserve original file permissions so the rename doesn't widen or strip
-    // the mode. Ignore errors — target may not exist yet or platform may not
-    // support it; the write already succeeded.
+    // the mode. A target that does not exist yet has none to keep. The temp
+    // file is ours, so setting its mode fails only on a filesystem without
+    // Unix modes (FAT, some network mounts), where there is no mode to keep
+    // either; the write goes ahead.
     if let Ok(meta) = std::fs::metadata(path) {
         let _ = std::fs::set_permissions(&tmp, meta.permissions());
     }

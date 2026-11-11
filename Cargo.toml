@@ -14,9 +14,63 @@ categories = ["command-line-utilities", "development-tools"]
 members = ["crates/tilth-core"]
 exclude = ["fuzz"]
 
+# Each dependency both crates use is declared here once, so the two can
+# never drift to different requirements.
+[workspace.dependencies]
+tree-sitter = "0.27"
+streaming-iterator = "0.1"
+ignore = "0.4"
+memchr = "2"
+dashmap = "6"
+tempfile = "3"
+
+# One lint policy for both crates. CI runs clippy with -D warnings, so every
+# warning here fails the build. An exception is an item-level
+# #[expect(lint, reason = "...")], which itself fails once the code it
+# excuses is gone.
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Project conventions, allowed everywhere. tree-sitter reports rows and
+# columns as usize, while its own APIs and our line numbers use u32 and i32.
+# tilth targets 64-bit hosts and source files far below 4 GiB, so these
+# conversions cannot lose a real value.
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+# Parser and search code names related values alike (start and end, node and
+# nodes).
+similar_names = "allow"
+# The pub items are internal API between the two crates. Their error and
+# panic behaviour is documented where it is surprising, not by rote.
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+# A curated nursery subset, each precise on this codebase.
+redundant_clone = "warn"
+use_self = "warn"
+or_fun_call = "warn"
+significant_drop_tightening = "warn"
+needless_collect = "warn"
+option_if_let_else = "warn"
+redundant_pub_crate = "warn"
+
+# Restrictions. clippy.toml exempts tests from the unwrap, expect, print and
+# dbg lints.
+undocumented_unsafe_blocks = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+
 [[bin]]
 name = "tilth"
 path = "src/main.rs"
+
+[lints]
+workspace = true
 
 [dependencies]
 # The parsing substrate: language detection, outlines, imports, callers, deps
@@ -27,20 +81,20 @@ clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 
 # Tree-sitter types the read, search, diff and edit layers still name
-tree-sitter = "0.27"
-streaming-iterator = "0.1"
+tree-sitter = { workspace = true }
+streaming-iterator = { workspace = true }
 
 # Search (ripgrep internals)
 grep-regex = "0.1"
 grep-searcher = "0.1"
-ignore = "0.4"
+ignore = { workspace = true }
 globset = "0.4"
 
 # Regex escaping (transitive dep of grep-regex, used directly for literal search)
 regex-syntax = "0.8"
 
 # Byte scanning (SIMD-accelerated)
-memchr = "2"
+memchr = { workspace = true }
 memmap2 = "0.9"
 
 # Parallelism
@@ -52,7 +106,7 @@ rayon = "1"
 crossbeam-channel = "0.5"
 
 # Concurrent map for the editor's per-file locks
-dashmap = "6"
+dashmap = { workspace = true }
 
 # Structured data parsing
 serde = { version = "1", features = ["derive"] }
@@ -79,7 +133,7 @@ terminal_size = "0.4"
 libc = "0.2"
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { workspace = true }
 tilth-core = { path = "crates/tilth-core", version = "0.13.0", features = ["test-fixtures"] }
 
 [profile.release]

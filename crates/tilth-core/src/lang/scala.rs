@@ -13,7 +13,7 @@ const SIBLING_QUERY: &str = concat!(
     "(call_expression function: (field_expression (identifier) @obj (identifier) @ref))\n",
 );
 
-pub(crate) const SPEC: LangSpec = LangSpec {
+pub const SPEC: LangSpec = LangSpec {
     display: "Scala",
     extensions: &["scala", "sc"],
     filenames: &[],

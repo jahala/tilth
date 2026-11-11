@@ -257,22 +257,19 @@ fn format_entry(entry: &OutlineEntry, indent: usize, lang: Lang, detail: Detail)
         return format!("{prefix}{range:<12} {kind_label} {}", entry.name);
     }
 
-    let sig = match &entry.signature {
-        Some(s) => format!("\n{prefix}           {s}"),
-        None => String::new(),
-    };
+    let sig = entry
+        .signature
+        .as_ref()
+        .map_or_else(String::new, |s| format!("\n{prefix}           {s}"));
 
-    let doc = match &entry.doc {
-        Some(d) => {
-            let truncated = if d.len() > 60 {
-                format!("{}...", tilth_core::types::truncate_str(d, 57))
-            } else {
-                d.clone()
-            };
-            format!("  // {truncated}")
-        }
-        None => String::new(),
-    };
+    let doc = entry.doc.as_ref().map_or_else(String::new, |d| {
+        let truncated = if d.len() > 60 {
+            format!("{}...", tilth_core::types::truncate_str(d, 57))
+        } else {
+            d.clone()
+        };
+        format!("  // {truncated}")
+    });
 
     format!("{prefix}{range:<12} {kind_label} {}{sig}{doc}", entry.name)
 }

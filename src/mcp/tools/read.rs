@@ -13,6 +13,10 @@ use tilth_core::types::{FileType, OutlineEntry, OutlineKind};
 
 use super::apply_budget;
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "split by responsibility in architecture step 10"
+)]
 pub(in crate::mcp) fn tool_read(
     args: &Value,
     cache: &OutlineCache,

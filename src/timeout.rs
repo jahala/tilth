@@ -35,7 +35,7 @@ const MAX_ABANDONED_THREADS: usize = 8;
 /// Live count of threads that timed out and are still running in the background.
 /// Owned by `Services`, so tests instantiate their own instance rather than
 /// serializing on a global.
-pub(crate) struct ThreadTracker {
+pub struct ThreadTracker {
     count: AtomicUsize,
 }
 
@@ -163,7 +163,7 @@ impl ThreadCoord {
 /// failure) can be added without churning every call site.
 #[derive(Debug, PartialEq)]
 #[non_exhaustive]
-pub(crate) enum SpawnFailure {
+pub enum SpawnFailure {
     Timeout,
     Panic,
 }
@@ -171,7 +171,7 @@ pub(crate) enum SpawnFailure {
 /// Per-request timeout for tool calls. If a tool doesn't respond within this
 /// duration, the MCP server returns a timeout error instead of hanging.
 /// Override with `TILTH_TIMEOUT` env var (seconds). Default: 90s.
-pub(crate) fn request_timeout() -> Duration {
+pub fn request_timeout() -> Duration {
     let secs = std::env::var("TILTH_TIMEOUT")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -183,7 +183,7 @@ pub(crate) fn request_timeout() -> Duration {
 /// Returns `Ok(result)` on success. On timeout, returns `Err(SpawnFailure::Timeout)`
 /// and detaches the worker; the tracker is incremented and the worker will
 /// decrement it when it eventually exits. On worker panic, returns `Err(Panic)`.
-pub(crate) fn spawn_with_timeout<F, R>(
+pub fn spawn_with_timeout<F, R>(
     tracker: &Arc<ThreadTracker>,
     timeout: Duration,
     work: F,
@@ -202,6 +202,8 @@ where
         // even if work() panics after the main thread has already timed out.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
         if let Ok(val) = result {
+            // The send fails only when the caller stopped waiting after its
+            // timeout; the result is then unwanted and is dropped with it.
             let _ = tx.send(val);
         }
         // tx is dropped here on panic, so main thread gets RecvError.
@@ -217,6 +219,9 @@ where
     select! {
         recv(rx) -> msg => match msg {
             Ok(result) => {
+                // The worker has delivered its result and only has its own
+                // bookkeeping left. Joining just waits for that; it catches
+                // its own panics, so the join has no error to report.
                 let _ = handle.join();
                 Ok(result)
             }
@@ -231,10 +236,10 @@ where
                 let n = tracker.record_timeout();
                 coord.ack_timeout();
                 if n == ABANDONED_THREAD_WARN {
-                    eprintln!(
+                    crate::diag::warn(&format!(
                         "tilth: warning: {n} abandoned threads still running. \
                          Consider reducing scope or increasing TILTH_TIMEOUT."
-                    );
+                    ));
                 }
             }
             Err(SpawnFailure::Timeout)

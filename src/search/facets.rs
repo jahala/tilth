@@ -117,12 +117,11 @@ pub fn totals(files: &[FileFacets], primary_def: Option<&Match>) -> FacetTotals 
         if f.usages == 0 {
             continue;
         }
-        let local = match f.path.parent() {
-            Some(dir) => *local_dirs
+        let local = f.path.parent().is_some_and(|dir| {
+            *local_dirs
                 .entry(dir)
-                .or_insert_with(|| is_same_package(&f.path, primary_pkg.as_ref())),
-            None => false,
-        };
+                .or_insert_with(|| is_same_package(&f.path, primary_pkg.as_ref()))
+        });
         if local {
             totals.usages_local += f.usages;
         } else {

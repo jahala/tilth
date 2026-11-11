@@ -27,7 +27,7 @@ pub(super) struct Block {
 
 /// What survives of one block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Fit {
+pub enum Fit {
     Whole,
     /// The block's lines before its expansion.
     WithoutBody,
@@ -49,7 +49,7 @@ pub(crate) enum Fit {
 ///
 /// When the total cost is within budget every block is kept whole, so the
 /// caller's render is byte-identical to the un-budgeted output.
-pub(crate) fn select_within_budget(items: &[(i64, u64, u64)], budget: u64) -> Vec<Fit> {
+pub fn select_within_budget(items: &[(i64, u64, u64)], budget: u64) -> Vec<Fit> {
     // Fast path: everything fits → keep all (byte-identical render). Saturating
     // so a future caller passing pathological token counts can't overflow-panic
     // in debug (within `fit_to_budget` the sum is bounded by the body length).

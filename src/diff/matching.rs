@@ -74,14 +74,25 @@ fn pair_overloads(
     pairs
 }
 
+/// The symbols a change is about: a matched pair, or one side alone.
+#[derive(Clone, Copy)]
+enum Sides<'a> {
+    Both(&'a DiffSymbol, &'a DiffSymbol),
+    Old(&'a DiffSymbol),
+    New(&'a DiffSymbol),
+}
+
 /// A change between an old and a new symbol, either of which may be absent.
 fn change_of(
-    old: Option<&DiffSymbol>,
-    new: Option<&DiffSymbol>,
+    sides: Sides<'_>,
     change: ChangeType,
     match_confidence: MatchConfidence,
 ) -> SymbolChange {
-    let named = new.or(old).expect("a change has an old or a new symbol");
+    let (old, new, named) = match sides {
+        Sides::Both(old, new) => (Some(old), Some(new), new),
+        Sides::Old(old) => (Some(old), None, old),
+        Sides::New(new) => (None, Some(new), new),
+    };
     let span = |s: &DiffSymbol| -> Span { (s.entry.start_line, s.entry.end_line) };
     SymbolChange {
         name: named.identity.name.clone(),
@@ -101,6 +112,10 @@ fn change_of(
 ///
 /// Returns a `SymbolChange` for **every** matched pair (including unchanged)
 /// plus any unmatched old (Deleted) and unmatched new (Added), in file order.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the diff model is rebuilt in architecture step 7"
+)]
 pub(crate) fn match_symbols(old: &[DiffSymbol], new: &[DiffSymbol]) -> Vec<SymbolChange> {
     let mut old_matched = vec![false; old.len()];
     let mut new_matched = vec![false; new.len()];
@@ -129,7 +144,7 @@ pub(crate) fn match_symbols(old: &[DiffSymbol], new: &[DiffSymbol]) -> Vec<Symbo
                 } else {
                     ChangeType::BodyChanged
                 };
-                changes.push(change_of(Some(o), Some(n), change, MatchConfidence::Exact));
+                changes.push(change_of(Sides::Both(o, n), change, MatchConfidence::Exact));
             }
             // Leftovers on either side fall through to the later phases.
         }
@@ -167,8 +182,7 @@ pub(crate) fn match_symbols(old: &[DiffSymbol], new: &[DiffSymbol]) -> Vec<Symbo
                     old_name: old[oi].identity.name.clone(),
                 };
                 changes.push(change_of(
-                    Some(&old[oi]),
-                    Some(&new[ni]),
+                    Sides::Both(&old[oi], &new[ni]),
                     renamed,
                     MatchConfidence::Structural,
                 ));
@@ -179,8 +193,7 @@ pub(crate) fn match_symbols(old: &[DiffSymbol], new: &[DiffSymbol]) -> Vec<Symbo
                     if !new_matched[ni] {
                         new_matched[ni] = true;
                         changes.push(change_of(
-                            None,
-                            Some(&new[ni]),
+                            Sides::New(&new[ni]),
                             ChangeType::Added,
                             MatchConfidence::Ambiguous(count),
                         ));
@@ -190,8 +203,7 @@ pub(crate) fn match_symbols(old: &[DiffSymbol], new: &[DiffSymbol]) -> Vec<Symbo
                     if !old_matched[oi] {
                         old_matched[oi] = true;
                         changes.push(change_of(
-                            Some(&old[oi]),
-                            None,
+                            Sides::Old(&old[oi]),
                             ChangeType::Deleted,
                             MatchConfidence::Ambiguous(count),
                         ));
@@ -231,7 +243,10 @@ pub(crate) fn match_symbols(old: &[DiffSymbol], new: &[DiffSymbol]) -> Vec<Symbo
             } else {
                 (len_b, len_a)
             };
-            #[allow(clippy::cast_precision_loss)]
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "a size ratio; line lengths fit the f32 mantissa"
+            )]
             if max_len == 0 || (min_len as f32 / max_len as f32) < 0.8 {
                 continue;
             }
@@ -264,8 +279,7 @@ pub(crate) fn match_symbols(old: &[DiffSymbol], new: &[DiffSymbol]) -> Vec<Symbo
             }
         };
         changes.push(change_of(
-            Some(&old[oi]),
-            Some(&new[ni]),
+            Sides::Both(&old[oi], &new[ni]),
             change,
             MatchConfidence::Fuzzy(score),
         ));
@@ -277,8 +291,7 @@ pub(crate) fn match_symbols(old: &[DiffSymbol], new: &[DiffSymbol]) -> Vec<Symbo
     for (i, matched) in old_matched.iter().enumerate() {
         if !matched {
             changes.push(change_of(
-                Some(&old[i]),
-                None,
+                Sides::Old(&old[i]),
                 ChangeType::Deleted,
                 MatchConfidence::Exact,
             ));
@@ -287,8 +300,7 @@ pub(crate) fn match_symbols(old: &[DiffSymbol], new: &[DiffSymbol]) -> Vec<Symbo
     for (i, matched) in new_matched.iter().enumerate() {
         if !matched {
             changes.push(change_of(
-                None,
-                Some(&new[i]),
+                Sides::New(&new[i]),
                 ChangeType::Added,
                 MatchConfidence::Exact,
             ));
@@ -686,6 +698,10 @@ mod tests {
     /// parameter is a signature change, and re-wrapping the header changes
     /// nothing in its signature.
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "a table of cases, one per language; its length is the data"
+    )]
     fn body_and_signature_edits_across_languages() {
         // (lang, file, the edited symbol's name, base, body edit, signature edit)
         let cases: &[(Lang, &str, &str, &str, &str, &str)] = &[
@@ -1071,11 +1087,11 @@ mod tests {
         ];
         let changes = match_symbols(&old, &new);
         // Both should be matched (by position order) — both changed
-        let body_changes: Vec<_> = changes
+        let body_changes = changes
             .iter()
             .filter(|c| matches!(c.change, ChangeType::BodyChanged))
-            .collect();
-        assert_eq!(body_changes.len(), 2);
+            .count();
+        assert_eq!(body_changes, 2);
     }
 
     // 4b. reordered overload: the unchanged twin must match exactly, not
@@ -1230,12 +1246,12 @@ mod tests {
             ),
         ];
         let changes = match_symbols(&old, &new);
-        let ambiguous: Vec<_> = changes
+        let ambiguous = changes
             .iter()
             .filter(|c| matches!(c.match_confidence, MatchConfidence::Ambiguous(_)))
-            .collect();
+            .count();
         assert!(
-            ambiguous.len() >= 2,
+            ambiguous >= 2,
             "multiple structural matches should produce Ambiguous entries"
         );
     }
@@ -1319,12 +1335,11 @@ mod tests {
         )];
         let changes = match_symbols(&old, &new);
         // Should not fuzzy-match due to size ratio pre-filter
-        let fuzzy: Vec<_> = changes
+        let any_fuzzy = changes
             .iter()
-            .filter(|c| matches!(c.match_confidence, MatchConfidence::Fuzzy(_)))
-            .collect();
+            .any(|c| matches!(c.match_confidence, MatchConfidence::Fuzzy(_)));
         assert!(
-            fuzzy.is_empty(),
+            !any_fuzzy,
             "vastly different sizes should be skipped by pre-filter"
         );
     }

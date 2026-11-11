@@ -90,6 +90,10 @@ enum EditResult {
 /// 4. Splice replacements
 /// 5. Write file
 /// 6. Return hashlined context around edit sites
+#[expect(
+    clippy::too_many_lines,
+    reason = "split by responsibility in architecture step 10"
+)]
 fn apply_edits(path: &Path, edits: &[Edit]) -> Result<EditResult, TilthError> {
     if edits.is_empty() {
         return Ok(EditResult::Applied {
@@ -383,7 +387,7 @@ fn format_diffs(diffs: &[EditDiff]) -> String {
 /// — surfacing as a flaky `dedup_catches_nonexistent_alias_spellings`
 /// failure under CI's parallel test runner. Pure-lexical normalization
 /// removes the race.
-pub(crate) fn normalize_path_key(path: &Path) -> String {
+pub fn normalize_path_key(path: &Path) -> String {
     let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| lexical_normalize(path));
     let key = resolved.to_string_lossy().into_owned();
     if cfg!(target_os = "macos") {
@@ -450,7 +454,7 @@ fn lexical_normalize(path: &Path) -> PathBuf {
 /// rather than lose an edit, but two entries for one file in a single batch
 /// are a malformed request: the second set of hashes was computed against
 /// content the first set is about to replace, so it can only fail.
-pub(crate) fn detect_duplicate_paths(tasks: &[FileEditTask]) -> Option<String> {
+pub fn detect_duplicate_paths(tasks: &[FileEditTask]) -> Option<String> {
     use std::collections::HashSet;
     let mut seen: HashSet<String> = HashSet::new();
     for task in tasks {
@@ -1342,7 +1346,7 @@ mod tests {
         let h = hash_at(content, 1);
 
         let tasks = vec![ready_task(
-            f.clone(),
+            f,
             vec![Edit {
                 start_line: 1,
                 start_hash: h,
@@ -1369,7 +1373,7 @@ mod tests {
         let h = hash_at(content, 1);
 
         let tasks = vec![ready_task(
-            f.clone(),
+            f,
             vec![Edit {
                 start_line: 1,
                 start_hash: h,

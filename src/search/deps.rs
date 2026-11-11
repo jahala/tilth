@@ -226,7 +226,10 @@ fn format_used_by(deps: &[&Dependent], scope: &Path, heading: &str) -> String {
 }
 
 /// Apply progressive budget truncation and reassemble the output.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "renderers become functions of a result model in architecture step 6"
+)]
 fn apply_budget_truncation(
     header: &str,
     uses_local_full: &str,

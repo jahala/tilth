@@ -3,6 +3,8 @@ use std::path::PathBuf;
 
 use serde_json::{json, Value};
 
+use crate::diag;
+
 // Supported MCP hosts and their config locations.
 //
 // Paths verified from official docs (2025):
@@ -92,12 +94,15 @@ pub fn run(host: &str, edit: bool) -> Result<(), String> {
     }
 
     if edit {
-        eprintln!("✓ tilth (edit mode) added to {}", host_info.path.display());
+        diag::info(&format!(
+            "✓ tilth (edit mode) added to {}",
+            host_info.path.display()
+        ));
     } else {
-        eprintln!("✓ tilth added to {}", host_info.path.display());
+        diag::info(&format!("✓ tilth added to {}", host_info.path.display()));
     }
     if let Some(note) = host_info.note {
-        eprintln!("  {note}");
+        diag::info(&format!("  {note}"));
     }
     Ok(())
 }
@@ -130,9 +135,9 @@ fn write_json_config(host_info: &HostInfo, edit: bool) -> Result<(), String> {
         tilth_server_entry(edit, &host_info.format),
     )?;
 
-    let out =
-        serde_json::to_string_pretty(&config).expect("serde_json::Value is always serializable");
-    atomic_write(&host_info.path, &out)?;
+    // `{:#}` is serde_json's pretty printer, the same one `to_string_pretty`
+    // uses, without its impossible error.
+    atomic_write(&host_info.path, &format!("{config:#}"))?;
     Ok(())
 }
 
@@ -300,6 +305,10 @@ struct HostInfo {
     note: Option<&'static str>,
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one match arm per supported host; its length is the host table"
+)]
 fn resolve_host(host: &str) -> Result<HostInfo, String> {
     let home = home_dir()?;
 

@@ -535,10 +535,10 @@ pub fn diff(
 
     let label = source_label(source);
     let mut output = if detail {
-        match detail_fn {
-            Some(f) => format::format_function_detail(&overlays[0], f),
-            None => format::format_file_detail(&overlays[0], &warnings, budget),
-        }
+        detail_fn.map_or_else(
+            || format::format_file_detail(&overlays[0], &warnings, budget),
+            |f| format::format_function_detail(&overlays[0], f),
+        )
     } else {
         let file_meta: Vec<(&Path, bool, bool)> = overlays
             .iter()
@@ -785,10 +785,10 @@ fn compute_blast(overlays: &[FileOverlay], repo: Option<&Path>) -> Vec<String> {
         return Vec::new();
     }
 
-    let scope = match repo {
-        Some(r) => r.to_path_buf(),
-        None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-    };
+    let scope = repo.map_or_else(
+        || std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        Path::to_path_buf,
+    );
     let bloom = tilth_core::index::bloom::BloomFilterCache::new();
 
     // Stops at the same bound as a write's blast radius, so a diff stays
@@ -1453,7 +1453,7 @@ diff --git a/src/main.rs b/src/main.rs
 
         let result = run_diff_in(
             dir.path(),
-            &DiffSource::Patch(patch.clone()),
+            &DiffSource::Patch(patch),
             None,
             None,
             false,

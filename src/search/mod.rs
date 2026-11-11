@@ -94,13 +94,15 @@ fn parse_pattern(query: &str) -> (&str, bool) {
 /// Does a file over the size limit contain what the search looks for? The
 /// walkers skip such a file without parsing it, and this one plain read is
 /// what lets the result name it instead of leaving it out in silence.
-pub(crate) fn oversized_holds(path: &Path, found: impl Fn(&[u8]) -> bool) -> bool {
+pub fn oversized_holds(path: &Path, found: impl Fn(&[u8]) -> bool) -> bool {
     std::fs::read(path).is_ok_and(|bytes| found(&bytes))
 }
 
 /// Does `matcher` match anywhere in `bytes`? Stops at the first hit.
-pub(crate) fn has_match(matcher: &grep_regex::RegexMatcher, bytes: &[u8]) -> bool {
+pub fn has_match(matcher: &grep_regex::RegexMatcher, bytes: &[u8]) -> bool {
     let mut hit = false;
+    // The sink only stops the search early and never errors, and a slice
+    // needs no I/O, so the `Result` carries nothing.
     let _ = grep_searcher::Searcher::new().search_slice(
         matcher,
         bytes,
@@ -113,7 +115,7 @@ pub(crate) fn has_match(matcher: &grep_regex::RegexMatcher, bytes: &[u8]) -> boo
 }
 
 /// Add `path` to a walker's shared list.
-pub(crate) fn record(list: &std::sync::Mutex<Vec<PathBuf>>, path: &Path) {
+pub fn record(list: &std::sync::Mutex<Vec<PathBuf>>, path: &Path) {
     list.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .push(path.to_path_buf());
@@ -121,7 +123,7 @@ pub(crate) fn record(list: &std::sync::Mutex<Vec<PathBuf>>, path: &Path) {
 
 /// A walker's shared list, taken and sorted so the output does not depend on
 /// thread timing.
-pub(crate) fn sorted(list: std::sync::Mutex<Vec<PathBuf>>) -> Vec<PathBuf> {
+pub fn sorted(list: std::sync::Mutex<Vec<PathBuf>>) -> Vec<PathBuf> {
     let mut paths = list
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -156,11 +158,7 @@ fn other_owners_note(result: &SearchResult) -> String {
 /// The definitions in `others`, each written as the qualified name the
 /// query's own separator would give it, with its place: `A::run (m.rs:3)`,
 /// or `run (m.rs:5)` for one at the top level. The first five are listed.
-pub(crate) fn owner_candidates(
-    query: &str,
-    others: &[crate::types::OtherOwner],
-    scope: &Path,
-) -> String {
+pub fn owner_candidates(query: &str, others: &[crate::types::OtherOwner], scope: &Path) -> String {
     const SHOWN: usize = 5;
     let name = tilth_core::search::scope::split_qualified(query).1;
     let sep = if query.ends_with(&format!("::{name}")) {
@@ -173,10 +171,10 @@ pub(crate) fn owner_candidates(
         .take(SHOWN)
         .map(|o| {
             let place = format!("{}:{}", rel(&o.path, scope), o.line);
-            match &o.owner {
-                Some(owner) => format!("{owner}{sep}{name} ({place})"),
-                None => format!("{name} ({place})"),
-            }
+            o.owner.as_ref().map_or_else(
+                || format!("{name} ({place})"),
+                |owner| format!("{owner}{sep}{name} ({place})"),
+            )
         })
         .collect();
     if others.len() > SHOWN {
@@ -187,7 +185,7 @@ pub(crate) fn owner_candidates(
 
 /// The note that names files a walk skipped for size although they contain
 /// the query, relative to `scope`. Empty when there are none.
-pub(crate) fn skipped_files_note(skipped: &[PathBuf], scope: &Path) -> String {
+pub fn skipped_files_note(skipped: &[PathBuf], scope: &Path) -> String {
     const SHOWN: usize = 5;
     if skipped.is_empty() {
         return String::new();
@@ -208,15 +206,12 @@ pub(crate) fn skipped_files_note(skipped: &[PathBuf], scope: &Path) -> String {
 }
 
 /// Get `file_lines` estimate and mtime from metadata. One `stat()` per file.
-pub(crate) fn file_metadata(path: &Path) -> (u32, SystemTime) {
-    match std::fs::metadata(path) {
-        Ok(meta) => {
-            let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-            let est_lines = (meta.len() / 40).max(1) as u32;
-            (est_lines, mtime)
-        }
-        Err(_) => (0, SystemTime::UNIX_EPOCH),
-    }
+pub fn file_metadata(path: &Path) -> (u32, SystemTime) {
+    std::fs::metadata(path).map_or((0, SystemTime::UNIX_EPOCH), |meta| {
+        let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        let est_lines = (meta.len() / 40).max(1) as u32;
+        (est_lines, mtime)
+    })
 }
 
 /// Dispatch search by query type. `full` is the caller's `--full`, with the
@@ -234,6 +229,10 @@ pub fn search_symbol(
     format_search_result(&result, cache, None, &bloom, 0, None)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "per-call options become one Request in architecture step 2"
+)]
 pub fn search_symbol_expanded(
     query: &str,
     scope: &Path,
@@ -250,6 +249,10 @@ pub fn search_symbol_expanded(
     format_search_result(&result, cache, Some(session), bloom, expand, budget)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "per-call options become one Request in architecture step 2"
+)]
 pub fn search_multi_symbol_expanded(
     queries: &[&str],
     scope: &Path,
@@ -349,6 +352,10 @@ pub fn search_regex(
     format_search_result(&result, cache, None, &bloom, 0, None)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "per-call options become one Request in architecture step 2"
+)]
 pub fn search_content_expanded(
     query: &str,
     scope: &Path,
@@ -367,6 +374,10 @@ pub fn search_content_expanded(
 }
 
 /// Expanded regex search — takes raw pattern, no slash wrapping needed.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "per-call options become one Request in architecture step 2"
+)]
 pub fn search_regex_expanded(
     pattern: &str,
     scope: &Path,
@@ -453,6 +464,10 @@ fn write_hidden_tail(out: &mut String, shown: usize, total: usize, kind: &str) {
 /// Format match entries with optional expansion.
 /// Groups consecutive usage matches in the same enclosing function to reduce token noise.
 /// Shared expand state enables cross-query dedup in multi-symbol search.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "renderers become functions of a result model in architecture step 6"
+)]
 fn format_matches(
     matches: &[Match],
     scope: &Path,
@@ -644,6 +659,11 @@ fn boost_query(m: &Match) -> Option<&str> {
 }
 
 /// Format a single match entry (unchanged from original behavior).
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "renderers become functions of a result model in architecture step 6"
+)]
 fn format_single_match(
     m: &Match,
     scope: &Path,
@@ -993,7 +1013,7 @@ fn find_basename_candidate(matches: &[Match], query_lower: &str) -> Option<PathB
 }
 
 /// Format a token count into a human-readable string (e.g. "~1.2k" or "~743").
-pub(crate) fn format_token_count(tokens: u64) -> String {
+pub fn format_token_count(tokens: u64) -> String {
     if tokens >= 1000 {
         format!("~{}.{}k", tokens / 1000, (tokens % 1000) / 100)
     } else {
@@ -1087,6 +1107,11 @@ fn basename_file_outline(
     ))
 }
 
+#[expect(
+    clippy::too_many_lines,
+    clippy::unnecessary_wraps,
+    reason = "renderers become functions of a result model in architecture step 6"
+)]
 fn format_search_result(
     result: &SearchResult,
     cache: &OutlineCache,
@@ -1326,7 +1351,7 @@ fn expand_match(m: &Match, scope: &Path) -> Option<(String, String)> {
     } else {
         let (s, e) = m
             .def_range
-            .unwrap_or((m.line.saturating_sub(10), m.line.saturating_add(10)));
+            .unwrap_or_else(|| (m.line.saturating_sub(10), m.line.saturating_add(10)));
         (s.max(1), e.min(total))
     };
 
@@ -1596,6 +1621,10 @@ fn extract_line_range(line: &str) -> Option<(u32, u32)> {
 }
 
 /// Format glob search results (file list with previews).
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "renderers become functions of a result model in architecture step 6"
+)]
 fn format_glob_result(result: &glob::GlobResult, scope: &Path) -> Result<String, TilthError> {
     let header = format!(
         "# Glob: \"{}\" in {} — {} files",
@@ -1705,14 +1734,14 @@ mod tests {
         )
         .expect("callers toml failed");
         let rs_callers: Vec<_> = rs_callers.per_file.into_iter().flatten().collect();
-        let toml_callers: Vec<_> = toml_callers.per_file.into_iter().flatten().collect();
+        let toml_has_callers = toml_callers.per_file.into_iter().flatten().next().is_some();
 
         assert!(
             !rs_callers.is_empty(),
             "*.rs should find callers of 'walker'"
         );
         assert!(
-            toml_callers.is_empty(),
+            !toml_has_callers,
             "*.toml should not find callers of 'walker'"
         );
         for (_, c) in &rs_callers {
@@ -1878,7 +1907,7 @@ mod tests {
         std::fs::write(&p, "class Foo {\n  bar() {\n    const x = 1;\n  }\n}\n").unwrap();
 
         let m = Match {
-            path: p.clone(),
+            path: p,
             line: 3,
             text: "    const x = 1;".to_string(),
             is_definition: false,
@@ -1929,7 +1958,7 @@ mod tests {
         std::fs::write(&p, src).unwrap();
 
         let m = Match {
-            path: p.clone(),
+            path: p,
             line: 4,
             text: "    pub fn exit_code(&self) -> i32 {".to_string(),
             is_definition: true,
@@ -2049,7 +2078,7 @@ mod tests {
         // Mimic the `Match` `find_defs_markdown_buf` would produce for a
         // markdown-heading def: weight 30, def_range covers the section span.
         let m = Match {
-            path: p.clone(),
+            path: p,
             line: 3, // `## Session 50`
             text: "## Session 50".to_string(),
             is_definition: true,
@@ -2107,7 +2136,7 @@ mod tests {
         std::fs::write(&p, &content).unwrap();
 
         let m = Match {
-            path: p.clone(),
+            path: p,
             line: 1,
             text: "## Big Section".to_string(),
             is_definition: true,
@@ -2179,7 +2208,7 @@ mod tests {
         std::fs::write(&p, &content).unwrap();
 
         let m = Match {
-            path: p.clone(),
+            path: p,
             line: 1,
             text: "## Big Section".to_string(),
             is_definition: true,

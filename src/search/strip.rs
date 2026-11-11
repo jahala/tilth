@@ -37,11 +37,7 @@ fn detect_lang(path: &Path) -> Option<StripFamily> {
 /// Returns an empty set if:
 /// - `def_range` is `None`
 /// - The file extension maps to an unsupported language
-pub(crate) fn strip_noise(
-    content: &str,
-    path: &Path,
-    def_range: Option<(u32, u32)>,
-) -> HashSet<u32> {
+pub fn strip_noise(content: &str, path: &Path, def_range: Option<(u32, u32)>) -> HashSet<u32> {
     let mut skip = HashSet::new();
 
     let Some((range_start, range_end)) = def_range else {

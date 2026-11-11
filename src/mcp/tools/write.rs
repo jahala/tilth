@@ -214,6 +214,10 @@ fn resolved_display(path: &Path) -> String {
         .to_string()
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "split by responsibility in architecture step 10"
+)]
 pub(in crate::mcp) fn tool_write(
     args: &Value,
     session: &Session,
@@ -281,12 +285,13 @@ pub(in crate::mcp) fn tool_write(
     // `root` (the headline cross-worktree scenario `root` exists to solve).
     // Only when BOTH `scope` and `root` are absent does this fall back to the
     // server cwd, exactly as before.
-    let scope_root: PathBuf = match args.get("scope").and_then(|v| v.as_str()) {
-        Some(s) => PathBuf::from(s),
-        None => root
-            .clone()
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into())),
-    };
+    let scope_root: PathBuf = args.get("scope").and_then(|v| v.as_str()).map_or_else(
+        || {
+            root.clone()
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()))
+        },
+        PathBuf::from,
+    );
     // Canonicalize the scope once for the overwrite/append containment check.
     // Fail closed on canonicalize failure: an unresolvable scope refuses
     // writes rather than silently disabling the guard.

@@ -8,19 +8,7 @@
 //! The documented surface is the set of items re-exported at this root. The
 //! modules behind it are shared with the `tilth` binary and carry no
 //! stability promise.
-#![warn(clippy::pedantic)]
 #![warn(missing_docs)]
-#![allow(
-    clippy::cast_possible_truncation,  // line numbers as u32 — we target 64-bit
-    clippy::cast_sign_loss,            // same
-    clippy::cast_possible_wrap,        // u32→i32 for tree-sitter APIs
-    clippy::module_name_repetitions,   // Rust naming conventions
-    clippy::similar_names,             // common in parser/search code
-    clippy::too_many_lines,            // the per-language AST walkers in lang/outline.rs
-    clippy::too_many_arguments,        // internal recursive AST walker
-    clippy::missing_errors_doc,        // internal fns don't need error docs
-    clippy::missing_panics_doc,        // same
-)]
 
 #[doc(hidden)]
 pub mod cache;

@@ -7,7 +7,7 @@ use super::file_metadata;
 use crate::search::rank;
 use crate::types::{FacetTotals, Match, SearchResult};
 use grep_regex::RegexMatcher;
-use grep_searcher::sinks::UTF8;
+use grep_searcher::sinks::Lossy;
 use grep_searcher::Searcher;
 use tilth_core::error::TilthError;
 
@@ -38,6 +38,10 @@ pub fn search(
 /// The display cap and the per-file collection bound are the same number in
 /// production. They are separate parameters so a test can raise one without
 /// the other and show that the bound leaves the displayed set untouched.
+#[expect(
+    clippy::too_many_lines,
+    reason = "reading goes through one Source in architecture step 3"
+)]
 fn search_capped(
     pattern: &str,
     scope: &Path,
@@ -128,10 +132,14 @@ fn search_capped(
             let mut file_matches = Vec::new();
             let mut searcher = Searcher::new();
 
+            // Lossy, not UTF8: the UTF8 sink ends the search at the first
+            // matched line that is not valid UTF-8, losing it and every later
+            // match in the file. With this sink and an in-memory slice the
+            // search cannot fail, so its `Result` carries nothing.
             let _ = searcher.search_slice(
                 matcher,
                 bytes,
-                UTF8(|line_num, line| {
+                Lossy(|line_num, line| {
                     file_matches.push(Match {
                         path: path.to_path_buf(),
                         line: line_num as u32,
@@ -299,5 +307,24 @@ mod completeness_tests {
             one_per_file.total_found, 12,
             "and the count must still be exact"
         );
+    }
+
+    /// A matched line that is not UTF-8, such as a Latin-1 comment, used to
+    /// end the search of its file. The sink stopped there with an error that
+    /// was dropped, so that line and every later match in the file went
+    /// missing while the result read as complete.
+    #[test]
+    fn non_utf8_line_does_not_end_the_file_search() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("latin1.txt"),
+            b"needle_delta caf\xe9\nneedle_delta two\nneedle_delta three\n",
+        )
+        .unwrap();
+        let r = search("needle_delta", d.path(), false, None, None, false).unwrap();
+        let mut lines: Vec<u32> = r.matches.iter().map(|m| m.line).collect();
+        lines.sort_unstable();
+        assert_eq!(lines, [1, 2, 3], "every matching line, in any encoding");
+        assert_eq!(r.total_found, 3);
     }
 }

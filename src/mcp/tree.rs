@@ -8,7 +8,7 @@ use crate::types::estimate_tokens;
 #[derive(Debug, Default)]
 struct DirNode {
     children_files: Vec<(String, u64)>, // (name, bytes)
-    children_dirs: std::collections::BTreeMap<String, Box<DirNode>>,
+    children_dirs: std::collections::BTreeMap<String, Box<Self>>,
     file_count: u64,
     total_bytes: u64,
 }
@@ -31,7 +31,10 @@ impl DirNode {
 
 /// Compact human token count, matching `map.rs::fmt_tokens`'s k/M scale and rounding.
 fn fmt_tokens(t: u64) -> String {
-    #[allow(clippy::cast_precision_loss)] // display-only; mantissa loss is fine for summaries
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "display only, rounded to one decimal"
+    )]
     let f = t as f64;
     if f >= 999_950.0 {
         format!("~{:.1}M tokens", f / 1_000_000.0)
@@ -53,22 +56,22 @@ fn render_dir(name: &str, node: &DirNode, prefix: &str, out: &mut String, is_roo
         );
     }
 
-    let mut entries: Vec<(bool, String, u64, Option<&DirNode>)> = Vec::new();
+    // A directory entry carries its node; a file entry has none.
+    let mut entries: Vec<(String, u64, Option<&DirNode>)> = Vec::new();
     for (n, b) in &node.children_files {
-        entries.push((false, n.clone(), *b, None));
+        entries.push((n.clone(), *b, None));
     }
     for (n, child) in &node.children_dirs {
-        entries.push((true, n.clone(), child.total_bytes, Some(child.as_ref())));
+        entries.push((n.clone(), child.total_bytes, Some(child.as_ref())));
     }
-    entries.sort_by(|a, b| a.1.cmp(&b.1));
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
 
     let n = entries.len();
-    for (i, (is_dir, name, bytes, child)) in entries.iter().enumerate() {
+    for (i, (name, bytes, child)) in entries.iter().enumerate() {
         let last = i == n - 1;
         let connector = if last { "└── " } else { "├── " };
         let child_prefix = if last { "    " } else { "│   " };
-        if *is_dir {
-            let child = child.expect("dir entry has node");
+        if let Some(child) = child {
             let _ = writeln!(
                 out,
                 "{prefix}{connector}{name}/      {tok}   {fc} files",

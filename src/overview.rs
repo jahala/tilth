@@ -23,14 +23,18 @@ pub fn fingerprint(root: &Path) -> String {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fingerprint_inner(root)));
     let elapsed = start.elapsed();
     if elapsed.as_millis() > 250 {
-        eprintln!(
+        crate::diag::warn(&format!(
             "[tilth] fingerprint took {}ms (>250ms budget)",
             elapsed.as_millis()
-        );
+        ));
     }
     result.unwrap_or_default()
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "split by responsibility in architecture step 10"
+)]
 fn fingerprint_inner(root: &Path) -> String {
     let mut lines: Vec<String> = Vec::new();
 
@@ -182,9 +186,9 @@ fn fingerprint_inner(root: &Path) -> String {
             // Manifest line
             let mut manifest_line = format!("  manifest: {manifest}");
             if let Some(name) = &info.name {
-                write!(manifest_line, " ({name}").unwrap();
+                let _ = write!(manifest_line, " ({name}");
                 if let Some(version) = &info.version {
-                    write!(manifest_line, " v{version}").unwrap();
+                    let _ = write!(manifest_line, " v{version}");
                 }
                 manifest_line.push(')');
             }
@@ -242,6 +246,10 @@ fn lang_display_name(lang: Lang) -> &'static str {
 // File walk (depth 2)
 // ---------------------------------------------------------------------------
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "one flag per test-directory convention, read by test_style"
+)]
 struct WalkResult {
     lang_counts: HashMap<Lang, usize>,
     /// Top-level dirs → per-language file counts
@@ -290,7 +298,10 @@ fn walk_files(root: &Path) -> WalkResult {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a WalkCtx struct in architecture step 10"
+)]
 fn walk_dir(
     dir: &Path,
     root: &Path,
@@ -589,6 +600,9 @@ fn git_output(root: &Path, args: &[&str]) -> Option<String> {
             }
             Ok(None) => {
                 if Instant::now() >= deadline {
+                    // Best effort, like the rest of this function: kill fails
+                    // only if git exited in the meantime, and the wait then
+                    // just reaps it.
                     let _ = child.kill();
                     let _ = child.wait();
                     return None;
@@ -796,11 +810,10 @@ fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opti
                 .max_by(|(a_sym, a_c), (b_sym, b_c)| a_c.cmp(b_c).then(b_sym.cmp(a_sym)))
                 .map(|(sym, _)| sym);
 
-            if let Some(sym) = top_sym {
-                format!("{rel_str}({sym}) ×{count}")
-            } else {
-                format!("{rel_str} ×{count}")
-            }
+            top_sym.map_or_else(
+                || format!("{rel_str} ×{count}"),
+                |sym| format!("{rel_str}({sym}) ×{count}"),
+            )
         })
         .collect();
 

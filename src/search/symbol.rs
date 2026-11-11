@@ -15,7 +15,7 @@ use tilth_core::lang::treesitter::{
 use crate::search::rank;
 use crate::types::{Match, OtherOwner, SearchResult};
 use grep_regex::RegexMatcher;
-use grep_searcher::sinks::UTF8;
+use grep_searcher::sinks::Lossy;
 use grep_searcher::Searcher;
 use tilth_core::error::TilthError;
 use tilth_core::lang::detect_file_type_with_content;
@@ -330,17 +330,21 @@ fn matches_in_file(path: &Path, wanted: Wanted, matchers: Matchers) -> Scan {
     let FileDefs {
         mut matches,
         others,
-    } = match std::str::from_utf8(bytes) {
-        Ok(content) => definitions_in(path, wanted, content, file_lines, mtime),
-        Err(_) => FileDefs::default(),
-    };
+    } = std::str::from_utf8(bytes).map_or_else(
+        |_| FileDefs::default(),
+        |content| definitions_in(path, wanted, content, file_lines, mtime),
+    );
     let def_count = matches.len();
 
     let mut searcher = Searcher::new();
+    // Lossy, not UTF8: the UTF8 sink ends the scan at the first matched line
+    // that is not valid UTF-8, losing it and every later usage in the file.
+    // With this sink and an in-memory slice the scan cannot fail, so its
+    // `Result` carries nothing.
     let _ = searcher.search_slice(
         matchers.usage,
         bytes,
-        UTF8(|line_num, line| {
+        Lossy(|line_num, line| {
             let line_num = line_num as u32;
             let on_definition = matches[..def_count].iter().any(|d| d.line == line_num);
             if !on_definition {
@@ -460,6 +464,11 @@ fn find_defs_treesitter(
 /// tree-sitter finds a parent by walking from the root. `wrapper_start` is the
 /// first row of the `export` or `declare` wrapper around `node`, which a
 /// definition's range covers.
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "a WalkCtx struct and a split in architecture step 10"
+)]
 fn walk_for_definitions(
     node: tree_sitter::Node,
     parent: Option<tree_sitter::Node>,
@@ -487,7 +496,7 @@ fn walk_for_definitions(
         let start = if kind == "decorated_definition" {
             wrapper_start
         } else {
-            Some(wrapper_start.unwrap_or(node.start_position().row))
+            Some(wrapper_start.unwrap_or_else(|| node.start_position().row))
         };
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
@@ -507,7 +516,7 @@ fn walk_for_definitions(
         }
         return;
     }
-    let start_row = wrapper_start.unwrap_or(node.start_position().row) as u32 + 1;
+    let start_row = wrapper_start.unwrap_or_else(|| node.start_position().row) as u32 + 1;
     let end_row = node.end_position().row as u32 + 1;
 
     // Definition kinds and name/weight ops come from the per-language spec. For
@@ -515,13 +524,11 @@ fn walk_for_definitions(
     // (the shared defaults, except where a language such as Elixir or Go
     // carries its own); when `lang` is unknown we fall back to the shared
     // defaults.
-    let (def_kinds, def_ops): (&[&str], &DefinitionOps) = match lang {
-        Some(l) => {
+    let (def_kinds, def_ops): (&[&str], &DefinitionOps) =
+        lang.map_or((DEFAULT_DEF_KINDS, &DEFAULT_DEFS), |l| {
             let s = spec(l);
             (s.definition_kinds, &s.definitions)
-        }
-        None => (DEFAULT_DEF_KINDS, &DEFAULT_DEFS),
-    };
+        });
 
     let query = wanted.name;
     if def_kinds.contains(&kind) {
@@ -716,7 +723,7 @@ fn name_row(node: tree_sitter::Node) -> usize {
     ["name", "identifier", "declarator"]
         .iter()
         .find_map(|field| node.child_by_field_name(field))
-        .map_or(node.start_position().row, |n| n.start_position().row)
+        .map_or_else(|| node.start_position().row, |n| n.start_position().row)
 }
 
 /// Whether definition `node` binds the name `query`. Most definitions bind
@@ -809,7 +816,6 @@ fn find_defs_markdown_buf(
     defs
 }
 
-#[allow(clippy::too_many_arguments)]
 fn walk_md_sections(
     node: tree_sitter::Node,
     lines: &[&str],
@@ -833,7 +839,6 @@ fn walk_md_sections(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn emit_md_section_match(
     section: tree_sitter::Node,
     lines: &[&str],
@@ -2393,5 +2398,23 @@ int area() { return 1; }
             c,
             &[("add", &[11]), ("point", &[4]), ("compare_fn", &[8])],
         );
+    }
+
+    /// A usage on a line that is not UTF-8 used to end the usage scan of its
+    /// file, so it and every later usage went missing. See the matching
+    /// content-search test.
+    #[test]
+    fn non_utf8_line_does_not_end_the_usage_scan() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("latin1.c"),
+            b"/* caf\xe9 */ int x = needle_delta();\nint y = needle_delta();\nint z = needle_delta();\n",
+        )
+        .unwrap();
+        let r = search("needle_delta", d.path(), None, None, false).unwrap();
+        let mut lines: Vec<u32> = r.matches.iter().map(|m| m.line).collect();
+        lines.sort_unstable();
+        assert_eq!(lines, [1, 2, 3], "every usage, in any encoding");
+        assert_eq!(r.total_found, 3);
     }
 }

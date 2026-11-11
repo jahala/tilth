@@ -25,16 +25,16 @@ pub enum ViewMode {
     Signature,
     Keys,
     // Reserved/roadmap: planned head+tail view mode, not yet wired.
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "reserved variant, never constructed yet")]
     HeadTail,
     Empty,
     Generated,
     Minified,
     // Reserved/roadmap: binary file view variant, not yet wired.
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "reserved variant, never constructed yet")]
     Binary,
     // Reserved/roadmap: error view variant, not yet wired.
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "reserved variant, never constructed yet")]
     Error,
     Section,
     Stripped,

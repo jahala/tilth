@@ -12,7 +12,7 @@ const SIBLING_QUERY: &str = concat!(
     "(invocation_expression function: (member_access_expression expression: (this_expression) name: (identifier) @ref))\n",
 );
 
-pub(crate) const SPEC: LangSpec = LangSpec {
+pub const SPEC: LangSpec = LangSpec {
     display: "C#",
     extensions: &["cs"],
     filenames: &[],

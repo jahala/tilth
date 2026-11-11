@@ -101,6 +101,10 @@ impl OutlineCache {
     /// [`Self::get_or_compute`]: concurrent callers would otherwise each parse
     /// the same cold file.
     #[must_use]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "the entry is held across the parse on purpose, and `insert` consumes it"
+    )]
     pub fn get_or_parse(&self, path: &Path) -> Option<Arc<ParsedFile>> {
         use dashmap::mapref::entry::Entry;
 
@@ -110,7 +114,7 @@ impl OutlineCache {
             return None;
         }
 
-        let mut slot = self.parsed.entry(path.to_path_buf());
+        let slot = self.parsed.entry(path.to_path_buf());
         if let Entry::Occupied(ref occupied) = slot {
             if occupied.get().mtime == mtime {
                 return Some(Arc::clone(&occupied.get().file));
@@ -138,14 +142,7 @@ impl OutlineCache {
             mtime,
             file: Arc::clone(&file),
         };
-        match slot {
-            Entry::Occupied(ref mut occupied) => {
-                occupied.insert(entry);
-            }
-            Entry::Vacant(vacant) => {
-                vacant.insert(entry);
-            }
-        }
+        slot.insert(entry);
         Some(file)
     }
 }

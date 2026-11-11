@@ -6,9 +6,14 @@
 //! write fails with a broken pipe no matter how small the output is or how
 //! fast the child runs.
 
+use std::fmt::Write as _;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
+#[expect(
+    clippy::expect_used,
+    reason = "test helper: a panic here is the test failure"
+)]
 fn run_into_closed_pipe(args: &[&str], cwd: &Path) -> Output {
     let (reader, writer) = std::io::pipe().expect("create pipe");
     drop(reader);
@@ -38,6 +43,10 @@ fn assert_quiet_exit(out: &Output, what: &str) {
 
 /// A small project: a manifest for the overview, a few source files to
 /// search, read and map, and a patch for the diff.
+#[expect(
+    clippy::unwrap_used,
+    reason = "test helper: a panic here is the test failure"
+)]
 fn project() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
@@ -47,9 +56,13 @@ fn project() -> tempfile::TempDir {
     )
     .unwrap();
     std::fs::create_dir(root.join("src")).unwrap();
-    let body: String = (0..400)
-        .map(|i| format!("pub fn handler_{i}() -> usize {{ shared_helper() + {i} }}\n"))
-        .collect();
+    let body = (0..400).fold(String::new(), |mut body, i| {
+        let _ = writeln!(
+            body,
+            "pub fn handler_{i}() -> usize {{ shared_helper() + {i} }}"
+        );
+        body
+    });
     std::fs::write(
         root.join("src/lib.rs"),
         format!("pub fn shared_helper() -> usize {{ 1 }}\n{body}"),

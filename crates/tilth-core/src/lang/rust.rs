@@ -90,7 +90,7 @@ fn has_test_attribute(item: tree_sitter::Node, content: &[u8]) -> bool {
     false
 }
 
-pub(crate) const SPEC: LangSpec = LangSpec {
+pub const SPEC: LangSpec = LangSpec {
     display: "Rust",
     extensions: &["rs"],
     filenames: &[],
