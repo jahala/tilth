@@ -467,6 +467,15 @@ pub(crate) fn detect_duplicate_paths(tasks: &[FileEditTask]) -> Option<String> {
     None
 }
 
+/// A batch in which at least one file's edits applied.
+#[derive(Debug)]
+pub struct BatchApplied {
+    /// The `## <path>` section of every task, joined by `---`.
+    pub output: String,
+    /// The task paths whose edits applied, in task order.
+    pub applied: Vec<PathBuf>,
+}
+
 /// Apply a batch of file edits in parallel.
 ///
 /// Each task is processed independently — a hash mismatch, parse error, or
@@ -482,37 +491,39 @@ pub fn apply_batch(
     tasks: Vec<FileEditTask>,
     bloom: &Arc<BloomFilterCache>,
     show_diff: bool,
-) -> Result<String, String> {
+) -> Result<BatchApplied, String> {
     if let Some(msg) = detect_duplicate_paths(&tasks) {
         return Err(msg);
     }
 
     let bloom: &BloomFilterCache = bloom;
-    let outcomes: Vec<(String, bool)> = tasks
+    let outcomes: Vec<(String, Option<PathBuf>)> = tasks
         .into_par_iter()
         .map(|task| apply_one(task, bloom, show_diff))
         .collect();
 
-    let any_success = outcomes.iter().any(|(_, ok)| *ok);
-    let combined = outcomes
-        .into_iter()
-        .map(|(s, _)| s)
-        .collect::<Vec<_>>()
-        .join("\n\n---\n\n");
+    let (sections, applied): (Vec<String>, Vec<Option<PathBuf>>) = outcomes.into_iter().unzip();
+    let output = sections.join("\n\n---\n\n");
+    let applied: Vec<PathBuf> = applied.into_iter().flatten().collect();
 
-    if any_success {
-        Ok(combined)
+    if applied.is_empty() {
+        Err(output)
     } else {
-        Err(combined)
+        Ok(BatchApplied { output, applied })
     }
 }
 
-/// Process one task into a `(section, success)` tuple. Kept separate so the
-/// parallel closure stays trivial and per-file logic is testable in isolation.
-fn apply_one(task: FileEditTask, bloom: &BloomFilterCache, show_diff: bool) -> (String, bool) {
+/// Process one task into its section and, when its edits applied, its path.
+/// Kept separate so the parallel closure stays trivial and per-file logic is
+/// testable in isolation.
+fn apply_one(
+    task: FileEditTask,
+    bloom: &BloomFilterCache,
+    show_diff: bool,
+) -> (String, Option<PathBuf>) {
     let (path, edits) = match task {
         FileEditTask::ParseError { label, msg } => {
-            return (format!("## {label}\nerror: {msg}"), false);
+            return (format!("## {label}\nerror: {msg}"), None);
         }
         FileEditTask::Ready { path, edits } => (path, edits),
     };
@@ -522,13 +533,14 @@ fn apply_one(task: FileEditTask, bloom: &BloomFilterCache, show_diff: bool) -> (
         Ok(body) => {
             let abs = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
             let header = format!("## {}", abs.display());
-            if body.is_empty() {
-                (header, true)
+            let section = if body.is_empty() {
+                header
             } else {
-                (format!("{header}\n{body}"), true)
-            }
+                format!("{header}\n{body}")
+            };
+            (section, Some(path))
         }
-        Err(msg) => (format!("## {}\n{msg}", path.display()), false),
+        Err(msg) => (format!("## {}\n{msg}", path.display()), None),
     }
 }
 
@@ -996,7 +1008,9 @@ mod tests {
             ),
         ];
 
-        let out = apply_batch(tasks, &fresh_bloom(), false).expect("batch should succeed");
+        let out = apply_batch(tasks, &fresh_bloom(), false)
+            .expect("batch should succeed")
+            .output;
         // The success header echoes the resolved absolute (canonicalized) path.
         let a_abs = a.canonicalize().unwrap();
         let b_abs = b.canonicalize().unwrap();
@@ -1039,7 +1053,13 @@ mod tests {
             ),
         ];
 
-        let out = apply_batch(tasks, &fresh_bloom(), false).expect("good half succeeded");
+        let batch = apply_batch(tasks, &fresh_bloom(), false).expect("good half succeeded");
+        assert_eq!(
+            batch.applied,
+            std::slice::from_ref(&good),
+            "only the good file applied"
+        );
+        let out = batch.output;
         assert!(out.contains("hash mismatch"), "bad file reports mismatch");
         assert!(out.contains(&format!("## {}", bad.display())));
         // good file actually got written
@@ -1094,8 +1114,9 @@ mod tests {
             },
         ];
 
-        let out =
-            apply_batch(tasks, &fresh_bloom(), false).expect("good half kept the batch alive");
+        let out = apply_batch(tasks, &fresh_bloom(), false)
+            .expect("good half kept the batch alive")
+            .output;
         assert!(out.contains("## files[1]"));
         assert!(out.contains("error: missing 'edits' array"));
         assert_eq!(std::fs::read_to_string(&good).unwrap(), "K\n");
@@ -1364,7 +1385,9 @@ mod tests {
             }],
         )];
 
-        let out = apply_batch(tasks, &fresh_bloom(), false).expect("edit applies");
+        let out = apply_batch(tasks, &fresh_bloom(), false)
+            .expect("edit applies")
+            .output;
         assert!(
             out.contains("\u{2500}\u{2500} parse \u{2500}\u{2500}"),
             "introduced error should surface a parse block: {out}"
@@ -1391,7 +1414,9 @@ mod tests {
             }],
         )];
 
-        let out = apply_batch(tasks, &fresh_bloom(), false).expect("edit applies");
+        let out = apply_batch(tasks, &fresh_bloom(), false)
+            .expect("edit applies")
+            .output;
         assert!(
             !out.contains("\u{2500}\u{2500} parse \u{2500}\u{2500}"),
             "clean edit must not surface a parse block: {out}"

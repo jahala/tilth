@@ -12,6 +12,10 @@ Thanks for your interest. tilth is small and intentionally so — clean, focused
    cargo clippy --workspace --all-targets -- -D warnings
    cargo test --workspace
    ```
+   If your editor uses rust-analyzer, add its components to the pinned toolchain once too:
+   ```bash
+   rustup component add rust-src rust-analyzer
+   ```
 3. Open a PR. Describe what changed and how to test it.
 
 CI runs the same three checks on every push, plus a publish dry-run of `tilth-core`.

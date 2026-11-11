@@ -49,7 +49,6 @@ missing_panics_doc = "allow"
 redundant_clone = "warn"
 use_self = "warn"
 or_fun_call = "warn"
-significant_drop_tightening = "warn"
 needless_collect = "warn"
 option_if_let_else = "warn"
 

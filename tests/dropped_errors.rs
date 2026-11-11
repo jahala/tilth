@@ -3,7 +3,8 @@
 //! Each case puts the binary where a working-directory call fails, and checks
 //! that the failure is reported instead of being replaced by an empty path or
 //! ignored. The cases rely on Unix permissions and on removing the directory a
-//! process runs in, so they run on Unix only.
+//! process runs in, so they run on Unix only. Two cases check warnings next
+//! to these, where nothing fails.
 #![cfg(unix)]
 
 use std::io::Write;
@@ -167,26 +168,87 @@ fn mcp_refuses_a_scope_it_cannot_enter() {
     );
 }
 
+const INITIALIZE_WITH_ROOTS: &str =
+    r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{"roots":{}}}}"#;
+
+/// The client's answer to the server's roots/list request, naming `root`.
+fn roots_response(root: &Path) -> String {
+    format!(
+        r#"{{"jsonrpc":"2.0","id":"tilth_roots_1","result":{{"roots":[{{"uri":"file://{}"}}]}}}}"#,
+        root.display()
+    )
+}
+
+/// The directory an MCP server launched in `dir` searches: the package root
+/// above it, if there is one.
+#[expect(
+    clippy::expect_used,
+    reason = "by design: a test helper, where a panic is the test failure"
+)]
+fn search_dir(dir: &Path) -> PathBuf {
+    let dir = dir.canonicalize().expect("resolve the launch directory");
+    tilth_core::lang::package_root(&dir).map_or_else(|| dir.clone(), Path::to_path_buf)
+}
+
 /// A root from the client that the server cannot enter used to be ignored
-/// without a word, leaving searches on the launch directory.
+/// without a word, leaving searches where they were. The warning names that
+/// directory, which can be the package root rather than the launch directory.
 #[test]
 fn mcp_warns_about_a_client_root_it_cannot_enter() {
     let tmp = tempfile::tempdir().expect("create temp dir");
     let Some(locked) = LockedDir::new(tmp.path()) else {
         return;
     };
-    let initialize =
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{"roots":{}}}}"#;
-    let roots = format!(
-        r#"{{"jsonrpc":"2.0","id":"tilth_roots_1","result":{{"roots":[{{"uri":"file://{}"}}]}}}}"#,
-        locked.path.display()
+    let session = format!(
+        "{INITIALIZE_WITH_ROOTS}\n{}\n",
+        roots_response(&locked.path)
     );
-    let out = mcp(&["--mcp"], tmp.path(), &format!("{initialize}\n{roots}\n"));
+    let out = mcp(&["--mcp"], tmp.path(), &session);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
     assert!(
         stderr.contains("cannot enter the client's root"),
         "the refused root must be reported, got: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "searches keep resolving against {}.",
+            search_dir(tmp.path()).display()
+        )),
+        "the directory searches use must be named, got: {stderr}"
+    );
+
+    // With no readable working directory, there is no directory to name.
+    let out = run_in_removed_dir(tmp.path(), &["--mcp"], &session);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("searches keep resolving against a working directory that cannot be read"),
+        "the unreadable directory must be named, got: {stderr}"
+    );
+}
+
+/// A roots/list answer that arrives after a tool ran is ignored. The warning
+/// said searches stay on the launch directory, which the server may have left
+/// for the package root.
+#[test]
+fn mcp_names_the_search_directory_when_it_ignores_late_roots() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let file = tmp.path().join("a.txt");
+    std::fs::write(&file, "a\n").expect("write a.txt");
+    let read = tool_call(2, "tilth_read", &serde_json::json!({ "path": file }));
+    let session = format!(
+        "{INITIALIZE_WITH_ROOTS}\n{read}{}\n",
+        roots_response(tmp.path())
+    );
+    let out = mcp(&["--mcp"], tmp.path(), &session);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "ignoring roots/list response that arrived after tools started; \
+             searches keep resolving against {}.",
+            search_dir(tmp.path()).display()
+        )),
+        "the directory searches use must be named, got: {stderr}"
     );
 }
 
@@ -246,6 +308,34 @@ fn write_names_an_unreadable_working_directory_as_the_refusal_cause() {
         2,
         "tilth_write",
         &serde_json::json!({
+            "files": [{ "path": target, "mode": "overwrite", "content": "x\n" }],
+        }),
+    );
+    let out = run_in_removed_dir(
+        tmp.path(),
+        &["--mcp", "--edit"],
+        &format!("{INITIALIZE}\n{write}"),
+    );
+    let text = tool_text(&out.stdout, 2);
+    assert!(
+        text.contains("refusing write") && text.contains("cannot read the current directory"),
+        "the refusal must name the unreadable directory, got: {text}"
+    );
+    assert!(!target.exists(), "the write must be refused");
+}
+
+/// A relative `scope` resolves against the server's working directory. When
+/// that could not be read, the refusal blamed the scope ("No such file or
+/// directory") instead of naming the cause.
+#[test]
+fn write_names_an_unreadable_working_directory_for_a_relative_scope() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let target = tmp.path().join("new.txt");
+    let write = tool_call(
+        2,
+        "tilth_write",
+        &serde_json::json!({
+            "scope": "..",
             "files": [{ "path": target, "mode": "overwrite", "content": "x\n" }],
         }),
     );
@@ -326,7 +416,10 @@ fn relative_writes_that_cannot_be_checked_warn_once_per_batch() {
     std::fs::create_dir(&files).expect("create the files dir");
     std::fs::write(files.join("a.txt"), "old a\n").expect("write a.txt");
     std::fs::write(files.join("b.txt"), "old b\n").expect("write b.txt");
+    std::fs::write(files.join("stale.txt"), "old stale\n").expect("write stale.txt");
+    std::fs::write(files.join("abs.txt"), "old abs\n").expect("write abs.txt");
     let anchor = hash_anchor(&files.join("a.txt"), "old a");
+    let abs_anchor = hash_anchor(&files.join("abs.txt"), "old abs");
     let hash = |name: &str| {
         serde_json::json!({
             "path": format!("../files/{name}"),
@@ -359,6 +452,40 @@ fn relative_writes_that_cannot_be_checked_warn_once_per_batch() {
         tool_text(&out.stdout, 2)
     );
 
+    // Only an absolute hash edit lands. The relative hash edit of an existing
+    // file fails on a stale anchor, so no relative write landed.
+    let stale = batch(
+        2,
+        vec![
+            hash("stale.txt"),
+            serde_json::json!({
+                "path": files.join("abs.txt"),
+                "edits": [{ "start": abs_anchor, "content": "new" }],
+            }),
+        ],
+    );
+    let out = run_in_removed_dir(
+        tmp.path(),
+        &["--mcp", "--edit"],
+        &format!("{INITIALIZE}\n{stale}"),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let text = tool_text(&out.stdout, 2);
+    assert_eq!(
+        std::fs::read_to_string(files.join("abs.txt")).expect("read abs.txt"),
+        "new\n",
+        "the absolute edit must apply, tool result: {text}"
+    );
+    assert!(
+        text.contains("hash mismatch"),
+        "the relative edit must fail on its anchor, tool result: {text}"
+    );
+    assert_eq!(
+        stderr.matches(SKIPPED).count(),
+        0,
+        "a failed relative edit is not a landed write, tool result: {text}\nstderr: {stderr}"
+    );
+
     // Two writes land, a hash edit of a.txt and a new c.txt; two fail.
     let mixed = batch(
         2,
@@ -389,5 +516,85 @@ fn relative_writes_that_cannot_be_checked_warn_once_per_batch() {
         stderr.matches(SKIPPED).count(),
         1,
         "one warning per batch, tool result: {text}\nstderr: {stderr}"
+    );
+}
+
+/// The cross-worktree check counted any relative hash-edit path that existed
+/// on disk as written, so an edit that failed on a stale anchor still warned
+/// that it had landed in another worktree.
+#[test]
+fn a_failed_relative_edit_gets_no_cross_worktree_warning() {
+    const CROSSED: &str = "cross-worktree write";
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    // A worktree nested in the launch directory's, so the relative path stays
+    // inside the write scope, which defaults to the launch directory.
+    let here = tmp.path().join("here");
+    let there = here.join("there");
+    for worktree in [&here, &there] {
+        std::fs::create_dir_all(worktree.join(".git")).expect("create a worktree");
+    }
+    std::fs::write(there.join("target.txt"), "old target\n").expect("write target.txt");
+    std::fs::write(there.join("abs.txt"), "old abs\n").expect("write abs.txt");
+    // A package manifest above the temp dir would move the server there, away
+    // from the directory the relative path is written for.
+    let canonical = here.canonicalize().expect("resolve the launch directory");
+    if let Some(package) = tilth_core::lang::package_root(&canonical) {
+        eprintln!(
+            "skipped: {} holds a package manifest, so the server would not stay in the launch directory",
+            package.display()
+        );
+        return;
+    }
+    let target_anchor = hash_anchor(&there.join("target.txt"), "old target");
+    let abs_anchor = hash_anchor(&there.join("abs.txt"), "old abs");
+    let relative = |anchor: &str| {
+        serde_json::json!({
+            "path": "there/target.txt",
+            "edits": [{ "start": anchor, "content": "new" }],
+        })
+    };
+    let write = |entries: Vec<serde_json::Value>| {
+        let call = tool_call(2, "tilth_write", &serde_json::json!({ "files": entries }));
+        let out = mcp(
+            &["--mcp", "--edit"],
+            &here,
+            &format!("{INITIALIZE}\n{call}"),
+        );
+        tool_text(&out.stdout, 2)
+    };
+
+    // The absolute edit lands; the relative one fails on a stale anchor.
+    let text = write(vec![
+        relative(&abs_anchor),
+        serde_json::json!({
+            "path": there.join("abs.txt"),
+            "edits": [{ "start": abs_anchor, "content": "new" }],
+        }),
+    ]);
+    assert_eq!(
+        std::fs::read_to_string(there.join("abs.txt")).expect("read abs.txt"),
+        "new\n",
+        "the absolute edit must apply, tool result: {text}"
+    );
+    assert!(
+        text.contains("hash mismatch"),
+        "the relative edit must fail on its anchor, tool result: {text}"
+    );
+    assert!(
+        !text.contains(CROSSED),
+        "a failed edit landed nowhere, tool result: {text}"
+    );
+
+    // The same relative edit with a fresh anchor lands, and is warned about.
+    let text = write(vec![relative(&target_anchor)]);
+    assert_eq!(
+        std::fs::read_to_string(there.join("target.txt")).expect("read target.txt"),
+        "new\n",
+        "the edit must apply, tool result: {text}"
+    );
+    assert_eq!(
+        text.matches(CROSSED).count(),
+        1,
+        "a landed edit in another worktree is warned about, tool result: {text}"
     );
 }

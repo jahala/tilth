@@ -122,14 +122,16 @@ pub fn run(edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
                         if let Err(e) = std::env::set_current_dir(&root_path) {
                             diag::emit(format_args!(
                                 "tilth: warning: cannot enter the client's root {}: {e}; \
-                                 searches keep resolving against the launch directory.",
-                                root_path.display()
+                                 searches keep resolving against {}.",
+                                root_path.display(),
+                                search_dir()
                             ));
                         }
                     } else if !scope_is_explicit {
                         diag::emit(format_args!(
                             "tilth: warning: ignoring roots/list response that arrived after \
-                             tools started; searches keep resolving against the launch directory."
+                             tools started; searches keep resolving against {}.",
+                            search_dir()
                         ));
                     }
                 }
@@ -218,6 +220,15 @@ fn enter_project_root(scope: Option<&Path>) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The directory searches resolve against, for a warning that they stay
+/// there. [`enter_project_root`] may have moved it from the launch directory.
+fn search_dir() -> String {
+    std::env::current_dir().map_or_else(
+        |e| format!("a working directory that cannot be read ({e})"),
+        |cwd| cwd.display().to_string(),
+    )
 }
 
 /// Whether a roots/list response may still move the server's working

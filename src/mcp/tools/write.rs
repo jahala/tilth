@@ -186,8 +186,8 @@ fn find_git_root(path: &Path) -> Option<PathBuf> {
 /// (no `root` argument) resolves into a different git worktree than the
 /// server's process cwd. Returns `None` when no warning is needed.
 fn cross_worktree_warning(path: &Path, cwd: &Path) -> Option<String> {
-    // Only warn for paths that actually resolve into a git repo (canonicalize
-    // fails when the file was never written, which self-filters failed edits).
+    // Callers pass only paths a write landed at. Only warn for those that
+    // resolve into a git repo.
     let resolved = path.canonicalize().ok()?;
     let write_root = find_git_root(&resolved)?;
     let cwd_root = find_git_root(cwd)?;
@@ -312,8 +312,9 @@ pub(in crate::mcp) fn tool_write(
     // whenever the server was launched from a different directory than
     // `root` (the headline cross-worktree scenario `root` exists to solve).
     // Only when BOTH `scope` and `root` are absent does this fall back to the
-    // server cwd, exactly as before. A cwd that cannot be read leaves no
-    // boundary, so every write is refused with that cause.
+    // server cwd, exactly as before. A relative `scope` resolves against the
+    // cwd too. A cwd that cannot be read leaves those without a boundary, so
+    // their writes are refused with that cause.
     //
     // The cwd is read once for the batch: it is also what relative writes
     // are checked against for a cross-worktree landing.
@@ -324,14 +325,15 @@ pub(in crate::mcp) fn tool_write(
         cwd: &cwd,
         unchecked: false,
     };
-    let scope_arg = args.get("scope").and_then(Value::as_str);
+    let scope_arg = args.get("scope").and_then(Value::as_str).map(Path::new);
+    let cwd_error = |e: &std::io::Error| std::io::Error::new(e.kind(), e.to_string());
     let scope_root: std::io::Result<PathBuf> = match (scope_arg, &root) {
-        (Some(scope), _) => Ok(PathBuf::from(scope)),
+        (Some(scope), _) if scope.is_relative() => {
+            cwd.as_ref().map(|_| scope.to_path_buf()).map_err(cwd_error)
+        }
+        (Some(scope), _) => Ok(scope.to_path_buf()),
         (None, Some(root)) => Ok(root.clone()),
-        (None, None) => cwd
-            .as_ref()
-            .cloned()
-            .map_err(|e| std::io::Error::new(e.kind(), e.to_string())),
+        (None, None) => cwd.as_ref().cloned().map_err(cwd_error),
     };
     // Canonicalize the scope once for the overwrite/append containment check.
     // Fail closed on canonicalize failure: an unresolvable scope refuses
@@ -515,21 +517,15 @@ pub(in crate::mcp) fn tool_write(
             }
         }
         match crate::edit::apply_batch(hash_tasks, bloom, show_diff) {
-            Ok(combined) => {
-                output.push_str(&combined);
-                // Cross-worktree warning for hash-mode relative paths. apply_batch
-                // returns only the combined text (not the applied path list), so
-                // warn over the relative paths we tracked, skipping any with no
-                // file on disk, which no edit wrote. Pre-canonicalize into a
-                // HashSet to de-duplicate.
-                let canon_relative: std::collections::HashSet<PathBuf> = hash_relative_paths
-                    .iter()
-                    .filter(|r| r.exists())
-                    .map(|r| r.canonicalize().unwrap_or_else(|_| r.clone()))
-                    .collect();
-                for p in &canon_relative {
-                    if let Some(warn) = relative_writes.landed(p) {
-                        output.push_str(&warn);
+            Ok(batch) => {
+                output.push_str(&batch.output);
+                // Cross-worktree warning for the hash-mode relative paths whose
+                // edits applied.
+                for path in &batch.applied {
+                    if hash_relative_paths.contains(path) {
+                        if let Some(warn) = relative_writes.landed(path) {
+                            output.push_str(&warn);
+                        }
                     }
                 }
             }

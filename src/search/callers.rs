@@ -73,7 +73,6 @@ fn collect_sites(
             rank_callers(&mut entry.kept, scope, context);
             entry.kept.truncate(keep);
         }
-        drop(merged);
     })?;
     let merged = merged
         .into_inner()

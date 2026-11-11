@@ -140,11 +140,9 @@ fn top_five(counts: &Mutex<HashMap<String, usize>>) -> Vec<String> {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut sorted: Vec<(&String, &usize)> = counts.iter().collect();
     sorted.sort_by_key(|&(_, &count)| std::cmp::Reverse(count));
-    let top = sorted
+    sorted
         .into_iter()
         .take(5)
         .map(|(key, count)| format!("{key} ({count})"))
-        .collect();
-    drop(counts);
-    top
+        .collect()
 }

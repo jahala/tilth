@@ -101,10 +101,6 @@ impl OutlineCache {
     /// [`Self::get_or_compute`]: concurrent callers would otherwise each parse
     /// the same cold file.
     #[must_use]
-    #[expect(
-        clippy::significant_drop_tightening,
-        reason = "by design: the entry is held across the parse on purpose, and `insert` consumes it"
-    )]
     pub fn get_or_parse(&self, path: &Path) -> Option<Arc<ParsedFile>> {
         use dashmap::mapref::entry::Entry;
 
