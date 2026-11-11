@@ -438,13 +438,19 @@ fn on_disk(repo: Option<&Path>, path: &Path) -> PathBuf {
     }
 }
 
-fn git_show(spec: &str, repo: Option<&Path>) -> Result<String, String> {
+pub(super) fn git_show(spec: &str, repo: Option<&Path>) -> Result<String, String> {
     let mut cmd = Command::new("git");
     if let Some(dir) = repo {
         cmd.current_dir(dir);
     }
     let output = cmd
-        .args(["-c", "core.quotePath=false", "show", spec])
+        .args([
+            "-c",
+            "core.quotePath=false",
+            "show",
+            "--end-of-options",
+            spec,
+        ])
         .output()
         .map_err(|e| format!("git show failed: {e}"))?;
     if output.status.success() {
