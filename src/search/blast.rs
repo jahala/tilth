@@ -83,13 +83,25 @@ pub(crate) fn blast_radius(
     let symbol_names: HashSet<String> = touched.iter().map(|t| t.name.clone()).collect();
 
     // Calls from the edited file itself are not part of its blast radius.
+    // The walk counts every call site toward its bound, so the bound is
+    // raised by the file's own calls: it then stops after `BLAST_STOP_AFTER`
+    // sites of other files, wherever in the walk the edited file comes.
+    // The scope is canonical too, so the walk names the edited file as
+    // `canonical` even through a symlinked scope (`/tmp` on macOS).
     let canonical = path.canonicalize().ok()?;
+    let scope = &scope.canonicalize().ok()?;
+    let own_calls: usize =
+        find_callers_batch(&symbol_names, &canonical, bloom, None, None, |s| s.len())
+            .ok()?
+            .per_file
+            .iter()
+            .sum();
     let walk = find_callers_batch(
         &symbol_names,
         scope,
         bloom,
         None,
-        Some(BLAST_STOP_AFTER),
+        Some(BLAST_STOP_AFTER + own_calls),
         |sites| {
             let mut file = FileCallers::default();
             for (symbol, m) in sites {
@@ -112,17 +124,23 @@ pub(crate) fn blast_radius(
     )
     .ok()?;
     let files = walk.per_file;
+    // The edited file was left out on purpose, not for its size.
+    let mut skipped_large = walk.skipped_large;
+    skipped_large.retain(|p| *p != canonical);
 
-    if files.iter().all(|f| f.by_symbol.is_empty() && f.tests == 0) {
+    if files.iter().all(|f| f.by_symbol.is_empty() && f.tests == 0) && skipped_large.is_empty() {
         return None;
     }
 
-    Some(format_blast_radius(
-        &touched,
-        &files,
-        walk.reached_bound,
-        scope,
-    ))
+    // A file skipped for size may hold callers the counts miss.
+    let mut out = format_blast_radius(&touched, &files, walk.reached_bound, scope);
+    let held = crate::search::names_phrase(symbol_names.iter().map(String::as_str));
+    if let Some(sentence) = crate::search::skipped_files_note(&skipped_large, &held, scope) {
+        out.push_str("> ");
+        out.push_str(&sentence);
+        out.push('\n');
+    }
+    Some(out)
 }
 
 /// Call sites after which a blast walk stops. Blast runs on every write
@@ -181,6 +199,15 @@ fn format_blast_radius(
             .map(|c| c.total)
             .sum();
         if total == 0 {
+            // The walk stopped before it may have reached this symbol's
+            // callers; no line would read as "no callers".
+            if partial {
+                let _ = writeln!(
+                    out,
+                    "{}: callers not counted (the search stopped at {BLAST_STOP_AFTER} call sites)",
+                    ts.name
+                );
+            }
             continue;
         }
 
@@ -405,5 +432,130 @@ mod tests {
             .unwrap();
         assert!((PROD_CALLERS_LISTED..=120).contains(&n), "{out}");
         assert!(out.contains("  ... and at least "), "{out}");
+    }
+
+    /// A walk that stops at the bound may never reach a touched symbol's
+    /// callers. Leaving that symbol out reads as "no callers".
+    #[test]
+    fn a_symbol_the_stopped_walk_found_no_calls_for_is_not_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("lib.rs");
+        std::fs::write(
+            &lib,
+            "pub fn target(x: u32) -> u32 {\n    x\n}\n\npub fn quiet(x: u32) -> u32 {\n    x\n}\n",
+        )
+        .unwrap();
+        let calls = "fn caller() {\n    target(1);\n    target(2);\n    target(3);\n}\n";
+        for i in 0..40 {
+            std::fs::write(dir.path().join(format!("c{i:02}.rs")), calls).unwrap();
+        }
+        let bloom = tilth_core::index::bloom::BloomFilterCache::new();
+        let scope = dir.path().canonicalize().unwrap();
+        let out = blast_radius(&lib, &[make_edit(1, 5)], &scope, &bloom).expect("blast radius");
+        assert!(out.contains("target: at least "), "{out}");
+        assert!(out.contains("quiet: callers not counted"), "{out}");
+    }
+
+    /// A file over the size cap is not searched. When it names the touched
+    /// symbol, the blast radius says so: its count may miss those calls.
+    #[test]
+    fn a_blast_names_a_big_file_it_did_not_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("lib.rs");
+        std::fs::write(&lib, "pub fn target(x: u32) -> u32 {\n    x\n}\n").unwrap();
+        std::fs::write(
+            dir.path().join("c.rs"),
+            "fn caller() {\n    target(1);\n}\n",
+        )
+        .unwrap();
+        let limit = usize::try_from(tilth_core::source::MAX_FILE_SIZE).unwrap();
+        let pad = "// padding line to push the file over the size limit\n".repeat(limit / 50 + 1);
+        std::fs::write(
+            dir.path().join("big.rs"),
+            format!("{pad}fn b() {{ target(2); }}\n"),
+        )
+        .unwrap();
+        let bloom = tilth_core::index::bloom::BloomFilterCache::new();
+        let scope = dir.path().canonicalize().unwrap();
+        let out = blast_radius(&lib, &[make_edit(1, 1)], &scope, &bloom).expect("blast radius");
+        assert!(out.contains("target: 1 caller\n"), "{out}");
+        assert!(
+            out.contains("\n> 1 file over 500 KB contains `target` and was not searched: big.rs"),
+            "{out}"
+        );
+    }
+
+    /// The walk's paths are compared with the edited file's canonical path.
+    /// Under a scope reached through a symlink (`/var` on macOS), a walked
+    /// path is not canonical, so the file's own recursive call could count
+    /// as an outside caller.
+    #[cfg(unix)]
+    #[test]
+    fn a_scope_through_a_symlink_keeps_own_calls_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let scope = dir.path().join("link");
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &scope).unwrap();
+        std::fs::write(
+            real.join("lib.rs"),
+            "pub fn target(n: u32) -> u32 {\n    if n == 0 { 0 } else { target(n - 1) }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(real.join("c.rs"), "fn caller() {\n    target(1);\n}\n").unwrap();
+        let bloom = tilth_core::index::bloom::BloomFilterCache::new();
+        let lib = scope.join("lib.rs");
+        let out = blast_radius(&lib, &[make_edit(1, 1)], &scope, &bloom).expect("blast radius");
+        assert!(out.contains("target: 1 caller\n"), "{out}");
+        assert!(out.contains("  c.rs:2  caller"), "{out}");
+    }
+
+    /// The edited file's own calls are no part of its blast radius, so a
+    /// big edited file is not one the walk left out: naming it said its
+    /// own calls might be missing.
+    #[test]
+    fn a_big_edited_file_is_not_named_as_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let limit = usize::try_from(tilth_core::source::MAX_FILE_SIZE).unwrap();
+        let pad = "// padding line to push the file over the size limit\n".repeat(limit / 50 + 1);
+        let lib = dir.path().join("lib.rs");
+        std::fs::write(
+            &lib,
+            format!("pub fn target(x: u32) -> u32 {{\n    x\n}}\n{pad}"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("c.rs"),
+            "fn caller() {\n    target(1);\n}\n",
+        )
+        .unwrap();
+        let bloom = tilth_core::index::bloom::BloomFilterCache::new();
+        let scope = dir.path().canonicalize().unwrap();
+        let out = blast_radius(&lib, &[make_edit(1, 1)], &scope, &bloom).expect("blast radius");
+        assert!(out.contains("target: 1 caller\n"), "{out}");
+        assert!(!out.contains("not searched"), "{out}");
+    }
+
+    /// Calls inside the edited file are no part of its blast radius, so
+    /// they must not use up the bound before the walk reaches other files.
+    #[test]
+    fn calls_in_the_edited_file_do_not_count_toward_the_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("lib.rs");
+        let mut body = String::from("pub fn target(x: u32) -> u32 {\n    x\n}\n\nfn local() {\n");
+        for i in 0..60 {
+            let _ = writeln!(body, "    target({i});");
+        }
+        body.push_str("}\n");
+        std::fs::write(&lib, body).unwrap();
+        std::fs::write(
+            dir.path().join("other.rs"),
+            "fn caller() {\n    target(1);\n}\n",
+        )
+        .unwrap();
+        let bloom = tilth_core::index::bloom::BloomFilterCache::new();
+        let scope = dir.path().canonicalize().unwrap();
+        let out = blast_radius(&lib, &[make_edit(1, 1)], &scope, &bloom).expect("blast radius");
+        assert!(out.contains("target: 1 caller\n"), "{out}");
     }
 }

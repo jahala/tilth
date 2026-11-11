@@ -100,7 +100,8 @@ fn resolve_by_name(name: &str, scope: &Path) -> Result<(ResolvedTarget, String, 
             suggestion,
         });
     };
-    let other_def_count = result.definitions.saturating_sub(1);
+    // A doc heading that names the symbol is no rival definition.
+    let other_def_count = result.code_definitions.saturating_sub(1);
     let (start, _end) = top.def_range.ok_or_else(|| TilthError::ParseError {
         path: top.path.clone(),
         reason: format!("definition match for `{name}` had no def_range"),
@@ -155,7 +156,7 @@ fn read_code_file(path: &Path) -> Result<(String, Lang), TilthError> {
             ),
         });
     }
-    let bytes = fs::read(path).map_err(|e| TilthError::IoError {
+    let bytes = tilth_core::source::read(path).map_err(|e| TilthError::IoError {
         path: path.to_path_buf(),
         source: e,
     })?;
@@ -200,6 +201,11 @@ fn enrich_from_outline(
         other => other,
     })?;
     let entries = get_outline_entries(&content, lang);
+    // A definition's range opens with the decorators beside it, but its
+    // outline entry starts on its own first line, below them.
+    let start_line =
+        tilth_core::lang::treesitter::decorated_definition_line(&content, lang, start_line)
+            .unwrap_or(start_line);
     // A one-line class and its first method start on the same line; the
     // name tells them apart.
     let entry = find_named_at(&entries, start_line, &name)
@@ -933,9 +939,10 @@ pub fn format_grok(result: &GrokResult, scope: &Path) -> String {
         }
     }
 
-    let skipped_note = crate::search::skipped_files_note(&result.skipped_large, scope);
-    if !skipped_note.is_empty() {
-        let _ = writeln!(out, "{skipped_note}");
+    // The walk looked for the target's bare name, whatever qualified it.
+    let held = crate::search::names_phrase([result.target.name.as_str()]);
+    if let Some(sentence) = crate::search::skipped_files_note(&result.skipped_large, &held, scope) {
+        let _ = writeln!(out, "\n\n> {sentence}");
     }
 
     out
@@ -1186,6 +1193,111 @@ mod tests {
         }
     }
 
+    /// A qualifier naming a package, a module or `Self`/`self`/`this` finds
+    /// the definition by its name, as grok's bare-name retry did before
+    /// #296, and an Elixir dotted module is found by its full name.
+    #[test]
+    fn grok_resolves_names_qualified_by_a_module_or_self() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(
+            tmp.path(),
+            "gin.go",
+            "package gin\n\nfunc New() int {\n\treturn 1\n}\n",
+        );
+        write_fixture(
+            tmp.path(),
+            "runner.rs",
+            "pub struct Runner;\nimpl Runner {\n    pub fn new() -> Self {\n        Runner\n    }\n    pub fn run(&self) {}\n}\n",
+        );
+        write_fixture(tmp.path(), "symbol.rs", "pub fn search() {}\n");
+        write_fixture(
+            tmp.path(),
+            "accounts.ex",
+            "defmodule MyApp.Accounts do\n  def get_user(id), do: id\nend\n",
+        );
+        for (spec, file, line) in [
+            ("gin.New", "gin.go", 3),
+            ("Self::new", "runner.rs", 3),
+            ("self.run", "runner.rs", 6),
+            ("crate::search::symbol::search", "symbol.rs", 1),
+            ("MyApp.Accounts", "accounts.ex", 1),
+            ("MyApp.Accounts.get_user", "accounts.ex", 2),
+        ] {
+            let target = grok_target(tmp.path(), spec).unwrap_or_else(|e| panic!("{spec}: {e}"));
+            assert_eq!(
+                (
+                    target.path.file_name().unwrap().to_str().unwrap(),
+                    target.start_line
+                ),
+                (file, line),
+                "{spec}"
+            );
+        }
+    }
+
+    /// grok and search mark an expanded definition in the session under one
+    /// line, so each shows the other's body as shown earlier. A definition
+    /// whose annotations, decorators or return type sit above its name line
+    /// was marked under two lines and inlined twice.
+    #[test]
+    fn grok_and_search_share_the_expansion_of_an_annotated_definition() {
+        // Twenty lines in each body, past the length grok degrades on repeat.
+        let lines = |indent: &str, end: &str| -> String {
+            (0..20).fold(String::new(), |mut out, i| {
+                let _ = writeln!(out, "{indent}v{i} = {i}{end}");
+                out
+            })
+        };
+        let body = lines("        int ", ";");
+        let java = format!("class Svc {{\n    @Override\n    public String run() {{\n{body}        return \"x\";\n    }}\n}}\n");
+        let py_body = lines("    ", "");
+        let py = format!("@app.get(\"/r\")\ndef route():\n{py_body}    return 1\n");
+        let c_body = lines("  int ", ";");
+        let c = format!("static int\nrun_c(void)\n{{\n{c_body}  return 0;\n}}\n");
+        for (file, fixture, query) in [
+            ("Svc.java", java.as_str(), "run"),
+            ("app.py", py.as_str(), "route"),
+            ("r.c", c.as_str(), "run_c"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            write_fixture(tmp.path(), file, fixture);
+            let bloom = BloomFilterCache::default();
+            let cache = tilth_core::cache::OutlineCache::new();
+            let search = |session: &crate::session::Session| {
+                crate::search::search_symbol_expanded(
+                    query,
+                    tmp.path(),
+                    &cache,
+                    session,
+                    &bloom,
+                    1,
+                    None,
+                    None,
+                    false,
+                    None,
+                )
+                .unwrap()
+            };
+
+            let session = crate::session::Session::default();
+            grok(query, tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
+            let out = search(&session);
+            assert!(
+                out.contains("[shown earlier]"),
+                "{file}: grok, then search: {out}"
+            );
+
+            let session = crate::session::Session::default();
+            search(&session);
+            let again = grok(query, tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
+            assert!(
+                again.body.contains("body shown earlier"),
+                "{file}: search, then grok: {}",
+                again.body
+            );
+        }
+    }
+
     /// A qualified target whose owner holds no definition of the name is not
     /// found, and the error names the definitions there are.
     #[test]
@@ -1378,6 +1490,38 @@ mod tests {
         let mut f = fs::File::create(&path).unwrap();
         f.write_all(body.as_bytes()).unwrap();
         path
+    }
+
+    /// A Markdown heading that names the symbol counts as a definition in
+    /// search, but it is no rival for grok to pick: only code definitions
+    /// make the target ambiguous.
+    #[test]
+    fn doc_headings_do_not_make_a_target_ambiguous() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(
+            tmp.path(),
+            "lib.rs",
+            "pub fn render_page() -> u32 {\n    1\n}\n",
+        );
+        write_fixture(
+            tmp.path(),
+            "README.md",
+            "# Docs\n\n## render_page\n\nText.\n",
+        );
+        write_fixture(
+            tmp.path(),
+            "GUIDE.md",
+            "# More\n\n## render_page\n\nMore.\n",
+        );
+        let target = grok_target(tmp.path(), "render_page").unwrap();
+        assert_eq!(target.other_def_count, 0);
+        write_fixture(
+            tmp.path(),
+            "other.rs",
+            "pub fn render_page() -> u32 {\n    2\n}\n",
+        );
+        let target = grok_target(tmp.path(), "render_page").unwrap();
+        assert_eq!(target.other_def_count, 1);
     }
 
     #[test]

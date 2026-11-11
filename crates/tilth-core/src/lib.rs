@@ -8,6 +8,7 @@
 //! The documented surface is the set of items re-exported at this root. The
 //! modules behind it are shared with the `tilth` binary and carry no
 //! stability promise.
+#![forbid(unsafe_code)]
 #![warn(clippy::pedantic)]
 #![warn(missing_docs)]
 #![allow(
@@ -36,6 +37,9 @@ pub mod lang;
 pub mod search;
 #[doc(hidden)]
 pub mod source;
+#[cfg(any(test, feature = "test-fixtures"))]
+#[doc(hidden)]
+pub mod test_readers;
 #[doc(hidden)]
 pub mod test_structure;
 #[doc(hidden)]

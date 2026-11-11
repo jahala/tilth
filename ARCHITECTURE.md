@@ -49,7 +49,8 @@ crates/tilth-core/src/
 │                    tree_sitter::Tree, both keyed by (path, mtime)
 ├── imports.rs       Imports as data (one per module named), import lines, related-file resolution
 ├── test_structure.rs describe/it/test calls as TestEntry data
-├── source.rs        read_source: reads a file for parsing or search
+├── source.rs        OpenFile, the one way tilth opens a file to read
+│                    it; read_source: reads a file for parsing or search
 │                    without its byte-order mark; MAX_FILE_SIZE, the
 │                    one size limit every parse and search walk shares
 │
@@ -125,6 +126,8 @@ src/
 │   ├── mod.rs           read_file decision tree, multi-section reader
 │   │                    (`read_ranges`), heading resolver, suggestion
 │   │                    fallback
+│   ├── ends.rs          A text's first and last lines and line count,
+│   │                    from memory or a stream
 │   └── outline/
 │       ├── mod.rs       Dispatch by FileType
 │       ├── code.rs      Tree-sitter outline for code
@@ -431,20 +434,33 @@ The biggest production-only file in the subsystem. Three layers stacked:
      Go, C, C++ and Elixir. The walk stops three nesting levels down, so
      declarations nested deeper are locals. Only real nesting counts:
      `WRAPPER_KINDS` (`export`, decorators, `declare`), namespaces and
-     modules, pass-through nodes (`#ifdef`, `extern "C"`, templates) and
-     the body of a `TYPE_KINDS` node are free. A variable declared in a
-     function body (`is_local_binding`) is never a definition. A wrapper
-     is not a definition of its own; the declaration it wraps is. A
-     definition's line is the line of its name, so decorators above it
-     sit in its range and its name line is not also a usage.
+     modules, pass-through nodes (`#ifdef`, `extern "C"`, templates),
+     a statement at the top of a file that defines nothing (`if`, `try`,
+     `with`), and the body of a `TYPE_KINDS` node are free (Python's root
+     `module` is no type). A variable declared in a function body
+     (`is_local_binding`) is never a definition; in Bash only `local`,
+     `declare` and `typeset` make one local, and a flag with `g` in it
+     (`-g`, `-gA`) makes it global. A wrapper is not a
+     definition of its own; the declaration it wraps is. A definition's
+     line is the line of its name, and its range opens with the
+     decorators or attributes beside it (`treesitter::decorators_start`),
+     so its name line is not also a usage and an expanded result shows
+     its decorators. Each name of `const a = 1, b = 2` is a definition.
    - A qualified query (`B::run`, `B.run`, `crate::m::B::run`) is split
      by `scope::split_qualified` into an owner and a bare name. Its
-     definitions are those of the bare name whose
-     `scope::definition_owner` is that owner: the enclosing type, the
-     type of a Rust `impl`, a Go receiver, or the class in a C++
-     out-of-line declarator. Its usages are the qualified text itself.
-     When the owner holds none, the definitions other owners hold come
-     back in `other_owners`, and search and grok name them.
+     definitions are those of the bare name that
+     `scope::names_definition` matches: the query's segments agree,
+     from the end, with the definition's owner (`scope::definition_owner`:
+     the enclosing type, the type of a Rust `impl`, a Go receiver, or the
+     class in a C++ out-of-line declarator) followed by its own name, so
+     an Elixir `defmodule MyApp.Accounts` or a Ruby `class Admin::User`
+     is found by its full name. `Self`, `self`, `this` and `cls` match
+     any owner, and never a definition with none. A top-level definition also matches when the qualifier
+     names its module (`scope::names_module`: the file's stem, its
+     directory, or a Go package clause), as in `gin.New`. Its usages are
+     the qualified text itself. When nothing matches, the definitions
+     other owners hold come back in `other_owners`; grok lists them, and
+     search notes them when one of them has an owner.
    - `find_defs_heuristic_buf` is a regex-free fallback for languages
      without grammars (Dockerfile, Make).
    - `find_defs_markdown_buf` handles ATX headings as
@@ -541,15 +557,20 @@ machinery:
   text names a target, and callers, grok and deps name them in a note. Each caller is annotated with its enclosing scope via
   `scope::walk_to_enclosing_definition` so the user sees
   `[caller: foo]` instead of just a line number. The label is the
-  nearest enclosing definition that is not a local variable, qualified
-  by its owner (`Service.run`, `Context.reset`): a call in
-  `const result = target()` inside `outer` is labelled `outer`. The 2nd
-  hop looks for the bare names of these labels. A call names a method
-  without its type, so a method name that more than one type defines
-  (`callers::definition_owners`) cannot be traced by name: its sites
-  are counted on one line (`__init__: 21 call sites, not attributed (52
-  types define it)`) and left out of the functions affected. When the walk returns
-  empty, a small `target_seen_in_scope` helper in the binary does an mmap-based
+  nearest enclosing definition that is not a variable declared in a
+  function (`binds_in_function`), qualified by its owner (`Service.run`,
+  `Context.reset`): a call in `const result = target()` inside `outer`
+  is labelled `outer`. A label passed back as a target is looked up by
+  its bare name, and the header says the receiver's type is not
+  checked. The 2nd hop looks for the bare names of these labels. A call
+  names a method without its type, so a method name that more than one
+  type defines cannot be traced by name; `find_callers_and_owners`
+  finds the sites and those types in one walk and one parse. Its sites
+  are counted on one line (`__init__: 21 call sites, not
+  attributed (52 types define it)`) and left out of the functions
+  affected. When one type defines it, its sites are counted, and the
+  affected total says method calls were matched by name. When the walk returns
+  empty, a small `target_seen_in_scope` helper in the binary does a
   literal scan so `no_callers_message` can distinguish typo from
   "real symbol with no direct callers" (indirect dispatch, dead code,
   framework registration).
@@ -570,20 +591,24 @@ machinery:
   other files import by name, then by length; the rest are named in
   the result), or imports the file: a walk resolves the imports of
   every file whose text names the file's module, then follows the
-  files that re-export it (`index.ts`, `__init__.py`, `export … from`)
-  to their importers. Python absolute imports resolve against the
-  importer's directories up to the project root, and their `src/`.
-  `format_deps` (binary)
+  files that re-export it (`index.ts`, `__init__.py`, `export … from`,
+  `export * from` at any depth) to their importers. Python absolute
+  imports resolve where Python 3 looks: the importer's directories that
+  are not packages, up to the project root, and their `src/`; without a
+  root, only the nearest. `from pkg import mod` resolves to the
+  submodule `pkg/mod.py` when there is one. `format_deps` (binary)
   does the human output: it lists the first 15 dependents, or all of
   them with `--full`, and says how many it left out, under a budget
-  too. The external-dep stdlib
+  too, and how many were found by a call alone. The external-dep stdlib
   heuristic (`is_stdlib`) is per-language; module-path validation
   (`is_valid_module_path`) avoids treating relative paths as packages.
 - **Blast** (`blast.rs`) — symbol-level blast radius, printed after
   every edit-mode write that touches a definition and counted by
   `tilth_diff --blast`. A write must stay fast on any tree, so both
   walks stop at `BLAST_STOP_AFTER` (50) call sites, and a count that
-  reached the bound reads "at least N".
+  reached the bound reads "at least N". A touched symbol the walk found
+  no call for by then reads "callers not counted". A write's own file
+  is no part of its blast radius, so its own calls raise the bound.
 
 ### Glob (`glob.rs`)
 
@@ -597,11 +622,15 @@ division.
 `read::read_file(path, section, full, cache, edit_mode)` is the
 gateway. The decision tree, in order:
 
-1. `metadata` errors → typed `TilthError::NotFound` /
-   `PermissionDenied` / `IoError` with a `suggest_similar` fallback
-   (Levenshtein on directory siblings).
+1. `metadata` and open errors → typed `TilthError::NotFound` /
+   `PermissionDenied` / `IoError` (`TilthError::from_io`, one mapping
+   for every step and for the edit read), with a `suggest_similar`
+   fallback (Levenshtein on directory siblings).
 2. **Directory** → `list_directory` (sorted entries, file types).
-3. **Empty file** → header with `ViewMode::Empty`.
+3. **Empty file, or not a regular file** → header with
+   `ViewMode::Empty`. A pipe, socket or device has no fixed contents and
+   is not opened. The path's metadata decides this before any open, so
+   an empty file shows as empty whatever its section or permissions.
 4. **`section: Some(...)` or `sections: [...]`** → `read_ranges`.
    Each range is either a line range (`"45-89"`) or a heading address
    (`"## Architecture"`, resolved by `resolve_heading`'s walk over
@@ -612,28 +641,57 @@ gateway. The decision tree, in order:
    header followed by per-block `─── lines X-Y ───` delimiters and are
    emitted in user-supplied order — overlap is honored verbatim, no
    coalescing. Returns the verbatim slice regardless of file size.
-5. **mmap + binary check** — `is_binary` looks for null bytes in the
-   first 512 bytes via `memchr`. Binary files emit just a header.
-6. **Generated** — by name (`Cargo.lock`, `package-lock.json`, etc.) or
-   content marker (`@generated`, `DO NOT EDIT`, `auto-generated`,
-   etc.).
-7. **Minified** — `.min.<ext>` convention or, for files >100KB, a
-   newline-density heuristic.
-8. **Full mode + oversized** — guard for `--full` on huge files. Caps
+   Line ranges stream through `LineSelector`, which copies the requested
+   lines out of each chunk, only counts the others and stops at the last
+   requested line. A heading needs the whole text to find its lines. An
+   empty file shows as empty, whatever its well-formed ranges; a
+   malformed range fails there as on any file.
+5. **The head decides first.** `detection::read_head` reads the first
+   `HEAD_WINDOW` bytes, and `is_binary` (null bytes in the first 512),
+   the generated markers (`@generated`, `DO NOT EDIT`, …, or a name such
+   as `Cargo.lock`) and the minified check (`.min.<ext>`, or for files
+   over 100 KB a newline-density heuristic) all look only there. A binary
+   file emits just a header; a generated or minified one emits a header
+   whose line count is streamed.
+6. **Log, CSV or unknown type, outlined.** Past the token threshold, or
+   over the cap with `--full`, these views show only a file's first and
+   last lines and its line count (`outline::EndsView`). The file streams
+   into `ends::EndsCollector`, so only the lines shown are held, each
+   once. A file with no more lines than the view shows is then held
+   whole by that pass, and goes on to step 7 without a second read. A
+   file whose outline OGATE rejects goes on to step 7 too, which reads
+   it whole.
+7. **Full mode + oversized.** This guards `--full` on huge files. Caps
    at `TILTH_FULL_SIZE_CAP` (default in `full_read_size_cap()`); above
    the cap, returns the outline with a banner explaining how to
-   override.
-9. **Below the token threshold or `--full`** → return full content
+   override. From this step on the file is read whole, up to the length
+   its open handle reported.
+8. **Below the token threshold or `--full`** → return full content
    (with `format::hashlines` if `edit_mode`, plain `number_lines`
    otherwise). Without `--full`, a full view over the caller's budget
    goes on to the outline instead.
-10. **Otherwise** → `outline::generate` per `FileType`, cached in
-    `OutlineCache::get_or_compute`. An outline over the budget is cut
-    by `outline::fit`: a code outline drops its signatures and docs
-    first (`outline::names_only`), so every symbol stays listed, then
-    whole entries from the end, and a closing line says which.
+9. **Otherwise** → `outline::generate` per `FileType`, cached in
+   `OutlineCache::get_or_compute`. OGATE returns the full view instead
+   when the outline saves too little. An outline over the budget is cut
+   by `outline::fit`: a code outline drops its signatures and docs
+   first (`outline::names_only`), so every symbol stays listed, then
+   whole entries from the end, and a closing line says which.
 
-The `outline/` submodule dispatches on `FileType`:
+Every read opens the file through `tilth_core::source::OpenFile`, as
+do `read_source`, `source::read` and `source::read_to_string`, which
+every parse, search and edit read goes through. On Unix it opens with
+`O_NONBLOCK`, checks the handle's own metadata and clears the flag on a
+regular file, so a pipe swapped in after the path was checked is still
+never read. A pipe, socket or device reads as empty everywhere. The one
+read that waits on a pipe is `tilth diff --patch`, which may be handed
+one.
+
+The signature and stripped views reshape only code. Any other file gets
+its default view, after a streamed check that it is UTF-8, so it fails
+as those views always made it fail.
+
+The `outline/` submodule dispatches on `FileType` through
+`outline::View`, the one mapping from file type to view:
 
 - `code.rs` — calls `lang::outline::walk_top_level` with the parsed
   tree-sitter tree, formats `OutlineEntry` instances as `[start-end]
@@ -643,10 +701,12 @@ The `outline/` submodule dispatches on `FileType`:
   indented code blocks).
 - `structured.rs` — JSON/YAML/TOML "keys" view (top-level keys + their
   shapes).
-- `tabular.rs` — CSV/TSV header + first/last few rows.
+- `tabular.rs`: CSV/TSV header + first/last few rows, rendered from
+  the text's `Ends`.
 - `test_file.rs` — describe/it grouping for test files, rendered over
   `tilth_core::test_entries`.
-- `fallback.rs` — last-resort head/tail when nothing else applies.
+- `fallback.rs`: last-resort head/tail and the log view, rendered from
+  the text's `Ends`.
 
 Two helpers feed the MCP layer:
 
@@ -693,8 +753,11 @@ edits. Beside it, `WRAPPER_KINDS`, `TYPE_KINDS`, `NAMESPACE_KINDS`,
 `.h` is the one extension two languages share. `detect_file_type` reads
 it as C; `detect_file_type_with_content` (and `refine_lang`, for a
 caller that already holds the path's language) reads a header that
-holds C++ syntax as C++. Every site that parses content uses the
-content-aware form; the overview's language counts stay path-only.
+holds C++ syntax as C++. An `extern "C" { ... }` block alone does not
+count: portable C headers guard one for C++ includers. Every site that
+parses content uses the content-aware form, including each side of a
+structural diff and every outline stored in the shared `OutlineCache`;
+the overview's language counts stay path-only.
 
 `lang::package_root(path)` walks up looking for known manifests
 (`Cargo.toml`, `package.json`, `pyproject.toml`, `go.mod`, etc.) and is
@@ -730,13 +793,18 @@ The ceiling on `get_or_parse` (`tilth_core::source::MAX_FILE_SIZE`,
 TypeScript bundles or vendored single-file libraries. Above the cap,
 `get_or_parse` returns `None` and callers fall back to text-based
 heuristics. The search walkers skip files over the same limit; a
-skipped file that contains the query is named under the result
-(`> 1 file over 500 KB contains the query and was not searched: …`).
-The check streams the file through a fixed buffer and stops at the
-first match, at a NUL byte (a binary file, which search never reads) or
-at a line over 1 MiB, so a multi-gigabyte file in the scope costs a few
-MB. grok names a callee defined in an imported file over the limit as
-`not parsed` instead of `extern`.
+skipped file that contains what the walk looked for is named under the
+result (``> 1 file over 500 KB contains `run` and was not searched: …``).
+The check (`tilth_core::source::file_holds`) streams the file in 64 KB
+chunks and stops at the first match, so a multi-gigabyte file in the
+scope costs a few chunks of memory whatever its line length. A NUL byte
+in the first 512 bytes makes the file binary, which holds nothing.
+Symbol search, callers, grok and deps look for whole identifiers
+(`file_mentions`); content and regex search for the query's match.
+Deps checks a big file for the target's names and its module's name,
+which for a package's entry file (`mod.rs`, `index.ts`, `__init__.py`)
+is its directory's name. grok names each imported file over the limit
+that holds an extern callee's name: those callees may be defined there.
 Parsing grows linearly with size, about 0.2 ms per KB for Rust and
 Python, so a 1 MB file costs about twice what a 500 KB one does; that
 is why the limit stays where it is.

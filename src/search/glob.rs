@@ -124,20 +124,17 @@ fn file_preview(path: &Path) -> Option<String> {
     Some(format!("~{tokens} tokens"))
 }
 
-/// Classify by content the way the read path does: a null byte in the first
-/// 512 bytes marks binary.
+/// Classify by content with the read path's rule, reading only the bytes
+/// that rule looks at. A pipe, socket or device reads as empty, which is
+/// not binary.
 fn is_binary_file(path: &Path) -> bool {
-    use std::io::Read;
-    let Ok(file) = std::fs::File::open(path) else {
+    use tilth_core::lang::detection::{is_binary, read_prefix, BINARY_WINDOW};
+    let Ok(Some(mut file)) = tilth_core::source::OpenFile::open(path) else {
         return false;
     };
-    // A bare read() may legally return fewer than 512 bytes before EOF;
-    // take + read_to_end retries until the cap or EOF, guaranteeing the window.
-    let mut head = Vec::with_capacity(512);
-    if file.take(512).read_to_end(&mut head).is_err() {
-        return false;
-    }
-    tilth_core::lang::detection::is_binary(&head)
+    file.reader()
+        .and_then(|reader| read_prefix(reader, BINARY_WINDOW))
+        .is_ok_and(|prefix| is_binary(&prefix))
 }
 
 #[cfg(test)]

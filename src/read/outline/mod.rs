@@ -7,9 +7,19 @@ pub mod test_file;
 
 use std::path::Path;
 
-use tilth_core::types::FileType;
+use tilth_core::types::{FileType, Lang};
+
+use crate::read::ends::{Ends, Shape};
 
 const OUTLINE_CAP: usize = 100; // max outline lines for huge files
+
+fn max_lines(capped: bool) -> usize {
+    if capped {
+        OUTLINE_CAP
+    } else {
+        usize::MAX
+    }
+}
 
 /// Generate a smart view based on file type.
 pub fn generate(
@@ -19,7 +29,7 @@ pub fn generate(
     buf: &[u8],
     capped: bool,
 ) -> String {
-    let max_lines = if capped { OUTLINE_CAP } else { usize::MAX };
+    let max_lines = max_lines(capped);
 
     // Test files get special treatment regardless of language
     if tilth_core::types::is_test_file(path) {
@@ -30,15 +40,74 @@ pub fn generate(
         }
     }
 
-    let outline = match file_type {
-        FileType::Code(lang) => code::outline(content, lang, max_lines),
-        FileType::Markdown => markdown::outline(buf, max_lines),
-        FileType::StructuredData => structured::outline(path, content, max_lines),
-        FileType::Tabular => tabular::outline(content, max_lines),
-        FileType::Log => fallback::log_view(content),
-        FileType::Other => fallback::head_tail(content),
+    let outline = match View::of(file_type) {
+        View::Code(lang) => code::outline(content, lang, max_lines),
+        View::Markdown => markdown::outline(buf, max_lines),
+        View::Structured => structured::outline(path, content, max_lines),
+        View::Ends(view) => view.outline_of_text(content),
     };
     with_omission_note(outline, max_lines)
+}
+
+/// What [`generate`] makes a file type's outline from: the whole text, or
+/// only its first and last lines. The one mapping from file type to view,
+/// so a text in memory and a file streamed from disk get the same view.
+pub(crate) enum View {
+    Code(Lang),
+    Markdown,
+    Structured,
+    Ends(EndsView),
+}
+
+impl View {
+    pub(crate) fn of(file_type: FileType) -> Self {
+        match file_type {
+            FileType::Code(lang) => Self::Code(lang),
+            FileType::Markdown => Self::Markdown,
+            FileType::StructuredData => Self::Structured,
+            FileType::Log => Self::Ends(EndsView::Log),
+            FileType::Tabular => Self::Ends(EndsView::Tabular),
+            FileType::Other => Self::Ends(EndsView::Other),
+        }
+    }
+}
+
+/// A view that shows only a text's first and last lines and its line count,
+/// so a file can stream into it without being held in memory.
+#[derive(Clone, Copy)]
+pub(crate) enum EndsView {
+    Log,
+    Tabular,
+    Other,
+}
+
+impl EndsView {
+    /// How many lines the view shows from each end.
+    pub(crate) fn shape(self) -> Shape {
+        match self {
+            Self::Log => fallback::LOG,
+            Self::Tabular => tabular::TABULAR,
+            Self::Other => fallback::OTHER,
+        }
+    }
+
+    /// What [`generate`] returns for a text whose [`shape`](Self::shape)
+    /// ends are `ends`.
+    pub(crate) fn generate(self, ends: &Ends<'_>, capped: bool) -> String {
+        with_omission_note(self.render(ends), max_lines(capped))
+    }
+
+    /// The view of `text`, held in memory, before any omission note.
+    fn outline_of_text(self, text: &str) -> String {
+        self.render(&Ends::of_text(text, self.shape()))
+    }
+
+    fn render(self, ends: &Ends<'_>) -> String {
+        match self {
+            Self::Log | Self::Other => fallback::excerpt(ends),
+            Self::Tabular => tabular::render(ends),
+        }
+    }
 }
 
 /// The outline of a code file with names alone, no signatures or docs,
@@ -51,7 +120,7 @@ pub fn names_only(path: &Path, file_type: FileType, content: &str, capped: bool)
     if tilth_core::types::is_test_file(path) {
         return None;
     }
-    let max_lines = if capped { OUTLINE_CAP } else { usize::MAX };
+    let max_lines = max_lines(capped);
     let outline = code::outline_with(content, lang, max_lines, code::Detail::Names);
     Some(with_omission_note(outline, max_lines))
 }

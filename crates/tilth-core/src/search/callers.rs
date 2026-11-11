@@ -2,7 +2,7 @@
 //! found with one parallel walk, a bloom and byte pre-filter, and a
 //! tree-sitter pass over the files that survive.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -77,6 +77,59 @@ where
     T: Send,
     F: Fn(Vec<(String, CallerMatch)>) -> T + Sync,
 {
+    let none = HashSet::new();
+    walk_callers(
+        targets,
+        &none,
+        scope,
+        bloom,
+        glob,
+        stop_after,
+        |sites, _| per_file(sites),
+    )
+}
+
+/// [`find_callers_batch`] that also reports, from the same parse, the types
+/// that define each of `owner_names` (each a subset of `targets`): `per_file`
+/// receives a file's call sites and its (name, owner) pairs, the owners a
+/// caller label would name for an owned definition with a body. A plain
+/// function adds no owner, and neither does a member declared without a body
+/// (a trait or interface method): a call through it runs an implementor's
+/// body, whose type is counted. `per_file` runs for each file with a call
+/// site or an owned definition.
+///
+/// A call site names a method without its type (`x.run()`), so a name that
+/// several types define cannot be traced to one of them by name alone; one
+/// walk tells both where the name is called and how many types define it.
+#[allow(clippy::implicit_hasher)]
+pub fn find_callers_and_owners<T, F>(
+    targets: &HashSet<String>,
+    owner_names: &HashSet<String>,
+    scope: &Path,
+    bloom: &crate::index::bloom::BloomFilterCache,
+    glob: Option<&str>,
+    per_file: F,
+) -> Result<CallerWalk<T>, TilthError>
+where
+    T: Send,
+    F: Fn(Vec<(String, CallerMatch)>, Vec<(String, String)>) -> T + Sync,
+{
+    walk_callers(targets, owner_names, scope, bloom, glob, None, per_file)
+}
+
+fn walk_callers<T, F>(
+    targets: &HashSet<String>,
+    owner_names: &HashSet<String>,
+    scope: &Path,
+    bloom: &crate::index::bloom::BloomFilterCache,
+    glob: Option<&str>,
+    stop_after: Option<usize>,
+    per_file: F,
+) -> Result<CallerWalk<T>, TilthError>
+where
+    T: Send,
+    F: Fn(Vec<(String, CallerMatch)>, Vec<(String, String)>) -> T + Sync,
+{
     let found: Mutex<Vec<(PathBuf, T)>> = Mutex::new(Vec::new());
     let skipped_large: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
     let sites_found = AtomicUsize::new(0);
@@ -144,14 +197,21 @@ where
                 return ignore::WalkState::Continue;
             };
 
-            let mut file_callers =
-                find_callers_treesitter_batch(path, scope, targets, &ts_lang, &content, lang);
+            let (mut file_callers, owners) = find_callers_treesitter_batch(
+                path,
+                scope,
+                targets,
+                owner_names,
+                &ts_lang,
+                &content,
+                lang,
+            );
 
-            if !file_callers.is_empty() {
+            if !file_callers.is_empty() || !owners.is_empty() {
                 // Stable, so two calls on one line keep the query's order.
                 file_callers.sort_by_key(|(_, m)| m.line);
                 sites_found.fetch_add(file_callers.len(), Ordering::Relaxed);
-                let kept = per_file(file_callers);
+                let kept = per_file(file_callers, owners);
                 found
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -177,102 +237,21 @@ where
     })
 }
 
-/// The types that define each of `names` under `scope`: for each name, the
-/// distinct owners (see [`super::scope::definition_owner`]) of its
-/// definitions, the same owners caller labels carry. A definition with no
-/// owner, such as a plain function, adds none, and neither does a member
-/// declared without a body (a trait or interface method): a call through
-/// it runs an implementor's body, whose type is counted. Names no type
-/// defines are left out.
-///
-/// A call site names a method without its type (`x.run()`), so a name that
-/// several types define cannot be traced to one of them by name alone.
-/// Files over the size cap are not parsed, as in [`find_callers_batch`].
-// The std hasher is part of the signature, as in `find_callers_batch`.
-#[allow(clippy::implicit_hasher)]
-pub fn definition_owners(
+/// The (name, owner) pair of each owned definition with a body of one of
+/// `names` in a parsed file.
+fn owners_in_tree(
+    tree: &tree_sitter::Tree,
+    lines: &[&str],
     names: &HashSet<String>,
-    scope: &Path,
-    bloom: &crate::index::bloom::BloomFilterCache,
-    glob: Option<&str>,
-) -> Result<HashMap<String, BTreeSet<String>>, TilthError> {
-    let found: Mutex<HashMap<String, BTreeSet<String>>> = Mutex::new(HashMap::new());
-    if names.is_empty() {
-        return Ok(HashMap::new());
-    }
-    let walker = super::walk::walker(scope, glob)?;
-
-    walker.run(|| {
-        let found = &found;
-        Box::new(move |entry| {
-            let Ok(entry) = entry else {
-                return ignore::WalkState::Continue;
-            };
-            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
-                return ignore::WalkState::Continue;
-            }
-            let path = entry.path();
-            let Some((content, _mtime)) = super::bloom_walk::read_with_bloom_check(
-                path,
-                names,
-                bloom,
-                crate::source::MAX_FILE_SIZE,
-            ) else {
-                return ignore::WalkState::Continue;
-            };
-            if !names
-                .iter()
-                .any(|n| memchr::memmem::find(content.as_bytes(), n.as_bytes()).is_some())
-            {
-                return ignore::WalkState::Continue;
-            }
-            let FileType::Code(lang) = detect_file_type_with_content(path, &content) else {
-                return ignore::WalkState::Continue;
-            };
-            let Some(ts_lang) = outline_language(lang) else {
-                return ignore::WalkState::Continue;
-            };
-            let owners = owners_in_file(&content, names, &ts_lang, lang);
-            if !owners.is_empty() {
-                let mut found = found
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                for (name, owner) in owners {
-                    found.entry(name).or_default().insert(owner);
-                }
-            }
-            ignore::WalkState::Continue
-        })
-    });
-
-    Ok(found
-        .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner))
-}
-
-/// The (name, owner) pair of each owned definition of one of `names` in a
-/// file's content.
-fn owners_in_file(
-    content: &str,
-    names: &HashSet<String>,
-    ts_lang: &tree_sitter::Language,
     lang: crate::types::Lang,
 ) -> Vec<(String, String)> {
-    let mut parser = tree_sitter::Parser::new();
-    if parser.set_language(ts_lang).is_err() {
-        return Vec::new();
-    }
-    let Some(tree) = parser.parse(content, None) else {
-        return Vec::new();
-    };
-    let lines: Vec<&str> = content.lines().collect();
     let mut owners = Vec::new();
     let mut cursor = tree.walk();
     loop {
         let node = cursor.node();
-        if let Some(name) = super::scope::definition_name(node, &lines, lang) {
+        if let Some(name) = super::scope::definition_name(node, lines, lang) {
             if names.contains(&name) && !is_bodiless_declaration(node) {
-                if let Some(owner) = super::scope::definition_owner(node, &lines, lang) {
+                if let Some(owner) = super::scope::definition_owner(node, lines, lang) {
                     owners.push((name, owner));
                 }
             }
@@ -294,8 +273,8 @@ fn owners_in_file(
 }
 
 /// Is `path` a code file the walk would parse, over the size cap, whose text
-/// holds one of `words` as a whole word? The check streams the file, so a
-/// file of any size costs about 1 MiB.
+/// mentions one of `words` as a whole identifier? `renew` is no call of
+/// `new`. The check streams the file, so its size costs no memory.
 #[must_use]
 pub fn oversized_code_holding(path: &Path, words: &[&str]) -> bool {
     let too_big = std::fs::metadata(path).is_ok_and(|m| m.len() > crate::source::MAX_FILE_SIZE);
@@ -305,35 +284,49 @@ pub fn oversized_code_holding(path: &Path, words: &[&str]) -> bool {
     let FileType::Code(lang) = detect_file_type(path) else {
         return false;
     };
-    outline_language(lang).is_some() && crate::source::holds_word(path, words)
+    outline_language(lang).is_some() && crate::source::file_mentions(path, words)
 }
 
-/// Tree-sitter call site detection for a set of target symbols.
-/// Returns tuples of (`matched_target_name`, `CallerMatch`).
+/// Tree-sitter call site detection for a set of target symbols, from one
+/// parse that also yields the owners of `owner_names` (see
+/// [`find_callers_and_owners`]). Returns tuples of (`matched_target_name`,
+/// `CallerMatch`), and (name, owner) pairs.
+type FileSites = (Vec<(String, CallerMatch)>, Vec<(String, String)>);
+
 fn find_callers_treesitter_batch(
     path: &Path,
     scope: &Path,
     targets: &HashSet<String>,
+    owner_names: &HashSet<String>,
     ts_lang: &tree_sitter::Language,
     content: &str,
     lang: crate::types::Lang,
-) -> Vec<(String, CallerMatch)> {
-    // Get the query string for this language
-    let Some(query_str) = super::callee_query::callee_query_str(lang) else {
-        return Vec::new();
-    };
-
+) -> FileSites {
     let mut parser = tree_sitter::Parser::new();
     if parser.set_language(ts_lang).is_err() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
 
     let Some(tree) = parser.parse(content, None) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
 
     let content_bytes = content.as_bytes();
     let lines: Vec<&str> = content.lines().collect();
+
+    let owners = if owner_names
+        .iter()
+        .any(|n| memchr::memmem::find(content_bytes, n.as_bytes()).is_some())
+    {
+        owners_in_tree(&tree, &lines, owner_names, lang)
+    } else {
+        Vec::new()
+    };
+
+    // Get the query string for this language
+    let Some(query_str) = super::callee_query::callee_query_str(lang) else {
+        return (Vec::new(), owners);
+    };
 
     // One Arc per file — all call sites share the same allocation.
     let shared_content: Arc<String> = Arc::new(content.to_string());
@@ -414,10 +407,10 @@ fn find_callers_treesitter_batch(
 
         callers
     }) else {
-        return Vec::new();
+        return (Vec::new(), owners);
     };
 
-    callers
+    (callers, owners)
 }
 
 /// Walk up the AST from a node to find the enclosing function definition.
@@ -436,12 +429,13 @@ fn find_enclosing_function(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{BTreeSet, HashMap};
 
     /// Each name maps to the types whose definitions of it a caller label
     /// would name. A plain function of the same name adds no type, and
     /// neither does a trait method declared without a body.
     #[test]
-    fn definition_owners_lists_the_types_that_define_a_name() {
+    fn the_caller_walk_lists_the_types_that_define_a_name() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("m.rs"),
@@ -452,7 +446,12 @@ mod tests {
         .unwrap();
         let bloom = crate::index::bloom::BloomFilterCache::new();
         let names: HashSet<String> = ["new", "only", "free"].map(String::from).into();
-        let owners = definition_owners(&names, dir.path(), &bloom, None).unwrap();
+        let walk =
+            find_callers_and_owners(&names, &names, dir.path(), &bloom, None, |_, o| o).unwrap();
+        let mut owners: HashMap<String, BTreeSet<String>> = HashMap::new();
+        for (name, owner) in walk.per_file.into_iter().flatten() {
+            owners.entry(name).or_default().insert(owner);
+        }
         let of = |n: &str| owners.get(n).map(|o| o.iter().cloned().collect::<Vec<_>>());
         assert_eq!(of("new"), Some(vec!["A".to_string(), "B".to_string()]));
         assert_eq!(of("only"), Some(vec!["B".to_string()]));
@@ -616,6 +615,35 @@ mod tests {
 
         let cpp = "struct B { int run(); };\nint B::run() { return go(); }\n";
         assert_eq!(caller_labels("b.cpp", cpp, "go"), labels(&[(2, "B.run")]));
+    }
+
+    /// A file skipped for size is listed only when it names a target as a
+    /// whole word: `renew` holds the text `new`, but no call of `new`.
+    #[test]
+    fn a_big_file_is_listed_only_when_it_names_a_target_as_a_word() {
+        let dir = tempfile::tempdir().unwrap();
+        let limit = usize::try_from(crate::source::MAX_FILE_SIZE).unwrap();
+        let pad = "// padding line to push the file over the size limit\n".repeat(limit / 50 + 1);
+        std::fs::write(
+            dir.path().join("word.rs"),
+            format!("{pad}fn a() {{ new(); }}\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("part.rs"),
+            format!("{pad}fn b() {{ renew(); }}\n"),
+        )
+        .unwrap();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let targets: HashSet<String> = std::iter::once("new".to_string()).collect();
+        let walk =
+            find_callers_batch(&targets, dir.path(), &bloom, None, None, |s| s.len()).unwrap();
+        let names: Vec<_> = walk
+            .skipped_large
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, ["word.rs"]);
     }
 
     /// `reached_bound` is set exactly when the walk found `stop_after` sites,

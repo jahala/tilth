@@ -360,7 +360,7 @@ pub(in crate::mcp) fn tool_write(
                 };
                 let pre_existed = path.try_exists().unwrap_or(false);
                 let before = (show_diff && pre_existed)
-                    .then(|| std::fs::read_to_string(&path).ok())
+                    .then(|| tilth_core::source::read_to_string(&path).ok())
                     .flatten();
                 match crate::mcp::write::write_overwrite(&path, content, overwrite) {
                     Ok(()) => {
@@ -409,7 +409,7 @@ pub(in crate::mcp) fn tool_write(
                 // re-read: re-reading would race a concurrent appender, whose
                 // extra lines inflate the count and mis-number the echoed hash
                 // anchors — the agent then hash-edits against wrong line numbers.
-                let before = std::fs::read_to_string(&path).ok();
+                let before = tilth_core::source::read_to_string(&path).ok();
                 match crate::mcp::write::write_append(&path, content) {
                     Ok(()) => {
                         let before_str = before.as_deref().unwrap_or("");

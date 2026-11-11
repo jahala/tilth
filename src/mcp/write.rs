@@ -5,10 +5,8 @@
 //! (regular file *or* dangling symlink), so there is no TOCTOU window and no
 //! silent clobber. Pass `overwrite = true` to replace an existing file. The
 //! replacement writes a sibling temp file and renames it over the target, so
-//! the original inode is never truncated: a concurrent reader holding an
-//! `Mmap` of it keeps a valid mapping instead of faulting with SIGBUS when
-//! the file shrinks under it. Readers see either the whole old file or the
-//! whole new one, never a prefix.
+//! the original inode is never truncated. Readers see either the whole old
+//! file or the whole new one, never a prefix.
 //!
 //! The rewrite refuses to follow symlinks (live or dangling): on Unix an
 //! `O_NOFOLLOW` open probes the target first, so the kernel returns `ELOOP`
@@ -125,74 +123,76 @@ fn open_append(path: &Path) -> std::io::Result<fs::File> {
 mod tests {
     use super::*;
 
-    /// Reader/writer race for [`overwrite_never_faults_an_mmap_reader`]. Runs
-    /// in a re-executed child because the fault it guards against kills the
-    /// process rather than failing an assertion.
-    fn mmap_race_body() {
-        use std::sync::atomic::{AtomicBool, Ordering};
+    /// `tilth_read` runs while `tilth_write` replaces the same file, back and
+    /// forth between two versions. Every read must succeed and show one whole
+    /// version. The reader starts only after the writer's first replace and
+    /// the writer keeps replacing until the reader is done, so every read
+    /// overlaps a writer that is running.
+    #[test]
+    fn a_read_during_an_overwrite_sees_one_whole_version() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        /// Marks the writer gone when it ends, a panic included, so the
+        /// reader never waits on a writer that will not come.
+        struct Gone<'a>(&'a AtomicBool);
+        impl Drop for Gone<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
 
         let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("foundation.py");
-        let line = "def f(): return 1  # ..........................................\n";
-        let content: String = line.repeat(365);
-        std::fs::write(&p, &content).unwrap();
-
-        let stop = AtomicBool::new(false);
+        let p = dir.path().join("f.rs");
+        let first = "fn alpha() {}\n".repeat(200);
+        let second = "fn beta() {}\n".repeat(300);
+        write_overwrite(&p, &first, false).unwrap();
         let cache = tilth_core::cache::OutlineCache::new();
+        let replaced = AtomicUsize::new(0);
+        let reader_done = AtomicBool::new(false);
+        let writer_gone = AtomicBool::new(false);
+
         std::thread::scope(|s| {
             s.spawn(|| {
-                while !stop.load(Ordering::Relaxed) {
-                    let _ = write_overwrite(&p, &content, true);
+                let _gone = Gone(&writer_gone);
+                while !reader_done.load(Ordering::SeqCst) {
+                    let next = if replaced.load(Ordering::SeqCst).is_multiple_of(2) {
+                        &second
+                    } else {
+                        &first
+                    };
+                    write_overwrite(&p, next, true).unwrap();
+                    replaced.fetch_add(1, Ordering::SeqCst);
                 }
             });
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-            while std::time::Instant::now() < deadline {
-                let _ = crate::read::read_file(&p, None, true, &cache, false, None);
+            while replaced.load(Ordering::SeqCst) == 0 {
+                if writer_gone.load(Ordering::SeqCst) {
+                    // The writer ended before its first replace; joining the
+                    // scope reports its panic.
+                    return;
+                }
+                std::thread::yield_now();
             }
-            stop.store(true, Ordering::Relaxed);
+            for _ in 0..200 {
+                let read = crate::read::read_file(&p, None, true, &cache, false, None);
+                let out = match read {
+                    Ok(out) => out,
+                    Err(e) => {
+                        reader_done.store(true, Ordering::SeqCst);
+                        panic!("a read during a concurrent overwrite failed: {e}");
+                    }
+                };
+                if !(out.ends_with(first.as_str()) || out.ends_with(second.as_str())) {
+                    reader_done.store(true, Ordering::SeqCst);
+                    panic!("a read showed neither whole version:\n{out}");
+                }
+            }
+            reader_done.store(true, Ordering::SeqCst);
         });
-    }
-
-    /// `tilth_read` holds an `Mmap` of a file while `tilth_write` replaces it.
-    /// An in-place `O_TRUNC` rewrite shrinks the inode under the live mapping,
-    /// so the reader's next page touch faults with SIGBUS and takes the whole
-    /// MCP process down. Replacing by rename leaves the reader's inode intact.
-    ///
-    /// The fault is a signal, not a panic, so the race runs in a re-executed
-    /// child of this test binary and the parent asserts on its exit status.
-    #[test]
-    fn overwrite_never_faults_an_mmap_reader() {
-        const CHILD_ENV: &str = "TILTH_MMAP_RACE_CHILD";
-        if std::env::var_os(CHILD_ENV).is_some() {
-            mmap_race_body();
-            return;
-        }
-        let out = std::process::Command::new(
-            std::env::current_exe().expect("test binary path is readable"),
-        )
-        .args([
-            "mcp::write::tests::overwrite_never_faults_an_mmap_reader",
-            "--exact",
-        ])
-        .env(CHILD_ENV, "1")
-        .output()
-        .expect("re-exec of the test binary");
-        assert!(
-            out.status.success(),
-            "a concurrent overwrite faulted an mmap reader: {}",
-            out.status
-        );
-        // A filter that matches nothing also exits 0, which would make this
-        // test pass without ever running the race.
-        assert!(
-            String::from_utf8_lossy(&out.stdout).contains("1 passed"),
-            "the child ran no test — the name filter matched nothing"
-        );
     }
 
     /// A concurrent reader must never observe a half-written file. The
     /// in-place `O_TRUNC` rewrite this replaced exposed a zero-length window
-    /// on every overwrite — the same window that faults an mmap reader.
+    /// on every overwrite.
     /// Setup writes go through the atomic primitive so any partial read the
     /// assertion catches can only come from `write_overwrite` itself.
     #[test]

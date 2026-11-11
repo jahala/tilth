@@ -24,6 +24,8 @@ const MAX_DEPENDENTS: usize = 15;
 ///
 /// Whenever dependents are left out, a line says how many.
 pub fn format_deps(result: &DepsResult, scope: &Path, budget: Option<usize>, full: bool) -> String {
+    // The result's paths are canonical; shown relative to the same scope.
+    let scope = &scope.canonicalize().unwrap_or_else(|_| scope.to_path_buf());
     let dep_count = result.used_by.len();
     let listed = if full {
         dep_count
@@ -42,14 +44,32 @@ pub fn format_deps(result: &DepsResult, scope: &Path, budget: Option<usize>, ful
         .unwrap_or(&result.target)
         .display()
         .to_string();
+    // A dependent with no import of the target was found by a call to a
+    // name the target defines, which another definition may own.
+    let by_name = result
+        .used_by
+        .iter()
+        .filter(|d| d.import_lines.is_empty())
+        .count();
+    let by_name_count = if by_name > 0 {
+        format!(", {by_name} of them by name only")
+    } else {
+        String::new()
+    };
     let header = format!(
-        "# Deps: {} — {} local, {} external, {} dependent{}",
+        "# Deps: {} — {} local, {} external, {} dependent{}{by_name_count}",
         rel_target,
         result.uses_local.len(),
         result.uses_external.len(),
         dep_count,
         if dep_count == 1 { "" } else { "s" },
     );
+    let by_name_note = if by_name > 0 {
+        "> By name only: the file calls a name the target defines, and no import of the \
+         target was found, so the call may reach another definition of the name."
+    } else {
+        ""
+    };
 
     let uses_local_section = format_uses_local(&result.uses_local, scope, true);
     let uses_external_section = format_uses_external(&result.uses_external);
@@ -67,6 +87,7 @@ pub fn format_deps(result: &DepsResult, scope: &Path, budget: Option<usize>, ful
         &used_by_tests_section,
         &unlisted_dependents(dep_count, listed),
         &unsearched,
+        by_name_note,
     ]);
     let full_tokens = crate::types::estimate_tokens(full_output.len() as u64) as usize;
 
@@ -89,7 +110,11 @@ pub fn format_deps(result: &DepsResult, scope: &Path, budget: Option<usize>, ful
     };
 
     // Kept under any budget: a skipped file may hold dependents nobody checked.
-    let output = output + &crate::search::skipped_files_note(&result.skipped_large, scope);
+    let held = format!("a name from `{rel_target}`");
+    let output = match crate::search::skipped_files_note(&result.skipped_large, &held, scope) {
+        Some(sentence) => format!("{output}\n\n> {sentence}"),
+        None => output,
+    };
 
     let token_est = crate::types::estimate_tokens(output.len() as u64);
     format!("{output}\n\n[~{token_est} tokens]")
@@ -368,6 +393,27 @@ mod tests {
             "{out}"
         );
         assert!(!out.contains("barrel file detected"), "{out}");
+    }
+
+    /// A dependent found only because it calls a name the target defines,
+    /// with no import of the target, may call another definition of that
+    /// name: on a short name such as `new`, most of them do. The count says
+    /// how many are of that kind, so it does not read as exact.
+    #[test]
+    fn dependents_matched_by_name_only_are_counted_apart() {
+        let mut result = twenty_dependents();
+        for d in &mut result.used_by[..12] {
+            d.import_lines.clear();
+        }
+        let out = format_deps(&result, Path::new("/r"), None, false);
+        assert!(
+            out.contains("20 dependents, 12 of them by name only"),
+            "{out}"
+        );
+        assert!(out.contains("> By name only:"), "{out}");
+        let all_imported = format_deps(&twenty_dependents(), Path::new("/r"), None, false);
+        assert!(!all_imported.contains("by name only"), "{all_imported}");
+        assert!(!all_imported.contains("By name only"), "{all_imported}");
     }
 
     fn listed(out: &str) -> usize {
