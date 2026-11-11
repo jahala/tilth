@@ -2354,6 +2354,45 @@ diff --git a/src/main.rs b/src/main.rs
         );
     }
 
+    /// A hunk's context lines inside an unchanged symbol belong to that
+    /// symbol, which shows no lines, so they never reach another block.
+    #[test]
+    fn context_inside_an_unchanged_symbol_stays_with_it() {
+        let dir = repo_with(&[(
+            "src/a.rs",
+            "fn alpha() {\n    1\n}\n\nfn beta() {\n    2\n}\n",
+        )]);
+        write_files(
+            dir.path(),
+            &[(
+                "src/a.rs",
+                "fn alpha() {\n    100\n}\n\nfn beta() {\n    2\n}\n\nfn gamma() {\n    3\n}\n",
+            )],
+        );
+        commit_all(dir.path(), "edit alpha, add gamma");
+        let out = diff_at(dir.path(), &last_commit(), Some("src/a.rs")).unwrap();
+        assert!(out.contains("## [ ] beta (L5-7, unchanged)"), "{out}");
+        let outside = &out[out.find("## outside symbols").expect(&out)..];
+        assert_eq!(
+            outside, "## outside symbols\n      4| \n  +   8| \n",
+            "{out}"
+        );
+    }
+
+    /// The same holds inside a changed type: an unchanged member keeps its
+    /// context, so the type's block shows only the type's own lines.
+    #[test]
+    fn context_inside_an_unchanged_member_stays_with_it() {
+        let class = "class A {\n  // v1\n  run() {\n    return 1;\n  }\n}\n";
+        let dir = repo_with(&[("src/a.ts", class)]);
+        write_files(dir.path(), &[("src/a.ts", &class.replace("v1", "v2"))]);
+        commit_all(dir.path(), "edit the comment");
+        let out = diff_at(dir.path(), &last_commit(), Some("src/a.ts")).unwrap();
+        assert!(out.contains("## [ ] A::run (L3-5, unchanged)"), "{out}");
+        assert!(out.contains("+   2|   // v2"), "{out}");
+        assert!(!out.contains("return 1;"), "{out}");
+    }
+
     #[test]
     fn repo_without_commits_diffs_against_nothing() {
         let dir = tempfile::tempdir().unwrap();

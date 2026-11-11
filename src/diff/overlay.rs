@@ -19,9 +19,9 @@ use super::{
 ///
 /// Reads the old and new content from `sides`, outlines both versions, runs
 /// three-phase symbol matching, and gives every patch line to the innermost
-/// changed symbol that holds it. Lines outside every changed symbol, and all
-/// lines of a file with no outline, stay visible in `other_lines`. `repo`
-/// anchors git commands and working-tree reads.
+/// symbol that holds it (see `attribute_lines`). Lines no symbol takes, and
+/// all lines of a file with no outline, stay visible in `other_lines`.
+/// `repo` anchors git commands and working-tree reads.
 pub(crate) fn compute_overlay(
     file_diff: &FileDiff,
     sides: &Sides,
@@ -250,16 +250,19 @@ fn symbol_changes(old_path: &Path, path: &Path, old: &str, new: &str) -> Vec<Sym
     match_symbols(&old_syms.unwrap_or_default(), &new_syms.unwrap_or_default())
 }
 
-/// Give each patch line to the innermost changed symbol whose span holds it:
-/// a removed line by its old line number, any other line by its new one.
-/// Returns the lines no changed symbol holds. Within one hunk, a symbol (or
-/// the outside) that receives only context lines receives none.
+/// Give each patch line to the innermost symbol whose span holds it: a
+/// removed line by its old line number, any other line by its new one. A
+/// changed line goes only to a changed symbol; a context line goes to any
+/// symbol, so the context inside an unchanged symbol stays with it. Returns
+/// the lines no symbol takes. Within one hunk, a symbol (or the outside)
+/// that receives only context lines receives none, so an unchanged symbol
+/// never receives any.
 fn attribute_lines(hunks: &[Hunk], changes: &mut [SymbolChange]) -> Vec<DiffLine> {
     let mut other = Vec::new();
     for hunk in hunks {
         let mut groups: Vec<(Option<usize>, Vec<DiffLine>)> = Vec::new();
         for line in &hunk.lines {
-            let owner = innermost_change(changes, line);
+            let owner = innermost_owner(changes, line);
             match groups.iter_mut().find(|(o, _)| *o == owner) {
                 Some((_, lines)) => lines.push(line.clone()),
                 None => groups.push((owner, vec![line.clone()])),
@@ -278,11 +281,13 @@ fn attribute_lines(hunks: &[Hunk], changes: &mut [SymbolChange]) -> Vec<DiffLine
     other
 }
 
-fn innermost_change(changes: &[SymbolChange], line: &DiffLine) -> Option<usize> {
+fn innermost_owner(changes: &[SymbolChange], line: &DiffLine) -> Option<usize> {
     changes
         .iter()
         .enumerate()
-        .filter(|(_, c)| !matches!(c.change, ChangeType::Unchanged))
+        .filter(|(_, c)| {
+            line.kind == DiffLineKind::Context || !matches!(c.change, ChangeType::Unchanged)
+        })
         .filter_map(|(i, c)| {
             let (start, end) = if line.kind == DiffLineKind::Removed {
                 c.old_span?
