@@ -221,15 +221,16 @@ fn segments(name: &str) -> Vec<&str> {
 /// when the two agree on every segment they both have, counted from the
 /// end, so `Accounts.get_user` and `crate::m::A::run` name `A`'s `run`.
 /// A bare query takes any owner. A qualified query needs an owner to
-/// compare, unless its qualifier is one of [`SELF_QUALIFIERS`], which
-/// stands for whatever type holds the name.
+/// compare. A qualifier from [`SELF_QUALIFIERS`] stands for whatever type
+/// holds the name, so it matches any owner, and never a definition with
+/// none.
 #[must_use]
 pub fn names_definition(query: &str, defined: &str, owner: Option<&str>) -> bool {
     let wanted = segments(query);
     let mut path: Vec<&str> = owner.map(segments).unwrap_or_default();
     path.extend(segments(defined));
     if wanted.len() == 2 && SELF_QUALIFIERS.contains(&wanted[0]) {
-        return path.last() == wanted.last();
+        return owner.is_some() && path.last() == wanted.last();
     }
     let shared = wanted.len().min(path.len());
     (wanted.len() == 1 || shared >= 2)

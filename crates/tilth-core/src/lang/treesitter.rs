@@ -269,7 +269,7 @@ pub fn binds_in_function(node: tree_sitter::Node) -> bool {
 }
 
 /// Whether `node` is a Bash `local`, `declare` or `typeset` command, without
-/// the `-g` that makes `declare` global.
+/// the `-g` that makes `declare` global. Flags combine in one word: `-gA`.
 fn is_bash_local_declaration(node: Option<tree_sitter::Node>, lines: &[&str]) -> bool {
     let Some(node) = node.filter(|n| n.kind() == "declaration_command") else {
         return false;
@@ -279,9 +279,13 @@ fn is_bash_local_declaration(node: Option<tree_sitter::Node>, lines: &[&str]) ->
     let local = children
         .next()
         .is_some_and(|k| matches!(k.kind(), "local" | "declare" | "typeset"));
-    local
-        && !children
-            .any(|c| c.kind() == "word" && node_text_simple(c, lines, NodeTextMode::Full) == "-g")
+    let global = |c: tree_sitter::Node| {
+        c.kind() == "word"
+            && node_text_simple(c, lines, NodeTextMode::Full)
+                .strip_prefix('-')
+                .is_some_and(|flags| flags.contains('g'))
+    };
+    local && !children.any(global)
 }
 
 /// C and C++ type specifiers. With a body they define a type; without one

@@ -139,7 +139,7 @@ pub fn search_callers_expanded(
     let (mut by_target, skipped_large) =
         collect_sites(&single, scope, bloom, glob, context, max_matches)?;
     let sites = by_target.remove(name).unwrap_or_default();
-    let held = (name != target).then_some(name);
+    let held: &[&str] = if name == target { &[] } else { &[name] };
     let skipped_note = crate::search::skipped_files_note(&skipped_large, scope, held);
 
     if sites.total == 0 {
@@ -501,7 +501,15 @@ pub fn search_callers_multi_expanded(
         .filter(|t| seen.insert(*t))
         .collect();
 
-    let target_set: HashSet<String> = ordered.iter().map(|t| called_name(t).to_string()).collect();
+    // The bare names the walk looks for, in target order, each once.
+    let mut names: Vec<&str> = Vec::new();
+    for target in &ordered {
+        let name = called_name(target);
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    let target_set: HashSet<String> = names.iter().map(|n| (*n).to_string()).collect();
     let (by_target, skipped_large) =
         collect_sites(&target_set, scope, bloom, glob, context, max_matches)?;
 
@@ -532,7 +540,7 @@ pub fn search_callers_multi_expanded(
         output.push('\n');
     }
 
-    let skipped_note = crate::search::skipped_files_note(&skipped_large, scope, None);
+    let skipped_note = crate::search::skipped_files_note(&skipped_large, scope, &names);
     if !skipped_note.is_empty() {
         output.push_str(skipped_note.trim_start_matches('\n'));
         output.push('\n');

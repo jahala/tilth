@@ -659,7 +659,7 @@ fn walk_for_definitions(
 
     // Recurse into children (for nested definitions, class bodies, impl blocks,
     // etc.).
-    let child_depth = if adds_nesting(node, parent, lang, lines) {
+    let child_depth = if adds_nesting(node, parent, def_kinds.contains(&kind), lang, lines) {
         depth + 1
     } else {
         depth
@@ -682,26 +682,30 @@ fn walk_for_definitions(
     }
 }
 
-/// Whether the children of `node` sit one nesting level deeper than `node`.
-/// The file's root nests its top-level declarations. Namespaces, modules and
-/// pass-through wrappers (`#ifdef`, `extern "C"`, `template <...>`) add no
-/// nesting, nor does a type's body: a method of a class in a namespace, or of
-/// a class nested in another class, is found like one in a top-level class,
-/// while a declaration in a function body stays a level deeper.
+/// Whether the children of `node`, a definition when `defines`, sit one
+/// nesting level deeper than `node`. The file's root nests its top-level
+/// declarations. A statement at the top that defines nothing (`if`, `try`,
+/// `with`) opens no scope, so it adds no nesting. Nor do namespaces, modules,
+/// pass-through wrappers (`#ifdef`, `extern "C"`, `template <...>`) or a
+/// type's body: a method of a class in a namespace, or of a class nested in
+/// another class, is found like one in a top-level class, while a
+/// declaration in a function body stays a level deeper.
 fn adds_nesting(
     node: tree_sitter::Node,
     parent: Option<tree_sitter::Node>,
+    defines: bool,
     lang: Option<tilth_core::types::Lang>,
     lines: &[&str],
 ) -> bool {
     let Some(parent) = parent else {
         return true;
     };
-    // Python's file root is a `module`, a type kind, but a root is no type.
-    let in_type = TYPE_KINDS.contains(&parent.kind()) && parent.parent().is_some();
-    let free = is_or_body_of(node, Some(parent), NAMESPACE_KINDS)
+    let at_top = parent.parent().is_none();
+    let free = (at_top && !defines)
+        || is_or_body_of(node, Some(parent), NAMESPACE_KINDS)
         || is_or_body_of(node, Some(parent), PASS_THROUGH_KINDS)
-        || in_type
+        // Python's file root is a `module`, a type kind, but a root is no type.
+        || (TYPE_KINDS.contains(&parent.kind()) && !at_top)
         || (lang == Some(tilth_core::types::Lang::Elixir)
             && is_elixir_container(node, Some(parent), lines));
     !free
@@ -2528,6 +2532,41 @@ impl Runner {
         assert_eq!(result.definitions, 1, "{result:?}");
     }
 
+    /// `Self`, `self`, `this` and `cls` stand for the type the call is
+    /// written in, so they never name a function no type holds.
+    #[test]
+    fn a_self_qualifier_skips_free_functions() {
+        let cases: &[(&str, &str, &str, &str, &str)] = &[
+            (
+                "util.py",
+                "def run():\n    return 1\n",
+                "job.py",
+                "class Job:\n    def run(self):\n        return 2\n",
+                "self.run",
+            ),
+            (
+                "util.rs",
+                "pub fn new() -> u8 {\n    1\n}\n",
+                "job.rs",
+                "pub struct Job;\n\nimpl Job {\n    pub fn new() -> Self {\n        Job\n    }\n}\n",
+                "Self::new",
+            ),
+        ];
+        for (free_file, free, owned_file, owned, query) in cases {
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::fs::write(dir.path().join(free_file), free).expect("write");
+            std::fs::write(dir.path().join(owned_file), owned).expect("write");
+            let result = search(query, dir.path(), None, None, false).expect("search");
+            let defs: Vec<&Path> = result
+                .matches
+                .iter()
+                .filter(|m| m.is_definition)
+                .map(|m| m.path.strip_prefix(dir.path()).expect("in dir"))
+                .collect();
+            assert_eq!(defs, [Path::new(owned_file)], "{query}: {result:?}");
+        }
+    }
+
     /// A definition whose own name is qualified (an Elixir dotted module, a
     /// Ruby `class Admin::User`, a nested TS or C++ namespace) is found by its
     /// full name, its last segment, and as the owner of its members.
@@ -2610,6 +2649,40 @@ impl Runner {
         assert_definitions("nest.ts", ts, &[("m", &[2]), ("deep", &[])]);
     }
 
+    /// An `if`, `try` or `with` at the top of a file opens no scope: a class
+    /// in its body keeps its methods, as a top-level class does.
+    #[test]
+    fn a_class_under_top_level_control_flow_keeps_its_methods() {
+        for (file, fixture, class_line) in [
+            (
+                "compat.py",
+                "import sys\nif sys.version_info >= (3, 8):\n    class Compat:\n        def run(self):\n            return 1\n",
+                3,
+            ),
+            (
+                "compat.py",
+                "try:\n    class Compat:\n        def run(self):\n            return 1\nexcept ImportError:\n    pass\n",
+                2,
+            ),
+            (
+                "compat.py",
+                "with open(\"x\"):\n    class Compat:\n        def run(self):\n            return 1\n",
+                2,
+            ),
+            (
+                "compat.ts",
+                "if (ready) {\n  class Compat {\n    run() {\n      return 1;\n    }\n  }\n}\n",
+                2,
+            ),
+        ] {
+            assert_definitions(
+                file,
+                fixture,
+                &[("Compat", &[class_line]), ("run", &[class_line + 1])],
+            );
+        }
+    }
+
     /// Every name of a declaration that binds several is a definition.
     #[test]
     fn each_name_of_a_multi_name_declaration_is_a_definition() {
@@ -2641,6 +2714,22 @@ impl Runner {
                 ("scratch", &[]),
                 ("LEVEL", &[5]),
                 ("MODE", &[6]),
+            ],
+        );
+
+        // `-g` combines with other flags in one word. Flags without it keep
+        // the variable local.
+        let sh = "setup() {\n  declare -gA MAP=()\n  declare -gx EXPORTED=1\n  typeset -ga LIST=()\n  declare -rg FIXED=1\n  declare -A table=()\n  local -r frozen=1\n}\n";
+        assert_definitions(
+            "s.sh",
+            sh,
+            &[
+                ("MAP", &[2]),
+                ("EXPORTED", &[3]),
+                ("LIST", &[4]),
+                ("FIXED", &[5]),
+                ("table", &[]),
+                ("frozen", &[]),
             ],
         );
     }

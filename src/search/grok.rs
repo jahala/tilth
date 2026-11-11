@@ -912,7 +912,7 @@ pub fn format_grok(result: &GrokResult, scope: &Path) -> String {
 
     // The walk looked for the target's bare name, whatever qualified it.
     let skipped_note =
-        crate::search::skipped_files_note(&result.skipped_large, scope, Some(&result.target.name));
+        crate::search::skipped_files_note(&result.skipped_large, scope, &[&result.target.name]);
     if !skipped_note.is_empty() {
         let _ = writeln!(out, "{skipped_note}");
     }

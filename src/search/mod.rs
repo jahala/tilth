@@ -156,9 +156,9 @@ fn skipped_large_note(result: &SearchResult) -> String {
     let mut note = other_owners_note(result);
     // A qualified query's big files are those that hold its bare name,
     // which a definition of it carries.
-    let held = match tilth_core::search::scope::split_qualified(&result.query) {
-        (Some(_), name) => Some(name),
-        (None, _) => None,
+    let held: &[&str] = match tilth_core::search::scope::split_qualified(&result.query) {
+        (Some(_), name) => &[name],
+        (None, _) => &[],
     };
     note.push_str(&skipped_files_note(
         &result.skipped_large,
@@ -220,10 +220,11 @@ pub(crate) fn owner_candidates(
 }
 
 /// The note that names files a walk skipped for size although they contain
-/// the query, relative to `scope`. Empty when there are none. `held` is
-/// what the walk looked for in them when that is not the query itself,
-/// such as the bare name of a qualified query.
-pub(crate) fn skipped_files_note(skipped: &[PathBuf], scope: &Path, held: Option<&str>) -> String {
+/// the query, relative to `scope`. Empty when there are none. `held` lists
+/// the names the walk looked for in them when that is not the query itself:
+/// the bare name of a qualified query, or each name of a multi-target one.
+/// Each file holds at least one of them.
+pub(crate) fn skipped_files_note(skipped: &[PathBuf], scope: &Path, held: &[&str]) -> String {
     const SHOWN: usize = 5;
     if skipped.is_empty() {
         return String::new();
@@ -232,7 +233,12 @@ pub(crate) fn skipped_files_note(skipped: &[PathBuf], scope: &Path, held: Option
     if skipped.len() > SHOWN {
         names.push(format!("and {} more", skipped.len() - SHOWN));
     }
-    let held = held.map_or_else(|| "the query".to_string(), |h| format!("`{h}`"));
+    let held = if held.is_empty() {
+        "the query".to_string()
+    } else {
+        let quoted: Vec<String> = held.iter().map(|h| format!("`{h}`")).collect();
+        quoted.join(" or ")
+    };
     let (count, verb) = match skipped.len() {
         1 => ("1 file".to_string(), format!("contains {held} and was")),
         n => (format!("{n} files"), format!("contain {held} and were")),
@@ -2833,5 +2839,20 @@ mod tests {
         let out = search_symbol("res.send", tmp.path(), &cache, None, false).unwrap();
         assert!(out.contains("response.js:3"), "{out}");
         assert!(!out.contains("is defined in"), "{out}");
+
+        // A multi-target walk looks for each target's bare name, once.
+        let bloom = tilth_core::index::bloom::BloomFilterCache::new();
+        let out = callers::search_callers_multi_expanded(
+            &["A.run", "start", "B::run"],
+            tmp.path(),
+            &bloom,
+            0,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(out.contains("not searched: big.rs"), "{out}");
+        assert!(out.contains("contains `run` or `start` and was"), "{out}");
     }
 }
