@@ -392,8 +392,8 @@ fn with_reexport_importers(
 /// path. A file is parsed only when its text names a target's module and
 /// passes `keep`, so the walk parses few files. With `through`, the
 /// targets are re-exporting files, and each importer records the one it
-/// imports as its `via`. Files over the size cap whose text names a
-/// target's module as a word are added to `skipped_large`.
+/// imports as its `via`. Files over the size cap whose text holds a
+/// target's `module_name` as a word are added to `skipped_large`.
 fn importers_of(
     targets: &[PathBuf],
     scope: &Path,
@@ -482,8 +482,12 @@ fn imports_one_of(
         return ImportScan::No;
     };
     if meta.len() > crate::source::MAX_FILE_SIZE {
-        let names_a_module =
-            std::fs::read(file).is_ok_and(|bytes| stems.iter().any(|stem| mentions(&bytes, stem)));
+        let names_a_module = std::fs::read(file).is_ok_and(|bytes| {
+            targets
+                .iter()
+                .filter_map(|target| module_name(target))
+                .any(|name| mentions(&bytes, name))
+        });
         return if names_a_module {
             ImportScan::TooLarge
         } else {
@@ -619,24 +623,33 @@ fn is_reexporting_file(file: &Path) -> bool {
         )
 }
 
-/// The words an import of `path` contains one of: its file stem, and for
-/// a package's entry file (`index.ts`, `__init__.py`, `mod.rs`) its
-/// directory's name, which is how most imports name a package.
+/// The words an import of `path` contains one of: its module's name, and
+/// its file stem, by which a file beside a package's entry file can import
+/// it (`./index`).
 fn module_stems(path: &Path) -> Vec<String> {
-    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-        return Vec::new();
-    };
-    let mut stems = vec![stem.to_string()];
-    if matches!(stem, "index" | "__init__" | "mod") {
-        if let Some(dir) = path
-            .parent()
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str())
-        {
-            stems.push(dir.to_string());
-        }
-    }
+    let stem = path.file_stem().and_then(|s| s.to_str());
+    let mut stems: Vec<String> = module_name(path)
+        .into_iter()
+        .chain(stem)
+        .map(str::to_string)
+        .collect();
+    stems.dedup();
     stems
+}
+
+/// The name an import gives `path`'s module: its file stem, or for a
+/// package's entry file (`mod.rs`, `index.ts`, `__init__.py`) its
+/// directory's name. The entry's own stem names no one package, and
+/// nearly every big file holds it as a word, as in `mod tests`.
+fn module_name(path: &Path) -> Option<&str> {
+    let is_package_entry =
+        is_reexporting_file(path) || path.file_name().is_some_and(|n| n == "mod.rs");
+    let name = if is_package_entry {
+        path.parent()?.file_name()
+    } else {
+        path.file_stem()
+    };
+    name?.to_str()
 }
 
 /// `content` holds `name` as a whole identifier.
@@ -1095,6 +1108,57 @@ mod tests {
         let bloom = crate::index::bloom::BloomFilterCache::new();
         let result = analyze_deps(&root.join("service.py"), &root, &bloom).unwrap();
         assert_eq!(result.skipped_large, [root.join("big.py")]);
+    }
+
+    /// A package's entry file is named in imports by its directory. The
+    /// entry stem itself (`mod`, `index`, `__init__`) is a word nearly every
+    /// big file holds, as in `mod tests {}`, so it made every big file a
+    /// skipped importer.
+    #[test]
+    fn a_big_file_is_listed_only_when_it_names_the_package() {
+        let limit = usize::try_from(crate::source::MAX_FILE_SIZE).unwrap();
+        let pad = |line: &str| format!("{line}\n").repeat(limit / line.len() + 1);
+        let cases = [
+            (
+                "src/foo/mod.rs",
+                "pub fn target() {}\n",
+                "big.rs",
+                "mod tests {}",
+                "mod foo;",
+            ),
+            (
+                "lib/index.js",
+                "export function target() {}\n",
+                "big.js",
+                "// index",
+                "import * as lib from './lib';",
+            ),
+            (
+                "pkg/__init__.py",
+                "def target():\n    pass\n",
+                "big.py",
+                "# __init__",
+                "import pkg",
+            ),
+        ];
+        for (entry, source, big, entry_word, import) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().canonicalize().unwrap();
+            write(&root, entry, source);
+            write(&root, big, &pad(entry_word));
+            write(
+                &root,
+                &format!("named_{big}"),
+                &format!("{import}\n{}", pad(entry_word)),
+            );
+            let bloom = crate::index::bloom::BloomFilterCache::new();
+            let result = analyze_deps(&root.join(entry), &root, &bloom).unwrap();
+            assert_eq!(
+                result.skipped_large,
+                [root.join(format!("named_{big}"))],
+                "{entry}"
+            );
+        }
     }
 
     /// Past the cap, the names other files import are searched first, and
