@@ -732,6 +732,11 @@ TypeScript bundles or vendored single-file libraries. Above the cap,
 heuristics. The search walkers skip files over the same limit; a
 skipped file that contains the query is named under the result
 (`> 1 file over 500 KB contains the query and was not searched: …`).
+The check streams the file through a fixed buffer and stops at the
+first match, at a NUL byte (a binary file, which search never reads) or
+at a line over 1 MiB, so a multi-gigabyte file in the scope costs a few
+MB. grok names a callee defined in an imported file over the limit as
+`not parsed` instead of `extern`.
 Parsing grows linearly with size, about 0.2 ms per KB for Rust and
 Python, so a 1 MB file costs about twice what a 500 KB one does; that
 is why the limit stays where it is.
