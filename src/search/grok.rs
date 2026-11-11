@@ -13,7 +13,7 @@ use tilth_core::index::bloom::BloomFilterCache;
 use tilth_core::lang::detect_file_type;
 use tilth_core::lang::outline::get_outline_entries;
 use tilth_core::search::callees::{extract_callee_names, resolve_callees, ResolvedCallee};
-use tilth_core::search::callers::{find_callers_batch, CallerMatch, BATCH_EARLY_QUIT};
+use tilth_core::search::callers::{find_callers_batch, CallerMatch};
 use tilth_core::types::{is_test_file, FileType, Lang, OutlineEntry, OutlineKind};
 
 /// What grok resolved the user's target string to.
@@ -122,16 +122,14 @@ fn resolve_def_by_query(
     query: &str,
     scope: &Path,
 ) -> Result<Option<(ResolvedTarget, String, Lang)>, TilthError> {
-    // full=false keeps grok exactly as it was. It is not a free choice: `full`
-    // also raises the definitions early-quit threshold (50 -> 300), so it
-    // changes which definitions the walker collects and therefore which one
-    // ranks first here. Grok's own caps come from `GrokCaps`.
+    // Only the top-ranked definition is used, so the short match list is
+    // enough; the count of the others comes from the exact total. Grok's own
+    // caps come from `GrokCaps`.
     let result = search_symbol_raw(query, scope, None, false)?;
-    let definitions: Vec<_> = result.matches.iter().filter(|m| m.is_definition).collect();
-    let Some(top) = definitions.first() else {
+    let Some(top) = result.matches.iter().find(|m| m.is_definition) else {
         return Ok(None);
     };
-    let other_def_count = definitions.len().saturating_sub(1);
+    let other_def_count = result.definitions.saturating_sub(1);
     let (start, _end) = top.def_range.ok_or_else(|| TilthError::ParseError {
         path: top.path.clone(),
         reason: format!("definition match for `{query}` had no def_range"),
@@ -475,20 +473,57 @@ pub fn grok(
     };
 
     // --- Callers + tests (one walk, partitioned by is_test_file) ----------
+    // Both are counted in full. The ones kept are spread across files: every
+    // file's first call site, by path, before any file's second, so a few
+    // shown callers name as many places as they can. Each file offers its
+    // first ones by line with their rank in the file, and they are merged
+    // into the running first ones as files arrive; (rank, path, line) is a
+    // total order, so the result does not depend on arrival order. Only the
+    // capped number are held at once, since each holds its file's text.
     let symbols: HashSet<String> = std::iter::once(target.name.clone()).collect();
-    let raw_callers = find_callers_batch(&symbols, scope, bloom, None, BATCH_EARLY_QUIT)?;
-
-    let prod_and_test: Vec<CallerMatch> = raw_callers
-        .into_iter()
-        .map(|(_, m)| m)
-        .filter(|m| !is_recursive_call_site(m, &canonical_target, &target))
-        .collect();
-
-    let (prod_callers, test_callers): (Vec<_>, Vec<_>) = prod_and_test
-        .into_iter()
-        .partition(|m| !is_test_file(&m.path) && !m.in_test);
-    let total_callers = prod_callers.len();
-    let total_tests = test_callers.len();
+    let spread = |a: &(usize, CallerMatch), b: &(usize, CallerMatch)| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.path.cmp(&b.1.path))
+            .then_with(|| a.1.line.cmp(&b.1.line))
+    };
+    let split: std::sync::Mutex<CallerSplit> = std::sync::Mutex::new(CallerSplit::default());
+    find_callers_batch(&symbols, scope, bloom, None, |sites| {
+        let mut file = CallerSplit::default();
+        for (_, m) in sites {
+            if is_recursive_call_site(&m, &canonical_target, &target) {
+                continue;
+            }
+            if !is_test_file(&m.path) && !m.in_test {
+                if file.callers.len() < caps.max_callers {
+                    file.callers.push((file.total_callers, m));
+                }
+                file.total_callers += 1;
+            } else {
+                if file.tests.len() < caps.max_tests {
+                    file.tests.push((file.total_tests, m));
+                }
+                file.total_tests += 1;
+            }
+        }
+        let mut all = split
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        all.total_callers += file.total_callers;
+        all.total_tests += file.total_tests;
+        all.callers.extend(file.callers);
+        all.callers.sort_by(spread);
+        all.callers.truncate(caps.max_callers);
+        all.tests.extend(file.tests);
+        all.tests.sort_by(spread);
+        all.tests.truncate(caps.max_tests);
+    })?;
+    let all = split
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let total_callers = all.total_callers;
+    let total_tests = all.total_tests;
+    let prod_callers: Vec<CallerMatch> = all.callers.into_iter().map(|(_, m)| m).collect();
+    let test_callers: Vec<CallerMatch> = all.tests.into_iter().map(|(_, m)| m).collect();
 
     // --- Siblings ----------------------------------------------------------
     let siblings_all = collect_siblings(&entries, &target);
@@ -911,6 +946,17 @@ fn is_self_definition(
     target: &ResolvedTarget,
 ) -> bool {
     callee.file == canonical_target && callee.start_line == target.start_line
+}
+
+/// A target's callers split into production code and tests, counted in
+/// full, with only the first ones kept up to the grok caps. Each kept site
+/// carries its rank among its file's sites of the same kind.
+#[derive(Default)]
+struct CallerSplit {
+    total_callers: usize,
+    total_tests: usize,
+    callers: Vec<(usize, CallerMatch)>,
+    tests: Vec<(usize, CallerMatch)>,
 }
 
 /// Is this caller match a recursive call from inside the target's own body?
@@ -1527,6 +1573,49 @@ pub fn caller_fn() {
             .map(|c| c.calling_function.as_str())
             .collect();
         assert_eq!(caller_names, ["caller_fn"]);
+    }
+
+    /// The caller walk quit at 50 call sites, so grok's caller total was
+    /// wherever the threads stopped, and the callers shown changed between
+    /// runs. 60 files with two callers each: the total is exact, and the five
+    /// shown name five files, the same five every run.
+    #[test]
+    fn grok_caller_totals_are_exact_and_spread_across_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(tmp.path(), "src/lib.rs", "pub fn target_fn() {}\n");
+        for i in 0..60 {
+            write_fixture(
+                tmp.path(),
+                &format!("src/c{i:02}.rs"),
+                &format!("pub fn a{i}() {{ target_fn(); }}\npub fn b{i}() {{ target_fn(); }}\n"),
+            );
+        }
+        let bloom = BloomFilterCache::default();
+        let run = || {
+            let session = crate::session::Session::default();
+            grok(
+                "target_fn",
+                tmp.path(),
+                &bloom,
+                &session,
+                GrokCaps::default(),
+            )
+            .unwrap()
+        };
+        let first = run();
+        assert_eq!(first.total_callers, 120);
+        let shown = |r: &GrokResult| -> Vec<String> {
+            r.callers
+                .iter()
+                .map(|c| c.calling_function.clone())
+                .collect()
+        };
+        assert_eq!(shown(&first), ["a0", "a1", "a2", "a3", "a4"]);
+        for _ in 0..3 {
+            let again = run();
+            assert_eq!(again.total_callers, 120);
+            assert_eq!(shown(&again), shown(&first));
+        }
     }
 
     /// Rust tests live in `tests/` and in `#[test]` functions, not in

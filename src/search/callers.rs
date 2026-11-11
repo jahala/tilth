@@ -1,13 +1,14 @@
 //! Caller search output: ranks the call sites `tilth_core` finds, renders one
 //! bucket per target, and adds the second-hop impact block.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 use tilth_core::index::bloom::BloomFilterCache;
-use tilth_core::search::callers::{find_callers_batch, CallerMatch, BATCH_EARLY_QUIT};
+use tilth_core::search::callers::{find_callers_batch, CallerMatch};
 use tilth_core::TilthError;
 
 const MAX_MATCHES: usize = 10;
@@ -17,30 +18,64 @@ const IMPACT_FANOUT_THRESHOLD: usize = 10;
 const IMPACT_MAX_RESULTS: usize = 15;
 /// Match-count cap when `--full` is set. Mirrors the symbol/content search caps.
 const FULL_MAX_MATCHES: usize = 100;
-/// Walker early-quit threshold when `--full` is set.
-const FULL_BATCH_EARLY_QUIT: usize = FULL_MAX_MATCHES * 3;
 
-/// Scale a single-target batch-walk budget for a multi-target search.
+/// One target's call sites over the whole walk.
+#[derive(Default)]
+struct TargetSites {
+    /// Every call site, counted.
+    total: usize,
+    /// Every distinct calling function, `<top-level>` left out.
+    caller_names: HashSet<String>,
+    /// The first sites in `rank_callers` order.
+    kept: Vec<CallerMatch>,
+}
+
+/// The call sites of each of `targets`, counted in full, with each target's
+/// first `keep` sites in `rank_callers` order kept.
 ///
-/// `find_callers_batch`'s `early_quit_threshold` is a walk-wide raw-match
-/// count shared by every target in the `HashSet` passed to it — the walker
-/// has no concept of "budget per target," it just stops once the total
-/// match count crosses the threshold (see `found_count` in
-/// `find_callers_batch`). A single target's budget (`BATCH_EARLY_QUIT` /
-/// `FULL_BATCH_EARLY_QUIT`) sized for one symbol therefore starves later
-/// targets in a multi-target search once an earlier, hit-rich target
-/// consumes it. Scaling linearly by target count gives each target
-/// approximately its own full budget's worth of headroom; `n_targets` is
-/// already bounded to 5 by the dispatch layer (`tool_search`'s
-/// `2..=5 => ...` arm), so the scaled result stays bounded too.
-///
-/// Note: the early-quit mechanism itself is a coarse walk-wide heuristic
-/// that is a candidate for removal/replacement in a future change — this
-/// scaling is a minimal parity fix so multi-target does not regress vs. N
-/// separate single-target calls, not a long-term investment in the
-/// mechanism's design.
-fn scaled_batch_quit(base_quit: usize, n_targets: usize) -> usize {
-    base_quit.saturating_mul(n_targets.max(1))
+/// Each file offers its first `keep` sites per target by line, and they are
+/// merged into the running first `keep`. That loses nothing: `rank_callers`
+/// compares two sites of one file by line alone, so any site in the overall
+/// first `keep` is in its own file's first `keep`. The order is total across
+/// files, since it ends on path and line, so the result does not depend on
+/// the order files arrive in. Only `keep` sites per target are held at once,
+/// which keeps memory flat on a large tree: each site holds its file's text.
+fn collect_sites(
+    targets: &HashSet<String>,
+    scope: &Path,
+    bloom: &BloomFilterCache,
+    glob: Option<&str>,
+    context: Option<&Path>,
+    keep: usize,
+) -> Result<HashMap<String, TargetSites>, TilthError> {
+    let merged: Mutex<HashMap<String, TargetSites>> = Mutex::new(HashMap::new());
+    find_callers_batch(targets, scope, bloom, glob, |sites| {
+        let mut by_target: HashMap<String, TargetSites> = HashMap::new();
+        for (target, m) in sites {
+            let entry = by_target.entry(target).or_default();
+            entry.total += 1;
+            if m.calling_function != "<top-level>" {
+                entry.caller_names.insert(m.calling_function.clone());
+            }
+            if entry.kept.len() < keep {
+                entry.kept.push(m);
+            }
+        }
+        let mut merged = merged
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (target, file) in by_target {
+            let entry = merged.entry(target).or_default();
+            entry.total += file.total;
+            entry.caller_names.extend(file.caller_names);
+            entry.kept.extend(file.kept);
+            rank_callers(&mut entry.kept, scope, context);
+            entry.kept.truncate(keep);
+        }
+    })?;
+    Ok(merged
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner))
 }
 
 /// Scan `scope` for the literal `target` byte sequence. Used by the
@@ -96,45 +131,26 @@ pub fn search_callers_expanded(
     glob: Option<&str>,
     full: bool,
 ) -> Result<String, TilthError> {
-    let (max_matches, batch_quit) = if full {
-        (FULL_MAX_MATCHES, FULL_BATCH_EARLY_QUIT)
-    } else {
-        (MAX_MATCHES, BATCH_EARLY_QUIT)
-    };
+    let max_matches = if full { FULL_MAX_MATCHES } else { MAX_MATCHES };
     let single: HashSet<String> = std::iter::once(target.to_string()).collect();
-    let raw = find_callers_batch(&single, scope, bloom, glob, batch_quit)?;
-    let callers: Vec<CallerMatch> = raw.into_iter().map(|(_, m)| m).collect();
+    let sites = collect_sites(&single, scope, bloom, glob, context, max_matches)?
+        .remove(target)
+        .unwrap_or_default();
 
-    if callers.is_empty() {
+    if sites.total == 0 {
         let target_seen = target_seen_in_scope(target, scope, glob);
         return Ok(no_callers_message(target, scope, target_seen, glob));
     }
 
-    // Sort by relevance (context file first, then by proximity)
-    let mut sorted_callers = callers;
-    rank_callers(&mut sorted_callers, scope, context);
-
-    let total = sorted_callers.len();
-
-    // Collect unique caller names BEFORE truncation for accurate fan-out threshold
-    let all_caller_names: HashSet<String> = sorted_callers
-        .iter()
-        .filter(|c| c.calling_function != "<top-level>")
-        .map(|c| c.calling_function.clone())
-        .collect();
-
-    sorted_callers.truncate(max_matches);
-
     let mut output = String::new();
-    write_caller_bucket(&mut output, target, scope, total, &sorted_callers, expand);
+    write_caller_bucket(&mut output, target, scope, sites.total, &sites.kept, expand);
     write_second_hop_impact(
         &mut output,
-        &all_caller_names,
-        &sorted_callers,
+        &sites.caller_names,
+        &sites.kept,
         scope,
         bloom,
         glob,
-        batch_quit,
     );
 
     let tokens = crate::types::estimate_tokens(output.len() as u64);
@@ -161,9 +177,14 @@ fn write_caller_bucket(
     sorted_callers: &[CallerMatch],
     expand: usize,
 ) {
+    let shown = if sorted_callers.len() < total {
+        format!("{} of ", sorted_callers.len())
+    } else {
+        String::new()
+    };
     let _ = writeln!(
         output,
-        "# Callers of \"{}\" in {} — {} call site{}",
+        "# Callers of \"{}\" in {} — {shown}{} call site{}",
         target,
         scope.display(),
         total,
@@ -212,6 +233,15 @@ fn write_caller_bucket(
             }
         }
     }
+
+    let hidden = total.saturating_sub(sorted_callers.len());
+    if hidden > 0 {
+        let _ = writeln!(
+            output,
+            "\n... and {hidden} more call site{}. Narrow with scope.",
+            if hidden == 1 { "" } else { "s" }
+        );
+    }
 }
 
 /// Adaptive 2nd-hop impact analysis, shared by single- and multi-target
@@ -229,14 +259,10 @@ fn write_second_hop_impact(
     scope: &Path,
     bloom: &BloomFilterCache,
     glob: Option<&str>,
-    batch_quit: usize,
 ) {
     if all_caller_names.is_empty() || all_caller_names.len() > IMPACT_FANOUT_THRESHOLD {
         return;
     }
-    let Ok(hop2) = find_callers_batch(all_caller_names, scope, bloom, glob, batch_quit) else {
-        return;
-    };
 
     // Filter out hop-1 matches (same file+line = same call site)
     let hop1_locations: HashSet<(PathBuf, u32)> = sorted_callers
@@ -244,42 +270,59 @@ fn write_second_hop_impact(
         .map(|c| (c.path.clone(), c.line))
         .collect();
 
-    let hop2_filtered: Vec<_> = hop2
-        .into_iter()
-        .filter(|(_, m)| !hop1_locations.contains(&(m.path.clone(), m.line)))
-        .collect();
-
-    if hop2_filtered.is_empty() {
+    // Per file: each calling function once, at its first call by line. The
+    // listing below is the first `IMPACT_MAX_RESULTS` of those by depth, path
+    // and line, a total order, so each file's are merged into a running first
+    // `IMPACT_MAX_RESULTS` as it arrives. The count of distinct functions is
+    // kept in full for the "... and N more" line and the affected total.
+    let hop2_order = |a: &(String, CallerMatch), b: &(String, CallerMatch)| {
+        let (a, b) = (&a.1, &b.1);
+        path_depth(&a.path, scope)
+            .cmp(&path_depth(&b.path, scope))
+            .then_with(|| a.path.cmp(&b.path))
+            .then_with(|| a.line.cmp(&b.line))
+    };
+    let first: Mutex<(usize, Vec<(String, CallerMatch)>)> = Mutex::new((0, Vec::new()));
+    let walked = find_callers_batch(all_caller_names, scope, bloom, glob, |sites| {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut file_first: Vec<(String, CallerMatch)> = Vec::new();
+        for (via, m) in sites {
+            if hop1_locations.contains(&(m.path.clone(), m.line)) {
+                continue;
+            }
+            if seen.insert(m.calling_function.clone()) && file_first.len() < IMPACT_MAX_RESULTS {
+                file_first.push((via, m));
+            }
+        }
+        let mut first = first
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        first.0 += seen.len();
+        first.1.extend(file_first);
+        first.1.sort_by(hop2_order);
+        first.1.truncate(IMPACT_MAX_RESULTS);
+    });
+    if walked.is_err() {
+        return;
+    }
+    let (unique_total, hop2) = first
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if unique_total == 0 {
         return;
     }
 
     output.push_str("\n-- impact (2nd hop) --\n");
 
-    let mut seen: HashSet<(String, PathBuf)> = HashSet::new();
-    let mut count = 0;
-    for (via, m) in &hop2_filtered {
-        let key = (m.calling_function.clone(), m.path.clone());
-        if !seen.insert(key) {
-            continue;
-        }
-        if count >= IMPACT_MAX_RESULTS {
-            break;
-        }
-
+    for (via, m) in &hop2 {
         let rel_path = m.path.strip_prefix(scope).unwrap_or(&m.path).display();
         let _ = writeln!(
             output,
             "  {:<20} {}:{}  -> {}",
             m.calling_function, rel_path, m.line, via
         );
-        count += 1;
     }
 
-    let unique_total = hop2_filtered
-        .iter()
-        .map(|(_, m)| (&m.calling_function, &m.path))
-        .collect::<HashSet<_>>()
-        .len();
     if unique_total > IMPACT_MAX_RESULTS {
         let _ = writeln!(
             output,
@@ -290,9 +333,9 @@ fn write_second_hop_impact(
 
     // Affected-count formula matches main's evolution: pre-truncation
     // hop-1 caller-name count + deduplicated hop-2 unique_total (NOT the
-    // post-truncation display `count`, which under-reports once the
-    // `IMPACT_MAX_RESULTS` cap above stops incrementing it while more
-    // unique callers still exist beyond the cap).
+    // post-truncation display count, which under-reports once the
+    // `IMPACT_MAX_RESULTS` cap stops the listing while more unique callers
+    // still exist beyond the cap).
     let _ = writeln!(
         output,
         "\n{} functions affected across 2 hops.",
@@ -308,9 +351,8 @@ fn write_second_hop_impact(
 /// `write_second_hop_impact` helpers the single-target path uses, so a
 /// bucket here is byte-identical to what a lone `search_callers_expanded`
 /// call for that target would produce (PR #138 review: HIGH — 2nd-hop parity;
-/// MED — header shape parity). The batch walk's early-quit budget is scaled
-/// by target count so a hit-rich earlier target cannot starve a later,
-/// rarer one (PR #138 review: MED — budget scaling).
+/// MED — header shape parity). The walk runs to the end and counts each
+/// target on its own, so a hit-rich target cannot starve a rarer one.
 pub fn search_callers_multi_expanded(
     targets: &[&str],
     scope: &Path,
@@ -320,11 +362,7 @@ pub fn search_callers_multi_expanded(
     glob: Option<&str>,
     full: bool,
 ) -> Result<String, TilthError> {
-    let (max_matches, base_batch_quit) = if full {
-        (FULL_MAX_MATCHES, FULL_BATCH_EARLY_QUIT)
-    } else {
-        (MAX_MATCHES, BATCH_EARLY_QUIT)
-    };
+    let max_matches = if full { FULL_MAX_MATCHES } else { MAX_MATCHES };
 
     // Dedupe targets, preserving first-seen order: a repeated target (e.g.
     // query "foo,foo") must not render an empty no-callers section on its
@@ -337,57 +375,29 @@ pub fn search_callers_multi_expanded(
         .filter(|t| seen.insert(*t))
         .collect();
 
-    // Scale the walk-wide early-quit budget by (deduped) target count so
-    // each target gets roughly its own single-target budget's headroom —
-    // see `scaled_batch_quit` for why an unscaled shared budget starves
-    // later targets.
-    let batch_quit = scaled_batch_quit(base_batch_quit, ordered.len());
-
     let target_set: HashSet<String> = ordered.iter().map(ToString::to_string).collect();
-    let raw = find_callers_batch(&target_set, scope, bloom, glob, batch_quit)?;
+    let mut by_target = collect_sites(&target_set, scope, bloom, glob, context, max_matches)?;
 
-    // Bucket matches by which target they call. Preserve the caller-supplied
-    // target order so output is deterministic.
-    let mut by_target: std::collections::HashMap<String, Vec<CallerMatch>> =
-        std::collections::HashMap::new();
-    for (name, m) in raw {
-        by_target.entry(name).or_default().push(m);
-    }
-
+    // Render in the caller-supplied target order so output is deterministic.
     let mut output = String::new();
     for target in &ordered {
-        let mut callers = by_target.remove(*target).unwrap_or_default();
+        let sites = by_target.remove(*target).unwrap_or_default();
 
-        if callers.is_empty() {
+        if sites.total == 0 {
             let target_seen = target_seen_in_scope(target, scope, glob);
             output.push_str(&no_callers_message(target, scope, target_seen, glob));
             output.push_str("\n\n");
             continue;
         }
 
-        rank_callers(&mut callers, scope, context);
-        let total = callers.len();
-
-        // Unique direct-caller names BEFORE truncation, same as the
-        // single-target path — feeds the 2nd-hop fan-out threshold check
-        // with the true hop-1 breadth rather than the display-capped one.
-        let all_caller_names: HashSet<String> = callers
-            .iter()
-            .filter(|c| c.calling_function != "<top-level>")
-            .map(|c| c.calling_function.clone())
-            .collect();
-
-        callers.truncate(max_matches);
-
-        write_caller_bucket(&mut output, target, scope, total, &callers, expand);
+        write_caller_bucket(&mut output, target, scope, sites.total, &sites.kept, expand);
         write_second_hop_impact(
             &mut output,
-            &all_caller_names,
-            &callers,
+            &sites.caller_names,
+            &sites.kept,
             scope,
             bloom,
             glob,
-            batch_quit,
         );
         output.push('\n');
     }
@@ -442,7 +452,9 @@ fn no_callers_message(target: &str, scope: &Path, target_seen: bool, glob: Optio
     )
 }
 
-/// Simple ranking: context file first, then by path length (proximity heuristic).
+/// Simple ranking: context file first, then by path length (proximity
+/// heuristic), then by path and line. Stable, so two calls on one line keep
+/// their order.
 fn rank_callers(callers: &mut [CallerMatch], scope: &Path, context: Option<&Path>) {
     callers.sort_by(|a, b| {
         // Context file wins
@@ -455,51 +467,71 @@ fn rank_callers(callers: &mut [CallerMatch], scope: &Path, context: Option<&Path
         }
 
         // Shorter paths (more similar to scope) rank higher
-        let a_rel = a.path.strip_prefix(scope).unwrap_or(&a.path);
-        let b_rel = b.path.strip_prefix(scope).unwrap_or(&b.path);
-        a_rel
-            .components()
-            .count()
-            .cmp(&b_rel.components().count())
+        path_depth(&a.path, scope)
+            .cmp(&path_depth(&b.path, scope))
             .then_with(|| a.path.cmp(&b.path))
             .then_with(|| a.line.cmp(&b.line))
     });
+}
+
+/// How many components `path` has below `scope`.
+fn path_depth(path: &Path, scope: &Path) -> usize {
+    path.strip_prefix(scope)
+        .unwrap_or(path)
+        .components()
+        .count()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// MED finding from PR review: the batch walk's early-quit budget is a
-    /// walk-wide raw-match count shared by every target passed to
-    /// `find_callers_batch` — a single target's budget therefore starves
-    /// later targets in a multi-target search. `scaled_batch_quit` is the
-    /// pure scaling function `search_callers_multi_expanded` uses to size
-    /// the walk's budget by target count instead of reusing the unscaled
-    /// single-target constant. This asserts the scaling directly (rather
-    /// than only via an integration test against the parallel walker, whose
-    /// starvation is real but not reliably reproducible in a small,
-    /// deterministic unit test — see
-    /// `callers_multi_target_later_target_not_starved_by_hit_rich_earlier_target`
-    /// in `src/mcp/tools/search.rs` for that scenario-level guard).
+    /// The caller walk quit on a shared counter at 50 sites, so the header
+    /// total was wherever the threads stopped: "175 call sites" for 625, and
+    /// the sites listed changed from run to run.
     #[test]
-    fn scaled_batch_quit_multiplies_by_target_count() {
-        assert_eq!(scaled_batch_quit(BATCH_EARLY_QUIT, 1), BATCH_EARLY_QUIT);
-        assert_eq!(
-            scaled_batch_quit(BATCH_EARLY_QUIT, 2),
-            BATCH_EARLY_QUIT * 2,
-            "2 targets must not share a single target's budget"
+    fn caller_totals_are_exact_and_identical_across_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let bloom = BloomFilterCache::new();
+        std::fs::write(dir.path().join("def.rs"), "pub fn hot() {}\n").unwrap();
+        for f in 0..25 {
+            let mut body = String::new();
+            for i in 0..25 {
+                let _ = writeln!(body, "fn caller_{f}_{i}() {{ hot(); }}");
+            }
+            std::fs::write(dir.path().join(format!("f{f:02}.rs")), body).unwrap();
+        }
+        let first =
+            search_callers_expanded("hot", dir.path(), &bloom, 0, None, None, false).unwrap();
+        assert!(
+            first.contains("— 10 of 625 call sites"),
+            "header must give the exact total:\n{first}"
         );
-        assert_eq!(scaled_batch_quit(BATCH_EARLY_QUIT, 5), BATCH_EARLY_QUIT * 5);
+        for _ in 0..4 {
+            let again =
+                search_callers_expanded("hot", dir.path(), &bloom, 0, None, None, false).unwrap();
+            assert_eq!(again, first, "same output every run");
+        }
+        let full = search_callers_expanded("hot", dir.path(), &bloom, 0, None, None, true).unwrap();
+        assert!(full.contains("— 100 of 625 call sites"), "{full}");
     }
 
-    /// `n_targets = 0` cannot happen through the dispatch layer (`tool_search`
-    /// rejects an empty query before reaching `search_callers_multi_expanded`),
-    /// but the scaling function must stay total rather than dividing by zero
-    /// or returning a zero budget that would make every walk quit instantly.
+    /// A list cut short must say so: 12 call sites with 10 shown said
+    /// nothing about the other two.
     #[test]
-    fn scaled_batch_quit_treats_zero_targets_as_one() {
-        assert_eq!(scaled_batch_quit(BATCH_EARLY_QUIT, 0), BATCH_EARLY_QUIT);
+    fn a_capped_caller_list_says_how_many_are_not_shown() {
+        let dir = tempfile::tempdir().unwrap();
+        let bloom = BloomFilterCache::new();
+        let mut body = String::from("pub fn target_fn() {}\n");
+        for i in 0..12 {
+            let _ = writeln!(body, "fn c{i}() {{ target_fn(); }}");
+        }
+        std::fs::write(dir.path().join("lib.rs"), body).unwrap();
+        let out =
+            search_callers_expanded("target_fn", dir.path(), &bloom, 0, None, None, false).unwrap();
+        assert!(out.contains("— 10 of 12 call sites"), "{out}");
+        assert!(out.contains("... and 2 more call sites."), "{out}");
+        assert_eq!(out.matches("\n## ").count(), 10);
     }
 
     #[test]

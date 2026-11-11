@@ -17,18 +17,15 @@ use crate::types::{is_test_file, FileType, OutlineKind};
 /// Maximum number of exported symbols to search for in the reverse direction.
 pub const MAX_EXPORTED_SYMBOLS: usize = 25;
 
-/// Maximum number of dependents to show before truncation.
-const MAX_DEPENDENTS: usize = 15;
-
 /// Result of a full dependency analysis for a single file.
 #[derive(Debug)]
 pub struct DepsResult {
     pub target: PathBuf,
     pub uses_local: Vec<LocalDep>,
     pub uses_external: Vec<String>,
+    /// Every file that calls one of the target's symbols, same directory
+    /// first, then non-tests before tests, then by path.
     pub used_by: Vec<Dependent>,
-    /// Total dependents found before truncation.
-    pub total_dependents: usize,
     pub exported_count: usize,
     /// Actual number of symbols searched (may be < `exported_count` if capped).
     pub searched_count: usize,
@@ -78,7 +75,6 @@ pub fn analyze_deps(
             uses_local: Vec::new(),
             uses_external: Vec::new(),
             used_by: Vec::new(),
-            total_dependents: 0,
             exported_count: 0,
             searched_count: 0,
         });
@@ -167,45 +163,31 @@ pub fn analyze_deps(
 
     // ── Phase 3: Reverse dependencies ────────────────────────────────────────
 
-    let mut used_by = if searched_count > 0 {
+    let used_by = if searched_count > 0 {
         let symbols_set: HashSet<String> = all_names.iter().cloned().collect();
-        let raw_matches = find_callers_batch(
-            &symbols_set,
-            scope,
-            bloom,
-            None,
-            crate::search::callers::BATCH_EARLY_QUIT,
-        )?;
-
-        // Group by file path
-        let mut by_file: HashMap<PathBuf, Vec<(String, String, u32)>> = HashMap::new();
-        for (matched_symbol, caller_match) in raw_matches {
-            // Exclude calls from within the target file itself (self-references)
-            if caller_match.path == *path {
-                continue;
+        // One `Dependent` per file that calls the target's symbols. Calls from
+        // within the target file itself are self-references, not dependents.
+        let found = find_callers_batch(&symbols_set, scope, bloom, None, |sites| {
+            let dep_path = sites.first().map(|(_, m)| m.path.clone())?;
+            if dep_path == *path {
+                return None;
             }
-            by_file.entry(caller_match.path).or_default().push((
-                caller_match.calling_function,
-                matched_symbol,
-                caller_match.line,
-            ));
-        }
-
-        // Build Dependent list
-        let target_dir = path.parent();
-        let mut dependents: Vec<Dependent> = by_file
-            .into_iter()
-            .map(|(dep_path, mut pairs)| {
-                pairs.sort();
-                pairs.dedup();
-                let is_test = is_test_file(&dep_path);
-                Dependent {
-                    path: dep_path,
-                    symbols: pairs,
-                    is_test,
-                }
+            let mut pairs: Vec<(String, String, u32)> = sites
+                .into_iter()
+                .map(|(symbol, m)| (m.calling_function, symbol, m.line))
+                .collect();
+            pairs.sort();
+            pairs.dedup();
+            let is_test = is_test_file(&dep_path);
+            Some(Dependent {
+                path: dep_path,
+                symbols: pairs,
+                is_test,
             })
-            .collect();
+        })?;
+
+        let target_dir = path.parent();
+        let mut dependents: Vec<Dependent> = found.into_iter().flatten().collect();
 
         // Sort: same directory first, non-tests before tests, then alphabetical
         dependents.sort_by(|a, b| {
@@ -222,15 +204,11 @@ pub fn analyze_deps(
         Vec::new()
     };
 
-    let total_dependents = used_by.len();
-    used_by.truncate(MAX_DEPENDENTS);
-
     Ok(DepsResult {
         target: path.clone(),
         uses_local,
         uses_external,
         used_by,
-        total_dependents,
         exported_count,
         searched_count,
     })
@@ -293,6 +271,7 @@ fn is_valid_module_path(source: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
 
     /// The external modules `analyze_deps` reports for one file.
     fn externals_of(file: &str, content: &str) -> Vec<String> {
@@ -431,5 +410,39 @@ mod tests {
         // Go 1.21+ added `cmp` and `maps` to the standard library.
         assert!(is_stdlib("cmp", crate::types::Lang::Go));
         assert!(is_stdlib("maps", crate::types::Lang::Go));
+    }
+
+    /// The import resolver stopped at eight files, a limit meant for the
+    /// read hint, so a file importing twelve local modules reported
+    /// "8 local". Sixty importers are also more than the old caller walk
+    /// read before it quit on its shared counter.
+    #[test]
+    fn deps_counts_every_local_import_and_every_dependent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut target = String::new();
+        for i in 0..12 {
+            let _ = writeln!(target, "import {{ m{i} }} from './m{i}';");
+            fs::write(
+                dir.path().join(format!("m{i}.ts")),
+                format!("export function m{i}() {{ return {i}; }}\n"),
+            )
+            .unwrap();
+        }
+        target.push_str("export function useAll() { return m0() + m11(); }\n");
+        fs::write(dir.path().join("target.ts"), target).unwrap();
+        for i in 0..60 {
+            fs::write(
+                dir.path().join(format!("user{i:02}.ts")),
+                format!(
+                    "import {{ useAll }} from './target';\nexport function u{i}() {{ return useAll(); }}\n"
+                ),
+            )
+            .unwrap();
+        }
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let result = analyze_deps(&dir.path().join("target.ts"), dir.path(), &bloom).unwrap();
+        assert_eq!(result.uses_local.len(), 12, "{:?}", result.uses_local);
+        assert_eq!(result.used_by.len(), 60);
+        assert!(result.used_by[0].path.ends_with("user00.ts"));
     }
 }

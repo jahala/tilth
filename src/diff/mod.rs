@@ -463,31 +463,32 @@ fn compute_blast(overlays: &[FileOverlay], repo: Option<&Path>) -> Vec<String> {
     };
     let bloom = tilth_core::index::bloom::BloomFilterCache::new();
 
-    match tilth_core::find_callers_batch(
-        &sig_changed,
-        &scope,
-        &bloom,
-        None,
-        tilth_core::search::callers::BATCH_EARLY_QUIT,
-    ) {
-        Ok(matches) => {
-            let mut counts: std::collections::HashMap<String, usize> =
-                std::collections::HashMap::new();
-            for (target, _) in &matches {
-                *counts.entry(target.clone()).or_default() += 1;
-            }
-            counts
-                .into_iter()
-                .map(|(name, count)| {
-                    format!(
-                        "blast: `{name}` signature changed — {count} caller{} may need updating",
-                        if count == 1 { "" } else { "s" }
-                    )
-                })
-                .collect()
+    let per_file = tilth_core::find_callers_batch(&sig_changed, &scope, &bloom, None, |sites| {
+        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for (target, _) in sites {
+            *counts.entry(target).or_default() += 1;
         }
-        Err(_) => Vec::new(),
+        counts
+    });
+    let Ok(per_file) = per_file else {
+        return Vec::new();
+    };
+    // Sorted by name so the lines come out in the same order every run.
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for file in per_file {
+        for (target, n) in file {
+            *counts.entry(target).or_default() += n;
+        }
     }
+    counts
+        .into_iter()
+        .map(|(name, count)| {
+            format!(
+                "blast: `{name}` signature changed — {count} caller{} may need updating",
+                if count == 1 { "" } else { "s" }
+            )
+        })
+        .collect()
 }
 
 /// Log mode pipeline: run per-commit diffs and format as commit summaries.

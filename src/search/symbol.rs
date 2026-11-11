@@ -1,6 +1,5 @@
 use std::fs;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
@@ -13,7 +12,7 @@ use tilth_core::lang::treesitter::{
 };
 
 use crate::search::rank;
-use crate::types::{FacetTotals, Match, SearchResult};
+use crate::types::{Match, SearchResult};
 use grep_regex::RegexMatcher;
 use grep_searcher::sinks::UTF8;
 use grep_searcher::Searcher;
@@ -23,18 +22,10 @@ use tilth_core::lang::outline::{heading_text, outline_language, parse_markdown};
 use tilth_core::types::FileType;
 
 const MAX_MATCHES: usize = 10;
-/// Stop walking once we have this many raw definition matches.
-const EARLY_QUIT_THRESHOLD_DEFINITIONS: usize = 50;
-/// Stop walking once we have this many raw usage matches.
-const EARLY_QUIT_THRESHOLD_USAGES: usize = MAX_MATCHES * 3;
 
 /// Match-count cap when `--full` is set. Generous but bounded so a `tilth
 /// foo --full` on a huge repo can't blow up output.
 const FULL_MAX_MATCHES: usize = 100;
-/// Walker early-quit threshold when `--full` is set. Proportional to
-/// `FULL_MAX_MATCHES` the same way the default thresholds are.
-const FULL_EARLY_QUIT_USAGES: usize = FULL_MAX_MATCHES * 3;
-const FULL_EARLY_QUIT_DEFINITIONS: usize = FULL_MAX_MATCHES * 3;
 
 /// Display-side stratum: 0 = code def, 1 = doc-heading def, 2 = usage. Used
 /// as a stable sort key after `rank::sort` so the `MAX_MATCHES` cap can't drop
@@ -47,13 +38,30 @@ fn stratum_for_display(m: &Match) -> u8 {
     }
 }
 
-/// Symbol search: find definitions via tree-sitter, usages via ripgrep, concurrently.
-/// Merge results, deduplicate, definitions first.
+/// Put matches in display order: by rank, then stratified so a real code
+/// definition always comes before a markdown-heading "definition" of the same
+/// query, and both before usages. Stable within each stratum, so the
+/// relevance ordering from `rank::sort` is kept. The walk applies this to
+/// each file and keeps its first `k`, then to the union with what it kept so
+/// far. That loses nothing: the order restricted to one file is the same
+/// order, so a match in the overall first `k` is in its own file's first `k`.
+fn display_order(
+    matches: &mut Vec<Match>,
+    query: &str,
+    scope: &Path,
+    context: Option<&Path>,
+    now: SystemTime,
+) {
+    rank::sort(matches, query, scope, context, now);
+    matches.sort_by_key(stratum_for_display);
+}
+
+/// Symbol search: find definitions via tree-sitter and usages via ripgrep in
+/// one walk over `scope`. The walk always runs to the end, so the totals are
+/// exact and the result does not depend on thread timing.
 ///
-/// `full` controls the truncation cap and walker early-quit thresholds:
-/// `false` (default) uses the tight defaults that keep agent token budgets
-/// in check; `true` raises both caps so interactive `--full` callers see
-/// every match instead of "... and N more matches."
+/// `full` raises the number of matches returned from `MAX_MATCHES` to
+/// `FULL_MAX_MATCHES`. It does not change the totals.
 pub fn search(
     query: &str,
     scope: &Path,
@@ -61,86 +69,40 @@ pub fn search(
     glob: Option<&str>,
     full: bool,
 ) -> Result<SearchResult, TilthError> {
-    let (max_matches, def_threshold, usage_threshold) = if full {
-        (
-            FULL_MAX_MATCHES,
-            FULL_EARLY_QUIT_DEFINITIONS,
-            FULL_EARLY_QUIT_USAGES,
-        )
-    } else {
-        (
-            MAX_MATCHES,
-            EARLY_QUIT_THRESHOLD_DEFINITIONS,
-            EARLY_QUIT_THRESHOLD_USAGES,
-        )
-    };
+    let max_matches = if full { FULL_MAX_MATCHES } else { MAX_MATCHES };
+    search_capped(query, scope, context, glob, max_matches, max_matches)
+}
 
-    // Compile regex once, share across both arms
+/// The display cap and the collection bound are the same number in
+/// production. They are separate parameters so a test can raise one without
+/// the other and show that the bound leaves the result untouched.
+fn search_capped(
+    query: &str,
+    scope: &Path,
+    context: Option<&Path>,
+    glob: Option<&str>,
+    max_matches: usize,
+    keep: usize,
+) -> Result<SearchResult, TilthError> {
     let word_pattern = format!(r"\b{}\b", regex_syntax::escape(query));
     let matcher = RegexMatcher::new(&word_pattern).map_err(|e| TilthError::InvalidQuery {
         query: query.to_string(),
         reason: e.to_string(),
     })?;
 
-    let gitignore = tilth_core::search::walk::call_gitignore_override();
-    let (defs, usages) = rayon::join(
-        || {
-            tilth_core::search::walk::with_gitignore_override(gitignore, || {
-                find_definitions(query, scope, glob, def_threshold)
-            })
-        },
-        || {
-            tilth_core::search::walk::with_gitignore_override(gitignore, || {
-                find_usages(query, &matcher, scope, glob, usage_threshold)
-            })
-        },
-    );
+    // One clock for the per-file bound and the final sort, so both rank by
+    // the same scores.
+    let now = SystemTime::now();
+    let walked = walk(query, &matcher, scope, context, glob, now, keep)?;
 
-    let defs = defs?;
-    let usages = usages?;
+    let definitions: usize = walked.per_file.iter().map(|f| f.definitions).sum();
+    let total: usize = walked.per_file.iter().map(|f| f.total).sum();
+    let mut merged = walked.kept;
+    display_order(&mut merged, query, scope, context, now);
 
-    // Deduplicate: remove usage matches that overlap with definition matches.
-    // Linear scan — max ~30 defs from EARLY_QUIT_THRESHOLD, no allocation needed.
-    let mut merged: Vec<Match> = defs;
-    let def_count = merged.len();
-
-    for m in usages {
-        let dominated = merged[..def_count]
-            .iter()
-            .any(|d| d.path == m.path && d.line == m.line);
-        if !dominated {
-            merged.push(m);
-        }
-    }
-
-    let total = merged.len();
-    let usage_count = total - def_count;
-
-    rank::sort(&mut merged, query, scope, context);
-
-    // Stratify so the cap can't drop a real code definition in favor of a
-    // markdown-heading "definition" of the same query. Stable within each
-    // stratum, so the relevance ordering from rank::sort is preserved. Code
-    // defs (def_weight >= 60) come first, doc-heading defs (def_weight 30)
-    // second, usages last. Display-side only — pre-cap totals below and the
-    // underlying ranking semantics for `--json` callers are unchanged.
-    merged.sort_by_key(stratum_for_display);
-
-    // Compute per-subfacet totals on the *pre-cap* set so the renderer can
-    // print `displayed/total` headings + per-facet hidden-count lines.
-    // `merged` is bounded by the early-quit thresholds (~80 entries), so the
-    // clone is cheap. Faceting is pure / side-effect-free.
-    let totals = {
-        let snapshot = merged.clone();
-        let f = super::facets::facet_matches(snapshot, scope);
-        FacetTotals {
-            definitions: f.definitions.len(),
-            implementations: f.implementations.len(),
-            tests: f.tests.len(),
-            usages_local: f.usages_local.len(),
-            usages_cross: f.usages_cross.len(),
-        }
-    };
+    let file_facets: Vec<super::facets::FileFacets> =
+        walked.per_file.into_iter().map(|f| f.facets).collect();
+    let facet_totals = super::facets::totals(&file_facets, merged.iter().find(|m| m.is_definition));
 
     merged.truncate(max_matches);
 
@@ -149,44 +111,51 @@ pub fn search(
         scope: scope.to_path_buf(),
         matches: merged,
         total_found: total,
-        definitions: def_count,
-        usages: usage_count,
-        facet_totals: totals,
+        definitions,
+        usages: total - definitions,
+        facet_totals,
     })
 }
 
-/// Find definitions using tree-sitter structural detection.
-/// For each file containing the query string, parse with tree-sitter and walk
-/// definition nodes to see if any declare the queried symbol.
-/// Falls back to keyword heuristic for files without grammars.
-///
-/// Single-read design: reads each file once, checks for symbol via
-/// `memchr::memmem` (SIMD), then reuses the buffer for tree-sitter parsing.
-/// Early termination: quits the parallel walker once enough defs are found.
-fn find_definitions(
+/// What the walk found in one file, beyond the matches it kept.
+struct FileCount {
+    total: usize,
+    definitions: usize,
+    facets: super::facets::FileFacets,
+}
+
+struct Walked {
+    /// The first `keep` matches in display order.
+    kept: Vec<Match>,
+    per_file: Vec<FileCount>,
+}
+
+/// Walk `scope` once and collect the definitions and usages of `query`.
+/// Every file is visited and counted, so the totals are exact. Only the
+/// first `keep` matches in display order are held: each file's first `keep`
+/// are merged into the running first `keep` as the file is read. The display
+/// order is total across files, since it ends on path and line, so what is
+/// kept does not depend on the order files arrive in.
+fn walk(
     query: &str,
+    matcher: &RegexMatcher,
     scope: &Path,
+    context: Option<&Path>,
     glob: Option<&str>,
-    early_quit_threshold: usize,
-) -> Result<Vec<Match>, TilthError> {
-    let matches: Mutex<Vec<Match>> = Mutex::new(Vec::new());
-    // Relaxed is correct: walker.run() joins all threads before we read the final value.
-    // Early-quit checks are approximate by design — one extra iteration is harmless.
-    let found_count = AtomicUsize::new(0);
-    let needle = query.as_bytes();
+    now: SystemTime,
+    keep: usize,
+) -> Result<Walked, TilthError> {
+    let found: Mutex<Walked> = Mutex::new(Walked {
+        kept: Vec::new(),
+        per_file: Vec::new(),
+    });
 
     let walker = tilth_core::search::walk::walker(scope, glob)?;
 
     walker.run(|| {
-        let matches = &matches;
-        let found_count = &found_count;
+        let found = &found;
 
         Box::new(move |entry| {
-            // Early termination: enough definitions found
-            if found_count.load(Ordering::Relaxed) >= early_quit_threshold {
-                return ignore::WalkState::Quit;
-            }
-
             let Ok(entry) = entry else {
                 return ignore::WalkState::Continue;
             };
@@ -196,108 +165,163 @@ fn find_definitions(
             }
 
             let path = entry.path();
-
-            // Skip files that look minified by filename — `.min.js`, `app-min.css`.
-            if path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(tilth_core::lang::detection::is_minified_by_name)
-            {
+            let mut file_matches = matches_in_file(path, query, matcher);
+            if file_matches.is_empty() {
                 return ignore::WalkState::Continue;
             }
 
-            // Skip oversized files — avoid tree-sitter parsing multi-MB minified bundles
-            let file_size = match std::fs::metadata(path) {
-                Ok(meta) => {
-                    if meta.len() > 500_000 {
-                        return ignore::WalkState::Continue;
-                    }
-                    meta.len()
-                }
-                Err(_) => 0,
+            let count = FileCount {
+                total: file_matches.len(),
+                definitions: file_matches.iter().filter(|m| m.is_definition).count(),
+                facets: super::facets::count_file(path, &file_matches),
             };
+            display_order(&mut file_matches, query, scope, context, now);
+            file_matches.truncate(keep);
 
-            // Single read: read file once, use buffer for both check and parse
-            let Ok(content) = fs::read_to_string(path) else {
-                return ignore::WalkState::Continue;
-            };
-
-            // Fast byte check via memchr::memmem (SIMD) — skip files without the symbol
-            if memchr::memmem::find(content.as_bytes(), needle).is_none() {
-                return ignore::WalkState::Continue;
-            }
-
-            // Catch unmarked minified bundles that slipped past the filename check.
-            if file_size >= tilth_core::lang::detection::MINIFIED_CHECK_THRESHOLD
-                && tilth_core::lang::detection::is_minified_by_content(content.as_bytes())
-            {
-                return ignore::WalkState::Continue;
-            }
-
-            // Get file metadata once per file
-            let (file_lines, mtime) = file_metadata(path);
-
-            // Try tree-sitter structural detection
-            let file_type = detect_file_type(path);
-            let lang = match file_type {
-                FileType::Code(l) => Some(l),
-                _ => None,
-            };
-
-            let ts_language = lang.and_then(outline_language);
-
-            let mut file_defs = if let Some(ref ts_lang) = ts_language {
-                find_defs_treesitter(path, query, ts_lang, lang, &content, file_lines, mtime)
-            } else {
-                Vec::new()
-            };
-
-            // Per-file-type fallback dispatch. The semantics of "definition"
-            // differ by file kind, so handle them separately:
-            //
-            // * Code without a tree-sitter grammar: keyword heuristic (looks
-            //   for lines starting with `function`/`const`/`class`/etc.).
-            // * Markdown / RST: heading-as-definition. A heading whose text
-            //   contains the query (`## parseCitations` in a doc) marks that
-            //   section AS being about the symbol — that is the documentation
-            //   analogue of a code definition. Quoted code blocks inside
-            //   docs are NOT treated as definitions; they're usages, because
-            //   the keyword heuristic would false-positive on every snippet
-            //   that quotes the real source. Heading defs carry a lower
-            //   `def_weight` (30) than code definitions (60-80) so the real
-            //   source still ranks first.
-            // * Structured data / tabular / log / other: no fallback.
-            //   Mentions are config values, data, or noise — not definitions.
-            //   (A future patch could treat top-level config keys matching
-            //   the query as soft definitions, but that's ambiguous enough
-            //   to skip for now.)
-            if file_defs.is_empty() && ts_language.is_none() {
-                file_defs = match file_type {
-                    FileType::Code(_) => {
-                        find_defs_heuristic_buf(path, query, &content, file_lines, mtime)
-                    }
-                    FileType::Markdown => {
-                        find_defs_markdown_buf(path, query, &content, file_lines, mtime)
-                    }
-                    _ => Vec::new(),
-                };
-            }
-
-            if !file_defs.is_empty() {
-                found_count.fetch_add(file_defs.len(), Ordering::Relaxed);
-                let mut all = matches
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                all.extend(file_defs);
-            }
+            let mut found = found
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            found.kept.extend(file_matches);
+            display_order(&mut found.kept, query, scope, context, now);
+            found.kept.truncate(keep);
+            found.per_file.push(count);
 
             ignore::WalkState::Continue
         })
     });
 
-    Ok(matches
+    Ok(found
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner))
+}
+
+/// The definitions and usages of `query` in one file, with a usage on a
+/// definition's line dropped in favour of the definition.
+///
+/// Single-read design: reads the file once, checks for the symbol via
+/// `memchr::memmem` (SIMD), then reuses the buffer for both the tree-sitter
+/// definition pass and the word-boundary usage pass. Definitions fall back
+/// to a keyword heuristic for code without a grammar.
+fn matches_in_file(path: &Path, query: &str, matcher: &RegexMatcher) -> Vec<Match> {
+    // Skip files that look minified by filename — `.min.js`, `app-min.css`.
+    if path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(tilth_core::lang::detection::is_minified_by_name)
+    {
+        return Vec::new();
+    }
+
+    // Skip oversized files — avoid tree-sitter parsing multi-MB minified bundles
+    let file_size = match std::fs::metadata(path) {
+        Ok(meta) => {
+            if meta.len() > 500_000 {
+                return Vec::new();
+            }
+            meta.len()
+        }
+        Err(_) => 0,
+    };
+
+    let Ok(bytes) = fs::read(path) else {
+        return Vec::new();
+    };
+
+    // Fast byte check — a word-boundary usage or a definition both need the
+    // symbol's bytes somewhere in the file.
+    if memchr::memmem::find(&bytes, query.as_bytes()).is_none() {
+        return Vec::new();
+    }
+
+    // Catch unmarked minified bundles that slipped past the filename check.
+    if file_size >= tilth_core::lang::detection::MINIFIED_CHECK_THRESHOLD
+        && tilth_core::lang::detection::is_minified_by_content(&bytes)
+    {
+        return Vec::new();
+    }
+
+    let (file_lines, mtime) = file_metadata(path);
+
+    let mut matches = match std::str::from_utf8(&bytes) {
+        Ok(content) => definitions_in(path, query, content, file_lines, mtime),
+        Err(_) => Vec::new(),
+    };
+    let def_count = matches.len();
+
+    let mut searcher = Searcher::new();
+    let _ = searcher.search_slice(
+        matcher,
+        &bytes,
+        UTF8(|line_num, line| {
+            let line_num = line_num as u32;
+            let on_definition = matches[..def_count].iter().any(|d| d.line == line_num);
+            if !on_definition {
+                matches.push(Match {
+                    path: path.to_path_buf(),
+                    line: line_num,
+                    text: line.trim_end().to_string(),
+                    is_definition: false,
+                    exact: line.contains(query),
+                    file_lines,
+                    mtime,
+                    def_range: None,
+                    def_name: None,
+                    def_weight: 0,
+                    impl_target: None,
+                });
+            }
+            Ok(true)
+        }),
+    );
+
+    matches
+}
+
+/// The definitions of `query` in one file's content.
+fn definitions_in(
+    path: &Path,
+    query: &str,
+    content: &str,
+    file_lines: u32,
+    mtime: SystemTime,
+) -> Vec<Match> {
+    // Try tree-sitter structural detection
+    let file_type = detect_file_type(path);
+    let lang = match file_type {
+        FileType::Code(l) => Some(l),
+        _ => None,
+    };
+
+    let ts_language = lang.and_then(outline_language);
+
+    if let Some(ref ts_lang) = ts_language {
+        return find_defs_treesitter(path, query, ts_lang, lang, content, file_lines, mtime);
+    }
+
+    // Per-file-type fallback dispatch. The semantics of "definition"
+    // differ by file kind, so handle them separately:
+    //
+    // * Code without a tree-sitter grammar: keyword heuristic (looks
+    //   for lines starting with `function`/`const`/`class`/etc.).
+    // * Markdown / RST: heading-as-definition. A heading whose text
+    //   contains the query (`## parseCitations` in a doc) marks that
+    //   section AS being about the symbol — that is the documentation
+    //   analogue of a code definition. Quoted code blocks inside
+    //   docs are NOT treated as definitions; they're usages, because
+    //   the keyword heuristic would false-positive on every snippet
+    //   that quotes the real source. Heading defs carry a lower
+    //   `def_weight` (30) than code definitions (60-80) so the real
+    //   source still ranks first.
+    // * Structured data / tabular / log / other: no fallback.
+    //   Mentions are config values, data, or noise — not definitions.
+    //   (A future patch could treat top-level config keys matching
+    //   the query as soft definitions, but that's ambiguous enough
+    //   to skip for now.)
+    match file_type {
+        FileType::Code(_) => find_defs_heuristic_buf(path, query, content, file_lines, mtime),
+        FileType::Markdown => find_defs_markdown_buf(path, query, content, file_lines, mtime),
+        _ => Vec::new(),
+    }
 }
 
 /// Tree-sitter structural definition detection.
@@ -554,119 +578,6 @@ fn find_defs_heuristic_buf(
     defs
 }
 
-/// Find all usages via ripgrep (word-boundary matching).
-/// Collects per-file, locks once per file (not per line).
-/// Early termination once enough usages found.
-fn find_usages(
-    query: &str,
-    matcher: &RegexMatcher,
-    scope: &Path,
-    glob: Option<&str>,
-    early_quit_threshold: usize,
-) -> Result<Vec<Match>, TilthError> {
-    let matches: Mutex<Vec<Match>> = Mutex::new(Vec::new());
-    // Relaxed: same reasoning as find_definitions — approximate early-quit, joined before read
-    let found_count = AtomicUsize::new(0);
-
-    let walker = tilth_core::search::walk::walker(scope, glob)?;
-
-    walker.run(|| {
-        let matches = &matches;
-        let found_count = &found_count;
-
-        Box::new(move |entry| {
-            // Early termination: enough usages found
-            if found_count.load(Ordering::Relaxed) >= early_quit_threshold {
-                return ignore::WalkState::Quit;
-            }
-
-            let Ok(entry) = entry else {
-                return ignore::WalkState::Continue;
-            };
-
-            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
-                return ignore::WalkState::Continue;
-            }
-
-            let path = entry.path();
-
-            // Skip files that look minified by filename — `.min.js`, `app-min.css`.
-            if path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(tilth_core::lang::detection::is_minified_by_name)
-            {
-                return ignore::WalkState::Continue;
-            }
-
-            // Skip oversized files
-            let file_size = match std::fs::metadata(path) {
-                Ok(meta) => {
-                    if meta.len() > 500_000 {
-                        return ignore::WalkState::Continue;
-                    }
-                    meta.len()
-                }
-                Err(_) => 0,
-            };
-
-            // Read once and dispatch via `search_slice` so the minified
-            // heuristic and the search share a single kernel read.
-            let Ok(bytes) = std::fs::read(path) else {
-                return ignore::WalkState::Continue;
-            };
-
-            // Catch unmarked minified bundles between 100KB and 500KB — they
-            // were not skipped by the filename check or the size cap above.
-            if file_size >= tilth_core::lang::detection::MINIFIED_CHECK_THRESHOLD
-                && tilth_core::lang::detection::is_minified_by_content(&bytes)
-            {
-                return ignore::WalkState::Continue;
-            }
-
-            let (file_lines, mtime) = file_metadata(path);
-
-            let mut file_matches = Vec::new();
-            let mut searcher = Searcher::new();
-
-            let _ = searcher.search_slice(
-                matcher,
-                &bytes,
-                UTF8(|line_num, line| {
-                    file_matches.push(Match {
-                        path: path.to_path_buf(),
-                        line: line_num as u32,
-                        text: line.trim_end().to_string(),
-                        is_definition: false,
-                        exact: line.contains(query),
-                        file_lines,
-                        mtime,
-                        def_range: None,
-                        def_name: None,
-                        def_weight: 0,
-                        impl_target: None,
-                    });
-                    Ok(true)
-                }),
-            );
-
-            if !file_matches.is_empty() {
-                found_count.fetch_add(file_matches.len(), Ordering::Relaxed);
-                let mut all = matches
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                all.extend(file_matches);
-            }
-
-            ignore::WalkState::Continue
-        })
-    });
-
-    Ok(matches
-        .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner))
-}
-
 /// Markdown heading definition detector.
 ///
 /// An ATX heading (`^#{1,6}\s+<text>`) in a `.md`/`.mdx`/`.rst` file is
@@ -859,6 +770,7 @@ fn is_definition_line(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
     use std::path::PathBuf;
     use std::time::SystemTime;
 
@@ -1369,6 +1281,99 @@ Body to end.
             "displayed slice after cap must be all code defs, got {:?}",
             matches.iter().map(|m| m.def_weight).collect::<Vec<_>>()
         );
+    }
+
+    /// The old walkers quit on a shared counter (50 definitions, 30 usages),
+    /// so the total was however far the threads got: "10 of 48" for a symbol
+    /// with 685 hits, and a different number on each run. 80 files with one
+    /// definition and two usages each are well past both thresholds.
+    #[test]
+    fn symbol_totals_are_exact_and_identical_across_runs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for i in 0..80 {
+            std::fs::write(
+                dir.path().join(format!("f{i:02}.rs")),
+                format!("pub fn exact_needle_{i}() {{}}\nfn exact_needle() {{}}\nfn user_{i}() {{ exact_needle(); exact_needle(); }}\n"),
+            )
+            .expect("write");
+        }
+        let first = search("exact_needle", dir.path(), None, None, false).expect("search");
+        assert_eq!(first.definitions, 80, "every definition is counted");
+        assert_eq!(first.usages, 80, "every usage line is counted");
+        assert_eq!(first.total_found, 160);
+        assert_eq!(
+            first.facet_totals.definitions
+                + first.facet_totals.usages_local
+                + first.facet_totals.usages_cross
+                + first.facet_totals.tests
+                + first.facet_totals.implementations,
+            160,
+            "facet totals add up to the exact total"
+        );
+        let shown = |r: &SearchResult| -> Vec<(PathBuf, u32)> {
+            r.matches.iter().map(|m| (m.path.clone(), m.line)).collect()
+        };
+        for _ in 0..4 {
+            let again = search("exact_needle", dir.path(), None, None, false).expect("search");
+            assert_eq!(again.total_found, first.total_found);
+            assert_eq!(shown(&again), shown(&first), "same matches every run");
+        }
+    }
+
+    /// The collection bound must be invisible in the result: at the
+    /// production bound and with no bound, the totals, the facet totals and
+    /// the matches shown are the same. A bound of one shows it is live.
+    #[test]
+    fn collection_bound_does_not_change_the_result() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for f in 0..6 {
+            // Comment mentions rank below a call, and the call is the last
+            // line, so keeping a file's first matches instead of its best
+            // would drop it.
+            let mut body = String::new();
+            if f % 2 == 0 {
+                body.push_str("pub fn bound_probe() {}\n");
+            }
+            for i in 0..13 {
+                let _ = writeln!(body, "// bound_probe note {i}");
+            }
+            body.push_str("fn user() { bound_probe(); }\n");
+            let sub = dir.path().join(format!("pkg{f}"));
+            std::fs::create_dir(&sub).expect("mkdir");
+            std::fs::write(sub.join("lib.rs"), body).expect("write");
+        }
+        let key = |r: &SearchResult| -> Vec<(PathBuf, u32, bool)> {
+            r.matches
+                .iter()
+                .map(|m| (m.path.clone(), m.line, m.is_definition))
+                .collect()
+        };
+        let run = |cap| search_capped("bound_probe", dir.path(), None, None, 10, cap).unwrap();
+        let bounded = run(10);
+        let unbounded = run(usize::MAX);
+        assert_eq!(bounded.total_found, 87);
+        assert!(
+            bounded
+                .matches
+                .iter()
+                .any(|m| m.text.starts_with("fn user()")),
+            "a file's best usage is its last line"
+        );
+        assert_eq!(bounded.total_found, unbounded.total_found);
+        assert_eq!(bounded.definitions, 3);
+        assert_eq!(key(&bounded), key(&unbounded));
+        assert_eq!(
+            format!("{:?}", bounded.facet_totals),
+            format!("{:?}", unbounded.facet_totals)
+        );
+        let one = run(1);
+        assert_eq!(one.matches.len(), 1, "one match is kept");
+        assert_eq!(
+            (&one.matches[0].path, one.matches[0].line),
+            (&bounded.matches[0].path, bounded.matches[0].line),
+            "the best one"
+        );
+        assert_eq!(one.total_found, 87, "and the count stays exact");
     }
 
     #[test]

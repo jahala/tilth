@@ -44,6 +44,10 @@ struct Cli {
     /// on comma-separated multi-symbol queries, which always expand at
     /// least one match per symbol. Output stays bounded by `--budget`.
     ///
+    /// `--callers`: raise the call-site cap from 10 to 100.
+    ///
+    /// `--deps`: list every dependent instead of the first 15.
+    ///
     /// Glob: no effect (glob queries already return a flat file list).
     #[arg(long)]
     full: bool,
@@ -365,7 +369,7 @@ fn main() {
                 }
             }
         };
-        let result = tilth::run_deps(&path, &scope, cli.budget);
+        let result = tilth::run_deps(&path, &scope, cli.budget, cli.full);
         emit_result(result, &query, cli.json, is_tty);
         return;
     }

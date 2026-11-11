@@ -164,7 +164,11 @@ pub(in crate::mcp) fn tool_read(
         let related = tilth_core::imports::resolve_related_files(&path, cache);
         if !related.is_empty() {
             output.push_str("\n\n> Related: ");
-            for (i, p) in related.iter().enumerate() {
+            for (i, p) in related
+                .iter()
+                .take(crate::read::RELATED_HINT_LIMIT)
+                .enumerate()
+            {
                 if i > 0 {
                     output.push_str(", ");
                 }

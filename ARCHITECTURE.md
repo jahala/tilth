@@ -296,7 +296,11 @@ up the one symbol." This explicit gate prevents collisions with regex
 Token budgeting (`budget::apply`) is a final filter applied to whatever
 string came out of the dispatch. It walks the output and snips off
 content past the budget; the entry-format header is preserved so the
-caller knows truncation happened.
+caller knows truncation happened. Search output goes through
+`alloc::fit_to_budget` first, which cuts by value instead of position:
+the lowest-value match blocks lose their expanded source first and are
+dropped only after that, so a definition whose body alone overruns the
+budget still shows where it is.
 
 ## Classification (`src/classify.rs`)
 
@@ -386,12 +390,19 @@ gitignore-style with whitelist, negation (`!`), and brace expansion.
 
 The biggest production-only file in the subsystem. Three layers stacked:
 
-1. **`search()`** — top-level entry. Walks files via `walker`, parses
-   each via `OutlineCache::get_or_parse` (cap: 500 KB), dispatches to
-   the right per-language definition extractor, runs a usage scan,
-   merges definitions + usages, ranks, facets (when >5 matches), and
-   computes `FacetTotals` from the pre-cap merged set. Returns a
-   `SearchResult`.
+1. **`search()`** — top-level entry. One walk via `walker` reads each
+   file once (cap: 500 KB), finds its definitions with the right
+   per-language extractor and its usages with a word-boundary scan,
+   and drops a usage that sits on a definition's line. The walk always
+   runs to the end, so the totals are exact and the same query gives
+   the same result on every run. Each file is counted in full, by
+   facet, and only the first matches in display order are kept: each
+   file's are merged into a running top N as it arrives. The display
+   order (`display_order`: rank, then code definitions, doc-heading
+   definitions, usages) ends on path and line, so it is total, and a
+   match in the overall top N is in its own file's top N; the bound
+   loses nothing. `FacetTotals` are summed from the per-file counts.
+   Returns a `SearchResult`.
 2. **Per-language definition extraction**:
    - `find_defs_treesitter` walks the tree-sitter tree and picks
      definitions whose name field equals the query. Uses
@@ -481,7 +492,13 @@ machinery:
   (`tilth-core`) is the single tree-sitter walk that resolves call sites for any number of target
   symbols (1 to N) — `search_callers_expanded` calls it with a
   one-element set, the deps / blast / 2nd-hop paths call it with the
-  full set. Each caller is annotated with its enclosing scope via
+  full set. The walk always runs to the end. It hands each file's call
+  sites, in line order, to a function the caller passes, and returns
+  that function's results in path order. Each caller counts there and
+  keeps only what it shows, merged into a running top N under a total
+  order, so totals are exact, output is the same on every run, and
+  memory stays flat on a large tree (each `CallerMatch` holds its
+  file's text). A capped list says how many it left out. Each caller is annotated with its enclosing scope via
   `scope::walk_to_enclosing_definition` so the user sees
   `[caller: foo]` instead of just a line number. When the walk returns
   empty, a small `target_seen_in_scope` helper in the binary does an mmap-based
@@ -500,8 +517,10 @@ machinery:
   queries against the same language stay separated.
 - **Deps** (`deps.rs`, both crates) — `analyze_deps` (`tilth-core`)
   is what `tilth_deps` runs. Returns a `DepsResult` with `Uses` (local
-  + external) and `Used by`. `format_deps` (binary) does the human
-  output. The external-dep stdlib
+  + external) and every dependent in `Used by`. `format_deps` (binary)
+  does the human output: it lists the first 15 dependents, or all of
+  them with `--full`, and says how many it left out, under a budget
+  too. The external-dep stdlib
   heuristic (`is_stdlib`) is per-language; module-path validation
   (`is_valid_module_path`) avoids treating relative paths as packages.
 - **Blast** (`blast.rs`) — symbol-level blast radius for diff
@@ -572,7 +591,9 @@ Two helpers feed the MCP layer:
   hints (`"Related: foo.ts, bar.ts"`) — only meaningful when the user
   is going to see an outline.
 - `tilth_core::imports::resolve_related_files` does the related-file
-  resolution for the same hint.
+  resolution for the same hint. It returns every local import; the
+  hint names the first `RELATED_HINT_LIMIT` (8). Deps and callee
+  resolution use the full list.
 
 ## Language layer (`crates/tilth-core/src/lang/`)
 

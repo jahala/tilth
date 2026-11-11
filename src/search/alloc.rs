@@ -10,62 +10,91 @@ use std::fmt::Write;
 
 use crate::types::estimate_tokens;
 
-/// Choose which blocks to keep within `budget` tokens, preferring higher value.
+/// One match block in assembled search output: its information value and its
+/// byte range `start..end`. `body_start` is where the block's expanded source
+/// begins, or `end` when it has none. Over budget, a block can keep
+/// `start..body_start` and lose its expansion.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Block {
+    pub value: i64,
+    pub start: usize,
+    pub body_start: usize,
+    pub end: usize,
+}
+
+/// What survives of one block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Fit {
+    Whole,
+    /// The block's lines before its expansion.
+    WithoutBody,
+    Dropped,
+}
+
+/// Choose what to keep of each block within `budget` tokens, preferring
+/// higher value.
 ///
-/// `items` is `(value, tokens)` per block in rendered order; higher `value`
-/// means more worth keeping. Returns a keep-mask in the SAME order as `items`.
+/// `items` is `(value, tokens, tokens_without_body)` per block in rendered
+/// order; higher `value` means more worth keeping. Returns one `Fit` per item,
+/// in the same order.
 ///
-/// Strategy: first-fit by value — consider blocks in descending value order and
-/// keep each that still fits in the remaining budget (a smaller, lower-value
-/// block can be kept after a larger higher-value one was skipped, so leftover
-/// budget is not wasted). Deterministic: ties broken by original index.
+/// Strategy: first-fit by value. Blocks are considered in descending value
+/// order. Each is kept whole if it fits in what is left of the budget, else
+/// without its body if that fits, else dropped. A smaller, lower-value block
+/// can still be kept after a larger higher-value one was cut, so leftover
+/// budget is not wasted. Deterministic: ties broken by original index.
 ///
-/// When the total cost is within budget every block is kept, so the caller's
-/// render is byte-identical to the un-budgeted output.
-pub(crate) fn select_within_budget(items: &[(i64, u64)], budget: u64) -> Vec<bool> {
+/// When the total cost is within budget every block is kept whole, so the
+/// caller's render is byte-identical to the un-budgeted output.
+pub(crate) fn select_within_budget(items: &[(i64, u64, u64)], budget: u64) -> Vec<Fit> {
     // Fast path: everything fits → keep all (byte-identical render). Saturating
     // so a future caller passing pathological token counts can't overflow-panic
     // in debug (within `fit_to_budget` the sum is bounded by the body length).
     let total: u64 = items
         .iter()
-        .fold(0u64, |acc, &(_, tokens)| acc.saturating_add(tokens));
+        .fold(0u64, |acc, &(_, tokens, _)| acc.saturating_add(tokens));
     if total <= budget {
-        return vec![true; items.len()];
+        return vec![Fit::Whole; items.len()];
     }
 
-    let mut keep = vec![false; items.len()];
+    let mut fit = vec![Fit::Dropped; items.len()];
     // Consider blocks by descending value, stable on original index.
     let mut order: Vec<usize> = (0..items.len()).collect();
     order.sort_by(|&a, &b| items[b].0.cmp(&items[a].0).then(a.cmp(&b)));
 
     let mut remaining = budget;
     for i in order {
-        let (_, tokens) = items[i];
+        let (_, tokens, without_body) = items[i];
         if tokens <= remaining {
-            keep[i] = true;
+            fit[i] = Fit::Whole;
             remaining -= tokens;
+        } else if without_body < tokens && without_body <= remaining {
+            fit[i] = Fit::WithoutBody;
+            remaining -= without_body;
         }
-        // else: skip — a smaller lower-value block may still fit.
+        // else: dropped — a smaller lower-value block may still fit.
     }
-    keep
+    fit
+}
+
+/// The line that replaces an expansion a budget cut.
+fn body_omitted_line(tokens: u64) -> String {
+    format!("\n... expansion omitted to fit budget (~{tokens} tokens)")
 }
 
 /// Fit assembled search output to `budget_tokens`, keeping the highest-value
-/// match blocks. `blocks` are `(value, byte_start, byte_end)` for each match
-/// block within `body`, in ascending `byte_start` order with no overlap; every
-/// other byte is structural (headers, facet labels, hidden-tails) and always
-/// kept.
+/// match blocks. `blocks` are in ascending `start` order with no overlap;
+/// every other byte is structural (headers, facet labels, hidden-tails) and
+/// always kept.
 ///
 /// When `body` is already within budget it is returned UNCHANGED (byte-identical
-/// to the streamed output). Over budget, the lowest-value blocks are dropped
-/// (not the trailing ones), so the most relevant matches survive whichever facet
-/// they landed in. Byte ranges come from `String::len()` snapshots taken during
-/// assembly, so every slice lands on a char boundary.
-pub(crate) fn fit_to_budget(
-    body: &str,
-    blocks: &[(i64, usize, usize)],
-    budget_tokens: u64,
-) -> String {
+/// to the streamed output). Over budget, the lowest-value blocks lose their
+/// expansion first and are dropped after that (not the trailing ones), so the
+/// most relevant matches survive whichever facet they landed in, and a match
+/// whose expansion alone overruns the budget still shows where it is. Byte
+/// ranges come from `String::len()` snapshots taken during assembly, so every
+/// slice lands on a char boundary.
+pub(crate) fn fit_to_budget(body: &str, blocks: &[Block], budget_tokens: u64) -> String {
     // Invariant the slicing below relies on: blocks are ascending, non-overlapping,
     // within `body`, and on char boundaries. They come from `String::len()`
     // snapshots taken during assembly; assert it in debug so a future regression in
@@ -74,16 +103,17 @@ pub(crate) fn fit_to_budget(
     #[cfg(debug_assertions)]
     {
         let mut prev_end = 0usize;
-        for &(_, start, end) in blocks {
-            debug_assert!(start >= prev_end, "blocks overlap or are out of order");
-            debug_assert!(end >= start, "block end precedes start");
-            debug_assert!(end <= body.len(), "block end exceeds body length");
+        for b in blocks {
+            debug_assert!(b.start >= prev_end, "blocks overlap or are out of order");
             debug_assert!(
-                body.is_char_boundary(start),
-                "block start off char boundary"
+                b.start <= b.body_start && b.body_start <= b.end,
+                "block body start outside the block"
             );
-            debug_assert!(body.is_char_boundary(end), "block end off char boundary");
-            prev_end = end;
+            debug_assert!(b.end <= body.len(), "block end exceeds body length");
+            for at in [b.start, b.body_start, b.end] {
+                debug_assert!(body.is_char_boundary(at), "block offset off char boundary");
+            }
+            prev_end = b.end;
         }
     }
 
@@ -93,7 +123,7 @@ pub(crate) fn fit_to_budget(
 
     // Structural bytes (everything outside a block) are always kept; the value
     // selection only spends the budget left after reserving them.
-    let block_bytes: usize = blocks.iter().map(|&(_, s, e)| e.saturating_sub(s)).sum();
+    let block_bytes: usize = blocks.iter().map(|b| b.end.saturating_sub(b.start)).sum();
     let structural_tokens = estimate_tokens(body.len().saturating_sub(block_bytes) as u64);
 
     // If structural bytes alone already meet or exceed the budget, value selection
@@ -106,23 +136,36 @@ pub(crate) fn fit_to_budget(
 
     let block_budget = budget_tokens.saturating_sub(structural_tokens);
 
-    let items: Vec<(i64, u64)> = blocks
+    let items: Vec<(i64, u64, u64)> = blocks
         .iter()
-        .map(|&(v, s, e)| (v, estimate_tokens(e.saturating_sub(s) as u64)))
+        .map(|b| {
+            let whole = estimate_tokens(b.end.saturating_sub(b.start) as u64);
+            let without_body = if b.body_start < b.end {
+                let omitted = estimate_tokens((b.end - b.body_start) as u64);
+                estimate_tokens((b.body_start - b.start + body_omitted_line(omitted).len()) as u64)
+            } else {
+                whole
+            };
+            (b.value, whole, without_body)
+        })
         .collect();
-    let keep = select_within_budget(&items, block_budget);
+    let fit = select_within_budget(&items, block_budget);
 
     let mut out = String::with_capacity(body.len());
     let mut cursor = 0usize;
     let mut dropped = 0usize;
-    for (i, &(_, start, end)) in blocks.iter().enumerate() {
-        out.push_str(&body[cursor..start]); // structural gap before this block
-        if keep[i] {
-            out.push_str(&body[start..end]);
-        } else {
-            dropped += 1;
+    for (b, fit) in blocks.iter().zip(&fit) {
+        out.push_str(&body[cursor..b.start]); // structural gap before this block
+        match fit {
+            Fit::Whole => out.push_str(&body[b.start..b.end]),
+            Fit::WithoutBody => {
+                out.push_str(&body[b.start..b.body_start]);
+                let omitted = estimate_tokens((b.end - b.body_start) as u64);
+                out.push_str(&body_omitted_line(omitted));
+            }
+            Fit::Dropped => dropped += 1,
         }
-        cursor = end;
+        cursor = b.end;
     }
     out.push_str(&body[cursor..]); // trailing structural bytes
 
@@ -139,17 +182,47 @@ pub(crate) fn fit_to_budget(
 mod tests {
     use super::*;
 
+    /// Blocks without an expansion: each is kept whole or dropped.
+    fn keep(items: &[(i64, u64)], budget: u64) -> Vec<bool> {
+        let items: Vec<(i64, u64, u64)> = items.iter().map(|&(v, t)| (v, t, t)).collect();
+        select_within_budget(&items, budget)
+            .into_iter()
+            .map(|f| f == Fit::Whole)
+            .collect()
+    }
+
+    /// A block that cannot fit whole keeps its lines before the expansion,
+    /// and then a lower-value block can still use what is left.
+    #[test]
+    fn a_block_too_big_to_keep_whole_keeps_its_head() {
+        let items = [(80, 600, 20), (0, 30, 30)];
+        assert_eq!(
+            select_within_budget(&items, 100),
+            vec![Fit::WithoutBody, Fit::Whole]
+        );
+    }
+
+    /// Simple constructor for a block with no expansion.
+    fn block(value: i64, start: usize, end: usize) -> Block {
+        Block {
+            value,
+            start,
+            body_start: end,
+            end,
+        }
+    }
+
     #[test]
     fn keeps_all_when_under_budget() {
         let items = [(10, 30), (5, 30), (1, 30)];
-        assert_eq!(select_within_budget(&items, 1000), vec![true, true, true]);
+        assert_eq!(keep(&items, 1000), vec![true, true, true]);
     }
 
     #[test]
     fn drops_lower_value_when_over_budget() {
         // Each block costs 100; budget fits exactly one → the highest-value one.
         let items = [(1, 100), (10, 100), (5, 100)];
-        assert_eq!(select_within_budget(&items, 100), vec![false, true, false]);
+        assert_eq!(keep(&items, 100), vec![false, true, false]);
     }
 
     #[test]
@@ -157,45 +230,45 @@ mod tests {
         // Value order: (10,60) kept (rem 40); (5,50) skipped (50 > 40);
         // (1,30) kept (30 <= 40) — leftover budget is not wasted.
         let items = [(10, 60), (5, 50), (1, 30)];
-        assert_eq!(select_within_budget(&items, 100), vec![true, false, true]);
+        assert_eq!(keep(&items, 100), vec![true, false, true]);
     }
 
     #[test]
     fn ties_break_by_original_index() {
         // Two equal-value blocks, budget fits one → the earlier index wins.
         let items = [(7, 100), (7, 100)];
-        assert_eq!(select_within_budget(&items, 100), vec![true, false]);
+        assert_eq!(keep(&items, 100), vec![true, false]);
     }
 
     #[test]
     fn zero_budget_keeps_nothing_costly() {
         let items = [(10, 1), (5, 1)];
-        assert_eq!(select_within_budget(&items, 0), vec![false, false]);
+        assert_eq!(keep(&items, 0), vec![false, false]);
     }
 
     #[test]
     fn zero_cost_block_always_kept() {
         // A zero-token block fits any budget, even 0.
         let items = [(1, 0), (10, 50)];
-        assert_eq!(select_within_budget(&items, 0), vec![true, false]);
+        assert_eq!(keep(&items, 0), vec![true, false]);
     }
 
     #[test]
     fn empty_input_is_empty() {
-        assert_eq!(select_within_budget(&[], 100), Vec::<bool>::new());
+        assert_eq!(keep(&[], 100), Vec::<bool>::new());
     }
 
     #[test]
     fn negative_values_are_ordered_correctly() {
         // Penalised (negative-value) blocks are dropped before positive ones.
         let items = [(-5, 100), (3, 100)];
-        assert_eq!(select_within_budget(&items, 100), vec![false, true]);
+        assert_eq!(keep(&items, 100), vec![false, true]);
     }
 
     #[test]
     fn fit_to_budget_under_budget_is_byte_identical() {
         let body = "HEADER\n## a\nbody-a\n## b\nbody-b".to_string();
-        let blocks = [(1i64, 7, 20), (2i64, 20, body.len())];
+        let blocks = [block(1, 7, 20), block(2, 20, body.len())];
         assert_eq!(fit_to_budget(&body, &blocks, 100_000), body);
     }
 
@@ -210,7 +283,7 @@ mod tests {
         let a_end = a_start + high.len();
         let b_start = body.find(&low).unwrap();
         let b_end = b_start + low.len();
-        let blocks = [(10i64, a_start, a_end), (1i64, b_start, b_end)];
+        let blocks = [block(10, a_start, a_end), block(1, b_start, b_end)];
 
         // body ~408 bytes (~102 tokens); structural ~8 bytes (~2 tokens); each
         // block ~50 tokens. Budget 55 → fits structural + one block.
@@ -239,7 +312,7 @@ mod tests {
         let header = "H".repeat(400); // ~100 tokens of structural bytes
         let body = format!("{header}## x\nbody-x");
         let blk_start = body.find("body-x").unwrap();
-        let blocks = [(1i64, blk_start, body.len())];
+        let blocks = [block(1, blk_start, body.len())];
         // Budget 10 tokens « structural ~100 tokens.
         let out = fit_to_budget(&body, &blocks, 10);
         assert_eq!(

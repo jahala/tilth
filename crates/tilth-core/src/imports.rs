@@ -11,8 +11,6 @@ use streaming_iterator::StreamingIterator;
 use crate::lang::detect_file_type;
 use crate::types::{FileType, Lang};
 
-const MAX_SUGGESTIONS: usize = 8;
-
 /// The local files a code file's imports resolve to, read through `cache`'s
 /// parsed tree so an outlined read does not parse the file a second time.
 /// Returns empty for non-code files, files with no imports, or when all
@@ -41,8 +39,8 @@ pub fn resolve_related_files_with_content(file_path: &Path, content: &str) -> Ve
 }
 
 /// Resolve the local imports of the file at `file_path` to existing files,
-/// first come first served, at most `MAX_SUGGESTIONS`. For a caller that
-/// already holds the file's imports.
+/// each once, in import order. For a caller that already holds the file's
+/// imports.
 #[must_use]
 pub fn resolve_imports(file_path: &Path, lang: Lang, imports: &[Import]) -> Vec<PathBuf> {
     let Some(dir) = file_path.parent() else {
@@ -51,9 +49,6 @@ pub fn resolve_imports(file_path: &Path, lang: Lang, imports: &[Import]) -> Vec<
 
     let mut results = Vec::new();
     for import in imports {
-        if results.len() >= MAX_SUGGESTIONS {
-            break;
-        }
         if is_external(&import.source, lang) {
             continue;
         }

@@ -19,9 +19,18 @@ const VENDOR_DIRS: &[&str] = &[
     "out",
 ];
 
-/// Sort matches by score (highest first). Deterministic: same inputs, same order.
-/// When `context` is provided, matches near the context file are boosted.
-pub fn sort(matches: &mut [Match], query: &str, scope: &Path, context: Option<&Path>) {
+/// Sort matches by score (highest first), ties by path then line. Each match
+/// is scored once. Deterministic: same inputs, same order. `now` is the
+/// clock the recency boost reads; a search passes one value to every call so
+/// that its per-file bound and its final sort rank by the same scores. When
+/// `context` is provided, matches near the context file are boosted.
+pub fn sort(
+    matches: &mut Vec<Match>,
+    query: &str,
+    scope: &Path,
+    context: Option<&Path>,
+    now: SystemTime,
+) {
     // Pre-compute context's package root once (same for entire batch)
     let ctx_parent = context.and_then(|c| c.parent());
     let ctx_pkg_root = context
@@ -30,55 +39,6 @@ pub fn sort(matches: &mut [Match], query: &str, scope: &Path, context: Option<&P
 
     // Cache package roots for match paths — avoids repeated stat walks
     let mut pkg_cache: HashMap<PathBuf, Option<PathBuf>> = HashMap::new();
-    // Capture now once so the sort comparator does not call SystemTime::now() O(n log n) times.
-    let now = SystemTime::now();
-
-    matches.sort_by(|a, b| {
-        let sa = score(
-            a,
-            query,
-            scope,
-            ctx_parent,
-            ctx_pkg_root.as_ref(),
-            &mut pkg_cache,
-            now,
-        );
-        let sb = score(
-            b,
-            query,
-            scope,
-            ctx_parent,
-            ctx_pkg_root.as_ref(),
-            &mut pkg_cache,
-            now,
-        );
-        sb.cmp(&sa)
-            .then_with(|| a.path.cmp(&b.path))
-            .then_with(|| a.line.cmp(&b.line))
-    });
-}
-
-/// Keep the `k` highest-ranked matches and drop the rest, preserving nothing
-/// else. Scores every match once — `sort`'s comparator re-scores O(n log n)
-/// times — and orders by the same (score, path, line) key, so the survivors are
-/// exactly the first `k` a full `sort` of the same slice would have produced.
-pub(crate) fn retain_top_k(
-    matches: &mut Vec<Match>,
-    query: &str,
-    scope: &Path,
-    context: Option<&Path>,
-    k: usize,
-) {
-    if matches.len() <= k {
-        return;
-    }
-
-    let ctx_parent = context.and_then(|c| c.parent());
-    let ctx_pkg_root = context
-        .and_then(tilth_core::lang::package_root)
-        .map(std::path::Path::to_path_buf);
-    let mut pkg_cache: HashMap<PathBuf, Option<PathBuf>> = HashMap::new();
-    let now = SystemTime::now();
 
     let mut scored: Vec<(i32, Match)> = std::mem::take(matches)
         .into_iter()
@@ -95,13 +55,30 @@ pub(crate) fn retain_top_k(
             (s, m)
         })
         .collect();
-    scored.sort_unstable_by(|(sa, a), (sb, b)| {
+    // Stable, so matches equal on every key keep their input order.
+    scored.sort_by(|(sa, a), (sb, b)| {
         sb.cmp(sa)
             .then_with(|| a.path.cmp(&b.path))
             .then_with(|| a.line.cmp(&b.line))
     });
-    scored.truncate(k);
     matches.extend(scored.into_iter().map(|(_, m)| m));
+}
+
+/// Keep the `k` highest-ranked matches and drop the rest: exactly the first
+/// `k` a full `sort` of the same matches would give.
+pub(crate) fn retain_top_k(
+    matches: &mut Vec<Match>,
+    query: &str,
+    scope: &Path,
+    context: Option<&Path>,
+    now: SystemTime,
+    k: usize,
+) {
+    if matches.len() <= k {
+        return;
+    }
+    sort(matches, query, scope, context, now);
+    matches.truncate(k);
 }
 
 /// Ranking function. Each match gets a score — no floating point, no randomness.
@@ -551,7 +528,7 @@ mod tests {
             ),
         ];
 
-        sort(&mut matches, "handleAuth", &scope, None);
+        sort(&mut matches, "handleAuth", &scope, None, SystemTime::now());
 
         assert!(matches[0].is_definition);
         assert_eq!(matches[0].def_name.as_deref(), Some("handleAuth"));
@@ -575,7 +552,7 @@ mod tests {
             ),
         ];
 
-        sort(&mut matches, "handleAuth", &scope, None);
+        sort(&mut matches, "handleAuth", &scope, None, SystemTime::now());
 
         assert_eq!(matches[0].path, PathBuf::from("/repo/src/auth.ts"));
     }
@@ -599,7 +576,13 @@ mod tests {
             ),
         ];
 
-        sort(&mut matches, "handleAuth", &scope, Some(&context));
+        sort(
+            &mut matches,
+            "handleAuth",
+            &scope,
+            Some(&context),
+            SystemTime::now(),
+        );
 
         assert_eq!(matches[0].path, PathBuf::from("/repo/src/auth/service.rs"));
     }
@@ -622,7 +605,7 @@ mod tests {
             ),
         ];
 
-        sort(&mut matches, "handleAuth", &scope, None);
+        sort(&mut matches, "handleAuth", &scope, None, SystemTime::now());
 
         assert_eq!(matches[0].path, PathBuf::from("/repo/src/public/auth.ts"));
     }
@@ -645,7 +628,7 @@ mod tests {
             ),
         ];
 
-        sort(&mut matches, "handleAuth", &scope, None);
+        sort(&mut matches, "handleAuth", &scope, None, SystemTime::now());
 
         assert_eq!(matches[0].path, PathBuf::from("/repo/src/auth.ts"));
     }
@@ -668,7 +651,7 @@ mod tests {
             ),
         ];
 
-        sort(&mut matches, "thinking", &scope, None);
+        sort(&mut matches, "thinking", &scope, None, SystemTime::now());
 
         assert!(
             matches[0].path.to_string_lossy().contains("thinking.go"),
@@ -695,7 +678,7 @@ mod tests {
             ),
         ];
 
-        sort(&mut matches, "alias", &scope, None);
+        sort(&mut matches, "alias", &scope, None, SystemTime::now());
 
         assert!(
             matches[0].path.to_string_lossy().contains("model_mapping"),
@@ -941,10 +924,17 @@ mod tests {
         };
 
         let mut bounded = build();
-        retain_top_k(&mut bounded, "handleAuth", &scope, None, 4);
+        retain_top_k(
+            &mut bounded,
+            "handleAuth",
+            &scope,
+            None,
+            SystemTime::now(),
+            4,
+        );
 
         let mut sorted = build();
-        sort(&mut sorted, "handleAuth", &scope, None);
+        sort(&mut sorted, "handleAuth", &scope, None, SystemTime::now());
         sorted.truncate(4);
 
         let key = |v: &[Match]| -> Vec<(u32, String)> {
@@ -963,7 +953,14 @@ mod tests {
 
         // Under the cap it is a no-op, order included.
         let mut untouched = build();
-        retain_top_k(&mut untouched, "handleAuth", &scope, None, 99);
+        retain_top_k(
+            &mut untouched,
+            "handleAuth",
+            &scope,
+            None,
+            SystemTime::now(),
+            99,
+        );
         assert_eq!(
             key(&untouched),
             key(&build()),

@@ -57,9 +57,8 @@ pub(crate) fn file_metadata(path: &Path) -> (u32, SystemTime) {
 }
 
 /// Dispatch search by query type. `full` is the caller's `--full`, with the
-/// same meaning here and in the five siblings below: it raises both the match
-/// cap and the walker's early-quit thresholds, so the reported totals move as
-/// well as the number of matches shown.
+/// same meaning here and in the five siblings below: it raises the match cap.
+/// The totals are exact either way.
 pub fn search_symbol(
     query: &str,
     scope: &Path,
@@ -120,7 +119,7 @@ pub fn search_multi_symbol_expanded(
             result.definitions,
             result.usages,
         );
-        let mut segments: Vec<(i64, usize, usize)> = Vec::new();
+        let mut segments: Vec<alloc::Block> = Vec::new();
         format_matches(
             &result.matches,
             &result.scope,
@@ -287,7 +286,7 @@ fn format_matches(
     expand_remaining: &mut usize,
     expanded_files: &mut HashSet<PathBuf>,
     out: &mut String,
-    segments: &mut Vec<(i64, usize, usize)>,
+    segments: &mut Vec<alloc::Block>,
 ) {
     // Multi-file: one expand per unique file. Single-file: sequential per-match.
     // expanded_files may contain entries from prior queries (cross-query dedup).
@@ -303,7 +302,7 @@ fn format_matches(
         if group.len() == 1 {
             // Single match — format as before
             let start = out.len();
-            format_single_match(
+            let body_start = format_single_match(
                 group[0],
                 scope,
                 cache,
@@ -314,7 +313,12 @@ fn format_matches(
                 multi_file,
                 out,
             );
-            segments.push((i64::from(group[0].def_weight), start, out.len()));
+            segments.push(alloc::Block {
+                value: i64::from(group[0].def_weight),
+                start,
+                body_start,
+                end: out.len(),
+            });
         } else {
             // Multiple usages collapsed into one entry
             let start = out.len();
@@ -324,7 +328,12 @@ fn format_matches(
                 .map(|m| i64::from(m.def_weight))
                 .max()
                 .unwrap_or(0);
-            segments.push((value, start, out.len()));
+            segments.push(alloc::Block {
+                value,
+                start,
+                body_start: out.len(),
+                end: out.len(),
+            });
         }
     }
 }
@@ -467,7 +476,7 @@ fn format_single_match(
     expanded_files: &mut HashSet<PathBuf>,
     multi_file: bool,
     out: &mut String,
-) {
+) -> usize {
     let kind = if m.impl_target.is_some() {
         "impl"
     } else if m.is_definition {
@@ -540,7 +549,7 @@ fn format_single_match(
                             "… ({truncated} more lines — pass --expand to see the full section)"
                         );
                     }
-                    return;
+                    return out.len();
                 }
             }
         }
@@ -575,6 +584,10 @@ fn format_single_match(
     } else if !fence_will_follow {
         let _ = write!(out, "\n-> [{}]   {}", m.line, m.text);
     }
+
+    // Everything from here on is the expansion, which a tight budget can
+    // drop while keeping the lines above.
+    let body_start = out.len();
 
     if *expand_remaining > 0 {
         if deduped {
@@ -730,6 +743,7 @@ fn format_single_match(
             }
         }
     }
+    body_start
 }
 
 /// Format a symbol/content search result.
@@ -910,7 +924,7 @@ fn format_search_result(
     let mut out = header;
     let mut expand_remaining = expand;
     let mut expanded_files = HashSet::new();
-    let mut segments: Vec<(i64, usize, usize)> = Vec::new();
+    let mut segments: Vec<alloc::Block> = Vec::new();
 
     // File-level retrieval: when a file basename matches the query exactly,
     // prepend a compact outline so the agent gets file-level context first.
@@ -1487,22 +1501,14 @@ mod tests {
         let bloom = tilth_core::index::bloom::BloomFilterCache::new();
         let single: std::collections::HashSet<String> =
             std::iter::once("walker".to_string()).collect();
-        let rs_callers = tilth_core::find_callers_batch(
-            &single,
-            &scope,
-            &bloom,
-            Some("*.rs"),
-            tilth_core::search::callers::BATCH_EARLY_QUIT,
-        )
-        .expect("callers failed");
-        let toml_callers = tilth_core::find_callers_batch(
-            &single,
-            &scope,
-            &bloom,
-            Some("*.toml"),
-            tilth_core::search::callers::BATCH_EARLY_QUIT,
-        )
-        .expect("callers toml failed");
+        let rs_callers =
+            tilth_core::find_callers_batch(&single, &scope, &bloom, Some("*.rs"), |sites| sites)
+                .expect("callers failed");
+        let toml_callers =
+            tilth_core::find_callers_batch(&single, &scope, &bloom, Some("*.toml"), |sites| sites)
+                .expect("callers toml failed");
+        let rs_callers: Vec<_> = rs_callers.into_iter().flatten().collect();
+        let toml_callers: Vec<_> = toml_callers.into_iter().flatten().collect();
 
         assert!(
             !rs_callers.is_empty(),
@@ -2115,7 +2121,7 @@ mod tests {
         let cache = OutlineCache::new();
         let bloom = BloomFilterCache::new();
         let mut out = String::from("HEADER");
-        let mut segments: Vec<(i64, usize, usize)> = Vec::new();
+        let mut segments: Vec<alloc::Block> = Vec::new();
         let mut expand_remaining = 0usize;
         let mut expanded_files = HashSet::new();
 
@@ -2135,14 +2141,19 @@ mod tests {
         assert_eq!(segments.len(), 3, "expected one segment per match");
 
         // Values must match def_weight casts.
-        assert_eq!(segments[0].0, 30i64);
-        assert_eq!(segments[1].0, 10i64);
-        assert_eq!(segments[2].0, 50i64);
+        assert_eq!(segments[0].value, 30i64);
+        assert_eq!(segments[1].value, 10i64);
+        assert_eq!(segments[2].value, 50i64);
 
         // Ranges must be valid, non-empty, and non-overlapping.
         let mut cursor = "HEADER".len();
-        for (i, &(_, start, end)) in segments.iter().enumerate() {
+        for (i, b) in segments.iter().enumerate() {
+            let (start, end) = (b.start, b.end);
             assert!(start >= cursor, "segment {i} start < cursor");
+            assert!(
+                (start..=end).contains(&b.body_start),
+                "segment {i} body start outside the block"
+            );
             assert!(end > start, "segment {i} is empty");
             assert!(end <= out.len(), "segment {i} end out of bounds");
             // Slice must not panic (validates char-boundary alignment).
@@ -2161,7 +2172,7 @@ mod tests {
     /// explicit budget, the positional tail-cut (`budget::apply`) keeps
     /// whatever rendered first (the low-value usage) and severs the
     /// definition; value-based selection (`fit_to_budget`) keeps the
-    /// definition (highest value) and drops the usage instead.
+    /// definition (highest value) and cuts the usage's expansion instead.
     #[test]
     fn search_symbol_expanded_threads_real_budget_into_value_selection() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2174,8 +2185,8 @@ mod tests {
         // definition's own boosts (def_weight*10 + definition_name_boost) so
         // this usage renders FIRST in the linear (<=5 match) format path.
         // Padded with filler lines so its expanded block is large enough that
-        // budget 400 must drop ONE of the two blocks — proving which one a
-        // real budget drops (positional: whichever renders last; value-based:
+        // budget 400 must cut ONE of the two blocks — proving which one a
+        // real budget cuts (positional: whichever renders last; value-based:
         // the lower-value one, regardless of render order).
         let mut usage_body = String::from("fn calls_it() {\n    budget_probe_target();\n");
         for i in 0..60 {
@@ -2207,9 +2218,11 @@ mod tests {
             "value-based selection must keep the highest-value block (the \
              definition) even though it rendered last: {out}"
         );
+        // The lower-value usage keeps its location and loses its expansion.
         assert!(
-            out.contains("lower-value match(es) omitted to fit budget"),
-            "must show fit_to_budget's value-based omission marker, not \
+            out.contains("### budget_probe_target.rs:2 [usage in function calls_it]")
+                && out.contains("expansion omitted to fit budget"),
+            "must show fit_to_budget's value-based cut, not \
              budget::apply's positional \"... truncated\" marker: {out}"
         );
         assert!(
@@ -2217,6 +2230,44 @@ mod tests {
             "positional tail-cut marker must not appear — the real budget \
              was supposed to reach fit_to_budget directly: {out}"
         );
+    }
+
+    /// A block was kept or dropped whole, so a definition whose expanded
+    /// body alone overran the budget vanished, and the note called it the
+    /// "lower-value" match while the usage stayed. The definition must keep
+    /// its location and lose only its body.
+    #[test]
+    fn a_tight_budget_keeps_the_definition_without_its_body() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut body = String::from("pub fn big_target() {\n");
+        for i in 0..400 {
+            let _ = writeln!(body, "    let v{i} = {i} + 1;");
+        }
+        body.push_str("}\n\nfn user() {\n    big_target();\n}\n");
+        std::fs::write(tmp.path().join("big.rs"), body).unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = tilth_core::index::bloom::BloomFilterCache::new();
+        let out = search_symbol_expanded(
+            "big_target",
+            tmp.path(),
+            &cache,
+            &session,
+            &bloom,
+            1,
+            None,
+            None,
+            false,
+            Some(300),
+        )
+        .unwrap();
+
+        assert!(out.contains("### big.rs:1-402 [definition]"), "{out}");
+        assert!(out.contains("expansion omitted to fit budget"), "{out}");
+        assert!(out.contains("[usage in function user]"), "{out}");
+        assert!(!out.contains("lower-value match(es) omitted"), "{out}");
+        assert!(!out.contains("let v399"), "{out}");
     }
 
     /// Regression guard: omitting the budget (`None`) must produce byte-

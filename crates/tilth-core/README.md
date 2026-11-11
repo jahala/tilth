@@ -26,7 +26,7 @@ are shared with the `tilth` binary and carry no stability promise.
 | `extract_import_source(&str, Option<Lang>) -> String` | The source an import statement's text names, read as one source. |
 | `is_external(&str, Lang) -> bool` | Whether that module lies outside the project. |
 | `resolve_related_files_with_content(&Path, &str) -> Vec<PathBuf>` | The local files a file's imports resolve to. |
-| `find_callers_batch(&HashSet<String>, &Path, &BloomFilterCache, Option<&str>, usize)` | Call sites of a set of symbols across a directory. |
+| `find_callers_batch(&HashSet<String>, &Path, &BloomFilterCache, Option<&str>, per_file) -> Result<Vec<T>, TilthError>` | Call sites of a set of symbols across a directory. `per_file` reduces each file's sites to what you keep; results come in path order. |
 | `CallerMatch`, `BloomFilterCache` | One call site; the per-file pre-filter the walk shares. |
 | `analyze_deps(&Path, &Path, &BloomFilterCache) -> Result<DepsResult, TilthError>` | What a file uses and what uses it. |
 | `DepsResult`, `LocalDep`, `Dependent` | The shape of a dependency report. |

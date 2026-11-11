@@ -63,6 +63,9 @@ fn search_capped(
     let total_found = AtomicUsize::new(0);
 
     let walker = tilth_core::search::walk::walker(scope, glob)?;
+    // One clock for the per-file bound and the final sort, so both rank by
+    // the same scores.
+    let now = std::time::SystemTime::now();
 
     walker.run(|| {
         let matcher = &matcher;
@@ -148,7 +151,14 @@ fn search_capped(
                 // the same comparator, so nothing displayed changes, while the
                 // collected set stays bounded by files × cap rather than by the
                 // hit count — which is what the early quit used to bound.
-                rank::retain_top_k(&mut file_matches, pattern, scope, context, per_file_cap);
+                rank::retain_top_k(
+                    &mut file_matches,
+                    pattern,
+                    scope,
+                    context,
+                    now,
+                    per_file_cap,
+                );
                 let mut all = matches
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -169,7 +179,7 @@ fn search_capped(
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    rank::sort(&mut all_matches, pattern, scope, context);
+    rank::sort(&mut all_matches, pattern, scope, context, now);
     all_matches.truncate(max_matches);
 
     Ok(SearchResult {

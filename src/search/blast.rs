@@ -1,11 +1,11 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::edit::Edit;
 use tilth_core::lang::detect_file_type;
 use tilth_core::lang::outline::get_outline_entries;
-use tilth_core::search::callers::{find_callers_batch, CallerMatch};
+use tilth_core::search::callers::find_callers_batch;
 use tilth_core::types::{is_test_file, FileType, OutlineEntry, OutlineKind};
 
 pub(crate) struct TouchedSymbol {
@@ -82,52 +82,72 @@ pub(crate) fn blast_radius(
 
     let symbol_names: HashSet<String> = touched.iter().map(|t| t.name.clone()).collect();
 
-    let callers = find_callers_batch(
-        &symbol_names,
-        scope,
-        bloom,
-        None,
-        tilth_core::search::callers::BATCH_EARLY_QUIT,
-    )
+    // Calls from the edited file itself are not part of its blast radius.
+    let canonical = path.canonicalize().ok()?;
+    let files: Vec<FileCallers> = find_callers_batch(&symbol_names, scope, bloom, None, |sites| {
+        let mut file = FileCallers::default();
+        for (symbol, m) in sites {
+            if m.path == canonical {
+                continue;
+            }
+            if is_test_file(&m.path) {
+                file.test_path.get_or_insert_with(|| m.path.clone());
+                file.tests += 1;
+                continue;
+            }
+            let entry = file.by_symbol.entry(symbol).or_default();
+            entry.total += 1;
+            if entry.first.len() < PROD_CALLERS_LISTED {
+                entry.first.push((m.path, m.line, m.calling_function));
+            }
+        }
+        file
+    })
     .ok()?;
 
-    let canonical = path.canonicalize().ok()?;
-    let callers: Vec<(String, CallerMatch)> = callers
-        .into_iter()
-        .filter(|(_, m)| m.path != canonical)
-        .collect();
-
-    if callers.is_empty() {
+    if files.iter().all(|f| f.by_symbol.is_empty() && f.tests == 0) {
         return None;
     }
 
-    Some(format_blast_radius(&touched, &callers, scope))
+    Some(format_blast_radius(&touched, &files, scope))
 }
 
-fn format_blast_radius(
-    touched: &[TouchedSymbol],
-    callers: &[(String, CallerMatch)],
-    scope: &Path,
-) -> String {
-    let mut out = String::from("\n── blast radius ──\n");
+/// Production callers listed per symbol before the rest are counted.
+const PROD_CALLERS_LISTED: usize = 8;
+/// Test files named in the test summary before the rest are counted.
+const TEST_FILES_LISTED: usize = 5;
 
-    // Group callers by symbol name, split into prod and test.
-    let mut by_symbol: HashMap<&str, (Vec<&CallerMatch>, Vec<&CallerMatch>)> = HashMap::new();
-    for (sym, m) in callers {
-        let entry = by_symbol.entry(sym.as_str()).or_default();
-        if is_test_file(&m.path) {
-            entry.1.push(m);
-        } else {
-            entry.0.push(m);
-        }
-    }
+/// One file's calls to the touched symbols: production calls counted per
+/// symbol with the first few kept, test calls counted.
+#[derive(Default)]
+struct FileCallers {
+    by_symbol: HashMap<String, SymbolCallers>,
+    /// Set when the file is a test file with at least one call.
+    test_path: Option<PathBuf>,
+    tests: usize,
+}
+
+#[derive(Default)]
+struct SymbolCallers {
+    total: usize,
+    /// (path, line, calling function) of the first calls, by line.
+    first: Vec<(PathBuf, u32, String)>,
+}
+
+/// `files` come in path order, so a symbol's listed callers are its first
+/// by (path, line).
+fn format_blast_radius(touched: &[TouchedSymbol], files: &[FileCallers], scope: &Path) -> String {
+    let mut out = String::from("\n── blast radius ──\n");
+    let rel = |p: &Path| p.strip_prefix(scope).unwrap_or(p).display().to_string();
 
     // Emit per-symbol prod callers in touched order (preserves definition order).
     for ts in touched {
-        let Some((prod, _)) = by_symbol.get(ts.name.as_str()) else {
-            continue;
-        };
-        if prod.is_empty() {
+        let total: usize = files
+            .iter()
+            .filter_map(|f| f.by_symbol.get(&ts.name))
+            .map(|c| c.total)
+            .sum();
+        if total == 0 {
             continue;
         }
 
@@ -135,48 +155,47 @@ fn format_blast_radius(
             out,
             "{}: {} caller{}",
             ts.name,
-            prod.len(),
-            if prod.len() == 1 { "" } else { "s" }
+            total,
+            if total == 1 { "" } else { "s" }
         );
 
-        for m in prod.iter().take(8) {
-            let rel = m
-                .path
-                .strip_prefix(scope)
-                .unwrap_or(&m.path)
-                .display()
-                .to_string();
-            let _ = writeln!(out, "  {}:{}  {}", rel, m.line, m.calling_function);
+        let listed = files
+            .iter()
+            .filter_map(|f| f.by_symbol.get(&ts.name))
+            .flat_map(|c| c.first.iter())
+            .take(PROD_CALLERS_LISTED);
+        for (path, line, calling_function) in listed {
+            let _ = writeln!(out, "  {}:{}  {}", rel(path), line, calling_function);
         }
 
-        if prod.len() > 8 {
-            let _ = writeln!(out, "  ... and {} more", prod.len() - 8);
-        }
-    }
-
-    // Test summary — group all test callers by file, across all symbols.
-    let mut test_counts: HashMap<String, usize> = HashMap::new();
-    for (_, m) in callers {
-        if is_test_file(&m.path) {
-            let rel = m
-                .path
-                .strip_prefix(scope)
-                .unwrap_or(&m.path)
-                .display()
-                .to_string();
-            *test_counts.entry(rel).or_insert(0) += 1;
+        if total > PROD_CALLERS_LISTED {
+            let _ = writeln!(out, "  ... and {} more", total - PROD_CALLERS_LISTED);
         }
     }
 
-    if !test_counts.is_empty() {
-        let mut files: Vec<(&String, usize)> = test_counts.iter().map(|(k, &v)| (k, v)).collect();
-        files.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    // Test summary — test files by how many calls they make, across all symbols.
+    let mut test_files: Vec<(String, usize)> = files
+        .iter()
+        .filter_map(|f| f.test_path.as_ref().map(|p| (rel(p), f.tests)))
+        .collect();
 
-        let shown = files.iter().take(5);
-        let summary: String = shown
+    if !test_files.is_empty() {
+        test_files.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+        let mut summary: String = test_files
+            .iter()
+            .take(TEST_FILES_LISTED)
             .map(|(f, c)| format!("{f} ({c})"))
             .collect::<Vec<_>>()
             .join(", ");
+        let unlisted = test_files.len().saturating_sub(TEST_FILES_LISTED);
+        if unlisted > 0 {
+            let _ = write!(
+                summary,
+                ", and {unlisted} more file{}",
+                if unlisted == 1 { "" } else { "s" }
+            );
+        }
 
         let _ = writeln!(out, "tests: {summary}");
     }

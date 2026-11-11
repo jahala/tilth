@@ -4,7 +4,6 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use streaming_iterator::StreamingIterator;
@@ -13,9 +12,6 @@ use crate::error::TilthError;
 use crate::lang::detect_file_type;
 use crate::lang::outline::outline_language;
 use crate::types::FileType;
-
-/// Stop the batch caller walk once we have this many raw matches. Generous headroom for dedup + ranking.
-pub const BATCH_EARLY_QUIT: usize = 50;
 
 /// A single caller match — a call site of a target symbol.
 #[derive(Debug)]
@@ -35,33 +31,38 @@ pub struct CallerMatch {
     pub content: Arc<String>,
 }
 
-/// Find all call sites of any symbol in `targets` across the codebase using a single walk.
-/// Returns tuples of (`target_name`, match) so callers know which symbol was matched.
+/// Find every call site of any symbol in `targets` under `scope`, in one
+/// parallel walk that always runs to the end.
+///
+/// `per_file` receives one file's call sites as (`target_name`, match)
+/// pairs in line order, and reduces them to what the caller keeps. It runs
+/// once per file that holds at least one call site. Its results come back
+/// sorted by file path, so the output does not depend on thread timing. A
+/// caller that needs exact totals counts inside `per_file` and keeps only
+/// the sites it will show; that is what bounds memory on a large tree.
 // The std hasher is part of the signature dependents pin; a generic hasher
 // would change it for every caller.
 #[allow(clippy::implicit_hasher)]
-pub fn find_callers_batch(
+pub fn find_callers_batch<T, F>(
     targets: &HashSet<String>,
     scope: &Path,
     bloom: &crate::index::bloom::BloomFilterCache,
     glob: Option<&str>,
-    early_quit_threshold: usize,
-) -> Result<Vec<(String, CallerMatch)>, TilthError> {
-    let matches: Mutex<Vec<(String, CallerMatch)>> = Mutex::new(Vec::new());
-    let found_count = AtomicUsize::new(0);
+    per_file: F,
+) -> Result<Vec<T>, TilthError>
+where
+    T: Send,
+    F: Fn(Vec<(String, CallerMatch)>) -> T + Sync,
+{
+    let found: Mutex<Vec<(PathBuf, T)>> = Mutex::new(Vec::new());
 
     let walker = super::walk::walker(scope, glob)?;
 
     walker.run(|| {
-        let matches = &matches;
-        let found_count = &found_count;
+        let found = &found;
+        let per_file = &per_file;
 
         Box::new(move |entry| {
-            // Early termination: enough callers found
-            if found_count.load(Ordering::Relaxed) >= early_quit_threshold {
-                return ignore::WalkState::Quit;
-            }
-
             let Ok(entry) = entry else {
                 return ignore::WalkState::Continue;
             };
@@ -101,24 +102,28 @@ pub fn find_callers_batch(
                 return ignore::WalkState::Continue;
             };
 
-            let file_callers =
+            let mut file_callers =
                 find_callers_treesitter_batch(path, scope, targets, &ts_lang, &content, lang);
 
             if !file_callers.is_empty() {
-                found_count.fetch_add(file_callers.len(), Ordering::Relaxed);
-                let mut all = matches
+                // Stable, so two calls on one line keep the query's order.
+                file_callers.sort_by_key(|(_, m)| m.line);
+                let kept = per_file(file_callers);
+                found
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                all.extend(file_callers);
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push((path.to_path_buf(), kept));
             }
 
             ignore::WalkState::Continue
         })
     });
 
-    Ok(matches
+    let mut found = found
         .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner))
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    found.sort_by(|(a, _), (b, _)| a.cmp(b));
+    Ok(found.into_iter().map(|(_, kept)| kept).collect())
 }
 
 /// Tree-sitter call site detection for a set of target symbols.
@@ -272,13 +277,14 @@ mod tests {
 
         let bloom = crate::index::bloom::BloomFilterCache::new();
         let targets: HashSet<String> = std::iter::once("helper_after".to_string()).collect();
-        let found =
-            find_callers_batch(&targets, dir.path(), &bloom, None, BATCH_EARLY_QUIT).unwrap();
-        let mut callers: Vec<&str> = found
-            .iter()
-            .map(|(_, m)| m.calling_function.as_str())
-            .collect();
-        callers.sort_unstable();
+        let found = find_callers_batch(&targets, dir.path(), &bloom, None, |sites| {
+            sites
+                .into_iter()
+                .map(|(_, m)| m.calling_function)
+                .collect::<Vec<_>>()
+        })
+        .unwrap();
+        let callers: Vec<&str> = found.iter().flatten().map(String::as_str).collect();
         assert_eq!(callers, ["comment_caller", "docstring_caller"]);
     }
 }
