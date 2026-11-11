@@ -513,9 +513,13 @@ fn importer_from(
         return None;
     }
     // A file that names none of what `keep` wants can still pass it all on
-    // with a star statement (`export * from`), which spells no name.
+    // with a star statement (`export * from`), which spells no name. Any
+    // `*` would not do as a pre-filter: most Python files hold `*args`.
     let mentions_wanted = keep(&content);
-    if !mentions_wanted && !content.contains('*') {
+    let may_star = ["import *", "export *"]
+        .iter()
+        .any(|star| memchr::memmem::find(content.as_bytes(), star.as_bytes()).is_some());
+    if !mentions_wanted && !may_star {
         return None;
     }
     let FileType::Code(lang) = detect_file_type_with_content(file, &content) else {
