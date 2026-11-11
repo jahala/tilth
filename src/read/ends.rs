@@ -51,7 +51,7 @@ impl<'a> Ends<'a> {
             None => 0,
         };
         let (head, rest) = text.split_at(head_end);
-        Ends {
+        Self {
             shape,
             head: Cow::Borrowed(head),
             tail: Cow::Borrowed(&rest[start_of_last_lines(rest, tail)..]),
@@ -84,8 +84,9 @@ impl<'a> Ends<'a> {
     }
 
     /// The bytes of the whole text when these ends are all of it, and
-    /// otherwise the ends themselves. The bytes are the ends' own, joined
-    /// in place, so the text is never held twice.
+    /// otherwise the ends themselves. Ends that a stream collected own
+    /// their bytes, which are joined in place, so the text is never held
+    /// twice.
     pub(crate) fn into_whole(self) -> Result<Vec<u8>, Self> {
         if !self.shows_all() {
             return Err(self);
