@@ -166,7 +166,9 @@ fn fingerprint_inner(root: &Path) -> String {
             }
 
             // Hot files (only for projects with local imports)
-            if let Some(hot) = hot_files(root, &walk, primary_lang) {
+            if let Some(hot) =
+                hot_files(root, &walk, primary_lang, Instant::now() + HOT_FILES_BUDGET)
+            {
                 lines.push(format!("  hot (× = importers): {hot}"));
             }
 
@@ -193,7 +195,7 @@ fn fingerprint_inner(root: &Path) -> String {
         }
     } else {
         // No manifest — still show hot, git, tests
-        if let Some(hot) = hot_files(root, &walk, primary_lang) {
+        if let Some(hot) = hot_files(root, &walk, primary_lang, Instant::now() + HOT_FILES_BUDGET) {
             lines.push(format!("  hot (× = importers): {hot}"));
         }
         if let Some(git) = git_context(root) {
@@ -700,9 +702,19 @@ fn test_style(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opt
 // Hot files — most imported local files
 // ---------------------------------------------------------------------------
 
-fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Option<String> {
+/// How long the hot-files pass may read imports: a share of the
+/// fingerprint's 250 ms budget.
+const HOT_FILES_BUDGET: Duration = Duration::from_millis(100);
+
+/// The most imported local files, from the imports of the smallest code
+/// files read before `deadline`.
+fn hot_files(
+    root: &Path,
+    walk: &WalkResult,
+    primary_lang: Option<Lang>,
+    deadline: Instant,
+) -> Option<String> {
     primary_lang?; // require a detected language
-    let start = Instant::now();
 
     // Sort by size (smallest first) and take first 100
     let mut files: Vec<&(String, u64)> = walk.code_files.iter().collect();
@@ -716,7 +728,7 @@ fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opti
     let mut all_import_sources: Vec<String> = Vec::new();
 
     for (rel_path, _) in &files {
-        if start.elapsed().as_millis() > 100 {
+        if Instant::now() >= deadline {
             break;
         }
         let full = root.join(rel_path);
@@ -866,10 +878,27 @@ mod tests {
             .unwrap();
         }
         let walk = walk_files(tmp.path());
-        let hot = hot_files(tmp.path(), &walk, Some(Lang::Rust));
+        let later = Instant::now() + Duration::from_secs(3600);
+        let hot = hot_files(tmp.path(), &walk, Some(Lang::Rust), later);
         assert_eq!(
             hot.as_deref(),
             Some("src/other.rs ×2, src/types.rs(Outline) ×2")
+        );
+    }
+
+    /// The deadline is the caller's, so a test sets one a loaded machine
+    /// cannot miss. One already past reads no file.
+    #[test]
+    fn hot_files_stop_at_the_deadline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("types.rs"), "pub struct Outline;\n").unwrap();
+        fs::write(src.join("a.rs"), "use crate::types::Outline;\n").unwrap();
+        let walk = walk_files(tmp.path());
+        assert_eq!(
+            hot_files(tmp.path(), &walk, Some(Lang::Rust), Instant::now()),
+            None
         );
     }
 
