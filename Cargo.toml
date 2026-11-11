@@ -1,6 +1,6 @@
 [package]
 name = "tilth"
-version = "0.13.0"
+version = "0.14.0"
 edition = "2021"
 description = "Smart code reading for AI agents. Definitions, callers, deps and function-level diffs from tree-sitter."
 license = "MIT"
@@ -79,7 +79,7 @@ workspace = true
 
 [dependencies]
 # The parsing substrate: language detection, outlines, imports, callers, deps
-tilth-core = { path = "crates/tilth-core", version = "0.13.0" }
+tilth-core = { path = "crates/tilth-core", version = "0.14.0" }
 
 # CLI
 clap = { version = "4", features = ["derive"] }
@@ -141,7 +141,7 @@ libc = "0.2"
 tempfile = { workspace = true }
 # tests/expect_reasons.rs parses every source file to read its #[expect] reasons
 syn = { version = "2", features = ["full", "visit"] }
-tilth-core = { path = "crates/tilth-core", version = "0.13.0", features = ["test-fixtures"] }
+tilth-core = { path = "crates/tilth-core", version = "0.14.0", features = ["test-fixtures"] }
 
 [profile.release]
 opt-level = 3
