@@ -38,11 +38,16 @@ fn fingerprint_inner(root: &Path) -> String {
     // Walk files (depth 2) — collect language counts, modules, entry points
     let walk = walk_files(root);
 
-    // Determine primary language
+    // Primary language: the most files, and on a tie the name first in
+    // alphabetical order, since the map iterates in a random order.
     let primary_lang = walk
         .lang_counts
         .iter()
-        .max_by_key(|(_, count)| *count)
+        .max_by(|(a, a_count), (b, b_count)| {
+            a_count
+                .cmp(b_count)
+                .then_with(|| lang_display_name(**b).cmp(lang_display_name(**a)))
+        })
         .map(|(lang, _)| *lang);
 
     let lang_name = primary_lang.map_or("Unknown", lang_display_name);
@@ -54,7 +59,7 @@ fn fingerprint_inner(root: &Path) -> String {
     // Modules: dirs with >=2 files of the primary language, with common prefix stripped.
     // Keys in module_lang_counts may be "dir" or "dir/subdir" (for deeply nested projects).
     let modules: Vec<String> = {
-        // Collect dirs with >=2 primary-language files, sorted by file count descending
+        // Collect dirs with >=2 primary-language files
         let mut mods: Vec<(String, usize)> = walk
             .module_lang_counts
             .iter()
@@ -70,7 +75,6 @@ fn fingerprint_inner(root: &Path) -> String {
                 }
             })
             .collect();
-        mods.sort_by_key(|b| std::cmp::Reverse(b.1)); // most files first
 
         // If all modules (or at least most) share a common top-level prefix
         // (e.g., all are "src/..."), strip it so we display short names
@@ -136,8 +140,9 @@ fn fingerprint_inner(root: &Path) -> String {
             // Check if ANY path component is a non-source dir
             !lower.split('/').any(|part| non_source.contains(&part))
         });
-        // Sort by file count descending, truncate to 10, extract names
-        mods.sort_by_key(|b| std::cmp::Reverse(b.1));
+        // Most files first, ties by name, then the top 10. The names come out
+        // of a hash map in a random order, so the name decides every tie.
+        mods.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         mods.truncate(10);
         mods.into_iter().map(|(name, _)| name).collect()
     };
@@ -166,9 +171,7 @@ fn fingerprint_inner(root: &Path) -> String {
             }
 
             // Hot files (only for projects with local imports)
-            if let Some(hot) =
-                hot_files(root, &walk, primary_lang, Instant::now() + HOT_FILES_BUDGET)
-            {
+            if let Some(hot) = hot_files(root, &walk, primary_lang) {
                 lines.push(format!("  hot (× = importers): {hot}"));
             }
 
@@ -195,7 +198,7 @@ fn fingerprint_inner(root: &Path) -> String {
         }
     } else {
         // No manifest — still show hot, git, tests
-        if let Some(hot) = hot_files(root, &walk, primary_lang, Instant::now() + HOT_FILES_BUDGET) {
+        if let Some(hot) = hot_files(root, &walk, primary_lang) {
             lines.push(format!("  hot (× = importers): {hot}"));
         }
         if let Some(git) = git_context(root) {
@@ -702,18 +705,10 @@ fn test_style(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opt
 // Hot files — most imported local files
 // ---------------------------------------------------------------------------
 
-/// How long the hot-files pass may read imports: a share of the
-/// fingerprint's 250 ms budget.
-const HOT_FILES_BUDGET: Duration = Duration::from_millis(100);
-
-/// The most imported local files, from the imports of the smallest code
-/// files read before `deadline`.
-fn hot_files(
-    root: &Path,
-    walk: &WalkResult,
-    primary_lang: Option<Lang>,
-    deadline: Instant,
-) -> Option<String> {
+/// The most imported local files, from the imports of the 100 smallest code
+/// files. The limit is a file count, never a clock, so a loaded machine
+/// reads the same files as an idle one (#281).
+fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Option<String> {
     primary_lang?; // require a detected language
 
     // Sort by size (smallest first) and take first 100
@@ -728,9 +723,6 @@ fn hot_files(
     let mut all_import_sources: Vec<String> = Vec::new();
 
     for (rel_path, _) in &files {
-        if Instant::now() >= deadline {
-            break;
-        }
         let full = root.join(rel_path);
         let Ok(content) = tilth_core::source::read_source(&full) else {
             continue;
@@ -878,28 +870,36 @@ mod tests {
             .unwrap();
         }
         let walk = walk_files(tmp.path());
-        let later = Instant::now() + Duration::from_secs(3600);
-        let hot = hot_files(tmp.path(), &walk, Some(Lang::Rust), later);
+        let hot = hot_files(tmp.path(), &walk, Some(Lang::Rust));
         assert_eq!(
             hot.as_deref(),
             Some("src/other.rs ×2, src/types.rs(Outline) ×2")
         );
     }
 
-    /// The deadline is the caller's, so a test sets one a loaded machine
-    /// cannot miss. One already past reads no file.
+    /// Counts that tie are ordered by name, so the same tree gives the same
+    /// overview on every build. The counts came out of hash maps, and each
+    /// map iterates in its own random order, so ties used to land anywhere
+    /// (#281). Here eight directories tie on file count and two languages
+    /// tie as the primary one.
     #[test]
-    fn hot_files_stop_at_the_deadline() {
+    fn tied_counts_give_the_same_overview_every_time() {
         let tmp = tempfile::tempdir().unwrap();
-        let src = tmp.path().join("src");
-        fs::create_dir_all(&src).unwrap();
-        fs::write(src.join("types.rs"), "pub struct Outline;\n").unwrap();
-        fs::write(src.join("a.rs"), "use crate::types::Outline;\n").unwrap();
-        let walk = walk_files(tmp.path());
-        assert_eq!(
-            hot_files(tmp.path(), &walk, Some(Lang::Rust), Instant::now()),
-            None
-        );
+        let dirs = [
+            "golf", "alpha", "hotel", "delta", "bravo", "foxtrot", "charlie", "echo",
+        ];
+        for dir in dirs {
+            let path = tmp.path().join(dir);
+            fs::create_dir_all(&path).unwrap();
+            for file in ["a.py", "b.py", "a.rs", "b.rs"] {
+                fs::write(path.join(file), "x = 1\n").unwrap();
+            }
+        }
+        let expected = "[tilth] Python project — 16 source files, 8 directories\n  \
+             dirs: alpha/ bravo/ charlie/ delta/ echo/ foxtrot/ golf/ hotel/";
+        for _ in 0..10 {
+            assert_eq!(fingerprint(tmp.path()), expected);
+        }
     }
 
     /// Editors on Windows save `package.json` with a byte-order mark, and
