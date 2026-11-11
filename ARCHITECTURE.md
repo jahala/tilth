@@ -854,7 +854,9 @@ single tool each.
    (read a `.patch` file), `Log(range)` (per-commit summaries). For a git
    source, every git command and working-tree read then runs at the
    repository top (`git rev-parse --show-toplevel`), because git prints
-   paths from there.
+   paths from there. `checkout` picks the repository: the one `root` (or
+   the cwd) is in, unless the scope lies outside it. Then the scope names
+   its own, so a scope in another worktree diffs that worktree.
 2. **`run_git_diff`** shells out to `git diff` with the right args
    (or reads the patch file). Before the first commit, `HEAD` is the
    empty tree.
@@ -865,7 +867,10 @@ single tool each.
    it with the working tree.
 4. **`parse::parse_unified_diff`** turns the raw text into
    `Vec<FileDiff>` — header, hunks, and lines numbered in the old file
-   (removed lines) or the new file (the rest).
+   (removed lines) or the new file (the rest). A file starts at a
+   `diff --git` line, or, in a patch from `diff -u`, at a `--- `/`+++ `
+   pair that a hunk follows. A patch file with text but no file is an
+   error, never "No changes."
 5. **`overlay::compute_overlay`** reads both sides of each `FileDiff`,
    outlines them and matches their symbols (`matching::match_symbols`:
    identity, then structural hash, then fuzzy similarity). Members are
@@ -883,7 +888,8 @@ single tool each.
    (or at its path before a rename) gives the file detail; a directory
    gives the overview of the changed files under it; a trailing part of
    a path (`main.rs`) must name one changed file. An existing path with
-   no changes says so; anything else is an error.
+   no changes says so; anything else is an error. A patch or a file pair
+   has no repository top, so an absolute scope there is refused.
 8. **`overlay::signature_warnings`** flags a signature changed in several
    files.
 9. **Search filter** (`keep_search_matches`) — narrows to symbols/files

@@ -487,7 +487,8 @@ fn build_overlays(raw: &str, sides: &Sides, repo: Option<&Path>) -> Vec<FileOver
 ///
 /// `repo` anchors every git command and working-tree read to the caller's
 /// checkout, and a relative `scope` resolves against it. `None` uses the
-/// process cwd (CLI, or an MCP call with no `root` arg).
+/// process cwd (CLI, or an MCP call with no `root` arg). A `scope` outside
+/// that repository diffs the repository it lies in.
 pub fn diff(
     source: &DiffSource,
     repo: Option<&Path>,
@@ -503,9 +504,12 @@ pub fn diff(
     };
     // Git prints paths from the top of the repository, so every git command
     // and working-tree read runs there, even from a subdirectory.
-    let toplevel = match source {
-        DiffSource::Files(..) | DiffSource::Patch(_) => None,
-        _ => Some(git_toplevel(Some(&base))?),
+    let (callers_root, toplevel) = match source {
+        DiffSource::Files(..) | DiffSource::Patch(_) => (base.clone(), None),
+        _ => {
+            let (callers_root, top) = checkout(&base, scope)?;
+            (callers_root, Some(top))
+        }
     };
     let repo = toplevel.as_deref().or(repo);
     let scope = scope.map(|s| ScopeSpec::new(s, &base, toplevel.as_deref()));
@@ -518,6 +522,15 @@ pub fn diff(
     let sides = resolve_sides(source, repo)?;
     let raw = run_git_diff(source, &sides, repo)?;
     let mut files = build_overlays(&raw, &sides, repo);
+    // A patch with text in it but no file header is not a clean result.
+    if let DiffSource::Patch(path) = source {
+        if files.is_empty() && !raw.trim().is_empty() {
+            return Err(format!(
+                "{} names no file: a unified diff has a `--- ` and a `+++ ` line before each file's hunks",
+                path.display()
+            ));
+        }
+    }
     if files.is_empty() && scope.is_none() {
         return Ok("No changes.".to_string());
     }
@@ -561,8 +574,9 @@ pub fn diff(
 
     if blast {
         // Callers are counted under the caller's root, which may sit below
-        // the repository top that git commands run in.
-        let mut blast_warnings = compute_blast(&overlays, &base);
+        // the repository top that git commands run in, or under the
+        // scope's repository when the scope lies outside the root's.
+        let mut blast_warnings = compute_blast(&overlays, &callers_root);
         warnings.append(&mut blast_warnings);
     }
 
@@ -599,9 +613,41 @@ pub fn diff(
     Ok(output)
 }
 
+/// The directory blast counts callers under, and the repository top a git
+/// diff runs at.
+///
+/// `base` (the caller's `root`, or the cwd) picks the repository. A scope
+/// that lies outside it names its own instead: a scope in another worktree
+/// diffs that worktree, and blast counts callers there (#321).
+fn checkout(base: &Path, scope: Option<&str>) -> Result<(PathBuf, PathBuf), String> {
+    let top = git_toplevel(Some(base));
+    let Some((path, _)) = scope.map(split_function) else {
+        return top.map(|t| (base.to_path_buf(), t));
+    };
+    let full = lexical_normalize(&base.join(path));
+    if let Ok(t) = top {
+        if relative_to(&full, &t).is_some() {
+            return Ok((base.to_path_buf(), t));
+        }
+    }
+    // A scope may name a file or directory the diff removed, so its
+    // repository is found from the nearest directory that still exists.
+    let dir = full.ancestors().find(|a| a.is_dir()).unwrap_or(base);
+    let top = git_toplevel(Some(dir)).map_err(|e| format!("scope '{path}': {e}"))?;
+    Ok((top.clone(), top))
+}
+
 // ---------------------------------------------------------------------------
 // Scope
 // ---------------------------------------------------------------------------
+
+/// Split `path:function` into its parts. A trailing `:` names no function.
+fn split_function(scope: &str) -> (&str, Option<&str>) {
+    match scope.split_once(':') {
+        Some((p, f)) if !f.is_empty() => (p, Some(f)),
+        _ => (scope, None),
+    }
+}
 
 /// A `--scope` value: a file or directory, optionally `file:function`.
 #[derive(Debug)]
@@ -644,10 +690,7 @@ impl ScopeSpec {
     /// cwd. `toplevel` is the repository top, absent for patch and
     /// file-to-file diffs.
     fn new(scope: &str, base: &Path, toplevel: Option<&Path>) -> Self {
-        let (path, function) = match scope.split_once(':') {
-            Some((p, f)) if !f.is_empty() => (p, Some(f.to_string())),
-            _ => (scope, None),
-        };
+        let (path, function) = split_function(scope);
         let given = Path::new(path);
         let absolute = lexical_normalize(&base.join(given));
         let from_top = match toplevel {
@@ -666,7 +709,7 @@ impl ScopeSpec {
             exists: absolute.exists(),
             is_dir: path.ends_with('/'),
             is_dir_on_disk: absolute.is_dir(),
-            function,
+            function: function.map(str::to_string),
         }
     }
 
@@ -731,6 +774,15 @@ impl ScopeSpec {
                     names.join(", ")
                 ));
             }
+        }
+        // With no repository top, an absolute scope matches no path, so its
+        // existing on disk says nothing about the diff.
+        if self.from_top.is_none() && self.suffix.is_none() {
+            return Err(format!(
+                "'{}' is an absolute path, and a patch or file-pair diff has no repository \
+                 to place it in. Give the path as the diff names it.",
+                self.raw
+            ));
         }
         if self.exists || self.is_dir {
             return Ok(Selection::Nothing);
@@ -1543,6 +1595,73 @@ diff --git a/src/main.rs b/src/main.rs
         );
     }
 
+    #[test]
+    fn a_patch_without_git_headers_is_read() {
+        // `diff -u o.rs n.rs` writes no `diff --git` line (#324).
+        let dir = tempfile::tempdir().unwrap();
+        let patch = dir.path().join("u.patch");
+        let content = "\
+--- o.rs\t2026-11-11 21:48:12
++++ n.rs\t2026-11-11 21:48:12
+@@ -1,3 +1,3 @@
+ fn a() {
+-    1;
++    2;
+ }
+";
+        fs::write(&patch, content).unwrap();
+        let result = diff(
+            &DiffSource::Patch(patch),
+            Some(dir.path()),
+            None,
+            None,
+            false,
+            0,
+            None,
+        )
+        .unwrap();
+        assert!(
+            result.contains("n.rs") && !result.contains("No changes"),
+            "expected the change to n.rs:\n{result}"
+        );
+    }
+
+    #[test]
+    fn a_patch_that_names_no_file_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let patch = dir.path().join("notes.txt");
+        fs::write(&patch, "these are notes, not a patch\n").unwrap();
+        let err = diff(
+            &DiffSource::Patch(patch),
+            Some(dir.path()),
+            None,
+            None,
+            false,
+            0,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("names no file"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_patch_has_no_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let patch = dir.path().join("empty.patch");
+        fs::write(&patch, "").unwrap();
+        let result = diff(
+            &DiffSource::Patch(patch),
+            Some(dir.path()),
+            None,
+            None,
+            false,
+            0,
+            None,
+        )
+        .unwrap();
+        assert_eq!(result, "No changes.");
+    }
+
     // 16. test_file_to_file
     #[test]
     fn test_file_to_file() {
@@ -1942,6 +2061,118 @@ diff --git a/src/main.rs b/src/main.rs
         assert!(out.contains("No changes"), "{out}");
         let err = diff_at(dir.path(), &DiffSource::GitUncommitted, Some("nowhere")).unwrap_err();
         assert!(err.contains("not found"), "{err}");
+    }
+
+    /// An absolute scope names its own checkout. A scope in another worktree
+    /// used to be matched against the launch checkout's changes, found none
+    /// there and answered "No changes" for a folder full of edits (#321).
+    #[test]
+    fn absolute_scope_in_another_checkout_diffs_that_checkout() {
+        let launch = repo_with(&[("here.rs", "fn here() {\n    1\n}\n")]);
+        write_files(launch.path(), &[("here.rs", "fn here() {\n    2\n}\n")]);
+        let other = repo_with(&[
+            ("prompts/base.rs", "fn hello() {\n    1;\n}\n"),
+            ("src/c.rs", "fn caller() {\n    hello();\n}\n"),
+        ]);
+        write_files(
+            other.path(),
+            &[("prompts/base.rs", "fn hello(n: u8) {\n    1;\n}\n")],
+        );
+        let dir = other.path().join("prompts");
+        let dir = dir.to_str().unwrap();
+        let file = format!("{dir}/base.rs");
+
+        let without_root = run_diff_in(
+            launch.path(),
+            &DiffSource::GitUncommitted,
+            Some(dir),
+            None,
+            true,
+            None,
+        )
+        .unwrap();
+        let with_root = diff_at(launch.path(), &DiffSource::GitUncommitted, Some(dir)).unwrap();
+        let file_detail = diff_at(launch.path(), &DiffSource::GitUncommitted, Some(&file)).unwrap();
+        for out in [&without_root, &with_root, &file_detail] {
+            assert!(
+                out.contains("prompts/base.rs") && !out.contains("here.rs"),
+                "the scope's checkout, not the launch one:\n{out}"
+            );
+        }
+        assert!(
+            without_root.contains("blast: `hello` signature changed — 1 caller may need updating"),
+            "blast counts callers in the scope's checkout:\n{without_root}"
+        );
+
+        commit_all(other.path(), "change hello");
+        let log = diff_at(
+            launch.path(),
+            &DiffSource::Log("HEAD~1..HEAD".into()),
+            Some(dir),
+        )
+        .unwrap();
+        assert!(
+            log.contains("change hello"),
+            "log in the scope's checkout:\n{log}"
+        );
+    }
+
+    /// A relative scope that climbs out of the root's repository names the
+    /// repository it lands in, as an absolute one does.
+    #[test]
+    fn relative_scope_that_leaves_the_repository_diffs_where_it_lands() {
+        let parent = tempfile::tempdir().expect("failed to create tempdir");
+        let launch = parent.path().join("launch");
+        let other = parent.path().join("other");
+        for (repo, file) in [(&launch, "here.rs"), (&other, "prompts/base.rs")] {
+            fs::create_dir_all(repo).unwrap();
+            git(repo, &["init", "-q"]);
+            write_files(repo, &[(file, "fn f() {\n    1\n}\n")]);
+            commit_all(repo, "base");
+            write_files(repo, &[(file, "fn f() {\n    2\n}\n")]);
+        }
+        let out = diff_at(
+            &launch,
+            &DiffSource::GitUncommitted,
+            Some("../other/prompts"),
+        )
+        .unwrap();
+        assert!(
+            out.contains("prompts/base.rs") && !out.contains("here.rs"),
+            "the checkout the scope lands in:\n{out}"
+        );
+    }
+
+    /// A patch names its files from a repository it does not record, so an
+    /// absolute scope has nothing to match. It is refused, never answered
+    /// with "No changes".
+    #[test]
+    fn absolute_scope_on_a_patch_is_refused() {
+        let dir = setup_test_repo();
+        let patch = dir.path().join("test.patch");
+        fs::write(
+            &patch,
+            "diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,1 +1,1 @@\n-fn hello() {\n+fn hullo() {\n",
+        )
+        .unwrap();
+        let scope = dir.path().join("src");
+        let scope = scope.to_str().unwrap();
+        let err = diff_at(dir.path(), &DiffSource::Patch(patch), Some(scope)).unwrap_err();
+        assert!(err.contains(scope) && err.contains("absolute"), "{err}");
+    }
+
+    /// An absolute scope outside every repository has no diff to show, so it
+    /// is an error, never "No changes".
+    #[test]
+    fn absolute_scope_outside_a_repository_is_an_error() {
+        let launch = repo_with(&[("here.rs", "fn here() {}\n")]);
+        let outside = tempfile::tempdir().expect("failed to create tempdir");
+        let scope = outside.path().to_str().unwrap();
+        let err = diff_at(launch.path(), &DiffSource::GitUncommitted, Some(scope)).unwrap_err();
+        assert!(
+            err.contains(scope) && err.contains("not a git repository"),
+            "{err}"
+        );
     }
 
     #[test]

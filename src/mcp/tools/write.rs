@@ -341,6 +341,13 @@ pub(in crate::mcp) fn tool_write(
     // writes rather than silently disabling the guard.
     let scope_canon: Result<PathBuf, std::io::Error> =
         scope_root.and_then(|scope| scope.canonicalize());
+    // A refusal names the parameter that moves the boundary: an explicit
+    // `scope` sets it, otherwise `root` does.
+    let widen_hint = if scope_arg.is_some() {
+        "pass a scope that contains this path"
+    } else {
+        "pass root: <dir containing this path> to write outside it"
+    };
 
     let mut hash_tasks: Vec<crate::edit::FileEditTask> = Vec::new();
     // Resolved paths for hash-mode files that were relative with no `root`, so
@@ -370,7 +377,7 @@ pub(in crate::mcp) fn tool_write(
             Ok(root) => {
                 if !path_within_scope(&path, root) {
                     direct_results.push(format!(
-                        "## {}\nerror: refusing write outside scope ({})",
+                        "## {}\nerror: refusing write outside scope ({}); {widen_hint}",
                         path.display(),
                         root.display()
                     ));
@@ -767,6 +774,51 @@ mod tests {
             std::fs::read_to_string(&p).unwrap(),
             "secret\n",
             "out-of-scope file must be untouched"
+        );
+    }
+
+    #[test]
+    fn refusal_outside_launch_folder_names_root() {
+        // #319: with neither `scope` nor `root`, the boundary is the server's
+        // cwd. An absolute path outside it is refused, and the refusal must
+        // name the parameter that moves the boundary.
+        let outside = tempfile::tempdir().unwrap();
+        let p = outside.path().join("probe.txt");
+        let args = serde_json::json!({
+            "files": [{"path": p.to_str().unwrap(), "mode": "overwrite", "content": "probe\n"}],
+        });
+        let out = tool_write(&args, &Session::new(), &fresh_bloom()).unwrap();
+        assert!(
+            out.contains("refusing write outside scope")
+                && out.contains("pass root: <dir containing this path>"),
+            "refusal must say to pass root: {out}"
+        );
+        assert!(!p.exists(), "out-of-scope path must not be written");
+
+        // Following the advice writes the file.
+        let args = serde_json::json!({
+            "root": outside.path().to_str().unwrap(),
+            "files": [{"path": p.to_str().unwrap(), "mode": "overwrite", "content": "probe\n"}],
+        });
+        tool_write(&args, &Session::new(), &fresh_bloom()).unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "probe\n");
+    }
+
+    #[test]
+    fn refusal_outside_explicit_scope_names_scope() {
+        // An explicit `scope` wins over `root` as the boundary, so the advice
+        // for it is a wider scope, not a root.
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let p = outside.path().join("escape.rs");
+        let args = serde_json::json!({
+            "scope": dir.path().to_str().unwrap(),
+            "files": [{"path": p.to_str().unwrap(), "mode": "overwrite", "content": "x"}],
+        });
+        let out = tool_write(&args, &Session::new(), &fresh_bloom()).unwrap();
+        assert!(
+            out.contains("pass a scope that contains this path"),
+            "refusal under an explicit scope must say to widen it: {out}"
         );
     }
 
