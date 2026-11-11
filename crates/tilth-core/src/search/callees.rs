@@ -224,7 +224,7 @@ pub fn resolve_callees(
             &import_path,
             remaining.iter().copied(),
             bloom,
-            super::bloom_walk::MAX_FILE_SIZE,
+            crate::source::MAX_FILE_SIZE,
         ) else {
             continue;
         };
@@ -294,7 +294,7 @@ fn resolve_same_package(
             break;
         }
 
-        let Ok(content) = std::fs::read_to_string(&go_path) else {
+        let Ok(content) = crate::source::read_source(&go_path) else {
             continue;
         };
 
@@ -371,7 +371,7 @@ fn resolve_second_hop(
         return Vec::new();
     };
 
-    let Ok(content) = std::fs::read_to_string(&parent.file) else {
+    let Ok(content) = crate::source::read_source(&parent.file) else {
         return Vec::new();
     };
 

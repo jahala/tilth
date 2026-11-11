@@ -12,6 +12,7 @@ use tilth_core::cache::OutlineCache;
 use tilth_core::error::TilthError;
 use tilth_core::lang::detect_file_type;
 use tilth_core::lang::outline::{heading_level, heading_text, parse_markdown};
+use tilth_core::source::{strip_bom, strip_bom_bytes};
 use tilth_core::types::FileType;
 
 pub(crate) const TOKEN_THRESHOLD: u64 = 6_000;
@@ -32,6 +33,17 @@ pub(crate) fn full_read_size_cap() -> u64 {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(2_000_000)
+}
+
+/// Lines in `buf`, counted the way `wc -l` does, plus a final line that has
+/// no newline. A newline ends a line, so a newline-terminated file has as
+/// many lines as newlines. Counting newlines + 1 made every such file one
+/// line longer than it is, and let a section past the last line succeed
+/// with an empty body.
+pub(crate) fn count_lines(buf: &[u8]) -> u32 {
+    let newlines = memchr::memchr_iter(b'\n', buf).count();
+    let unterminated = usize::from(buf.last().is_some_and(|&b| b != b'\n'));
+    u32::try_from(newlines + unterminated).unwrap_or(u32::MAX)
 }
 
 /// Main entry point for read mode. Routes through the decision tree.
@@ -102,7 +114,7 @@ pub fn read_file(
     if tilth_core::lang::detection::is_generated_by_name(name)
         || tilth_core::lang::detection::is_generated_by_content(buf)
     {
-        let line_count = memchr::memchr_iter(b'\n', buf).count() as u32 + 1;
+        let line_count = count_lines(buf);
         return Ok(format::file_header(
             path,
             byte_len,
@@ -116,7 +128,7 @@ pub fn read_file(
         || (byte_len >= tilth_core::lang::detection::MINIFIED_CHECK_THRESHOLD
             && tilth_core::lang::detection::is_minified_by_content(buf))
     {
-        let line_count = memchr::memchr_iter(b'\n', buf).count() as u32 + 1;
+        let line_count = count_lines(buf);
         return Ok(format::file_header(
             path,
             byte_len,
@@ -127,7 +139,7 @@ pub fn read_file(
 
     let tokens = estimate_tokens(byte_len);
     let content = String::from_utf8_lossy(buf);
-    let line_count = memchr::memchr_iter(b'\n', buf).count() as u32 + 1;
+    let line_count = count_lines(buf);
 
     // Guard: full=true on very large files. Return outline + warning instead of
     // dumping megabytes that would blow up the MCP client's timeout/memory.
@@ -141,7 +153,13 @@ pub fn read_file(
         let file_mb = byte_len as f64 / 1_000_000.0;
 
         let outline = cache.get_or_compute(path, mtime, || {
-            outline::generate(path, file_type, &content, buf, true)
+            outline::generate(
+                path,
+                file_type,
+                strip_bom(&content),
+                strip_bom_bytes(buf),
+                true,
+            )
         });
 
         let header = format::file_header(path, byte_len, line_count, ViewMode::Outline);
@@ -173,8 +191,17 @@ pub fn read_file(
 
     let capped = byte_len > FILE_SIZE_CAP;
 
+    // The outline parses the file without its byte-order mark, as search
+    // does; the full view above prints the bytes as they are, because its
+    // hash anchors must match what `tilth_write` reads from disk.
     let outline = cache.get_or_compute(path, mtime, || {
-        outline::generate(path, file_type, &content, buf, capped)
+        outline::generate(
+            path,
+            file_type,
+            strip_bom(&content),
+            strip_bom_bytes(buf),
+            capped,
+        )
     });
 
     // OGATE: if the outline is not meaningfully smaller than the full file,
@@ -504,11 +531,14 @@ fn collect_blocks(
     })?;
     let buf = &mmap[..];
 
+    // `line_offsets[i]` is the byte where line `i + 1` starts. A final
+    // newline leaves a trailing offset at `buf.len()` that starts no line,
+    // so the line count comes from `count_lines`, not from this table.
     let mut line_offsets: Vec<usize> = vec![0];
     for pos in memchr::memchr_iter(b'\n', buf) {
         line_offsets.push(pos + 1);
     }
-    let total = line_offsets.len();
+    let total = count_lines(buf) as usize;
 
     let mut blocks: Vec<Block> = Vec::with_capacity(ranges.len());
     let mut total_bytes: u64 = 0;
@@ -516,14 +546,15 @@ fn collect_blocks(
 
     for range in ranges {
         let (start, end) = resolve_range(buf, range)?;
-        let s = start.saturating_sub(1).min(total);
-        let e = end.min(total);
-        if s >= e {
+        if start > total {
             return Err(TilthError::InvalidQuery {
                 query: (*range).to_string(),
-                reason: format!("range out of bounds (file has {total} lines)"),
+                reason: format!("starts past the end of the file, which has {total} lines"),
             });
         }
+        // An end past the last line clamps to it.
+        let s = start - 1;
+        let e = end.min(total);
         let start_byte = line_offsets[s];
         let end_byte = if e < line_offsets.len() {
             line_offsets[e]
@@ -1201,5 +1232,76 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A newline ends a line; it does not start one. `gin/errors.go` has 175
+    /// lines by `wc -l` and the header said 176. Full, outline, generated and
+    /// section headers all count the same way.
+    #[test]
+    fn header_counts_lines_like_wc() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = OutlineCache::new();
+        for (content, lines) in [
+            ("one\n", 1),
+            ("one\ntwo\n", 2),
+            ("one\ntwo", 2),
+            ("one\n\n", 2),
+            ("\n", 1),
+        ] {
+            let path = dir.path().join("f.txt");
+            std::fs::write(&path, content).unwrap();
+            let full = read_file(&path, None, true, &cache, false).unwrap();
+            assert!(
+                full.contains(&format!("({lines} lines")),
+                "{content:?} should read as {lines} lines: {full}"
+            );
+            let all = read_ranges(&path, &["1-1000"], false).unwrap();
+            assert!(
+                all.contains(&format!("({lines} lines")),
+                "{content:?} section should cover {lines} lines: {all}"
+            );
+        }
+    }
+
+    /// A section that starts past the last line used to succeed with an empty
+    /// body. It is an error that names the file's length.
+    #[test]
+    fn section_past_the_end_is_an_error_naming_the_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("two.txt");
+        std::fs::write(&path, "alpha\nbeta\n").unwrap();
+        let err = read_ranges(&path, &["3-100"], false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("3-100") && err.contains("2 lines"),
+            "error must name the range and the length: {err}"
+        );
+        // An end past EOF still clamps to the last line.
+        let out = read_ranges(&path, &["2-100"], false).unwrap();
+        assert!(out.contains("(1 lines") && out.contains("2  beta"), "{out}");
+    }
+
+    /// The CSV outline counted the final newline as a row too.
+    #[test]
+    fn tabular_rows_ignore_the_final_newline() {
+        let out = outline::tabular::outline("a,b\n1,2\n3,4\n", 100);
+        assert!(out.contains("rows: 2"), "{out}");
+        let unterminated = outline::tabular::outline("a,b\n1,2\n3,4", 100);
+        assert!(unterminated.contains("rows: 2"), "{unterminated}");
+    }
+
+    /// The hash-anchored view keeps a byte-order mark: `tilth_write` checks
+    /// anchors against the file as it is on disk, mark included, so a view
+    /// that dropped it would hand out a line-1 anchor that never matches.
+    #[test]
+    fn hashline_view_keeps_the_byte_order_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.py");
+        std::fs::write(&path, "\u{feff}import os\n").unwrap();
+        let cache = OutlineCache::new();
+        let out = read_file(&path, None, true, &cache, true).unwrap();
+        let hash = format::line_hash("\u{feff}import os".as_bytes());
+        assert!(out.contains(&format!("1:{hash:03x}|")), "{out}");
     }
 }

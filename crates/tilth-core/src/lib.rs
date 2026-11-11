@@ -35,6 +35,8 @@ pub mod lang;
 #[doc(hidden)]
 pub mod search;
 #[doc(hidden)]
+pub mod source;
+#[doc(hidden)]
 pub mod test_structure;
 #[doc(hidden)]
 pub mod types;
