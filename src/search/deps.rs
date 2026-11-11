@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::Path;
 
+use crate::format::noun;
 use tilth_core::search::deps::{Dependent, DepsResult, LocalDep, MAX_EXPORTED_SYMBOLS};
 
 /// Dependents listed before the rest are summarised in a count, unless the
@@ -57,12 +58,12 @@ pub fn format_deps(result: &DepsResult, scope: &Path, budget: Option<usize>, ful
         String::new()
     };
     let header = format!(
-        "# Deps: {} — {} local, {} external, {} dependent{}{by_name_count}",
+        "# Deps: {} — {} local, {} external, {} {}{by_name_count}",
         rel_target,
         result.uses_local.len(),
         result.uses_external.len(),
         dep_count,
-        if dep_count == 1 { "" } else { "s" },
+        noun(dep_count, "dependent", "dependents"),
     );
     let by_name_note = if by_name > 0 {
         "> By name only: the file calls a name the target defines, and no import of the \
@@ -150,14 +151,8 @@ fn unsearched_note(result: &DepsResult) -> String {
 fn unlisted_dependents(total: usize, listed: usize) -> String {
     match total.saturating_sub(listed) {
         0 => String::new(),
-        n if listed == 0 => format!(
-            "... {n} dependent{} not listed",
-            if n == 1 { "" } else { "s" }
-        ),
-        n => format!(
-            "... and {n} more dependent{}",
-            if n == 1 { "" } else { "s" }
-        ),
+        n if listed == 0 => format!("... {n} {} not listed", noun(n, "dependent", "dependents")),
+        n => format!("... and {n} more {}", noun(n, "dependent", "dependents")),
     }
 }
 

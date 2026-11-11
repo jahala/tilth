@@ -991,7 +991,9 @@ A handful of small files cut across every subsystem.
 - **`format.rs`** — `file_header` / `binary_header` / `search_header`
   produce the `# path (N lines, ~Mk tokens) [outline]`-style banners.
   `number_lines(content, start)` and `hashlines(content, start)` are
-  the line-numbering / hash-anchored variants.
+  the line-numbering / hash-anchored variants. `noun(n, one, many)`
+  picks the noun after every count in tilth's output, so a count of
+  one reads `1 line`.
 - **`budget.rs`** — `apply(output, budget)` truncates a finished
   output string to a token budget. Used by every entry point and tool.
 - **`error.rs`** (`tilth-core`) — `TilthError` enum (`NotFound`, `PermissionDenied`,

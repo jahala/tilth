@@ -113,6 +113,7 @@ fn apply_edits(path: &Path, edits: &[Edit]) -> Result<EditResult, TilthError> {
 
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len();
+    let lines_noun = format::noun(total, "line", "lines");
 
     // Phase 1: Verify all hashes
     let mut mismatches: Vec<String> = Vec::new();
@@ -121,15 +122,15 @@ fn apply_edits(path: &Path, edits: &[Edit]) -> Result<EditResult, TilthError> {
         // Bounds check
         if edit.start_line < 1 || edit.start_line > total {
             mismatches.push(format!(
-                "Line {} out of bounds (file has {} lines)",
-                edit.start_line, total
+                "Line {} out of bounds (file has {total} {lines_noun})",
+                edit.start_line
             ));
             continue;
         }
         if edit.end_line < 1 || edit.end_line > total {
             mismatches.push(format!(
-                "Line {} out of bounds (file has {} lines)",
-                edit.end_line, total
+                "Line {} out of bounds (file has {total} {lines_noun})",
+                edit.end_line
             ));
             continue;
         }

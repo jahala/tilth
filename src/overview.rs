@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
+use crate::format::noun;
 use tilth_core::lang::detect_file_type;
 use tilth_core::search::walk::SKIP_DIRS;
 use tilth_core::types::{FileType, Lang};
@@ -145,7 +146,9 @@ fn fingerprint_inner(root: &Path) -> String {
     // Header line
     let dir_count = modules.len();
     lines.push(format!(
-        "[tilth] {lang_name} project — {total_files} source files, {dir_count} directories"
+        "[tilth] {lang_name} project — {total_files} source {}, {dir_count} {}",
+        noun(total_files, "file", "files"),
+        noun(dir_count, "directory", "directories")
     ));
 
     // Directories (cap at 10, sorted by file count descending)

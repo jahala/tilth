@@ -363,9 +363,10 @@ pub fn search_multi_symbol_expanded(
         );
         if result.total_found > result.matches.len() {
             let omitted = result.total_found - result.matches.len();
+            let matches = format::noun(omitted, "match", "matches");
             let _ = write!(
                 out,
-                "\n\n... and {omitted} more matches. Narrow with scope."
+                "\n\n... and {omitted} more {matches}. Narrow with scope."
             );
         }
         out.push_str(&skipped_large_note(&result));
@@ -516,9 +517,10 @@ fn count_label(shown: usize, total: usize) -> String {
 /// Emit a per-facet hidden-count tail line after a truncated facet's entries.
 /// Wording mirrors the linear-path global tail so a reader sees a single
 /// consistent shape — only the noun changes per facet kind.
-fn write_hidden_tail(out: &mut String, shown: usize, total: usize, kind: &str) {
+fn write_hidden_tail(out: &mut String, shown: usize, total: usize, (one, many): (&str, &str)) {
     if shown < total {
         let hidden = total - shown;
+        let kind = format::noun(hidden, one, many);
         let _ = write!(out, "\n\n... and {hidden} more {kind}. Narrow with scope.");
     }
 }
@@ -806,7 +808,8 @@ fn format_single_match(
                         let truncated = total_body_lines - take_n;
                         let _ = write!(
                             out,
-                            "… ({truncated} more lines — pass --expand to see the full section)"
+                            "… ({truncated} more {} — pass --expand to see the full section)",
+                            format::noun(truncated, "line", "lines")
                         );
                     }
                     return (out.len(), None);
@@ -1168,7 +1171,8 @@ fn basename_file_outline(
     let rel_path = rel(&matched_path, scope);
     let line_count = content.lines().count();
     Some(format!(
-        "## File overview: {rel_path} ({line_count} lines)\n{outline}"
+        "## File overview: {rel_path} ({line_count} {})\n{outline}",
+        format::noun(line_count, "line", "lines")
     ))
 }
 
@@ -1239,7 +1243,7 @@ fn format_search_result(
                 &mut out,
                 faceted.definitions.len(),
                 totals.definitions,
-                "definitions",
+                ("definition", "definitions"),
             );
         }
 
@@ -1264,7 +1268,7 @@ fn format_search_result(
                 &mut out,
                 faceted.implementations.len(),
                 totals.implementations,
-                "implementations",
+                ("implementation", "implementations"),
             );
         }
 
@@ -1284,7 +1288,12 @@ fn format_search_result(
                     m.text.trim()
                 );
             }
-            write_hidden_tail(&mut out, faceted.tests.len(), totals.tests, "tests");
+            write_hidden_tail(
+                &mut out,
+                faceted.tests.len(),
+                totals.tests,
+                ("test", "tests"),
+            );
         }
 
         if !faceted.usages_local.is_empty() {
@@ -1308,7 +1317,7 @@ fn format_search_result(
                 &mut out,
                 faceted.usages_local.len(),
                 totals.usages_local,
-                "usages",
+                ("usage", "usages"),
             );
         }
 
@@ -1333,7 +1342,7 @@ fn format_search_result(
                 &mut out,
                 faceted.usages_cross.len(),
                 totals.usages_cross,
-                "usages",
+                ("usage", "usages"),
             );
         }
 
@@ -1348,9 +1357,10 @@ fn format_search_result(
             > 0;
         if !facet_totals_present && result.total_found > result.matches.len() {
             let omitted = result.total_found - result.matches.len();
+            let matches = format::noun(omitted, "match", "matches");
             let _ = write!(
                 out,
-                "\n\n... and {omitted} more matches. Narrow with scope."
+                "\n\n... and {omitted} more {matches}. Narrow with scope."
             );
         }
     } else {
@@ -1372,9 +1382,10 @@ fn format_search_result(
         // matches.
         if result.total_found > result.matches.len() {
             let omitted = result.total_found - result.matches.len();
+            let matches = format::noun(omitted, "match", "matches");
             let _ = write!(
                 out,
-                "\n\n... and {omitted} more matches. Narrow with scope."
+                "\n\n... and {omitted} more {matches}. Narrow with scope."
             );
         }
     }
@@ -1695,10 +1706,11 @@ fn extract_line_range(line: &str) -> Option<(u32, u32)> {
 )]
 fn format_glob_result(result: &glob::GlobResult, scope: &Path) -> Result<String, TilthError> {
     let header = format!(
-        "# Glob: \"{}\" in {} — {} files",
+        "# Glob: \"{}\" in {} — {} {}",
         result.pattern,
         scope.display(),
-        result.files.len()
+        result.files.len(),
+        format::noun(result.files.len(), "file", "files")
     );
 
     let mut out = header;
@@ -1711,7 +1723,11 @@ fn format_glob_result(result: &glob::GlobResult, scope: &Path) -> Result<String,
 
     if result.total_found > result.files.len() {
         let omitted = result.total_found - result.files.len();
-        let _ = write!(out, "\n\n... and {omitted} more files. Narrow with scope.");
+        let files = format::noun(omitted, "file", "files");
+        let _ = write!(
+            out,
+            "\n\n... and {omitted} more {files}. Narrow with scope."
+        );
     }
 
     if result.files.is_empty() && !result.available_extensions.is_empty() {
@@ -2111,15 +2127,20 @@ mod tests {
     #[test]
     fn write_hidden_tail_emits_only_when_truncated() {
         let mut out = String::new();
-        write_hidden_tail(&mut out, 3, 3, "definitions");
+        let definitions = ("definition", "definitions");
+        write_hidden_tail(&mut out, 3, 3, definitions);
         assert!(out.is_empty(), "no truncation → no tail line, got {out:?}");
 
         let mut out = String::new();
-        write_hidden_tail(&mut out, 10, 14, "definitions");
+        write_hidden_tail(&mut out, 10, 14, definitions);
         assert_eq!(out, "\n\n... and 4 more definitions. Narrow with scope.");
 
         let mut out = String::new();
-        write_hidden_tail(&mut out, 3, 27, "usages");
+        write_hidden_tail(&mut out, 3, 4, definitions);
+        assert_eq!(out, "\n\n... and 1 more definition. Narrow with scope.");
+
+        let mut out = String::new();
+        write_hidden_tail(&mut out, 3, 27, ("usage", "usages"));
         assert_eq!(out, "\n\n... and 24 more usages. Narrow with scope.");
     }
 

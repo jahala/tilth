@@ -1,5 +1,7 @@
 use std::path::Path;
 
+use crate::format::noun;
+
 /// Depth-limited outline for JSON, YAML, TOML.
 pub fn outline(path: &Path, content: &str, max_lines: usize) -> String {
     match path.extension().and_then(|e| e.to_str()) {
@@ -36,7 +38,7 @@ fn walk_json(
         serde_json::Value::Object(map) => {
             if depth >= max_depth {
                 if !prefix.is_empty() {
-                    lines.push(format!("{prefix}: {{{} keys}}", map.len()));
+                    lines.push(format!("{prefix}: {{{}}}", key_count(map.len())));
                 }
                 return;
             }
@@ -60,8 +62,8 @@ fn walk_json(
                                 .join(", ");
                             let suffix = if inner.len() > 5 { ", ..." } else { "" };
                             lines.push(format!(
-                                "{full_key}: {{{} keys}} [{key_list}{suffix}]",
-                                inner.len()
+                                "{full_key}: {{{}}} [{key_list}{suffix}]",
+                                key_count(inner.len())
                             ));
                         } else {
                             walk_json(val, &full_key, depth + 1, max_depth, max_lines, lines);
@@ -72,7 +74,7 @@ fn walk_json(
                             "[]".to_string()
                         } else {
                             let first = truncate_json_value(&arr[0], 40);
-                            format!("[{} items] [{first}]", arr.len())
+                            format!("[{}] [{first}]", item_count(arr.len()))
                         };
                         lines.push(format!("{full_key}: {preview}"));
                     }
@@ -85,13 +87,23 @@ fn walk_json(
             }
         }
         serde_json::Value::Array(arr) => {
-            lines.push(format!("{prefix}: [{} items]", arr.len()));
+            lines.push(format!("{prefix}: [{}]", item_count(arr.len())));
         }
         _ => {
             let val_str = truncate_json_value(value, 40);
             lines.push(format!("{prefix}: {val_str}"));
         }
     }
+}
+
+/// The size of a collapsed table or object: `3 keys`, `1 key`.
+fn key_count(n: usize) -> String {
+    format!("{n} {}", noun(n, "key", "keys"))
+}
+
+/// The length of a collapsed array: `4 items`, `1 item`.
+fn item_count(n: usize) -> String {
+    format!("{n} {}", noun(n, "item", "items"))
 }
 
 fn json_type_name(v: &serde_json::Value) -> &'static str {
@@ -198,10 +210,10 @@ fn walk_toml(
                     walk_toml(val, depth + 1, max_depth, max_lines, lines);
                 }
                 toml::Value::Table(inner) => {
-                    lines.push(format!("{indent}{key}: {{{} keys}}", inner.len()));
+                    lines.push(format!("{indent}{key}: {{{}}}", key_count(inner.len())));
                 }
                 toml::Value::Array(arr) => {
-                    lines.push(format!("{indent}{key}: [{} items]", arr.len()));
+                    lines.push(format!("{indent}{key}: [{}]", item_count(arr.len())));
                 }
                 _ => {
                     let val_str = val.to_string();
@@ -284,7 +296,7 @@ key = \"deep\"
         let out = toml_outline(content, 100);
         // The collapsed form names the key-count of the inner table.
         assert!(
-            out.contains('{') && out.contains("keys}"),
+            out.contains("c: {1 key}"),
             "deep table should collapse to key-count summary:\n{out}"
         );
     }

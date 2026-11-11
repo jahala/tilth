@@ -9,6 +9,7 @@ use std::path::Path;
 
 use tilth_core::types::{FileType, Lang};
 
+use crate::format::noun;
 use crate::read::ends::{Ends, Shape};
 
 const OUTLINE_CAP: usize = 100; // max outline lines for huge files
@@ -149,9 +150,11 @@ pub fn fit(outline: &str, names: Option<String>, room: u64) -> String {
             parts.push("signatures and docs left out".to_string());
         }
         if entries < total_entries {
-            parts.push(format!("{entries} of {total_entries} entries shown"));
+            let unit = noun(total_entries, "entry", "entries");
+            parts.push(format!("{entries} of {total_entries} {unit} shown"));
         } else if kept < lines.len() {
-            parts.push(format!("{kept} of {} lines shown", lines.len()));
+            let unit = noun(lines.len(), "line", "lines");
+            parts.push(format!("{kept} of {} {unit} shown", lines.len()));
         }
         if parts.is_empty() {
             return String::new();
