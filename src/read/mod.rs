@@ -23,7 +23,7 @@ use tilth_core::types::FileType;
 pub(crate) const TOKEN_THRESHOLD: u64 = 6_000;
 /// How many of a file's local imports the "Related:" hint under an outlined
 /// read names, in import order.
-pub(crate) const RELATED_HINT_LIMIT: usize = 8;
+const RELATED_HINT_LIMIT: usize = 8;
 /// Minimum compression ratio required to prefer the outline over full content.
 /// If `outline_tokens >= full_tokens * OUTLINE_MIN_COMPRESSION / 100`, the
 /// outline saves too few tokens to be worth the information loss, so the full
@@ -470,6 +470,27 @@ pub fn read_file(
     let header = format::file_header(path, byte_len, line_count, mode);
     let names = || outline::names_only(path, file_type, strip_bom(&content), capped);
     Ok(outline_view(&header, &outline, names, budget))
+}
+
+/// The "Related:" hint under an outlined read of a file whose local imports
+/// are `related`, in import order: the first [`RELATED_HINT_LIMIT`], then
+/// how many more there are. Empty when there are none.
+pub(crate) fn related_hint<'a>(related: impl ExactSizeIterator<Item = &'a Path>) -> String {
+    let total = related.len();
+    if total == 0 {
+        return String::new();
+    }
+    let mut hint = String::from("\n\n> Related: ");
+    for (i, path) in related.take(RELATED_HINT_LIMIT).enumerate() {
+        if i > 0 {
+            hint.push_str(", ");
+        }
+        let _ = write!(hint, "{}", path.display());
+    }
+    if total > RELATED_HINT_LIMIT {
+        let _ = write!(hint, ", and {} more", total - RELATED_HINT_LIMIT);
+    }
+    hint
 }
 
 /// Would this file produce an outline (rather than full content) in default read mode?

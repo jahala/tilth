@@ -184,23 +184,12 @@ pub(in crate::mcp) fn tool_read(
     // The related-file hint for outlined code files (not section reads, not
     // batch). It is built first, so the read is fitted to the room it leaves
     // and the final cut never removes the note that says what a fit left out.
-    let mut related_hint = String::new();
-    if section.is_none() && crate::read::would_outline(&path) {
+    let related_hint = if section.is_none() && crate::read::would_outline(&path) {
         let related = tilth_core::imports::resolve_related_files(&path, cache);
-        if !related.is_empty() {
-            related_hint.push_str("\n\n> Related: ");
-            for (i, p) in related
-                .iter()
-                .take(crate::read::RELATED_HINT_LIMIT)
-                .enumerate()
-            {
-                if i > 0 {
-                    related_hint.push_str(", ");
-                }
-                let _ = write!(related_hint, "{}", p.display());
-            }
-        }
-    }
+        crate::read::related_hint(related.iter().map(PathBuf::as_path))
+    } else {
+        String::new()
+    };
     let file_budget =
         read_budget.saturating_sub(crate::types::estimate_tokens(related_hint.len() as u64));
 
@@ -775,7 +764,21 @@ mod tests {
     /// A JS file with one function per line: its outline is nearly as long
     /// as the file, and both are far over the default budget.
     fn write_dense_js(dir: &Path, name: &str) -> PathBuf {
-        let mut src = String::from("import { helper } from './helper';\n");
+        write_dense_js_importing(dir, name, &["helper"])
+    }
+
+    /// [`write_dense_js`] that imports one function from each of `helpers`,
+    /// written beside it as `<helper>.js`.
+    fn write_dense_js_importing(dir: &Path, name: &str, helpers: &[&str]) -> PathBuf {
+        let mut src = String::new();
+        for helper in helpers {
+            let _ = writeln!(src, "import {{ {helper} }} from './{helper}';");
+            std::fs::write(
+                dir.join(format!("{helper}.js")),
+                format!("export function {helper}() {{}}\n"),
+            )
+            .unwrap();
+        }
         for i in 0..6000 {
             let _ = writeln!(
                 src,
@@ -784,7 +787,6 @@ mod tests {
         }
         let path = dir.join(name);
         std::fs::write(&path, src).unwrap();
-        std::fs::write(dir.join("helper.js"), "export function helper() {}\n").unwrap();
         path
     }
 
@@ -826,6 +828,38 @@ mod tests {
         );
         assert!(out.contains("> Related: "), "{}", tail(&out));
         assert!(!out.contains("... truncated"), "{}", tail(&out));
+    }
+
+    /// The `> Related:` line named the first eight local imports and said
+    /// nothing of the rest, so a file with twelve read as one with eight.
+    #[test]
+    fn tool_read_related_line_counts_the_imports_it_leaves_out() {
+        let related_line = |helpers: &[&str]| {
+            let dir = tempfile::tempdir().unwrap();
+            let path = write_dense_js_importing(dir.path(), "dense.js", helpers);
+            let out = read_args(&serde_json::json!({ "path": path.to_str().unwrap() }));
+            let names = |shown: &[&str]| {
+                shown
+                    .iter()
+                    .map(|h| dir.path().join(format!("{h}.js")).display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let line = out
+                .lines()
+                .find(|l| l.starts_with("> Related: "))
+                .unwrap_or_else(|| panic!("no Related line: {}", tail(&out)))
+                .to_string();
+            (line, names(&helpers[..helpers.len().min(8)]))
+        };
+        let helpers: Vec<String> = (0..12).map(|i| format!("helper{i:02}")).collect();
+        let helpers: Vec<&str> = helpers.iter().map(String::as_str).collect();
+
+        let (line, shown) = related_line(&helpers);
+        assert_eq!(line, format!("> Related: {shown}, and 4 more"));
+
+        let (line, shown) = related_line(&helpers[..8]);
+        assert_eq!(line, format!("> Related: {shown}"));
     }
 
     /// A batch gave each file the whole budget, so the first big file used
