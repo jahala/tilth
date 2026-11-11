@@ -522,6 +522,15 @@ pub fn diff(
     let sides = resolve_sides(source, repo)?;
     let raw = run_git_diff(source, &sides, repo)?;
     let mut files = build_overlays(&raw, &sides, repo);
+    // A patch with text in it but no file header is not a clean result.
+    if let DiffSource::Patch(path) = source {
+        if files.is_empty() && !raw.trim().is_empty() {
+            return Err(format!(
+                "{} names no file: a unified diff has a `--- ` and a `+++ ` line before each file's hunks",
+                path.display()
+            ));
+        }
+    }
     if files.is_empty() && scope.is_none() {
         return Ok("No changes.".to_string());
     }
@@ -1584,6 +1593,73 @@ diff --git a/src/main.rs b/src/main.rs
             result.contains("main.rs"),
             "expected main.rs in patch result:\n{result}"
         );
+    }
+
+    #[test]
+    fn a_patch_without_git_headers_is_read() {
+        // `diff -u o.rs n.rs` writes no `diff --git` line (#324).
+        let dir = tempfile::tempdir().unwrap();
+        let patch = dir.path().join("u.patch");
+        let content = "\
+--- o.rs\t2026-11-11 21:48:12
++++ n.rs\t2026-11-11 21:48:12
+@@ -1,3 +1,3 @@
+ fn a() {
+-    1;
++    2;
+ }
+";
+        fs::write(&patch, content).unwrap();
+        let result = diff(
+            &DiffSource::Patch(patch),
+            Some(dir.path()),
+            None,
+            None,
+            false,
+            0,
+            None,
+        )
+        .unwrap();
+        assert!(
+            result.contains("n.rs") && !result.contains("No changes"),
+            "expected the change to n.rs:\n{result}"
+        );
+    }
+
+    #[test]
+    fn a_patch_that_names_no_file_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let patch = dir.path().join("notes.txt");
+        fs::write(&patch, "these are notes, not a patch\n").unwrap();
+        let err = diff(
+            &DiffSource::Patch(patch),
+            Some(dir.path()),
+            None,
+            None,
+            false,
+            0,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("names no file"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_patch_has_no_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let patch = dir.path().join("empty.patch");
+        fs::write(&patch, "").unwrap();
+        let result = diff(
+            &DiffSource::Patch(patch),
+            Some(dir.path()),
+            None,
+            None,
+            false,
+            0,
+            None,
+        )
+        .unwrap();
+        assert_eq!(result, "No changes.");
     }
 
     // 16. test_file_to_file

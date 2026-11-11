@@ -867,7 +867,10 @@ single tool each.
    it with the working tree.
 4. **`parse::parse_unified_diff`** turns the raw text into
    `Vec<FileDiff>` — header, hunks, and lines numbered in the old file
-   (removed lines) or the new file (the rest).
+   (removed lines) or the new file (the rest). A file starts at a
+   `diff --git` line, or, in a patch from `diff -u`, at a `--- `/`+++ `
+   pair that a hunk follows. A patch file with text but no file is an
+   error, never "No changes."
 5. **`overlay::compute_overlay`** reads both sides of each `FileDiff`,
    outlines them and matches their symbols (`matching::match_symbols`:
    identity, then structural hash, then fuzzy similarity). Members are
