@@ -242,7 +242,7 @@ pub(crate) fn match_symbols(old: &[DiffSymbol], new: &[DiffSymbol]) -> Vec<Symbo
             };
             #[expect(
                 clippy::cast_precision_loss,
-                reason = "a size ratio; line lengths fit the f32 mantissa"
+                reason = "by design: a size ratio; line lengths fit the f32 mantissa"
             )]
             if max_len == 0 || (min_len as f32 / max_len as f32) < 0.8 {
                 continue;
@@ -697,7 +697,7 @@ mod tests {
     #[test]
     #[expect(
         clippy::too_many_lines,
-        reason = "a table of cases, one per language; its length is the data"
+        reason = "by design: a table of cases, one per language; its length is the data"
     )]
     fn body_and_signature_edits_across_languages() {
         // (lang, file, the edited symbol's name, base, body edit, signature edit)

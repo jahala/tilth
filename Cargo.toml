@@ -53,10 +53,13 @@ significant_drop_tightening = "warn"
 needless_collect = "warn"
 option_if_let_else = "warn"
 
-# Restrictions. clippy.toml exempts tests from the unwrap, expect, print and
-# dbg lints. An exception is an #[expect] with a reason on the item or
-# statement it excuses, which fails once its violation is gone;
-# allow_attributes forbids #[allow].
+# Restrictions. clippy.toml exempts #[test] functions and #[cfg(test)]
+# modules from the unwrap, expect, print and dbg lints; a helper function in
+# tests/*.rs needs its own #[expect]. An exception is an #[expect] with a
+# reason on the item or statement it excuses, which fails once its violation
+# is gone; allow_attributes forbids #[allow]. The reason names the issue
+# that removes the exception, or starts with "by design: " for a permanent
+# one; tests/expect_reasons.rs holds that.
 allow_attributes = "warn"
 allow_attributes_without_reason = "warn"
 undocumented_unsafe_blocks = "warn"
@@ -137,6 +140,8 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# tests/expect_reasons.rs parses every source file to read its #[expect] reasons
+syn = { version = "2", features = ["full", "visit"] }
 tilth-core = { path = "crates/tilth-core", version = "0.13.0", features = ["test-fixtures"] }
 
 [profile.release]

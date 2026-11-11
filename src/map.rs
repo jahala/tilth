@@ -125,7 +125,7 @@ fn compute_dir_totals(tree: &BTreeMap<PathBuf, Vec<FileEntry>>) -> BTreeMap<Path
 fn fmt_tokens(n: u64) -> String {
     #[expect(
         clippy::cast_precision_loss,
-        reason = "display only, rounded to one decimal"
+        reason = "by design: display only, rounded to one decimal"
     )]
     let f = n as f64;
     if f >= 999_950.0 {

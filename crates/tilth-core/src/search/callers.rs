@@ -64,7 +64,7 @@ pub struct CallerWalk<T> {
 /// reached first then depends on thread timing.
 #[expect(
     clippy::implicit_hasher,
-    reason = "the std hasher is part of the signature dependents pin; a generic one would change it for every caller"
+    reason = "by design: the std hasher is part of the signature dependents pin; a generic one would change it for every caller"
 )]
 pub fn find_callers_batch<T, F>(
     targets: &HashSet<String>,
@@ -189,7 +189,7 @@ where
 /// Files over the size cap are not parsed, as in [`find_callers_batch`].
 #[expect(
     clippy::implicit_hasher,
-    reason = "the std hasher is part of the signature, as in find_callers_batch"
+    reason = "by design: the std hasher is part of the signature, as in find_callers_batch"
 )]
 pub fn definition_owners(
     names: &HashSet<String>,

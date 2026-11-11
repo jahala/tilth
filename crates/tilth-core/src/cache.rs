@@ -103,7 +103,7 @@ impl OutlineCache {
     #[must_use]
     #[expect(
         clippy::significant_drop_tightening,
-        reason = "the entry is held across the parse on purpose, and `insert` consumes it"
+        reason = "by design: the entry is held across the parse on purpose, and `insert` consumes it"
     )]
     pub fn get_or_parse(&self, path: &Path) -> Option<Arc<ParsedFile>> {
         use dashmap::mapref::entry::Entry;

@@ -168,12 +168,12 @@ pub fn read_file(
         let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
         #[expect(
             clippy::cast_precision_loss,
-            reason = "display only; file sizes fit the f64 mantissa"
+            reason = "by design: display only; file sizes fit the f64 mantissa"
         )]
         let cap_mb = cap as f64 / 1_000_000.0;
         #[expect(
             clippy::cast_precision_loss,
-            reason = "display only; file sizes fit the f64 mantissa"
+            reason = "by design: display only; file sizes fit the f64 mantissa"
         )]
         let file_mb = byte_len as f64 / 1_000_000.0;
 

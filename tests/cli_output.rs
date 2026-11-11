@@ -12,7 +12,7 @@ use std::process::{Command, Output, Stdio};
 
 #[expect(
     clippy::expect_used,
-    reason = "test helper: a panic here is the test failure"
+    reason = "by design: a test helper, where a panic is the test failure"
 )]
 fn run_into_closed_pipe(args: &[&str], cwd: &Path) -> Output {
     let (reader, writer) = std::io::pipe().expect("create pipe");
@@ -45,7 +45,7 @@ fn assert_quiet_exit(out: &Output, what: &str) {
 /// search, read and map, and a patch for the diff.
 #[expect(
     clippy::unwrap_used,
-    reason = "test helper: a panic here is the test failure"
+    reason = "by design: a test helper, where a panic is the test failure"
 )]
 fn project() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();

@@ -245,7 +245,7 @@ fn lang_display_name(lang: Lang) -> &'static str {
 
 #[expect(
     clippy::struct_excessive_bools,
-    reason = "one flag per test-directory convention, read by test_style"
+    reason = "by design: one flag per test-directory convention, read by test_style"
 )]
 struct WalkResult {
     lang_counts: HashMap<Lang, usize>,

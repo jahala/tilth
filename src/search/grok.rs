@@ -327,7 +327,7 @@ fn read_delegate_content(
 #[derive(Debug, Clone, Copy)]
 #[expect(
     clippy::struct_field_names,
-    reason = "each field is a cap, and max_ names that"
+    reason = "by design: each field is a cap, and max_ names that"
 )]
 pub struct GrokCaps {
     pub max_callees: usize,

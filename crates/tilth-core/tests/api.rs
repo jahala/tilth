@@ -61,7 +61,7 @@ const SAMPLES: &[Sample] = &[
 
 #[expect(
     clippy::unwrap_used,
-    reason = "test helper: a panic here is the test failure"
+    reason = "by design: a test helper, where a panic is the test failure"
 )]
 fn line_of(source: &str, needle: &str) -> u32 {
     let idx = source

@@ -18,7 +18,7 @@ const TILTH: &str = env!("CARGO_BIN_EXE_tilth");
 /// in a directory whose path cannot be read.
 #[expect(
     clippy::expect_used,
-    reason = "test helper: a panic here is the test failure"
+    reason = "by design: a test helper, where a panic is the test failure"
 )]
 fn run_in_removed_dir(args: &[&str], stdin: &str) -> Output {
     let parent = tempfile::tempdir().expect("create temp dir");
@@ -60,7 +60,7 @@ impl LockedDir {
     #[expect(
         clippy::expect_used,
         clippy::print_stderr,
-        reason = "test helper: a panic is the test failure, and a skip says so"
+        reason = "by design: a test helper, where a panic is the test failure and a skip says so"
     )]
     fn new(parent: &Path) -> Option<Self> {
         let dir = Self {
@@ -89,7 +89,7 @@ impl Drop for LockedDir {
 
 #[expect(
     clippy::expect_used,
-    reason = "test helper: a panic here is the test failure"
+    reason = "by design: a test helper, where a panic is the test failure"
 )]
 fn mcp(args: &[&str], cwd: &Path, stdin: &str) -> Output {
     let mut child = Command::new(TILTH)

@@ -17,7 +17,10 @@ use std::io::Write;
 /// Write `message` and a newline to stderr, as in
 /// `diag::emit(format_args!("grok error: {e}"))`.
 pub fn emit(message: fmt::Arguments<'_>) {
-    #[expect(clippy::disallowed_methods, reason = "this is the one stderr sink")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "by design: this is the one stderr sink"
+    )]
     let stderr = std::io::stderr();
     // Dropped on failure; see the module comment.
     let _ = writeln!(stderr.lock(), "{message}");

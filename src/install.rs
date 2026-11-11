@@ -310,7 +310,7 @@ struct HostInfo {
 
 #[expect(
     clippy::too_many_lines,
-    reason = "one match arm per supported host; its length is the host table"
+    reason = "by design: one match arm per supported host; its length is the host table"
 )]
 fn resolve_host(host: &str) -> Result<HostInfo, String> {
     let home = home_dir()?;

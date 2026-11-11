@@ -33,7 +33,7 @@ impl DirNode {
 fn fmt_tokens(t: u64) -> String {
     #[expect(
         clippy::cast_precision_loss,
-        reason = "display only, rounded to one decimal"
+        reason = "by design: display only, rounded to one decimal"
     )]
     let f = t as f64;
     if f >= 999_950.0 {

@@ -616,7 +616,7 @@ pub(crate) fn definition_weight(kind: &str) -> u16 {
 /// grammars (e.g. tree-sitter-kotlin-ng) return `None`.
 #[expect(
     clippy::type_complexity,
-    reason = "a key tuple and a map under a lock; a type alias would only rename it"
+    reason = "by design: a key tuple and a map under a lock; a type alias would only rename it"
 )]
 static QUERY_CACHE: LazyLock<Mutex<HashMap<(usize, usize, usize), tree_sitter::Query>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));

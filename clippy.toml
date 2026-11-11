@@ -1,4 +1,6 @@
-# Tests may unwrap, expect, print and dbg: a panic there is the failure report.
+# #[test] functions and #[cfg(test)] modules may unwrap, expect, print and
+# dbg: a panic there is the failure report. A helper function in tests/*.rs is
+# neither, so it needs its own #[expect].
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 allow-print-in-tests = true

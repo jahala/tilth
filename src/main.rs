@@ -12,7 +12,7 @@ use tilth::{diag, FileScopeHint};
 #[command(name = "tilth", version, about)]
 #[expect(
     clippy::struct_excessive_bools,
-    reason = "clap derives the CLI from this struct, one bool per on/off flag"
+    reason = "by design: clap derives the CLI from this struct, one bool per on/off flag"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -68,7 +68,7 @@ struct Cli {
     #[arg(long)]
     #[expect(
         clippy::doc_markdown,
-        reason = "clap prints this comment as --help text, where backticks would show"
+        reason = "by design: clap prints this comment as --help text, where backticks would show"
     )]
     edit: bool,
 
@@ -119,7 +119,7 @@ enum Command {
         #[arg(long)]
         #[expect(
             clippy::doc_markdown,
-            reason = "clap prints this comment as --help text, where backticks would show"
+            reason = "by design: clap prints this comment as --help text, where backticks would show"
         )]
         edit: bool,
     },
@@ -522,7 +522,7 @@ fn emit_output(output: &str, is_tty: bool) {
 fn write_stdout(output: &str) {
     #[expect(
         clippy::disallowed_methods,
-        reason = "this is the CLI's one stdout sink"
+        reason = "by design: this is the CLI's one stdout sink"
     )]
     let stdout = io::stdout();
     if let Err(e) = write_output(&mut stdout.lock(), output) {
@@ -539,7 +539,7 @@ fn write_stdout(output: &str) {
 fn stdout_is_terminal() -> bool {
     #[expect(
         clippy::disallowed_methods,
-        reason = "a query on stdout; writes go through write_stdout"
+        reason = "by design: a query on stdout; writes go through write_stdout"
     )]
     let stdout = io::stdout();
     stdout.is_terminal()
