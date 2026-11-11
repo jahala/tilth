@@ -22,6 +22,11 @@ pub(crate) fn parse_unified_diff(raw: &str) -> Vec<FileDiff> {
     let mut current_hunk: Option<Hunk> = None;
     let mut old_line: u32 = 0;
     let mut new_line: u32 = 0;
+    // Old and new lines the hunk header says are still to come. While any
+    // are, a line is hunk content even when it looks like a header: a
+    // removed `-- x` (an SQL or Lua comment) reads `--- x`.
+    let mut old_left: u32 = 0;
+    let mut new_left: u32 = 0;
 
     // Commit the current in-progress file (if any) to `results`.
     macro_rules! flush_file {
@@ -48,6 +53,45 @@ pub(crate) fn parse_unified_diff(raw: &str) -> Vec<FileDiff> {
     }
 
     for line in raw.lines() {
+        // ── Hunk body, counted ──────────────────────────────────────────────
+        if let Some(hunk) = current_hunk.as_mut().filter(|_| old_left > 0 || new_left > 0) {
+            // An empty line is a blank context line whose space was stripped.
+            let body = match line.as_bytes().first() {
+                Some(b'+') => Some((DiffLineKind::Added, &line[1..])),
+                Some(b'-') => Some((DiffLineKind::Removed, &line[1..])),
+                Some(b' ') => Some((DiffLineKind::Context, &line[1..])),
+                None => Some((DiffLineKind::Context, "")),
+                // `\ No newline at end of file`.
+                Some(b'\\') => continue,
+                // Not a hunk line, so the header counted wrong: the hunk
+                // ends here, and the line is read as a header below.
+                Some(_) => None,
+            };
+            if let Some((kind, content)) = body {
+                let number = if kind == DiffLineKind::Removed {
+                    old_line
+                } else {
+                    new_line
+                };
+                hunk.lines.push(DiffLine {
+                    kind,
+                    line: number,
+                    content: content.to_owned(),
+                });
+                if kind != DiffLineKind::Added {
+                    old_line += 1;
+                    old_left = old_left.saturating_sub(1);
+                }
+                if kind != DiffLineKind::Removed {
+                    new_line += 1;
+                    new_left = new_left.saturating_sub(1);
+                }
+                continue;
+            }
+            old_left = 0;
+            new_left = 0;
+        }
+
         // ── New file header ─────────────────────────────────────────────────
         if let Some(rest) = line.strip_prefix("diff --git ") {
             flush_file!();
@@ -114,6 +158,8 @@ pub(crate) fn parse_unified_diff(raw: &str) -> Vec<FileDiff> {
             if let Some((old_start, old_count, new_start, new_count)) = parse_hunk_header(rest) {
                 old_line = old_start;
                 new_line = new_start;
+                old_left = old_count;
+                new_left = new_count;
                 current_hunk = Some(Hunk {
                     old_start,
                     old_count,
@@ -546,6 +592,45 @@ diff --git a/z.rs b/z.rs
             diffs[0].hunks.is_empty(),
             "malformed hunk header must be skipped, got {:?}",
             diffs[0].hunks
+        );
+    }
+
+    // ── 15. Lines that look like file headers inside a hunk ──────────────────
+    #[test]
+    fn hunk_lines_that_look_like_file_headers_are_content() {
+        // A removed SQL or Lua comment `-- x` reads `--- x` in the patch, and
+        // an added `++ x` reads `+++ x`. Inside a hunk they are lines, so the
+        // hunk keeps them and the old line numbers after them stay right.
+        let raw = "\
+diff --git a/q.sql b/q.sql
+--- a/q.sql
++++ b/q.sql
+@@ -1,4 +1,4 @@
+ SELECT 1;
+--- old comment
++++ new counter
+ SELECT 2;
+-SELECT 3;
++SELECT 4;
+";
+        let diffs = parse_unified_diff(raw);
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].status, FileStatus::Modified);
+        let lines: Vec<(DiffLineKind, u32, &str)> = diffs[0].hunks[0]
+            .lines
+            .iter()
+            .map(|l| (l.kind, l.line, l.content.as_str()))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                (DiffLineKind::Context, 1, "SELECT 1;"),
+                (DiffLineKind::Removed, 2, "-- old comment"),
+                (DiffLineKind::Added, 2, "++ new counter"),
+                (DiffLineKind::Context, 3, "SELECT 2;"),
+                (DiffLineKind::Removed, 4, "SELECT 3;"),
+                (DiffLineKind::Added, 4, "SELECT 4;"),
+            ]
         );
     }
 }
