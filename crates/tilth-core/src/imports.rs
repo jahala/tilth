@@ -44,7 +44,7 @@ pub fn resolve_related_files_with_content(file_path: &Path, content: &str) -> Ve
 pub fn resolve_imports(file_path: &Path, lang: Lang, imports: &[Import]) -> Vec<PathBuf> {
     let mut results = Vec::new();
     for import in imports {
-        if let Some(path) = resolve_import(file_path, lang, import) {
+        for path in resolve_import(file_path, lang, import) {
             if !results.contains(&path) {
                 results.push(path);
             }
@@ -53,17 +53,46 @@ pub fn resolve_imports(file_path: &Path, lang: Lang, imports: &[Import]) -> Vec<
     results
 }
 
-/// The local file one import of the file at `file_path` names, if it
-/// resolves to one. A Python absolute import (`from pkg.mod import x`) is
-/// local when `pkg/mod.py` sits under a directory above the importer, up
-/// to its project root; `is_external` cannot tell that without the disk.
+/// The local files one import of the file at `file_path` names, empty when
+/// it names none. A Python absolute import (`from pkg.mod import x`) is
+/// local when `pkg/mod.py` sits where Python would look for it (see
+/// `resolve_python_absolute`); `is_external` cannot tell that without the
+/// disk. `from pkg import a, b` names the submodule `pkg/a.py` when there is
+/// one, and `pkg` itself for a name that is no submodule.
 #[must_use]
-pub fn resolve_import(file_path: &Path, lang: Lang, import: &Import) -> Option<PathBuf> {
-    let dir = file_path.parent()?;
+pub fn resolve_import(file_path: &Path, lang: Lang, import: &Import) -> Vec<PathBuf> {
+    let Some(dir) = file_path.parent() else {
+        return Vec::new();
+    };
     if is_external(&import.source, lang) && lang != Lang::Python {
-        return None;
+        return Vec::new();
     }
-    resolve(dir, &import.source, lang)
+    if import.names.is_empty() {
+        return resolve(dir, &import.source, lang).into_iter().collect();
+    }
+    let mut files = Vec::new();
+    let mut names_the_module = false;
+    for name in &import.names {
+        // `from . import x` names `.x`; `from pkg import x` names `pkg.x`.
+        let submodule = if import.source.ends_with('.') {
+            format!("{}{name}", import.source)
+        } else {
+            format!("{}.{name}", import.source)
+        };
+        match resolve(dir, &submodule, lang) {
+            Some(file) if !files.contains(&file) => files.push(file),
+            Some(_) => {}
+            None => names_the_module = true,
+        }
+    }
+    if names_the_module {
+        if let Some(file) = resolve(dir, &import.source, lang) {
+            if !files.contains(&file) {
+                files.push(file);
+            }
+        }
+    }
+    files
 }
 
 /// One module an import statement names.
@@ -84,6 +113,10 @@ pub struct Import {
     pub start_line: u32,
     /// The 1-based last line of the statement, inclusive.
     pub end_line: u32,
+    /// What a Python `from m import a, b` takes from `m`: `a` and `b`, each
+    /// a name in `m` or a submodule of it. Empty for every other import, and
+    /// for `from m import *`.
+    pub names: Vec<String>,
 }
 
 /// Every module `content` imports, one [`Import`] per module, in source order.
@@ -144,11 +177,17 @@ pub fn imports_in_tree(root: tree_sitter::Node, content: &str, lang: Lang) -> Ve
                 if source.is_empty() {
                     continue;
                 }
+                let names = if lang == Lang::Python && node.kind() == "import_from_statement" {
+                    python_from_names(node, content)
+                } else {
+                    Vec::new()
+                };
                 out.push(Import {
                     source,
                     line,
                     start_line: line_of(node),
                     end_line: last_line_of(node),
+                    names,
                 });
             }
         }
@@ -235,6 +274,7 @@ fn line_imports(content: &str, lang: Lang) -> Vec<Import> {
             line,
             start_line: line,
             end_line: line,
+            names: Vec::new(),
         });
     }
     out
@@ -307,6 +347,14 @@ fn statement_modules(node: tree_sitter::Node, src: &str, lang: Lang) -> Option<V
         _ => return None,
     }
     Some(out)
+}
+
+/// The names a Python `from m import a, b as c` takes from `m`: `a`, `b`.
+fn python_from_names(node: tree_sitter::Node, src: &str) -> Vec<String> {
+    let mut cursor = node.walk();
+    node.children_by_field_name("name", &mut cursor)
+        .map(|name| compact(name.child_by_field_name("name").unwrap_or(name), src))
+        .collect()
 }
 
 /// Go: `import "m"` and `import ( "a"; x "b" )`, one module per spec.
@@ -770,33 +818,45 @@ fn resolve_python(dir: &Path, source: &str) -> Option<PathBuf> {
 }
 
 /// `a.b.c` as Python finds it from a file in `dir`: `a/b/c.py` or
-/// `a/b/c/__init__.py` under `dir` or a directory above it, or under that
-/// directory's `src/` (the src layout). The nearest directory wins, as the
-/// importer's own directory comes first on Python's path. The search stops
-/// at the project root: the first directory holding `.git`,
-/// `pyproject.toml`, `setup.py` or `setup.cfg`.
+/// `a/b/c/__init__.py` under a directory on Python's path, or under that
+/// directory's `src/` (the src layout). Python 3 puts a script's own
+/// directory on its path, and for a module in a package the directory
+/// above its top package; the directory of a package is never on it, so a
+/// `json.py` inside a package does not hide the standard library's `json`.
+/// When a project root is marked (`.git`, `pyproject.toml`, `setup.py` or
+/// `setup.cfg`), every directory from `dir` up to it that is not a package
+/// is searched, nearest first, as running a test or script from the root
+/// puts them on the path. Without one, only the nearest such directory is.
 fn resolve_python_absolute(dir: &Path, source: &str) -> Option<PathBuf> {
     const ROOT_MARKERS: [&str; 4] = [".git", "pyproject.toml", "setup.py", "setup.cfg"];
-    let mut parts = source.split('.');
-    let first = parts.next().filter(|p| !p.is_empty())?;
+    let first = source.split('.').next().filter(|p| !p.is_empty())?;
     let rel: PathBuf = source.split('.').collect();
+    let root = dir
+        .ancestors()
+        .find(|a| ROOT_MARKERS.iter().any(|m| a.join(m).exists()));
     for ancestor in dir.ancestors() {
-        for base in [ancestor.to_path_buf(), ancestor.join("src")] {
-            // One stat rules out most bases: the top-level package or module.
-            let top = base.join(first);
-            if !top.is_dir() && !top.with_extension("py").is_file() {
-                continue;
+        let at_root = Some(ancestor) == root;
+        if at_root || !ancestor.join("__init__.py").is_file() {
+            for base in [ancestor.to_path_buf(), ancestor.join("src")] {
+                // One stat rules out most bases: the top-level package or module.
+                let top = base.join(first);
+                if !top.is_dir() && !top.with_extension("py").is_file() {
+                    continue;
+                }
+                let as_file = base.join(&rel).with_extension("py");
+                if as_file.is_file() {
+                    return Some(as_file);
+                }
+                let as_pkg = base.join(&rel).join("__init__.py");
+                if as_pkg.is_file() {
+                    return Some(as_pkg);
+                }
             }
-            let as_file = base.join(&rel).with_extension("py");
-            if as_file.is_file() {
-                return Some(as_file);
-            }
-            let as_pkg = base.join(&rel).join("__init__.py");
-            if as_pkg.is_file() {
-                return Some(as_pkg);
+            if root.is_none() {
+                return None;
             }
         }
-        if ROOT_MARKERS.iter().any(|m| ancestor.join(m).exists()) {
+        if at_root {
             break;
         }
     }
@@ -852,6 +912,83 @@ mod tests {
             assert!(reads_statements_from_tree(lang), "{lang:?}");
             assert!(statement_query(lang).is_some(), "{lang:?}");
         }
+    }
+
+    /// The files `rel` (a Python file under `root`) imports, relative to
+    /// `root`.
+    fn python_related(root: &Path, rel: &str) -> Vec<String> {
+        let file = root.join(rel);
+        let content = fs::read_to_string(&file).unwrap();
+        resolve_related_files_with_content(&file, &content)
+            .iter()
+            .map(|p| p.strip_prefix(root).unwrap().display().to_string())
+            .collect()
+    }
+
+    fn write_tree(root: &Path, files: &[(&str, &str)]) {
+        for (rel, content) in files {
+            let path = root.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, content).unwrap();
+        }
+    }
+
+    /// `from pkg import mod` imports the submodule `pkg/mod.py` when there
+    /// is one, and a name from `pkg/__init__.py` otherwise.
+    #[test]
+    fn python_from_import_resolves_submodules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        write_tree(
+            &root,
+            &[
+                ("pyproject.toml", ""),
+                ("pkg/__init__.py", ""),
+                ("pkg/other.py", ""),
+                ("pkg/sub/__init__.py", "def helper():\n    pass\n"),
+                ("pkg/sub/mod.py", ""),
+                ("pkg/a.py", "from pkg.sub import mod\nfrom . import other\n"),
+                ("pkg/b.py", "from pkg.sub import (\n    mod as m,\n    helper,\n)\n"),
+            ],
+        );
+        assert_eq!(python_related(&root, "pkg/a.py"), ["pkg/sub/mod.py", "pkg/other.py"]);
+        assert_eq!(
+            python_related(&root, "pkg/b.py"),
+            ["pkg/sub/mod.py", "pkg/sub/__init__.py"]
+        );
+    }
+
+    /// Python 3 puts a script's directory on the path, and for a module in
+    /// a package the directory above its top package; a package's own
+    /// directory is never on it. So `import json` in a package module is the
+    /// standard library even beside a `json.py`, while a script imports its
+    /// neighbour. Without a project root, the search stops there instead of
+    /// climbing to `/`.
+    #[test]
+    fn python_absolute_imports_search_where_python_does() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        write_tree(
+            &root,
+            &[
+                ("proj/pyproject.toml", ""),
+                ("proj/pkg/__init__.py", ""),
+                ("proj/pkg/json.py", ""),
+                ("proj/pkg/util.py", ""),
+                ("proj/pkg/a.py", "import json\nimport pkg.util\n"),
+                ("proj/scripts/helper.py", ""),
+                ("proj/scripts/run.py", "import helper\nimport json\n"),
+                ("loose/util.py", ""),
+                ("loose/inner/pkg2/__init__.py", ""),
+                ("loose/inner/pkg2/a.py", "import util\nimport pkg2\n"),
+            ],
+        );
+        assert_eq!(python_related(&root.join("proj"), "pkg/a.py"), ["pkg/util.py"]);
+        assert_eq!(python_related(&root.join("proj"), "scripts/run.py"), ["scripts/helper.py"]);
+        assert_eq!(
+            python_related(&root.join("loose"), "inner/pkg2/a.py"),
+            ["inner/pkg2/__init__.py"]
+        );
     }
 
     fn sources(content: &str, lang: Lang) -> Vec<String> {

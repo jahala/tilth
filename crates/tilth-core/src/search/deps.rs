@@ -166,8 +166,11 @@ pub fn analyze_deps(
     let imports = extract_imports(&content, lang);
     let mut external_set: HashSet<String> = HashSet::new();
     for import in &imports {
-        if let Some(import_path) = resolve_import(path, lang, import) {
-            local_by_file.entry(import_path).or_default();
+        let local = resolve_import(path, lang, import);
+        if !local.is_empty() {
+            for import_path in local {
+                local_by_file.entry(import_path).or_default();
+            }
         } else if is_external(&import.source, lang)
             && !is_stdlib(&import.source, lang)
             && is_valid_module_path(&import.source)
@@ -463,16 +466,14 @@ fn imports_one_of(
     let mut reexports = barrel_file;
     let own_path = file.canonicalize().ok()?;
     for import in extract_imports(&content, lang) {
-        let Some(resolved) = resolve_import(file, lang, &import) else {
+        let target = resolve_import(file, lang, &import)
+            .into_iter()
+            .filter(|r| r.file_name().is_some_and(|n| names.contains(n)))
+            .map(|r| r.canonicalize().unwrap_or(r))
+            .find(|r| targets.contains(r) && *r != own_path);
+        let Some(resolved) = target else {
             continue;
         };
-        if !resolved.file_name().is_some_and(|n| names.contains(n)) {
-            continue;
-        }
-        let resolved = resolved.canonicalize().unwrap_or(resolved);
-        if !targets.contains(&resolved) || resolved == own_path {
-            continue;
-        }
         let statement = content
             .lines()
             .skip(import.start_line as usize - 1)
