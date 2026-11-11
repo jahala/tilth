@@ -530,10 +530,7 @@ pub fn diff(
             }
             Selection::Files(keep) => {
                 if let Some(f) = &spec.function {
-                    return Err(format!(
-                        "'{}' is a directory; `{f}` needs a file scope such as path/to/file.rs:{f}",
-                        spec.raw
-                    ));
+                    return Err(spec.function_needs_a_file(f));
                 }
                 files = files
                     .into_iter()
@@ -614,6 +611,8 @@ struct ScopeSpec {
     exists: bool,
     /// The caller named a directory with a trailing `/`.
     is_dir: bool,
+    /// The path is a directory on disk.
+    is_dir_on_disk: bool,
     function: Option<String>,
 }
 
@@ -660,8 +659,17 @@ impl ScopeSpec {
             suffix,
             exists: absolute.exists(),
             is_dir: path.ends_with('/'),
+            is_dir_on_disk: absolute.is_dir(),
             function,
         }
+    }
+
+    /// The refusal of `dir:function`: a function is looked up in one file.
+    fn function_needs_a_file(&self, function: &str) -> String {
+        format!(
+            "'{}' is a directory; `{function}` needs a file scope such as path/to/file.rs:{function}",
+            self.raw
+        )
     }
 
     fn hit(&self, overlay: &FileOverlay) -> Option<Hit> {
@@ -875,6 +883,16 @@ fn diff_log(
     scope: Option<&ScopeSpec>,
     budget: Option<u64>,
 ) -> Result<String, String> {
+    // A directory known before any commit is read is refused once, here,
+    // whether or not the range touched it.
+    if let Some(spec) = scope {
+        if let Some(f) = &spec.function {
+            if spec.is_dir || spec.is_dir_on_disk {
+                return Err(spec.function_needs_a_file(f));
+            }
+        }
+    }
+
     // Fields end in NUL so a subject may hold any other character; the
     // subject comes last because only it may be empty or hold spaces.
     let mut cmd = git_command(repo);
@@ -929,13 +947,11 @@ fn diff_log(
         if let Some(spec) = scope {
             overlays.retain(|o| spec.hit(o).is_some());
             // `file:function` keeps the commits that changed the function,
-            // and names only it in them.
+            // and names only it in them. A directory that is gone from disk
+            // shows only in the commits that touched it.
             if let Some(f) = &spec.function {
                 if overlays.iter().any(|o| spec.hit(o) == Some(Hit::Under)) {
-                    return Err(format!(
-                        "'{}' is a directory; `{f}` needs a file scope such as path/to/file.rs:{f}",
-                        spec.raw
-                    ));
+                    return Err(spec.function_needs_a_file(f));
                 }
                 for overlay in &mut overlays {
                     overlay
@@ -2381,5 +2397,27 @@ diff --git a/src/main.rs b/src/main.rs
         )
         .unwrap_err();
         assert!(err.contains("needs a file scope"), "{err}");
+    }
+
+    /// `dir:function` is refused in log mode whether or not a commit of the
+    /// range touched the directory. Checked inside the commit loop, it was
+    /// refused only then, and a range that never touched it logged nothing.
+    #[test]
+    fn log_refuses_a_function_in_a_directory_the_range_never_touched() {
+        let dir = repo_with(&[
+            ("src/a.rs", "fn alpha() {\n    1\n}\n"),
+            ("lib/b.rs", "fn beta() {\n    1\n}\n"),
+        ]);
+        write_files(dir.path(), &[("src/a.rs", "fn alpha() {\n    2\n}\n")]);
+        commit_all(dir.path(), "touch alpha");
+        for scope in ["lib:beta", "lib/:beta"] {
+            let err = diff_at(
+                dir.path(),
+                &DiffSource::Log("HEAD~1..HEAD".into()),
+                Some(scope),
+            )
+            .unwrap_err();
+            assert!(err.contains("needs a file scope"), "{scope}: {err}");
+        }
     }
 }
