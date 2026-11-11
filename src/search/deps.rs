@@ -24,6 +24,10 @@ const MAX_DEPENDENTS: usize = 15;
 ///
 /// Whenever dependents are left out, a line says how many.
 pub fn format_deps(result: &DepsResult, scope: &Path, budget: Option<usize>, full: bool) -> String {
+    // The result's paths are canonical; shown relative to the same scope.
+    let scope = &scope
+        .canonicalize()
+        .unwrap_or_else(|_| scope.to_path_buf());
     let dep_count = result.used_by.len();
     let listed = if full {
         dep_count
