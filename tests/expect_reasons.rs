@@ -3,7 +3,10 @@
 //! An exception is an `#[expect(lint, reason = "...")]`. A temporary one names
 //! the issue that removes it, as in `reason = "split by responsibility in
 //! #315"`. A permanent one starts its reason with `by design: `. This test
-//! parses every Rust file of both crates and fails on any other reason.
+//! parses every Rust file of both crates and fails on any other reason. It
+//! reads `#[expect]` and `#[cfg_attr(..., expect(...))]` alike. `syn` sees a
+//! macro's body only as tokens, so an attribute written inside a
+//! `macro_rules!` body, or in any other macro's input, is not checked.
 
 use std::path::{Path, PathBuf};
 
@@ -24,30 +27,60 @@ struct Expects {
     reasons: Vec<Option<String>>,
 }
 
+impl Expects {
+    /// Record the reason of `meta` if it is an `expect`, and of every
+    /// `expect` that a `cfg_attr` around it would apply.
+    fn collect(&mut self, meta: &syn::Meta) {
+        if meta.path().is_ident("expect") {
+            let reason = meta.require_list().ok().and_then(|list| {
+                let mut reason = None;
+                let parsed = list.parse_nested_meta(|meta| {
+                    if meta.path.is_ident("reason") {
+                        reason = Some(meta.value()?.parse::<syn::LitStr>()?.value());
+                    }
+                    Ok(())
+                });
+                parsed.ok().and(reason)
+            });
+            self.reasons.push(reason);
+        } else if meta.path().is_ident("cfg_attr") {
+            // `cfg_attr(condition, attr, ...)`: everything after the
+            // condition is an attribute, and may itself be a `cfg_attr`.
+            let parsed = meta.require_list().and_then(|list| {
+                list.parse_args_with(
+                    syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+                )
+            });
+            match parsed {
+                Ok(metas) => metas.iter().skip(1).for_each(|meta| self.collect(meta)),
+                // Unreadable, so it may hide an `expect` without a reason.
+                Err(_) => self.reasons.push(None),
+            }
+        }
+    }
+}
+
 impl Visit<'_> for Expects {
     fn visit_attribute(&mut self, attr: &syn::Attribute) {
-        if attr.path().is_ident("expect") {
-            let mut reason = None;
-            let parsed = attr.parse_nested_meta(|meta| {
-                if meta.path.is_ident("reason") {
-                    reason = Some(meta.value()?.parse::<syn::LitStr>()?.value());
-                }
-                Ok(())
-            });
-            self.reasons.push(parsed.ok().and(reason));
-        }
+        self.collect(&attr.meta);
         syn::visit::visit_attribute(self, attr);
     }
 }
 
-/// A reason is valid when it names an issue (`#` and a digit) or says the
-/// exception is permanent.
+/// A reason is valid when it says the exception is permanent or names an
+/// issue: a `#` and digits that stand as a word of their own, so `#315` and
+/// `(#315)` count and `C#1` does not.
 fn is_valid(reason: &str) -> bool {
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
     reason.starts_with(PERMANENT)
-        || reason
-            .as_bytes()
-            .windows(2)
-            .any(|pair| pair[0] == b'#' && pair[1].is_ascii_digit())
+        || reason.match_indices('#').any(|(at, _)| {
+            let before = reason[..at].chars().next_back();
+            let after = &reason[at + 1..];
+            let digits = after.len() - after.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+            digits > 0
+                && !before.is_some_and(is_word)
+                && !after[digits..].chars().next().is_some_and(is_word)
+        })
 }
 
 /// Every `.rs` file under `dir`, in a stable order.
@@ -107,4 +140,14 @@ fn every_expect_reason_names_an_issue_or_is_by_design() {
          one starts with {PERMANENT:?}. These do neither:\n{}",
         wrong.join("\n")
     );
+}
+
+#[test]
+fn an_issue_reference_is_a_hash_and_digits_standing_alone() {
+    for reason in ["split in #315", "(#315)", "see #12.", "#7", "by design: x"] {
+        assert!(is_valid(reason), "{reason:?} must count");
+    }
+    for reason in ["see C#1", "#1a", "item_#2", "a # 3", "#", "no issue"] {
+        assert!(!is_valid(reason), "{reason:?} must not count");
+    }
 }
