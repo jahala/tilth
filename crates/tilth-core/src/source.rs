@@ -324,9 +324,9 @@ pub fn file_mentions(path: &Path, words: &[&str]) -> bool {
     })
 }
 
-/// Does the file at `path` hold a hit of `find`? It is opened through
-/// [`OpenFile`] and streamed through [`holds`]. A file that cannot be read
-/// holds nothing.
+/// Does the file at `path` hold a hit of `find`? The file is opened
+/// through [`OpenFile`] and streamed in bounded windows; see `holds` for
+/// what `find` and `overlap` mean. A file that cannot be read holds nothing.
 pub fn file_holds(
     path: &Path,
     overlap: usize,
@@ -344,8 +344,8 @@ pub fn file_holds(
 /// character, enough for a word boundary, `^` or `$`.
 const EDGE: usize = 4;
 
-/// Does `reader` hold a hit of `find`? Binary input, with a NUL byte in
-/// its first [`BINARY_WINDOW`] bytes as every read rules, holds nothing.
+/// Does `reader` hold a hit of `find`? Binary input holds nothing: a NUL
+/// byte in its first [`BINARY_WINDOW`] bytes, the rule every read uses.
 ///
 /// The input streams through a window of one chunk plus the last
 /// `overlap + 2 * EDGE` bytes of the window before, so the check holds that
@@ -363,7 +363,7 @@ const EDGE: usize = 4;
 /// # Errors
 ///
 /// Returns the reader's I/O error.
-pub fn holds(
+fn holds(
     reader: impl Read,
     overlap: usize,
     mut find: impl FnMut(&[u8], usize) -> Option<Range<usize>>,
