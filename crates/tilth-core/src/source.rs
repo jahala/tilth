@@ -298,16 +298,6 @@ impl StreamFinder {
     }
 }
 
-/// Whether `reader` holds `needle`: a one-off [`StreamFinder`]. A caller
-/// that checks many inputs keeps a `StreamFinder` instead.
-///
-/// # Errors
-///
-/// Returns the reader's I/O error.
-pub fn stream_contains(reader: impl Read, needle: &[u8]) -> io::Result<bool> {
-    StreamFinder::new(needle).contains(reader)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,25 +370,26 @@ mod tests {
     }
 
     #[test]
-    fn stream_contains_finds_a_needle_split_across_reads() {
+    fn a_finder_finds_a_needle_split_across_reads() {
         use crate::test_readers::OneByte;
-        assert!(stream_contains(OneByte(b"xx needle yy"), b"needle").unwrap());
-        assert!(!stream_contains(OneByte(b"xx needl e yy"), b"needle").unwrap());
+        let mut finder = StreamFinder::new(b"needle");
+        assert!(finder.contains(OneByte(b"xx needle yy")).unwrap());
+        assert!(!finder.contains(OneByte(b"xx needl e yy")).unwrap());
 
         let mut big = vec![b'a'; STREAM_CHUNK * 3];
         let at = STREAM_CHUNK * 2 - 3;
         big[at..at + 6].copy_from_slice(b"needle");
-        assert!(stream_contains(&big[..], b"needle").unwrap());
-        assert!(!stream_contains(&big[..at], b"needle").unwrap());
-        assert!(stream_contains(&b""[..], b"").unwrap());
+        assert!(finder.contains(&big[..]).unwrap());
+        assert!(!finder.contains(&big[..at]).unwrap());
+        assert!(StreamFinder::new(b"").contains(&b""[..]).unwrap());
     }
 
     #[test]
-    fn stream_contains_stops_at_the_first_match() {
+    fn a_finder_stops_at_the_first_match() {
         // Reading past the match would hit the error, so a true answer
         // proves the scan stopped there.
         let reader = crate::test_readers::ThenFail::new(b"needle");
-        assert!(stream_contains(reader, b"needle").unwrap());
+        assert!(StreamFinder::new(b"needle").contains(reader).unwrap());
     }
 
     #[test]
