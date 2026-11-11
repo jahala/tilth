@@ -30,11 +30,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # ratchet:actions/checkout@v6
 
+      # Fuzzing needs nightly's sanitizer flags, so this job runs on nightly
+      # alone. `+nightly` takes precedence over rust-toolchain.toml.
       - name: Install nightly Rust
         run: rustup toolchain install nightly --profile minimal --component rust-src
 
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        run: cargo +nightly install cargo-fuzz --locked
 
       - name: Cache fuzz corpus
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # ratchet:actions/cache@v5

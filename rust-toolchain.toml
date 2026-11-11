@@ -1,0 +1,7 @@
+# The toolchain every build, lint and test runs on, locally and in CI.
+# Clippy's lints change between releases, so bumping this is a deliberate
+# PR that re-runs `cargo clippy --workspace --all-targets -- -D warnings`.
+[toolchain]
+channel = "1.99.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"
