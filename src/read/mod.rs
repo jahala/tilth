@@ -787,37 +787,33 @@ mod tests {
         assert_eq!(resolve_heading(input, "hello"), None);
     }
 
+    /// Over the default cap, `full=true` gives the outline and a warning.
+    /// The test used to lower the cap through `TILTH_FULL_SIZE_CAP`, which
+    /// is process-wide, so grok tests running alongside it saw a 100-byte
+    /// cap and failed. It writes a file over the default cap instead, as
+    /// plain text, whose head-and-tail view is quick to build.
     #[test]
     fn full_true_size_cap_returns_outline() {
-        use std::io::Write;
-
-        // Create a temp file larger than our small cap (100 bytes)
-        let path = std::env::temp_dir().join("tilth_test_large.rs");
-        let mut f = std::fs::File::create(&path).unwrap();
-        // Write enough to exceed the cap — 200 bytes of Rust code
-        for i in 0..20 {
-            writeln!(f, "pub fn func_{i}() {{ println!(\"hello\"); }}").unwrap();
-        }
-        drop(f);
-
-        // Set a tiny cap so the guard triggers
-        std::env::set_var("TILTH_FULL_SIZE_CAP", "100");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.txt");
+        let cap = usize::try_from(full_read_size_cap()).unwrap();
+        let filler = "// filler line that pushes the file over the full-read cap\n";
+        let mut src = String::from("pub fn func_0() { println!(\"hello\"); }\n");
+        src.push_str(&filler.repeat(cap / filler.len() + 1));
+        std::fs::write(&path, src).unwrap();
 
         let cache = OutlineCache::new();
         let result = read_file(&path, None, true, &cache, false, None).unwrap();
 
-        // Should contain the warning, not the full file content
         assert!(
             result.contains("full=true skipped"),
-            "expected size cap warning, got: {result}"
+            "expected size cap warning, got: {}",
+            &result[..result.len().min(400)]
         );
         assert!(
             result.contains("func_0"),
             "expected outline content in output"
         );
-
-        std::env::remove_var("TILTH_FULL_SIZE_CAP");
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
