@@ -86,7 +86,10 @@ pub(crate) fn blast_radius(
     // The walk counts every call site toward its bound, so the bound is
     // raised by the file's own calls: it then stops after `BLAST_STOP_AFTER`
     // sites of other files, wherever in the walk the edited file comes.
+    // The scope is canonical too, so the walk names the edited file as
+    // `canonical` even through a symlinked scope (`/tmp` on macOS).
     let canonical = path.canonicalize().ok()?;
+    let scope = &scope.canonicalize().ok()?;
     let own_calls: usize =
         find_callers_batch(&symbol_names, &canonical, bloom, None, None, |s| s.len())
             .ok()?
@@ -121,15 +124,17 @@ pub(crate) fn blast_radius(
     )
     .ok()?;
     let files = walk.per_file;
+    // The edited file was left out on purpose, not for its size.
+    let mut skipped_large = walk.skipped_large;
+    skipped_large.retain(|p| *p != canonical);
 
-    if files.iter().all(|f| f.by_symbol.is_empty() && f.tests == 0) && walk.skipped_large.is_empty()
-    {
+    if files.iter().all(|f| f.by_symbol.is_empty() && f.tests == 0) && skipped_large.is_empty() {
         return None;
     }
 
     // A file skipped for size may hold callers the counts miss.
     let mut out = format_blast_radius(&touched, &files, walk.reached_bound, scope);
-    let note = crate::search::skipped_files_note(&walk.skipped_large, scope);
+    let note = crate::search::skipped_files_note(&skipped_large, scope);
     if !note.is_empty() {
         out.push_str(note.trim_start_matches('\n'));
         out.push('\n');
@@ -474,6 +479,57 @@ mod tests {
         let out = blast_radius(&lib, &[make_edit(1, 1)], &scope, &bloom).expect("blast radius");
         assert!(out.contains("target: 1 caller\n"), "{out}");
         assert!(out.contains("not searched: big.rs"), "{out}");
+    }
+
+    /// The walk's paths are compared with the edited file's canonical path.
+    /// Under a scope reached through a symlink (`/var` on macOS), a walked
+    /// path is not canonical, so the file's own recursive call could count
+    /// as an outside caller.
+    #[cfg(unix)]
+    #[test]
+    fn a_scope_through_a_symlink_keeps_own_calls_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let scope = dir.path().join("link");
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &scope).unwrap();
+        std::fs::write(
+            real.join("lib.rs"),
+            "pub fn target(n: u32) -> u32 {\n    if n == 0 { 0 } else { target(n - 1) }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(real.join("c.rs"), "fn caller() {\n    target(1);\n}\n").unwrap();
+        let bloom = tilth_core::index::bloom::BloomFilterCache::new();
+        let lib = scope.join("lib.rs");
+        let out = blast_radius(&lib, &[make_edit(1, 1)], &scope, &bloom).expect("blast radius");
+        assert!(out.contains("target: 1 caller\n"), "{out}");
+        assert!(out.contains("  c.rs:2  caller"), "{out}");
+    }
+
+    /// The edited file's own calls are no part of its blast radius, so a
+    /// big edited file is not one the walk left out: naming it said its
+    /// own calls might be missing.
+    #[test]
+    fn a_big_edited_file_is_not_named_as_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let limit = usize::try_from(tilth_core::source::MAX_FILE_SIZE).unwrap();
+        let pad = "// padding line to push the file over the size limit\n".repeat(limit / 50 + 1);
+        let lib = dir.path().join("lib.rs");
+        std::fs::write(
+            &lib,
+            format!("pub fn target(x: u32) -> u32 {{\n    x\n}}\n{pad}"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("c.rs"),
+            "fn caller() {\n    target(1);\n}\n",
+        )
+        .unwrap();
+        let bloom = tilth_core::index::bloom::BloomFilterCache::new();
+        let scope = dir.path().canonicalize().unwrap();
+        let out = blast_radius(&lib, &[make_edit(1, 1)], &scope, &bloom).expect("blast radius");
+        assert!(out.contains("target: 1 caller\n"), "{out}");
+        assert!(!out.contains("not searched"), "{out}");
     }
 
     /// Calls inside the edited file are no part of its blast radius, so
