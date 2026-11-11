@@ -901,6 +901,9 @@ single tool each.
     `format::format_function_detail` (`file:fn`, where `fn` may be
     qualified as `Type::fn`). Marker line prefixes are
     `[+]`/`[-]`/`[~]`/`[~:sig]`; output is budgeted via `budget::apply`.
+    `--expand N` adds, below the overview's warnings, the file-detail
+    section of the first N changed symbols that hold patch lines of their
+    own, so a budget cut takes those sections before any file.
 12. **Conflict detection** — only on `DiffSource::GitUncommitted`,
     `overlay::detect_conflicts` scans each affected file for git
     merge-conflict markers and `format::format_conflicts` appends the

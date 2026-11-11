@@ -252,7 +252,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     "expand": {
                         "type": "number",
                         "default": 0,
-                        "description": "Number of changed symbols to expand with full source context."
+                        "description": "Show the changed lines, with context, of the first N changed symbols below the overview. A file scope already shows every symbol's lines."
                     },
                     "budget": {
                         "type": "number",

@@ -159,7 +159,7 @@ enum Command {
         #[arg(long)]
         blast: bool,
 
-        /// Expand top N changed symbols with full source context.
+        /// Show the changed lines of the first N changed symbols below the overview.
         #[arg(long, default_value_t = 0)]
         expand: usize,
 

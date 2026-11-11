@@ -489,13 +489,17 @@ fn build_overlays(raw: &str, sides: &Sides, repo: Option<&Path>) -> Vec<FileOver
 /// checkout, and a relative `scope` resolves against it. `None` uses the
 /// process cwd (CLI, or an MCP call with no `root` arg). A `scope` outside
 /// that repository diffs the repository it lies in.
+///
+/// `expand` adds the patch lines of the first `expand` changed symbols below
+/// an overview. A file scope already shows every symbol's lines, and a log
+/// lists symbols only, so neither takes it.
 pub fn diff(
     source: &DiffSource,
     repo: Option<&Path>,
     scope: Option<&str>,
     search: Option<&str>,
     blast: bool,
-    _expand: usize,
+    expand: usize,
     budget: Option<u64>,
 ) -> Result<String, String> {
     let base = match repo {
@@ -587,7 +591,7 @@ pub fn diff(
             |f| format::format_function_detail(&overlays[0], f),
         )
     } else {
-        format::format_overview(&overlays, &warnings, &label, budget)
+        format::format_overview(&overlays, &warnings, &label, expand, budget)
     };
 
     // Conflict detection for uncommitted diffs.
@@ -2658,5 +2662,87 @@ diff --git a/src/main.rs b/src/main.rs
             .unwrap_err();
             assert!(err.contains("needs a file scope"), "{scope}: {err}");
         }
+    }
+
+    /// The overview's lines after its `# Diff:` header, whose token count
+    /// grows with the output.
+    fn after_header(out: &str) -> &str {
+        out.split_once('\n').map_or("", |(_, rest)| rest)
+    }
+
+    /// `expand: N` keeps the overview as it is and adds, below it, the
+    /// sections of the first N changed symbols, as a file scope prints them.
+    #[test]
+    fn expand_adds_the_first_changed_symbols_below_the_overview() {
+        let three = |n: u8| {
+            format!("fn alpha() {{\n    {n}\n}}\n\nfn beta() {{\n    {n}\n}}\n\nfn gamma() {{\n    {n}\n}}\n")
+        };
+        let dir = repo_with(&[("src/lib.rs", &three(1))]);
+        write_files(dir.path(), &[("src/lib.rs", &three(2))]);
+        let run = |expand| {
+            diff(
+                &DiffSource::GitUncommitted,
+                Some(dir.path()),
+                None,
+                None,
+                false,
+                expand,
+                None,
+            )
+            .unwrap()
+        };
+        let (plain, expanded) = (run(0), run(2));
+        let sections = "
+## [~] src/lib.rs:alpha — body changed (L1-3)
+      1| fn alpha() {
+  -   2|     1
+  +   2|     2
+      3| }
+
+## [~] src/lib.rs:beta — body changed (L5-7)
+      5| fn beta() {
+  -   6|     1
+  +   6|     2
+      7| }
+";
+        assert_eq!(
+            after_header(&expanded),
+            format!("{}{sections}", after_header(&plain)),
+            "{expanded}"
+        );
+    }
+
+    /// A changed type whose every changed line sits in a changed member has
+    /// no lines of its own to show, so it takes no place in the count.
+    #[test]
+    fn expand_skips_a_changed_symbol_with_no_lines_of_its_own() {
+        let two = |n: u8| {
+            format!("struct S;\n\nimpl S {{\n    fn a() {{\n        {n}\n    }}\n\n    fn b() {{\n        {n}\n    }}\n}}\n")
+        };
+        let dir = repo_with(&[("src/lib.rs", &two(1))]);
+        write_files(dir.path(), &[("src/lib.rs", &two(2))]);
+        let out = diff(
+            &DiffSource::GitUncommitted,
+            Some(dir.path()),
+            None,
+            None,
+            false,
+            2,
+            None,
+        )
+        .unwrap();
+        assert!(
+            out.contains("[~]      impl S"),
+            "the impl must be a change: {out}"
+        );
+        assert!(
+            out.contains("## [~] src/lib.rs:S::a — body changed"),
+            "{out}"
+        );
+        assert!(
+            out.contains("## [~] src/lib.rs:S::b — body changed"),
+            "{out}"
+        );
+        assert!(!out.contains("src/lib.rs:impl S"), "{out}");
     }
 }
