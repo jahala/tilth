@@ -327,17 +327,14 @@ fn matches_in_file(path: &Path, wanted: Wanted, matchers: Matchers) -> Scan {
 
     let (file_lines, mtime) = file_metadata(path);
 
-    #[expect(
-        clippy::option_if_let_else,
-        reason = "a file that is not UTF-8 yields no definitions; one decoding rule in #308"
-    )]
+    // A file that is not UTF-8 yields no definitions; one decoding rule in #308.
     let FileDefs {
         mut matches,
         others,
-    } = match std::str::from_utf8(bytes) {
-        Ok(content) => definitions_in(path, wanted, content, file_lines, mtime),
-        Err(_) => FileDefs::default(),
-    };
+    } = std::str::from_utf8(bytes).map_or_else(
+        |_| FileDefs::default(),
+        |content| definitions_in(path, wanted, content, file_lines, mtime),
+    );
     let def_count = matches.len();
 
     let mut searcher = Searcher::new();

@@ -41,10 +41,6 @@ struct TargetSites {
 /// the order files arrive in. Only `keep` sites per target are held at once,
 /// which keeps memory flat on a large tree: each site holds its file's text.
 /// Also returns the code files skipped for size that hold a target.
-#[expect(
-    clippy::significant_drop_tightening,
-    reason = "the merge loop uses the lock for its whole body, which ends the closure"
-)]
 fn collect_sites(
     targets: &HashSet<String>,
     scope: &Path,
@@ -77,6 +73,7 @@ fn collect_sites(
             rank_callers(&mut entry.kept, scope, context);
             entry.kept.truncate(keep);
         }
+        drop(merged);
     })?;
     let merged = merged
         .into_inner()
