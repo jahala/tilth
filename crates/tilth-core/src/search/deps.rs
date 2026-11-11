@@ -33,7 +33,7 @@ pub struct DepsResult {
     /// first, then non-tests before tests, then by path.
     pub used_by: Vec<Dependent>,
     /// Code files skipped for size although they name one of the target's
-    /// symbols, so they may be dependents nobody checked.
+    /// symbols or its module, so they may be dependents nobody checked.
     pub skipped_large: Vec<PathBuf>,
     pub exported_count: usize,
     /// The names left out of the call-site search, because the file has
@@ -141,7 +141,14 @@ pub fn analyze_deps(
     // The files that import this one. What their import statements name
     // is what other files use, so past the cap those names are searched
     // first.
-    let direct = importers_of(std::slice::from_ref(path), scope, &|_| true, false)?;
+    let mut skipped_importers = Vec::new();
+    let direct = importers_of(
+        std::slice::from_ref(path),
+        scope,
+        &|_| true,
+        false,
+        &mut skipped_importers,
+    )?;
     let (searched, unsearched) = choose_names(all_names, &direct);
 
     // ── Phase 2: Forward dependencies ────────────────────────────────────────
@@ -240,7 +247,13 @@ pub fn analyze_deps(
     // does not depend on the target.
     let mut every_name = searched;
     every_name.extend(unsearched.iter().cloned());
-    for importer in with_reexport_importers(path, direct, scope, &every_name)? {
+    let importers = with_reexport_importers(path, direct, scope, &every_name, &mut skipped_importers)?;
+    // A big file that names the target's module was not read for imports.
+    let mut skipped_large = skipped_large;
+    skipped_large.extend(skipped_importers);
+    skipped_large.sort();
+    skipped_large.dedup();
+    for importer in importers {
         let dependent = found_by_path
             .entry(importer.path.clone())
             .or_insert_with(|| Dependent {
@@ -334,6 +347,7 @@ fn with_reexport_importers(
     direct: Vec<Importer>,
     scope: &Path,
     names: &[String],
+    skipped_large: &mut Vec<PathBuf>,
 ) -> Result<Vec<Importer>, TilthError> {
     let mut seen: HashSet<PathBuf> = HashSet::from([target.to_path_buf()]);
     let mut out = Vec::new();
@@ -353,7 +367,7 @@ fn with_reexport_importers(
     }
     let names_one = |text: &str| names.iter().any(|n| mentions(text.as_bytes(), n));
     while !barrels.is_empty() {
-        let found = importers_of(&barrels, scope, &names_one, true)?;
+        let found = importers_of(&barrels, scope, &names_one, true, skipped_large)?;
         barrels = Vec::new();
         for importer in found {
             let canonical = importer
@@ -377,19 +391,23 @@ fn with_reexport_importers(
 /// path. A file is parsed only when its text names a target's module and
 /// passes `keep`, so the walk parses few files. With `through`, the
 /// targets are re-exporting files, and each importer records the one it
-/// imports as its `via`.
+/// imports as its `via`. Files over the size cap whose text names a
+/// target's module as a word are added to `skipped_large`.
 fn importers_of(
     targets: &[PathBuf],
     scope: &Path,
     keep: &(dyn Fn(&str) -> bool + Sync),
     through: bool,
+    skipped_large: &mut Vec<PathBuf>,
 ) -> Result<Vec<Importer>, TilthError> {
     let stems: Vec<String> = targets.iter().flat_map(|t| module_stems(t)).collect();
     let names: HashSet<&std::ffi::OsStr> = targets.iter().filter_map(|t| t.file_name()).collect();
     let found: Mutex<Vec<Importer>> = Mutex::new(Vec::new());
+    let too_large: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
     let walker = super::walk::walker(scope, None)?;
     walker.run(|| {
         let found = &found;
+        let too_large = &too_large;
         let stems = &stems;
         let names = &names;
         Box::new(move |entry| {
@@ -400,11 +418,16 @@ fn importers_of(
                 return ignore::WalkState::Continue;
             }
             let file = entry.path();
-            if let Some(importer) = imports_one_of(file, targets, stems, names, keep, through) {
-                found
+            match imports_one_of(file, targets, stems, names, keep, through) {
+                ImportScan::Importer(importer) => found
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .push(importer);
+                    .push(importer),
+                ImportScan::TooLarge => too_large
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(file.to_path_buf()),
+                ImportScan::No => {}
             }
             ignore::WalkState::Continue
         })
@@ -413,7 +436,20 @@ fn importers_of(
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     found.sort_by(|a, b| a.path.cmp(&b.path));
+    skipped_large.extend(
+        too_large
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
     Ok(found)
+}
+
+/// What one file of an importer walk is.
+enum ImportScan {
+    Importer(Importer),
+    /// Over the size cap, with a target's module named in its text.
+    TooLarge,
+    No,
 }
 
 /// `file` as an `Importer` of one of `targets`, if its imports name one.
@@ -424,11 +460,8 @@ fn imports_one_of(
     names: &HashSet<&std::ffi::OsStr>,
     keep: &(dyn Fn(&str) -> bool + Sync),
     through: bool,
-) -> Option<Importer> {
-    if std::fs::metadata(file).ok()?.len() > crate::source::MAX_FILE_SIZE {
-        return None;
-    }
-    if !matches!(
+) -> ImportScan {
+    let importable = matches!(
         crate::lang::detect_file_type(file),
         FileType::Code(
             Lang::Rust
@@ -440,9 +473,37 @@ fn imports_one_of(
                 | Lang::Cpp
                 | Lang::Bash
         )
-    ) {
-        return None;
+    );
+    if !importable {
+        return ImportScan::No;
     }
+    let Ok(meta) = std::fs::metadata(file) else {
+        return ImportScan::No;
+    };
+    if meta.len() > crate::source::MAX_FILE_SIZE {
+        let names_a_module = std::fs::read(file)
+            .is_ok_and(|bytes| stems.iter().any(|stem| mentions(&bytes, stem)));
+        return if names_a_module {
+            ImportScan::TooLarge
+        } else {
+            ImportScan::No
+        };
+    }
+    match importer_from(file, targets, stems, names, keep, through) {
+        Some(importer) => ImportScan::Importer(importer),
+        None => ImportScan::No,
+    }
+}
+
+/// `file`, under the size cap, as an `Importer` of one of `targets`.
+fn importer_from(
+    file: &Path,
+    targets: &[PathBuf],
+    stems: &[String],
+    names: &HashSet<&std::ffi::OsStr>,
+    keep: &(dyn Fn(&str) -> bool + Sync),
+    through: bool,
+) -> Option<Importer> {
     let content = crate::source::read_source(file).ok()?;
     if !stems
         .iter()
@@ -976,6 +1037,23 @@ mod tests {
                 ("src/index.ts".to_string(), vec![], Some("src/core/index.ts".to_string())),
             ]
         );
+    }
+
+    /// A file over the size cap is not read for its imports. When it names
+    /// the target's module, the result lists it as skipped, as the call
+    /// search does for a file that names one of the target's names.
+    #[test]
+    fn a_big_importer_is_listed_as_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        write(&root, "service.py", "def serve():\n    return 1\n");
+        let limit = usize::try_from(crate::source::MAX_FILE_SIZE).unwrap();
+        let pad = "# padding line to push the file over the size limit\n".repeat(limit / 50 + 1);
+        write(&root, "big.py", &format!("import service\n{pad}"));
+        write(&root, "other_big.py", &pad);
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let result = analyze_deps(&root.join("service.py"), &root, &bloom).unwrap();
+        assert_eq!(result.skipped_large, [root.join("big.py")]);
     }
 
     /// Past the cap, the names other files import are searched first, and
