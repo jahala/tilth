@@ -84,7 +84,7 @@ pub(in crate::mcp) fn tool_read(
             } else if force_stripped {
                 read_stripped_file(&path, cache).map(|(body, _, _)| body)
             } else {
-                crate::read::read_file(&path, None, force_full, cache, edit_mode)
+                crate::read::read_file(&path, None, force_full, cache, edit_mode, budget)
             };
             match read {
                 Ok(output) => results.push(output),
@@ -155,7 +155,7 @@ pub(in crate::mcp) fn tool_read(
             .map(|(body, _, _)| body)
             .map_err(|e| e.to_string())?
     } else {
-        crate::read::read_file(&path, section, force_full, cache, edit_mode)
+        crate::read::read_file(&path, section, force_full, cache, edit_mode, budget)
             .map_err(|e| e.to_string())?
     };
 
@@ -206,7 +206,7 @@ fn read_signature_file(path: &Path, cache: &OutlineCache) -> Result<(String, u32
 
     let FileType::Code(lang) = tilth_core::lang::detect_file_type_with_content(path, &content)
     else {
-        let body = crate::read::read_file(path, None, false, cache, false)?;
+        let body = crate::read::read_file(path, None, false, cache, false, None)?;
         return Ok((body, line_count));
     };
 
@@ -270,7 +270,7 @@ fn read_stripped_file(path: &Path, cache: &OutlineCache) -> Result<(String, u32,
     let total_lines = u32::try_from(content.lines().count()).unwrap_or(u32::MAX);
 
     if !matches!(detect_file_type(path), FileType::Code(_)) {
-        let body = crate::read::read_file(path, None, false, cache, false)?;
+        let body = crate::read::read_file(path, None, false, cache, false, None)?;
         return Ok((body, total_lines, 0));
     }
 

@@ -603,9 +603,13 @@ gateway. The decision tree, in order:
    override.
 9. **Below the token threshold or `--full`** → return full content
    (with `format::hashlines` if `edit_mode`, plain `number_lines`
-   otherwise).
+   otherwise). Without `--full`, a full view over the caller's budget
+   goes on to the outline instead.
 10. **Otherwise** → `outline::generate` per `FileType`, cached in
-    `OutlineCache::get_or_compute`.
+    `OutlineCache::get_or_compute`. An outline over the budget is cut
+    by `outline::fit`: a code outline drops its signatures and docs
+    first (`outline::names_only`), so every symbol stays listed, then
+    whole entries from the end, and a closing line says which.
 
 The `outline/` submodule dispatches on `FileType`:
 

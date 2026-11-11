@@ -424,7 +424,7 @@ fn run_inner(
     // FilePath and Glob are read operations, not search — handle before expanded dispatch
     let output = match query_type {
         QueryType::FilePath(path) => {
-            let mut out = read::read_file(&path, section, full, cache, false)?;
+            let mut out = read::read_file(&path, section, full, cache, false, budget_tokens)?;
             if section.is_none() && !full && read::would_outline(&path) {
                 let related = tilth_core::imports::resolve_related_files(&path, cache);
                 if !related.is_empty() {
