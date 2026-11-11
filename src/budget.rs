@@ -23,7 +23,7 @@ pub fn apply(output: &str, budget: u64) -> String {
 }
 
 /// Number of original bytes preserved by the position-based budget cut.
-pub fn retained_prefix_len(output: &str, budget: u64) -> usize {
+pub(crate) fn retained_prefix_len(output: &str, budget: u64) -> usize {
     if estimate_tokens(output.len() as u64) <= budget {
         return output.len();
     }

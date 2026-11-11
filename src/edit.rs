@@ -387,7 +387,7 @@ fn format_diffs(diffs: &[EditDiff]) -> String {
 /// — surfacing as a flaky `dedup_catches_nonexistent_alias_spellings`
 /// failure under CI's parallel test runner. Pure-lexical normalization
 /// removes the race.
-pub fn normalize_path_key(path: &Path) -> String {
+pub(crate) fn normalize_path_key(path: &Path) -> String {
     let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| lexical_normalize(path));
     let key = resolved.to_string_lossy().into_owned();
     if cfg!(target_os = "macos") {
@@ -454,7 +454,7 @@ fn lexical_normalize(path: &Path) -> PathBuf {
 /// rather than lose an edit, but two entries for one file in a single batch
 /// are a malformed request: the second set of hashes was computed against
 /// content the first set is about to replace, so it can only fail.
-pub fn detect_duplicate_paths(tasks: &[FileEditTask]) -> Option<String> {
+pub(crate) fn detect_duplicate_paths(tasks: &[FileEditTask]) -> Option<String> {
     use std::collections::HashSet;
     let mut seen: HashSet<String> = HashSet::new();
     for task in tasks {

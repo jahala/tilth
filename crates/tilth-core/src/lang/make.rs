@@ -2,7 +2,7 @@
 
 use crate::lang::spec::{LangSpec, StdlibRule, DEFAULT_DEFS, DEFAULT_DEF_KINDS};
 
-pub const SPEC: LangSpec = LangSpec {
+pub(crate) const SPEC: LangSpec = LangSpec {
     display: "Make",
     extensions: &[],
     filenames: &["Makefile", "GNUmakefile"],

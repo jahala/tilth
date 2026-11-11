@@ -116,17 +116,17 @@ pub fn run(edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
                 if let Some(root_path) = extract_root_from_response(&msg) {
                     if roots_handoff_allowed(scope_is_explicit, tool_dispatched) {
                         if let Err(e) = std::env::set_current_dir(&root_path) {
-                            diag::warn(&format!(
+                            diag::emit(format_args!(
                                 "tilth: warning: cannot enter the client's root {}: {e}; \
                                  searches keep resolving against the launch directory.",
                                 root_path.display()
                             ));
                         }
                     } else if !scope_is_explicit {
-                        diag::warn(
+                        diag::emit(format_args!(
                             "tilth: warning: ignoring roots/list response that arrived after \
-                             tools started; searches keep resolving against the launch directory.",
-                        );
+                             tools started; searches keep resolving against the launch directory."
+                        ));
                     }
                 }
                 continue;
@@ -190,17 +190,16 @@ pub fn run(edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
 /// the project root is reported and the server starts where it was launched.
 fn enter_project_root(scope: Option<&Path>) -> io::Result<()> {
     if let Some(s) = scope {
-        if s.is_dir() {
-            std::env::set_current_dir(s).map_err(|e| {
-                io::Error::new(e.kind(), format!("cannot enter scope {}: {e}", s.display()))
-            })?;
-        }
+        // A file or a missing path fails here too, with its own cause.
+        std::env::set_current_dir(s).map_err(|e| {
+            io::Error::new(e.kind(), format!("cannot enter scope {}: {e}", s.display()))
+        })?;
     } else {
         match std::env::current_dir() {
             Ok(cwd) => {
                 if let Some(root) = tilth_core::lang::package_root(&cwd) {
                     if let Err(e) = std::env::set_current_dir(root) {
-                        diag::warn(&format!(
+                        diag::emit(format_args!(
                             "tilth: warning: cannot enter the project root {}: {e}; \
                              searches resolve against the launch directory.",
                             root.display()
@@ -208,7 +207,7 @@ fn enter_project_root(scope: Option<&Path>) -> io::Result<()> {
                     }
                 }
             }
-            Err(e) => diag::warn(&format!(
+            Err(e) => diag::emit(format_args!(
                 "tilth: warning: cannot read the current directory: {e}; \
                  relative paths will not resolve. Pass --scope or use absolute paths."
             )),
@@ -286,7 +285,7 @@ fn handle_request(req: &JsonRpcRequest, services: &Services) -> JsonRpcResponse 
                 match std::env::current_dir() {
                     Ok(cwd) => crate::overview::fingerprint(&cwd),
                     Err(e) => {
-                        diag::warn(&format!(
+                        diag::emit(format_args!(
                             "tilth: warning: no project overview: \
                              cannot read the current directory: {e}"
                         ));
@@ -467,6 +466,21 @@ fn write_error(w: &mut impl Write, id: Option<Value>, code: i32, msg: &str) -> i
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An explicit scope that is a file used to be skipped without a word, so
+    /// the server answered for its launch directory. The failure path never
+    /// changes directory, so this test leaves the process where it was.
+    #[test]
+    fn a_scope_that_is_not_a_directory_is_an_error() {
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("file.txt");
+        std::fs::write(&file, "").unwrap();
+        let err = enter_project_root(Some(&file)).unwrap_err();
+        assert!(
+            err.to_string().contains("cannot enter scope"),
+            "the scope must be named as the cause, got: {err}"
+        );
+    }
 
     // -- extract_root_from_response -------------------------------------------
 

@@ -10,7 +10,7 @@ const CALLEE_QUERY: &str = concat!(
 const SIBLING_QUERY: &str =
     "(navigation_expression target: (self_expression) suffix: (navigation_suffix suffix: (simple_identifier) @ref))\n";
 
-pub const SPEC: LangSpec = LangSpec {
+pub(crate) const SPEC: LangSpec = LangSpec {
     display: "Swift",
     extensions: &["swift"],
     filenames: &[],

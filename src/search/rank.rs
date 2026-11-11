@@ -66,7 +66,7 @@ pub fn sort(
 
 /// Keep the `k` highest-ranked matches and drop the rest: exactly the first
 /// `k` a full `sort` of the same matches would give.
-pub fn retain_top_k(
+pub(crate) fn retain_top_k(
     matches: &mut Vec<Match>,
     query: &str,
     scope: &Path,

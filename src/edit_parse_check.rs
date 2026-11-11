@@ -24,13 +24,13 @@ const MAX_LISTED: usize = 10;
 const DETAIL_MAX_CHARS: usize = 40;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ErrorKind {
+pub(crate) enum ErrorKind {
     Error,
     Missing,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParseError {
+pub(crate) struct ParseError {
     /// 1-indexed line number, suitable for direct display.
     pub(crate) line: usize,
     /// 0-indexed column from `tree_sitter::Point::column`. Internal sort key
@@ -43,7 +43,7 @@ pub struct ParseError {
 }
 
 #[derive(Debug, Clone)]
-pub struct ParseReport {
+pub(crate) struct ParseReport {
     pub(crate) new_errors: Vec<ParseError>,
     /// Total errors in the post-edit parse, used for the truncation summary.
     pub(crate) total_post: usize,
@@ -53,7 +53,7 @@ pub struct ParseReport {
 /// edit. Returns `None` when:
 /// - the path's language has no tree-sitter grammar, or
 /// - no new errors were introduced.
-pub fn check(path: &Path, before: &str, after: &str) -> Option<ParseReport> {
+pub(crate) fn check(path: &Path, before: &str, after: &str) -> Option<ParseReport> {
     let FileType::Code(lang) = detect_file_type_with_content(path, after) else {
         return None;
     };
@@ -79,7 +79,7 @@ pub fn check(path: &Path, before: &str, after: &str) -> Option<ParseReport> {
 }
 
 /// Format a report as a `── parse ──` block, caps at `MAX_LISTED` lines.
-pub fn format_report(report: &ParseReport) -> String {
+pub(crate) fn format_report(report: &ParseReport) -> String {
     use std::fmt::Write as _;
     let mut out = String::from("\u{2500}\u{2500} parse \u{2500}\u{2500}");
     for e in report.new_errors.iter().take(MAX_LISTED) {

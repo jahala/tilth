@@ -3,7 +3,7 @@
 use crate::lang::javascript::{CALLEE_QUERY, SIBLING_QUERY};
 use crate::lang::spec::{LangSpec, StdlibRule, StripFamily, DEFAULT_DEFS, DEFAULT_DEF_KINDS};
 
-pub const SPEC: LangSpec = LangSpec {
+pub(crate) const SPEC: LangSpec = LangSpec {
     display: "TSX",
     extensions: &["tsx"],
     filenames: &[],

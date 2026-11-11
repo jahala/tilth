@@ -35,7 +35,7 @@ const MAX_ABANDONED_THREADS: usize = 8;
 /// Live count of threads that timed out and are still running in the background.
 /// Owned by `Services`, so tests instantiate their own instance rather than
 /// serializing on a global.
-pub struct ThreadTracker {
+pub(crate) struct ThreadTracker {
     count: AtomicUsize,
 }
 
@@ -163,7 +163,7 @@ impl ThreadCoord {
 /// failure) can be added without churning every call site.
 #[derive(Debug, PartialEq)]
 #[non_exhaustive]
-pub enum SpawnFailure {
+pub(crate) enum SpawnFailure {
     Timeout,
     Panic,
 }
@@ -171,7 +171,7 @@ pub enum SpawnFailure {
 /// Per-request timeout for tool calls. If a tool doesn't respond within this
 /// duration, the MCP server returns a timeout error instead of hanging.
 /// Override with `TILTH_TIMEOUT` env var (seconds). Default: 90s.
-pub fn request_timeout() -> Duration {
+pub(crate) fn request_timeout() -> Duration {
     let secs = std::env::var("TILTH_TIMEOUT")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -183,7 +183,7 @@ pub fn request_timeout() -> Duration {
 /// Returns `Ok(result)` on success. On timeout, returns `Err(SpawnFailure::Timeout)`
 /// and detaches the worker; the tracker is incremented and the worker will
 /// decrement it when it eventually exits. On worker panic, returns `Err(Panic)`.
-pub fn spawn_with_timeout<F, R>(
+pub(crate) fn spawn_with_timeout<F, R>(
     tracker: &Arc<ThreadTracker>,
     timeout: Duration,
     work: F,
@@ -236,7 +236,7 @@ where
                 let n = tracker.record_timeout();
                 coord.ack_timeout();
                 if n == ABANDONED_THREAD_WARN {
-                    crate::diag::warn(&format!(
+                    crate::diag::emit(format_args!(
                         "tilth: warning: {n} abandoned threads still running. \
                          Consider reducing scope or increasing TILTH_TIMEOUT."
                     ));

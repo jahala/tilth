@@ -94,12 +94,20 @@ fn parse_pattern(query: &str) -> (&str, bool) {
 /// Does a file over the size limit contain what the search looks for? The
 /// walkers skip such a file without parsing it, and this one plain read is
 /// what lets the result name it instead of leaving it out in silence.
-pub fn oversized_holds(path: &Path, found: impl Fn(&[u8]) -> bool) -> bool {
+pub(crate) fn oversized_holds(path: &Path, found: impl Fn(&[u8]) -> bool) -> bool {
     std::fs::read(path).is_ok_and(|bytes| found(&bytes))
 }
 
+/// The searcher for a file's lines. A NUL byte marks the file as binary and
+/// ends its search, so compiled artefacts and images yield no matches.
+pub(crate) fn text_searcher() -> grep_searcher::Searcher {
+    grep_searcher::SearcherBuilder::new()
+        .binary_detection(grep_searcher::BinaryDetection::quit(b'\0'))
+        .build()
+}
+
 /// Does `matcher` match anywhere in `bytes`? Stops at the first hit.
-pub fn has_match(matcher: &grep_regex::RegexMatcher, bytes: &[u8]) -> bool {
+pub(crate) fn has_match(matcher: &grep_regex::RegexMatcher, bytes: &[u8]) -> bool {
     let mut hit = false;
     // The sink only stops the search early and never errors, and a slice
     // needs no I/O, so the `Result` carries nothing.
@@ -115,7 +123,7 @@ pub fn has_match(matcher: &grep_regex::RegexMatcher, bytes: &[u8]) -> bool {
 }
 
 /// Add `path` to a walker's shared list.
-pub fn record(list: &std::sync::Mutex<Vec<PathBuf>>, path: &Path) {
+pub(crate) fn record(list: &std::sync::Mutex<Vec<PathBuf>>, path: &Path) {
     list.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .push(path.to_path_buf());
@@ -123,7 +131,7 @@ pub fn record(list: &std::sync::Mutex<Vec<PathBuf>>, path: &Path) {
 
 /// A walker's shared list, taken and sorted so the output does not depend on
 /// thread timing.
-pub fn sorted(list: std::sync::Mutex<Vec<PathBuf>>) -> Vec<PathBuf> {
+pub(crate) fn sorted(list: std::sync::Mutex<Vec<PathBuf>>) -> Vec<PathBuf> {
     let mut paths = list
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -158,7 +166,11 @@ fn other_owners_note(result: &SearchResult) -> String {
 /// The definitions in `others`, each written as the qualified name the
 /// query's own separator would give it, with its place: `A::run (m.rs:3)`,
 /// or `run (m.rs:5)` for one at the top level. The first five are listed.
-pub fn owner_candidates(query: &str, others: &[crate::types::OtherOwner], scope: &Path) -> String {
+pub(crate) fn owner_candidates(
+    query: &str,
+    others: &[crate::types::OtherOwner],
+    scope: &Path,
+) -> String {
     const SHOWN: usize = 5;
     let name = tilth_core::search::scope::split_qualified(query).1;
     let sep = if query.ends_with(&format!("::{name}")) {
@@ -185,7 +197,7 @@ pub fn owner_candidates(query: &str, others: &[crate::types::OtherOwner], scope:
 
 /// The note that names files a walk skipped for size although they contain
 /// the query, relative to `scope`. Empty when there are none.
-pub fn skipped_files_note(skipped: &[PathBuf], scope: &Path) -> String {
+pub(crate) fn skipped_files_note(skipped: &[PathBuf], scope: &Path) -> String {
     const SHOWN: usize = 5;
     if skipped.is_empty() {
         return String::new();
@@ -206,7 +218,7 @@ pub fn skipped_files_note(skipped: &[PathBuf], scope: &Path) -> String {
 }
 
 /// Get `file_lines` estimate and mtime from metadata. One `stat()` per file.
-pub fn file_metadata(path: &Path) -> (u32, SystemTime) {
+pub(crate) fn file_metadata(path: &Path) -> (u32, SystemTime) {
     std::fs::metadata(path).map_or((0, SystemTime::UNIX_EPOCH), |meta| {
         let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
         let est_lines = (meta.len() / 40).max(1) as u32;
@@ -1013,7 +1025,7 @@ fn find_basename_candidate(matches: &[Match], query_lower: &str) -> Option<PathB
 }
 
 /// Format a token count into a human-readable string (e.g. "~1.2k" or "~743").
-pub fn format_token_count(tokens: u64) -> String {
+pub(crate) fn format_token_count(tokens: u64) -> String {
     if tokens >= 1000 {
         format!("~{}.{}k", tokens / 1000, (tokens % 1000) / 100)
     } else {

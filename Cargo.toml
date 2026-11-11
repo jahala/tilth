@@ -52,7 +52,6 @@ or_fun_call = "warn"
 significant_drop_tightening = "warn"
 needless_collect = "warn"
 option_if_let_else = "warn"
-redundant_pub_crate = "warn"
 
 # Restrictions. clippy.toml exempts tests from the unwrap, expect, print and
 # dbg lints.

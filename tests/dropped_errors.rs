@@ -48,26 +48,34 @@ fn run_in_removed_dir(args: &[&str], stdin: &str) -> Output {
     out
 }
 
-/// A directory nobody may enter, restored on drop so the temp dir can be
-/// removed even when the test fails.
+/// A directory nobody may enter. Dropping it restores its permissions, so
+/// the temp dir can be removed on every path, a failed test included.
 struct LockedDir {
     path: PathBuf,
 }
 
 impl LockedDir {
+    /// Lock `parent/locked`, or `None` when permissions do not bind this user
+    /// (root reads any directory), so the caller cannot run and returns.
     #[expect(
         clippy::expect_used,
-        reason = "test helper: a panic here is the test failure"
+        clippy::print_stderr,
+        reason = "test helper: a panic is the test failure, and a skip says so"
     )]
-    fn new(parent: &Path) -> Self {
-        let path = parent.join("locked");
-        std::fs::create_dir(&path).expect("create locked dir");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("lock dir");
-        assert!(
-            std::fs::read_dir(&path).is_err(),
-            "these tests need a user that permissions bind (not root)"
-        );
-        Self { path }
+    fn new(parent: &Path) -> Option<Self> {
+        let dir = Self {
+            path: parent.join("locked"),
+        };
+        std::fs::create_dir(&dir.path).expect("create locked dir");
+        // `dir` exists before the chmod, so its drop restores the mode even
+        // if a later step panics.
+        std::fs::set_permissions(&dir.path, std::fs::Permissions::from_mode(0o000))
+            .expect("lock dir");
+        if std::fs::read_dir(&dir.path).is_ok() {
+            eprintln!("skipped: permissions do not bind this user, so no directory can be locked");
+            return None;
+        }
+        Some(dir)
     }
 }
 
@@ -144,7 +152,9 @@ fn mcp_warns_about_an_unreadable_working_directory() {
 #[test]
 fn mcp_refuses_a_scope_it_cannot_enter() {
     let tmp = tempfile::tempdir().expect("create temp dir");
-    let locked = LockedDir::new(tmp.path());
+    let Some(locked) = LockedDir::new(tmp.path()) else {
+        return;
+    };
     let scope = locked.path.to_str().expect("utf-8 temp path");
     let out = mcp(&["--mcp", "--scope", scope], tmp.path(), "");
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -160,7 +170,9 @@ fn mcp_refuses_a_scope_it_cannot_enter() {
 #[test]
 fn mcp_warns_about_a_client_root_it_cannot_enter() {
     let tmp = tempfile::tempdir().expect("create temp dir");
-    let locked = LockedDir::new(tmp.path());
+    let Some(locked) = LockedDir::new(tmp.path()) else {
+        return;
+    };
     let initialize =
         r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{"roots":{}}}}"#;
     let roots = format!(

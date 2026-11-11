@@ -4,7 +4,7 @@ use crate::lang::spec::{LangSpec, StdlibRule, StripFamily, DEFAULT_DEFS, DEFAULT
 
 const CALLEE_QUERY: &str = "(command name: (command_name) @callee)\n";
 
-pub const SPEC: LangSpec = LangSpec {
+pub(crate) const SPEC: LangSpec = LangSpec {
     display: "Bash",
     extensions: &["sh", "bash", "bats"],
     filenames: &[".bashrc", ".bash_profile", ".bash_aliases", ".profile"],

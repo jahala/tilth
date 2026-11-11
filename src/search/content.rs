@@ -8,7 +8,6 @@ use crate::search::rank;
 use crate::types::{FacetTotals, Match, SearchResult};
 use grep_regex::RegexMatcher;
 use grep_searcher::sinks::Lossy;
-use grep_searcher::Searcher;
 use tilth_core::error::TilthError;
 
 const MAX_MATCHES: usize = 10;
@@ -130,13 +129,11 @@ fn search_capped(
             let (file_lines, mtime) = file_metadata(path);
 
             let mut file_matches = Vec::new();
-            let mut searcher = Searcher::new();
-
             // Lossy, not UTF8: the UTF8 sink ends the search at the first
             // matched line that is not valid UTF-8, losing it and every later
             // match in the file. With this sink and an in-memory slice the
             // search cannot fail, so its `Result` carries nothing.
-            let _ = searcher.search_slice(
+            let _ = super::text_searcher().search_slice(
                 matcher,
                 bytes,
                 Lossy(|line_num, line| {
@@ -326,5 +323,20 @@ mod completeness_tests {
         lines.sort_unstable();
         assert_eq!(lines, [1, 2, 3], "every matching line, in any encoding");
         assert_eq!(r.total_found, 3);
+    }
+
+    /// A file with a NUL byte is binary and is not searched, even where its
+    /// bytes spell the query.
+    #[test]
+    fn binary_file_is_not_searched() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("module.wasm"),
+            b"\0asm\x01\0\0\0\x07\x91needle_delta\xff\nneedle_delta\n",
+        )
+        .unwrap();
+        let r = search("needle_delta", d.path(), false, None, None, false).unwrap();
+        assert!(r.matches.is_empty(), "got {:?}", r.matches);
+        assert_eq!(r.total_found, 0);
     }
 }

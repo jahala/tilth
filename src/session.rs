@@ -135,16 +135,16 @@ impl Default for Session {
 
 /// The five highest counts, as `key (count)`, highest first.
 fn top_five(counts: &Mutex<HashMap<String, usize>>) -> Vec<String> {
-    let mut sorted: Vec<(String, usize)> = counts
+    let counts = counts
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .iter()
-        .map(|(key, &count)| (key.clone(), count))
-        .collect();
-    sorted.sort_by_key(|&(_, count)| std::cmp::Reverse(count));
-    sorted
-        .iter()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut sorted: Vec<(&String, &usize)> = counts.iter().collect();
+    sorted.sort_by_key(|&(_, &count)| std::cmp::Reverse(count));
+    let top = sorted
+        .into_iter()
         .take(5)
         .map(|(key, count)| format!("{key} ({count})"))
-        .collect()
+        .collect();
+    drop(counts);
+    top
 }

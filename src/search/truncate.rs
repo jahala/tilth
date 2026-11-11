@@ -26,7 +26,7 @@ const SMART_TRUNCATE_MAX_LINES: usize = 40;
 /// substring) receive a [`QUERY_MATCH_BOOST`] on top of their structural score,
 /// and their immediate neighbours (±1) receive a [`QUERY_PROXIMITY_BOOST`].
 /// When `query` is `None`, behaviour is byte-identical to the previous version.
-pub fn select_diverse_lines(
+pub(crate) fn select_diverse_lines(
     content: &str,
     start: u32,
     end: u32,

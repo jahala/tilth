@@ -36,7 +36,7 @@ const STDLIB_MODULES: &[&str] = &[
     "asyncio",
 ];
 
-pub const SPEC: LangSpec = LangSpec {
+pub(crate) const SPEC: LangSpec = LangSpec {
     display: "Python",
     extensions: &["py", "pyi"],
     filenames: &[],

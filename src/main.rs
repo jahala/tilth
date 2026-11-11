@@ -210,20 +210,20 @@ fn main() {
         match cmd {
             Command::Install { ref host, edit } => {
                 if let Err(e) = tilth::install::run(host, edit) {
-                    diag::error(&format!("install error: {e}"));
+                    diag::emit(format_args!("install error: {e}"));
                     process::exit(1);
                 }
             }
             Command::Overview => {
                 let cwd = std::env::current_dir().unwrap_or_else(|e| {
-                    diag::error(&format!(
+                    diag::emit(format_args!(
                         "overview error: cannot read the current directory: {e}"
                     ));
                     process::exit(1);
                 });
                 let output = tilth::overview::fingerprint(&cwd);
                 if output.is_empty() {
-                    diag::error("No project fingerprint could be generated.");
+                    diag::emit(format_args!("No project fingerprint could be generated."));
                     process::exit(1);
                 }
                 write_stdout(&output);
@@ -238,7 +238,7 @@ fn main() {
                 match tilth::run_grok(&target, &scope, full) {
                     Ok(output) => emit_output(&output, io::stdout().is_terminal()),
                     Err(e) => {
-                        diag::error(&format!("grok error: {e}"));
+                        diag::emit(format_args!("grok error: {e}"));
                         process::exit(e.exit_code());
                     }
                 }
@@ -267,7 +267,7 @@ fn main() {
                 ) {
                     Ok(s) => s,
                     Err(e) => {
-                        diag::error(&format!("diff error: {e}"));
+                        diag::emit(format_args!("diff error: {e}"));
                         process::exit(1);
                     }
                 };
@@ -283,7 +283,7 @@ fn main() {
                 ) {
                     Ok(output) => emit_output(&output, io::stdout().is_terminal()),
                     Err(e) => {
-                        diag::error(&format!("diff error: {e}"));
+                        diag::emit(format_args!("diff error: {e}"));
                         process::exit(1);
                     }
                 }
@@ -306,7 +306,7 @@ fn main() {
             Some(cli_scope(&cli.scope, FileScopeHint::Directory).unwrap_or_else(|e| usage_exit(&e)))
         };
         if let Err(e) = tilth::mcp::run(cli.edit, mcp_scope.as_deref()) {
-            diag::error(&format!("mcp error: {e}"));
+            diag::emit(format_args!("mcp error: {e}"));
             process::exit(1);
         }
         return;
@@ -326,7 +326,9 @@ fn main() {
 
     // CLI mode: single query
     let Some(query) = cli.query else {
-        diag::error("usage: tilth <query> [--scope DIR] [--section N-M] [--budget N]");
+        diag::emit(format_args!(
+            "usage: tilth <query> [--scope DIR] [--section N-M] [--budget N]"
+        ));
         process::exit(3);
     };
 
@@ -452,7 +454,7 @@ fn cli_scope(raw: &Path, hint: FileScopeHint) -> Result<PathBuf, String> {
 
 /// Report a usage error and exit with the invalid-input code.
 fn usage_exit(msg: &str) -> ! {
-    diag::error(msg);
+    diag::emit(format_args!("{msg}"));
     process::exit(3);
 }
 
@@ -477,7 +479,7 @@ fn emit_result(
             }
         }
         Err(e) => {
-            diag::error(&e.to_string());
+            diag::emit(format_args!("{e}"));
             process::exit(e.exit_code());
         }
     }
@@ -522,7 +524,7 @@ fn write_stdout(output: &str) {
         if e.kind() == io::ErrorKind::BrokenPipe {
             process::exit(0);
         }
-        diag::error(&format!("output error: {e}"));
+        diag::emit(format_args!("output error: {e}"));
         process::exit(1);
     }
 }

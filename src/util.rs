@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Whether a guarded write reached the target, or refused because the target
 /// no longer held the content the caller verified.
 #[derive(Debug, PartialEq, Eq)]
-pub enum WriteOutcome {
+pub(crate) enum WriteOutcome {
     Written,
     Stale,
 }
@@ -20,7 +20,7 @@ pub enum WriteOutcome {
 /// one read plus one rename rather than the caller's whole verify-and-compute
 /// pass. That window is not zero: this narrows cross-process lost updates, it
 /// does not eliminate them.
-pub fn atomic_write_bytes_if_unchanged(
+pub(crate) fn atomic_write_bytes_if_unchanged(
     path: &Path,
     bytes: &[u8],
     expected: &[u8],
@@ -36,7 +36,7 @@ pub fn atomic_write_bytes_if_unchanged(
 ///
 /// The temp name is qualified with the process ID and a process-wide counter
 /// so concurrent or batched writes in the same directory can't collide.
-pub fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     write_via_temp(path, bytes, None).map(drop)
 }
 

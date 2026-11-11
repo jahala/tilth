@@ -25,7 +25,7 @@ pub fn binary_header(path: &Path, byte_len: u64, mime: &str) -> String {
 }
 
 /// The `binary, <size>, <mime>` fragment shared by read headers and glob previews.
-pub fn binary_summary(byte_len: u64, mime: &str) -> String {
+pub(crate) fn binary_summary(byte_len: u64, mime: &str) -> String {
     let size_str = format_size(byte_len);
     format!("binary, {size_str}, {mime}")
 }
@@ -84,7 +84,7 @@ pub fn number_lines(content: &str, start: u32) -> String {
 
 /// FNV-1a hash of a line, truncated to 12 bits (3 hex chars).
 /// Used as a per-line content checksum for edit-mode anchors.
-pub fn line_hash(bytes: &[u8]) -> u16 {
+pub(crate) fn line_hash(bytes: &[u8]) -> u16 {
     let mut h: u32 = 0x811c_9dc5;
     for &b in bytes {
         h ^= u32::from(b);
@@ -108,7 +108,7 @@ pub fn hashlines(content: &str, start: u32) -> String {
 
 /// Parse a hashline anchor `"42:a3f"` into `(line_number, hash)`.
 /// Inverse of the format produced by [`hashlines`].
-pub fn parse_anchor(s: &str) -> Option<(usize, u16)> {
+pub(crate) fn parse_anchor(s: &str) -> Option<(usize, u16)> {
     let (line_str, hash_str) = s.split_once(':')?;
     let line: usize = line_str.trim().parse().ok()?;
     if line == 0 {
@@ -119,7 +119,7 @@ pub fn parse_anchor(s: &str) -> Option<(usize, u16)> {
 }
 
 /// Path relative to scope for cleaner output. Falls back to full path.
-pub fn rel(path: &Path, scope: &Path) -> String {
+pub(crate) fn rel(path: &Path, scope: &Path) -> String {
     path.strip_prefix(scope)
         .unwrap_or(path)
         .display()

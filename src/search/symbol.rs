@@ -15,8 +15,7 @@ use tilth_core::lang::treesitter::{
 use crate::search::rank;
 use crate::types::{Match, OtherOwner, SearchResult};
 use grep_regex::RegexMatcher;
-use grep_searcher::sinks::Lossy;
-use grep_searcher::Searcher;
+use grep_searcher::sinks::UTF8;
 use tilth_core::error::TilthError;
 use tilth_core::lang::detect_file_type_with_content;
 use tilth_core::lang::outline::{heading_text, outline_language, parse_markdown};
@@ -327,24 +326,22 @@ fn matches_in_file(path: &Path, wanted: Wanted, matchers: Matchers) -> Scan {
 
     let (file_lines, mtime) = file_metadata(path);
 
+    // One decode for both passes. A byte that is not UTF-8, such as a Latin-1
+    // comment, becomes U+FFFD and costs neither pass its definitions or
+    // usages. Valid UTF-8 is borrowed, not copied.
+    let text = String::from_utf8_lossy(bytes);
     let FileDefs {
         mut matches,
         others,
-    } = std::str::from_utf8(bytes).map_or_else(
-        |_| FileDefs::default(),
-        |content| definitions_in(path, wanted, content, file_lines, mtime),
-    );
+    } = definitions_in(path, wanted, &text, file_lines, mtime);
     let def_count = matches.len();
 
-    let mut searcher = Searcher::new();
-    // Lossy, not UTF8: the UTF8 sink ends the scan at the first matched line
-    // that is not valid UTF-8, losing it and every later usage in the file.
-    // With this sink and an in-memory slice the scan cannot fail, so its
-    // `Result` carries nothing.
-    let _ = searcher.search_slice(
+    // `text` is valid UTF-8 and a slice needs no I/O, so the scan cannot fail
+    // and its `Result` carries nothing.
+    let _ = super::text_searcher().search_slice(
         matchers.usage,
-        bytes,
-        Lossy(|line_num, line| {
+        text.as_bytes(),
+        UTF8(|line_num, line| {
             let line_num = line_num as u32;
             let on_definition = matches[..def_count].iter().any(|d| d.line == line_num);
             if !on_definition {
@@ -2416,5 +2413,44 @@ int area() { return 1; }
         lines.sort_unstable();
         assert_eq!(lines, [1, 2, 3], "every usage, in any encoding");
         assert_eq!(r.total_found, 3);
+    }
+
+    /// A file that is not UTF-8 used to yield no definitions at all, since
+    /// the definition pass needed the whole file to decode.
+    #[test]
+    fn non_utf8_file_keeps_its_definitions() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("latin1.c"),
+            b"/* caf\xe9 */\nint needle_delta(void) { return 0; }\nint y = needle_delta();\n",
+        )
+        .unwrap();
+        let r = search("needle_delta", d.path(), None, None, false).unwrap();
+        let defs: Vec<u32> = r
+            .matches
+            .iter()
+            .filter(|m| m.is_definition)
+            .map(|m| m.line)
+            .collect();
+        assert_eq!(
+            defs,
+            [2],
+            "the function is a definition, got {:?}",
+            r.matches
+        );
+    }
+
+    /// A file with a NUL byte is binary, and its bytes are not usages.
+    #[test]
+    fn binary_file_has_no_usages() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("module.wasm"),
+            b"\0asm\x01\0\0\0\x07\x91needle_delta\xff\nneedle_delta\n",
+        )
+        .unwrap();
+        let r = search("needle_delta", d.path(), None, None, false).unwrap();
+        assert!(r.matches.is_empty(), "got {:?}", r.matches);
+        assert_eq!(r.total_found, 0);
     }
 }

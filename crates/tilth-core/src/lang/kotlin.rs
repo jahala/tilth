@@ -7,7 +7,7 @@ const CALLEE_QUERY: &str = concat!(
     "(call_expression (navigation_expression (identifier) @callee .))\n",
 );
 
-pub const SPEC: LangSpec = LangSpec {
+pub(crate) const SPEC: LangSpec = LangSpec {
     display: "Kotlin",
     extensions: &["kt", "kts"],
     filenames: &[],

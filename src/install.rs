@@ -94,15 +94,18 @@ pub fn run(host: &str, edit: bool) -> Result<(), String> {
     }
 
     if edit {
-        diag::info(&format!(
+        diag::emit(format_args!(
             "✓ tilth (edit mode) added to {}",
             host_info.path.display()
         ));
     } else {
-        diag::info(&format!("✓ tilth added to {}", host_info.path.display()));
+        diag::emit(format_args!(
+            "✓ tilth added to {}",
+            host_info.path.display()
+        ));
     }
     if let Some(note) = host_info.note {
-        diag::info(&format!("  {note}"));
+        diag::emit(format_args!("  {note}"));
     }
     Ok(())
 }

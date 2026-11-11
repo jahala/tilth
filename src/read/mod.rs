@@ -15,10 +15,10 @@ use tilth_core::lang::outline::{heading_level, heading_text, parse_markdown};
 use tilth_core::source::{strip_bom, strip_bom_bytes};
 use tilth_core::types::FileType;
 
-pub const TOKEN_THRESHOLD: u64 = 6_000;
+pub(crate) const TOKEN_THRESHOLD: u64 = 6_000;
 /// How many of a file's local imports the "Related:" hint under an outlined
 /// read names, in import order.
-pub const RELATED_HINT_LIMIT: usize = 8;
+pub(crate) const RELATED_HINT_LIMIT: usize = 8;
 /// Minimum compression ratio required to prefer the outline over full content.
 /// If `outline_tokens >= full_tokens * OUTLINE_MIN_COMPRESSION / 100`, the
 /// outline saves too few tokens to be worth the information loss, so the full
@@ -31,7 +31,7 @@ const FILE_SIZE_CAP: u64 = 500_000; // 500KB
 /// responses that cause MCP client timeouts. Grok shares this cap to bound
 /// its lossy decode + outline parse of code files.
 /// Override with `TILTH_FULL_SIZE_CAP` env var (bytes). Default: 2MB.
-pub fn full_read_size_cap() -> u64 {
+pub(crate) fn full_read_size_cap() -> u64 {
     std::env::var("TILTH_FULL_SIZE_CAP")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -43,7 +43,7 @@ pub fn full_read_size_cap() -> u64 {
 /// many lines as newlines. Counting newlines + 1 made every such file one
 /// line longer than it is, and let a section past the last line succeed
 /// with an empty body.
-pub fn count_lines(buf: &[u8]) -> u32 {
+pub(crate) fn count_lines(buf: &[u8]) -> u32 {
     let newlines = memchr::memchr_iter(b'\n', buf).count();
     let unterminated = usize::from(buf.last().is_some_and(|&b| b != b'\n'));
     u32::try_from(newlines + unterminated).unwrap_or(u32::MAX)
@@ -712,7 +712,7 @@ fn edit_distance(a: &str, b: &str) -> usize {
 }
 
 /// Guess MIME type from extension for binary file headers.
-pub fn mime_from_ext(path: &Path) -> &'static str {
+pub(crate) fn mime_from_ext(path: &Path) -> &'static str {
     match path.extension().and_then(|e| e.to_str()) {
         Some("png") => "image/png",
         Some("jpg" | "jpeg") => "image/jpeg",
