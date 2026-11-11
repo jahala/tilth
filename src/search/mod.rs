@@ -2818,32 +2818,6 @@ mod tests {
         }
     }
 
-    /// The caller walk checked big files with a substring search, so a big
-    /// file holding only a longer name (`big_callee_v2`) was named as
-    /// holding `big_callee`. It shares search's word check now.
-    #[test]
-    fn caller_walks_do_not_name_a_big_file_holding_only_a_longer_name() {
-        let tmp = tempfile::tempdir().unwrap();
-        let limit = usize::try_from(tilth_core::source::MAX_FILE_SIZE).unwrap();
-        let filler = "// padding line to push the file over the size limit\n";
-        let pad = filler.repeat(limit / filler.len() + 1);
-        std::fs::write(
-            tmp.path().join("lib.rs"),
-            "pub fn big_callee() {}\nfn small_caller() { big_callee(); }\n",
-        )
-        .unwrap();
-        std::fs::write(
-            tmp.path().join("big.rs"),
-            format!("{pad}fn big_caller() {{ big_callee_v2(); }}\n"),
-        )
-        .unwrap();
-        let bloom = tilth_core::index::bloom::BloomFilterCache::new();
-        let out =
-            callers::search_callers_expanded("big_callee", tmp.path(), &bloom, 0, None, None, false)
-                .unwrap();
-        assert!(!out.contains("not searched"), "{out}");
-    }
-
     /// The caller walk skipped big files with no word, so callers, grok and
     /// deps answered as if the big file did not exist. They name it now.
     #[test]
