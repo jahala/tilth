@@ -110,7 +110,11 @@ pub fn format_deps(result: &DepsResult, scope: &Path, budget: Option<usize>, ful
     };
 
     // Kept under any budget: a skipped file may hold dependents nobody checked.
-    let output = output + &crate::search::skipped_files_note(&result.skipped_large, scope);
+    let held = format!("a name from `{rel_target}`");
+    let output = match crate::search::skipped_files_note(&result.skipped_large, &held, scope) {
+        Some(sentence) => format!("{output}\n\n> {sentence}"),
+        None => output,
+    };
 
     let token_est = crate::types::estimate_tokens(output.len() as u64);
     format!("{output}\n\n[~{token_est} tokens]")

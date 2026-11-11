@@ -129,11 +129,16 @@ pub(crate) fn sorted(list: std::sync::Mutex<Vec<PathBuf>>) -> Vec<PathBuf> {
     paths
 }
 
-/// The note under a result that names files the walk skipped for size
-/// although they contain the query. Empty when there are none.
+/// The notes under a result: where else a qualified name is defined, and
+/// the files the walk skipped for size although they contain the query.
+/// Empty when there is nothing to say.
 fn skipped_large_note(result: &SearchResult) -> String {
     let mut note = other_owners_note(result);
-    note.push_str(&skipped_files_note(&result.skipped_large, &result.scope));
+    let held = format!("`{}`", result.query);
+    if let Some(skipped) = skipped_files_note(&result.skipped_large, &held, &result.scope) {
+        note.push_str("\n\n> ");
+        note.push_str(&skipped);
+    }
     note
 }
 
@@ -185,26 +190,48 @@ pub(crate) fn owner_candidates(
     listed.join(", ")
 }
 
-/// The note that names files a walk skipped for size although they contain
-/// the query, relative to `scope`. Empty when there are none.
-pub(crate) fn skipped_files_note(skipped: &[PathBuf], scope: &Path) -> String {
+/// The sentence that names the files a walk skipped for size although they
+/// contain `held`, relative to `scope`: "1 file over 500 KB contains `run`
+/// and was not searched: big.rs". `None` when there are none. Each caller
+/// sets the sentence in its own output.
+pub(crate) fn skipped_files_note(skipped: &[PathBuf], held: &str, scope: &Path) -> Option<String> {
     const SHOWN: usize = 5;
     if skipped.is_empty() {
-        return String::new();
+        return None;
     }
-    let mut names: Vec<String> = skipped.iter().take(SHOWN).map(|p| rel(p, scope)).collect();
+    let mut files: Vec<String> = skipped.iter().take(SHOWN).map(|p| rel(p, scope)).collect();
     if skipped.len() > SHOWN {
-        names.push(format!("and {} more", skipped.len() - SHOWN));
+        files.push(format!("and {} more", skipped.len() - SHOWN));
     }
-    let (count, verb) = match skipped.len() {
-        1 => ("1 file".to_string(), "contains the query and was"),
-        n => (format!("{n} files"), "contain the query and were"),
+    let (count, contains, was) = match skipped.len() {
+        1 => ("1 file".to_string(), "contains", "was"),
+        n => (format!("{n} files"), "contain", "were"),
     };
-    format!(
-        "\n\n> {count} over {} {verb} not searched: {}",
+    Some(format!(
+        "{count} over {} {contains} {held} and {was} not searched: {}",
         tilth_core::source::max_file_size_label(),
-        names.join(", ")
-    )
+        files.join(", ")
+    ))
+}
+
+/// `names`, sorted, as a phrase in backticks: "`a`", "`a` or `b`",
+/// "`a`, `b` or `c`", and past three, "`a`, `b`, `c` or 2 other names".
+pub(crate) fn names_phrase<'a>(names: impl IntoIterator<Item = &'a str>) -> String {
+    const SHOWN: usize = 3;
+    let mut names: Vec<&str> = names.into_iter().collect();
+    names.sort_unstable();
+    names.dedup();
+    let mut quoted: Vec<String> = names.iter().take(SHOWN).map(|n| format!("`{n}`")).collect();
+    let last = match names.len().saturating_sub(SHOWN) {
+        0 => quoted.pop(),
+        1 => Some("1 other name".to_string()),
+        others => Some(format!("{others} other names")),
+    };
+    match last {
+        Some(last) if quoted.is_empty() => last,
+        Some(last) => format!("{} or {last}", quoted.join(", ")),
+        None => String::new(),
+    }
 }
 
 /// Get `file_lines` estimate and mtime from metadata. One `stat()` per file.
@@ -2668,15 +2695,23 @@ mod tests {
         std::fs::write(tmp.path().join("other_big.rs"), &pad).unwrap();
         std::fs::write(tmp.path().join("small.rs"), "fn unrelated() {}\n").unwrap();
         let cache = OutlineCache::new();
-        for out in [
-            search_symbol("needle_target_fn", tmp.path(), &cache, None, false).unwrap(),
-            search_content("needle_target_fn", tmp.path(), &cache, None, false).unwrap(),
-            search_regex("needle_t.rget_fn", tmp.path(), &cache, None, false).unwrap(),
+        for (query, out) in [
+            (
+                "needle_target_fn",
+                search_symbol("needle_target_fn", tmp.path(), &cache, None, false).unwrap(),
+            ),
+            (
+                "needle_target_fn",
+                search_content("needle_target_fn", tmp.path(), &cache, None, false).unwrap(),
+            ),
+            (
+                "needle_t.rget_fn",
+                search_regex("needle_t.rget_fn", tmp.path(), &cache, None, false).unwrap(),
+            ),
         ] {
-            assert!(
-                out.contains("over 500 KB") && out.contains("not searched: big.rs"),
-                "the skipped file must be named: {out}"
-            );
+            let note =
+                format!("\n> 1 file over 500 KB contains `{query}` and was not searched: big.rs");
+            assert!(out.contains(&note), "the skipped file must be named: {out}");
             assert!(!out.contains("other_big.rs"), "{out}");
         }
         let quiet = search_symbol("unrelated", tmp.path(), &cache, None, false).unwrap();
@@ -2726,12 +2761,34 @@ mod tests {
         .unwrap();
         let grok = crate::run_grok("big_callee", tmp.path(), false).unwrap();
         let deps = crate::run_deps(&tmp.path().join("lib.rs"), tmp.path(), None, false).unwrap();
-        for out in [callers, multi, grok, deps] {
-            assert!(
-                out.contains("over 500 KB") && out.contains("not searched: big.rs"),
-                "the skipped file must be named: {out}"
-            );
+        for (held, out) in [
+            ("`big_callee`", callers),
+            ("`big_callee` or `small_caller`", multi),
+            ("`big_callee`", grok),
+            ("a name from `lib.rs`", deps),
+        ] {
+            let note =
+                format!("\n> 1 file over 500 KB contains {held} and was not searched: big.rs");
+            assert!(out.contains(&note), "the skipped file must be named: {out}");
             assert!(!out.contains("other_big.rs"), "{out}");
         }
+    }
+
+    /// The names a skipped file was checked for read as one phrase, and a
+    /// long list ends in a count.
+    #[test]
+    fn names_read_as_one_phrase() {
+        assert_eq!(names_phrase([]), "");
+        assert_eq!(names_phrase(["a"]), "`a`");
+        assert_eq!(names_phrase(["b", "a", "b"]), "`a` or `b`");
+        assert_eq!(names_phrase(["c", "a", "b"]), "`a`, `b` or `c`");
+        assert_eq!(
+            names_phrase(["a", "b", "c", "d"]),
+            "`a`, `b`, `c` or 1 other name"
+        );
+        assert_eq!(
+            names_phrase(["a", "b", "c", "d", "e"]),
+            "`a`, `b`, `c` or 2 other names"
+        );
     }
 }

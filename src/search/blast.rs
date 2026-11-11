@@ -134,9 +134,10 @@ pub(crate) fn blast_radius(
 
     // A file skipped for size may hold callers the counts miss.
     let mut out = format_blast_radius(&touched, &files, walk.reached_bound, scope);
-    let note = crate::search::skipped_files_note(&skipped_large, scope);
-    if !note.is_empty() {
-        out.push_str(note.trim_start_matches('\n'));
+    let held = crate::search::names_phrase(symbol_names.iter().map(String::as_str));
+    if let Some(sentence) = crate::search::skipped_files_note(&skipped_large, &held, scope) {
+        out.push_str("> ");
+        out.push_str(&sentence);
         out.push('\n');
     }
     Some(out)
@@ -478,7 +479,10 @@ mod tests {
         let scope = dir.path().canonicalize().unwrap();
         let out = blast_radius(&lib, &[make_edit(1, 1)], &scope, &bloom).expect("blast radius");
         assert!(out.contains("target: 1 caller\n"), "{out}");
-        assert!(out.contains("not searched: big.rs"), "{out}");
+        assert!(
+            out.contains("\n> 1 file over 500 KB contains `target` and was not searched: big.rs"),
+            "{out}"
+        );
     }
 
     /// The walk's paths are compared with the edited file's canonical path.

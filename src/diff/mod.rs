@@ -839,7 +839,8 @@ fn compute_blast(overlays: &[FileOverlay], scope: &Path) -> Vec<String> {
         return Vec::new();
     };
     // A file skipped for size may hold callers the counts miss.
-    let skipped = crate::search::skipped_files_note(&walk.skipped_large, scope);
+    let held = crate::search::names_phrase(sig_changed.iter().map(String::as_str));
+    let skipped = crate::search::skipped_files_note(&walk.skipped_large, &held, scope);
     // Sorted by name so the lines come out in the same order every run.
     let at_least = if walk.reached_bound { "at least " } else { "" };
     let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
@@ -869,10 +870,7 @@ fn compute_blast(overlays: &[FileOverlay], scope: &Path) -> Vec<String> {
                 if count == 1 { "" } else { "s" }
             )
         })
-        .chain(
-            (!skipped.is_empty())
-                .then(|| format!("blast: {}", skipped.trim_start_matches("\n\n> "))),
-        )
+        .chain(skipped.map(|sentence| format!("blast: {sentence}")))
         .collect()
 }
 
@@ -2318,7 +2316,7 @@ diff --git a/src/main.rs b/src/main.rs
         .unwrap();
         assert!(
             out.contains(
-                "⚠ blast: 1 file over 500 KB contains the query and was not searched: src/big.rs"
+                "⚠ blast: 1 file over 500 KB contains `hello` and was not searched: src/big.rs"
             ),
             "{out}"
         );

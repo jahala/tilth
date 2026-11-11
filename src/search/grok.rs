@@ -906,9 +906,9 @@ pub fn format_grok(result: &GrokResult, scope: &Path) -> String {
         }
     }
 
-    let skipped_note = crate::search::skipped_files_note(&result.skipped_large, scope);
-    if !skipped_note.is_empty() {
-        let _ = writeln!(out, "{skipped_note}");
+    let held = crate::search::names_phrase([result.target.name.as_str()]);
+    if let Some(sentence) = crate::search::skipped_files_note(&result.skipped_large, &held, scope) {
+        let _ = writeln!(out, "\n\n> {sentence}");
     }
 
     out

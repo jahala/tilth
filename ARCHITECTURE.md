@@ -730,8 +730,11 @@ The ceiling on `get_or_parse` (`tilth_core::source::MAX_FILE_SIZE`,
 TypeScript bundles or vendored single-file libraries. Above the cap,
 `get_or_parse` returns `None` and callers fall back to text-based
 heuristics. The search walkers skip files over the same limit; a
-skipped file that contains the query is named under the result
-(`> 1 file over 500 KB contains the query and was not searched: …`).
+skipped file that contains what the walk looked for is named under the
+result (``> 1 file over 500 KB contains `run` and was not searched: …``).
+Deps checks a big file for the target's names and its module's name,
+which for a package's entry file (`mod.rs`, `index.ts`, `__init__.py`)
+is its directory's name.
 Parsing grows linearly with size, about 0.2 ms per KB for Rust and
 Python, so a 1 MB file costs about twice what a 500 KB one does; that
 is why the limit stays where it is.
