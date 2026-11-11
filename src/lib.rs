@@ -118,10 +118,16 @@ pub fn refuse_file_scope(raw: &Path, resolved: &Path, hint: FileScopeHint) -> Re
 /// With nothing close, it names that nearest existing parent. Suggested
 /// paths stay in the caller's frame: a relative scope gets relative paths.
 /// The scan runs only when that parent lies inside `project` (the CLI's
-/// working directory, or the MCP call's root) or inside a checkout;
-/// anywhere else, the hint names the parent alone.
+/// working directory, or the MCP call's root) or inside a checkout, and
+/// neither is the filesystem root or the home directory; anywhere else, the
+/// hint names the parent alone.
 #[must_use]
 pub fn missing_scope_hint(raw: &Path, resolved: &Path, project: &Path) -> String {
+    scope_hint(raw, resolved, project, home::home_dir().as_deref())
+}
+
+/// [`missing_scope_hint`] with the home directory given.
+fn scope_hint(raw: &Path, resolved: &Path, project: &Path, home: Option<&Path>) -> String {
     let Some(wanted) = resolved
         .file_name()
         .map(|n| n.to_string_lossy().to_lowercase())
@@ -150,12 +156,15 @@ pub fn missing_scope_hint(raw: &Path, resolved: &Path, project: &Path) -> String
     // Scan for close names only inside a project: the caller's own, or the
     // checkout the scope points into. Anywhere else the nearest parent can
     // be `/` or a mount point, where listing directories is slow or, on a
-    // stale network mount, blocks.
+    // stale network mount, blocks. A desktop MCP server often runs in `/`
+    // or the home directory, which hold every path, so neither counts.
+    let home = home.and_then(|h| h.canonicalize().ok());
+    let scannable = |frame: &Path| frame.parent().is_some() && home.as_deref() != Some(frame);
     let in_project = base.canonicalize().is_ok_and(|base| {
         project
             .canonicalize()
-            .is_ok_and(|project| base.starts_with(project))
-            || in_a_checkout(&base)
+            .is_ok_and(|project| scannable(&project) && base.starts_with(project))
+            || in_a_checkout(&base, scannable)
     });
     let close = if in_project {
         close_directories(&base, &wanted)
@@ -175,13 +184,12 @@ pub fn missing_scope_hint(raw: &Path, resolved: &Path, project: &Path) -> String
     format!("Did you mean {}?", named.join(" or "))
 }
 
-/// Is `dir` inside a checkout: below a directory, other than the
-/// filesystem root, that holds `.git` or a package manifest?
-fn in_a_checkout(dir: &Path) -> bool {
-    let below_root = |d: &Path| d.parent().is_some();
+/// Is `dir` inside a checkout: below a `scannable` directory that holds
+/// `.git` or a package manifest?
+fn in_a_checkout(dir: &Path, scannable: impl Fn(&Path) -> bool) -> bool {
     dir.ancestors()
-        .any(|d| below_root(d) && d.join(".git").exists())
-        || tilth_core::lang::package_root(dir).is_some_and(below_root)
+        .any(|d| scannable(d) && d.join(".git").exists())
+        || tilth_core::lang::package_root(dir).is_some_and(|root| scannable(root))
 }
 
 /// Directories under `base` (relative to it) whose name is within a small
@@ -797,6 +805,28 @@ mod tests {
                 "The nearest existing directory is \"{}\".",
                 dir.path().display()
             )
+        );
+    }
+
+    /// A frame of `/` or the home directory, the usual working directory of
+    /// a desktop MCP server, holds every path, so it let the scan run
+    /// anywhere. Such a frame grants no scan.
+    #[test]
+    fn missing_scope_hint_does_not_scan_from_a_frame_of_root_or_home() {
+        let dir = dir_tree();
+        let raw = dir.path().join("dosc");
+        let nearest = format!(
+            "The nearest existing directory is \"{}\".",
+            dir.path().display()
+        );
+        assert_eq!(missing_scope_hint(&raw, &raw, Path::new("/")), nearest);
+        assert_eq!(scope_hint(&raw, &raw, dir.path(), Some(dir.path())), nearest);
+        // A checkout at home is no project either.
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            scope_hint(&raw, &raw, elsewhere.path(), Some(dir.path())),
+            nearest
         );
     }
 
