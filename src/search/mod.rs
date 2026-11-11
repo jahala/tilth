@@ -14,7 +14,6 @@ pub mod truncate;
 
 use std::collections::HashSet;
 use std::fmt::Write;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -517,7 +516,7 @@ fn format_single_match(
     // the existing outline / single-line preview branches.
     if m.is_definition && m.def_weight == 30 {
         if let Some((heading_line_1, section_end_1)) = m.def_range {
-            if let Ok(content) = fs::read_to_string(&m.path) {
+            if let Ok(content) = tilth_core::source::read_source(&m.path) {
                 let lines: Vec<&str> = content.lines().collect();
                 // def_range is `(heading_line, section_end)` in 1-indexed
                 // inclusive form (see `find_defs_markdown_buf`). The body
@@ -864,7 +863,7 @@ fn basename_file_outline(
         .or_else(|| find_basename_fallback(scope, &query_lower))?;
 
     // Read file and generate outline
-    let content = std::fs::read_to_string(&matched_path).ok()?;
+    let content = tilth_core::source::read_source(&matched_path).ok()?;
     let file_type = tilth_core::lang::detect_file_type(&matched_path);
     let mtime = std::fs::metadata(&matched_path)
         .and_then(|m| m.modified())
@@ -1114,7 +1113,7 @@ fn format_search_result(
 /// For definitions: use tree-sitter node range (`def_range`).
 /// For usages: ±10 lines around the match.
 fn expand_match(m: &Match, scope: &Path) -> Option<(String, String)> {
-    let content = fs::read_to_string(&m.path).ok()?;
+    let content = tilth_core::source::read_source(&m.path).ok()?;
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len() as u32;
 
@@ -1236,7 +1235,7 @@ fn get_outline_str(path: &std::path::Path, cache: &OutlineCache) -> Option<std::
         return None;
     }
     Some(cache.get_or_compute(path, mtime, || {
-        let content = std::fs::read_to_string(path).unwrap_or_default();
+        let content = tilth_core::source::read_source(path).unwrap_or_default();
         let buf = content.as_bytes();
         read::outline::generate(path, file_type, &content, buf, false)
     }))
@@ -1312,7 +1311,7 @@ fn markdown_enclosing_scope(path: &std::path::Path, match_line: u32) -> Option<S
     if match_line == 0 {
         return None;
     }
-    let content = std::fs::read_to_string(path).ok()?;
+    let content = tilth_core::source::read_source(path).ok()?;
     let tree = tilth_core::lang::outline::parse_markdown(&content)?;
     let lines: Vec<&str> = content.lines().collect();
     let mut best: Option<(tree_sitter::Node, u32)> = None;
@@ -2379,5 +2378,27 @@ mod tests {
             multi.contains("10 of 15 matches"),
             "each multi-symbol section header must disclose its own cap: {multi}"
         );
+    }
+
+    /// A byte-order mark must not reach search output: a match on line 1
+    /// printed a stray U+FEFF in front of the code, and a definition there
+    /// carried it in its signature.
+    #[test]
+    fn a_byte_order_mark_stays_out_of_search_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("m.py"),
+            "\u{feff}def bom_func():\n    return 1\n\nbom_func()\n",
+        )
+        .unwrap();
+        let cache = OutlineCache::new();
+        for out in [
+            search_symbol("bom_func", tmp.path(), &cache, None, false).unwrap(),
+            search_content("bom_func", tmp.path(), &cache, None, false).unwrap(),
+            search_regex("bom_f.nc", tmp.path(), &cache, None, false).unwrap(),
+        ] {
+            assert!(out.contains("bom_func"), "{out}");
+            assert!(!out.contains('\u{feff}'), "stray BOM in: {out}");
+        }
     }
 }

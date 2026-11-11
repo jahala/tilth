@@ -107,10 +107,11 @@ fn search_capped(
             let Ok(bytes) = std::fs::read(path) else {
                 return ignore::WalkState::Continue;
             };
+            let bytes = tilth_core::source::strip_bom_bytes(&bytes);
 
             // Catch unmarked minified bundles in the 100KB–500KB range.
             if file_size >= tilth_core::lang::detection::MINIFIED_CHECK_THRESHOLD
-                && tilth_core::lang::detection::is_minified_by_content(&bytes)
+                && tilth_core::lang::detection::is_minified_by_content(bytes)
             {
                 return ignore::WalkState::Continue;
             }
@@ -122,7 +123,7 @@ fn search_capped(
 
             let _ = searcher.search_slice(
                 matcher,
-                &bytes,
+                bytes,
                 UTF8(|line_num, line| {
                     file_matches.push(Match {
                         path: path.to_path_buf(),

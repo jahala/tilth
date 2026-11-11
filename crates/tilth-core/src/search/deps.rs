@@ -3,7 +3,6 @@
 //! `tilth_deps`.
 
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::error::TilthError;
@@ -66,7 +65,7 @@ pub fn analyze_deps(
         source: e,
     })?;
 
-    let content = fs::read_to_string(path).map_err(|e| TilthError::IoError {
+    let content = crate::source::read_source(path).map_err(|e| TilthError::IoError {
         path: path.clone(),
         source: e,
     })?;
@@ -293,6 +292,7 @@ fn is_valid_module_path(source: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     /// The external modules `analyze_deps` reports for one file.
     fn externals_of(file: &str, content: &str) -> Vec<String> {
@@ -303,6 +303,37 @@ mod tests {
         analyze_deps(&path, tmp.path(), &bloom)
             .unwrap()
             .uses_external
+    }
+
+    /// A UTF-8 byte-order mark sits in front of line 1, so a file that opens
+    /// with an import lost it: `\u{feff}#include "b.h"` is not an include.
+    #[test]
+    fn a_byte_order_mark_keeps_the_first_import() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("b.h"), "int b(void);\n").unwrap();
+        fs::write(tmp.path().join("c.h"), "int c(void);\n").unwrap();
+        let a = tmp.path().join("a.cpp");
+        fs::write(
+            &a,
+            "\u{feff}#include \"b.h\"\n#include \"c.h\"\nint a() { return b() + c(); }\n",
+        )
+        .unwrap();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let deps = analyze_deps(&a, tmp.path(), &bloom).unwrap();
+        let mut local: Vec<String> = deps
+            .uses_local
+            .iter()
+            .map(|d| d.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        local.sort();
+        assert_eq!(local, ["b.h", "c.h"]);
+
+        let py = tmp.path().join("m.py");
+        fs::write(&py, "\u{feff}import requests\nimport numpy\n").unwrap();
+        assert_eq!(
+            analyze_deps(&py, tmp.path(), &bloom).unwrap().uses_external,
+            ["numpy", "requests"]
+        );
     }
 
     /// Each spec of a Go import block is its own module. Read line by line,

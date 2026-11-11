@@ -49,6 +49,8 @@ crates/tilth-core/src/
 │                    tree_sitter::Tree, both keyed by (path, mtime)
 ├── imports.rs       Imports as data (one per module named), import lines, related-file resolution
 ├── test_structure.rs describe/it/test calls as TestEntry data
+├── source.rs        read_source: reads a file for parsing or search
+│                    without its byte-order mark
 │
 ├── search/          Cross-file queries
 │   ├── walk.rs          Walker and ignore policy (SKIP_DIRS, .tilthignore,

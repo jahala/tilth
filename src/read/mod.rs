@@ -12,6 +12,7 @@ use tilth_core::cache::OutlineCache;
 use tilth_core::error::TilthError;
 use tilth_core::lang::detect_file_type;
 use tilth_core::lang::outline::{heading_level, heading_text, parse_markdown};
+use tilth_core::source::{strip_bom, strip_bom_bytes};
 use tilth_core::types::FileType;
 
 pub(crate) const TOKEN_THRESHOLD: u64 = 6_000;
@@ -152,7 +153,13 @@ pub fn read_file(
         let file_mb = byte_len as f64 / 1_000_000.0;
 
         let outline = cache.get_or_compute(path, mtime, || {
-            outline::generate(path, file_type, &content, buf, true)
+            outline::generate(
+                path,
+                file_type,
+                strip_bom(&content),
+                strip_bom_bytes(buf),
+                true,
+            )
         });
 
         let header = format::file_header(path, byte_len, line_count, ViewMode::Outline);
@@ -184,8 +191,17 @@ pub fn read_file(
 
     let capped = byte_len > FILE_SIZE_CAP;
 
+    // The outline parses the file without its byte-order mark, as search
+    // does; the full view above prints the bytes as they are, because its
+    // hash anchors must match what `tilth_write` reads from disk.
     let outline = cache.get_or_compute(path, mtime, || {
-        outline::generate(path, file_type, &content, buf, capped)
+        outline::generate(
+            path,
+            file_type,
+            strip_bom(&content),
+            strip_bom_bytes(buf),
+            capped,
+        )
     });
 
     // OGATE: if the outline is not meaningfully smaller than the full file,
@@ -1273,5 +1289,19 @@ mod tests {
         assert!(out.contains("rows: 2"), "{out}");
         let unterminated = outline::tabular::outline("a,b\n1,2\n3,4", 100);
         assert!(unterminated.contains("rows: 2"), "{unterminated}");
+    }
+
+    /// The hash-anchored view keeps a byte-order mark: `tilth_write` checks
+    /// anchors against the file as it is on disk, mark included, so a view
+    /// that dropped it would hand out a line-1 anchor that never matches.
+    #[test]
+    fn hashline_view_keeps_the_byte_order_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.py");
+        std::fs::write(&path, "\u{feff}import os\n").unwrap();
+        let cache = OutlineCache::new();
+        let out = read_file(&path, None, true, &cache, true).unwrap();
+        let hash = format::line_hash("\u{feff}import os".as_bytes());
+        assert!(out.contains(&format!("1:{hash:03x}|")), "{out}");
     }
 }

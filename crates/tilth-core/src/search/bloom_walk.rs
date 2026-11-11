@@ -34,7 +34,7 @@ where
         return None;
     }
     let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-    let content = std::fs::read_to_string(path).ok()?;
+    let content = crate::source::read_source(path).ok()?;
 
     if !targets
         .into_iter()

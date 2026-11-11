@@ -1,4 +1,3 @@
-use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -218,7 +217,7 @@ fn find_definitions(
             };
 
             // Single read: read file once, use buffer for both check and parse
-            let Ok(content) = fs::read_to_string(path) else {
+            let Ok(content) = tilth_core::source::read_source(path) else {
                 return ignore::WalkState::Continue;
             };
 
@@ -615,11 +614,12 @@ fn find_usages(
             let Ok(bytes) = std::fs::read(path) else {
                 return ignore::WalkState::Continue;
             };
+            let bytes = tilth_core::source::strip_bom_bytes(&bytes);
 
             // Catch unmarked minified bundles between 100KB and 500KB — they
             // were not skipped by the filename check or the size cap above.
             if file_size >= tilth_core::lang::detection::MINIFIED_CHECK_THRESHOLD
-                && tilth_core::lang::detection::is_minified_by_content(&bytes)
+                && tilth_core::lang::detection::is_minified_by_content(bytes)
             {
                 return ignore::WalkState::Continue;
             }
@@ -631,7 +631,7 @@ fn find_usages(
 
             let _ = searcher.search_slice(
                 matcher,
-                &bytes,
+                bytes,
                 UTF8(|line_num, line| {
                     file_matches.push(Match {
                         path: path.to_path_buf(),

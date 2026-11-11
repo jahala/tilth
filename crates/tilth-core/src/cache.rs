@@ -124,7 +124,7 @@ impl OutlineCache {
             return None;
         };
         let ts_lang = crate::lang::outline::outline_language(lang)?;
-        let content = std::fs::read_to_string(path).ok()?;
+        let content = crate::source::read_source(path).ok()?;
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&ts_lang).ok()?;
         let tree = parser.parse(&content, None)?;
