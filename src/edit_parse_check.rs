@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use tilth_core::lang::detect_file_type;
+use tilth_core::lang::detect_file_type_with_content;
 use tilth_core::lang::outline::outline_language;
 use tilth_core::types::FileType;
 
@@ -54,7 +54,7 @@ pub(crate) struct ParseReport {
 /// - the path's language has no tree-sitter grammar, or
 /// - no new errors were introduced.
 pub(crate) fn check(path: &Path, before: &str, after: &str) -> Option<ParseReport> {
-    let FileType::Code(lang) = detect_file_type(path) else {
+    let FileType::Code(lang) = detect_file_type_with_content(path, after) else {
         return None;
     };
     let grammar = outline_language(lang)?;

@@ -8,8 +8,9 @@ pub(crate) const CALLEE_QUERY: &str = concat!(
     "(call_expression function: (field_expression field: (field_identifier) @callee))\n",
 );
 
-/// C definition node kinds: functions with a body, and the types a
-/// `struct`/`union`/`enum` body or a `typedef` defines. A prototype is a
+/// C definition node kinds: functions with a body, the types a
+/// `struct`/`union`/`enum` body or a `typedef` defines, and `#define` macros.
+/// A prototype is a
 /// `declaration`, so it is not a definition; neither is a `struct point` with
 /// no body, which `extract_definition_name` gives no name.
 const C_DEFINITION_KINDS: &[&str] = &[
@@ -18,6 +19,8 @@ const C_DEFINITION_KINDS: &[&str] = &[
     "union_specifier",
     "enum_specifier",
     "type_definition",
+    "preproc_def",
+    "preproc_function_def",
 ];
 
 pub(crate) const SPEC: LangSpec = LangSpec {

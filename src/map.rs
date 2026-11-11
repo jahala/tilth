@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use crate::read::outline;
 use crate::types::estimate_tokens;
 use tilth_core::cache::OutlineCache;
-use tilth_core::lang::detect_file_type;
+use tilth_core::lang::{detect_file_type, detect_file_type_with_content};
 use tilth_core::search::walk::base_walk_builder;
 use tilth_core::types::FileType;
 
@@ -55,6 +55,7 @@ pub fn generate(scope: &Path, depth: usize, budget: Option<u64>, cache: &Outline
                     // aborting the map. Errors are intentionally swallowed here.
                     let content = std::fs::read_to_string(path).unwrap_or_default();
                     let buf = content.as_bytes();
+                    let file_type = detect_file_type_with_content(path, &content);
                     outline::generate(path, file_type, &content, buf, true)
                 });
 

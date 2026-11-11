@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::TilthError;
 use crate::imports::{extract_imports, is_external, resolve_related_files_with_content};
-use crate::lang::detect_file_type;
+use crate::lang::detect_file_type_with_content;
 use crate::lang::outline::get_outline_entries;
 use crate::search::callees::{extract_callee_names, resolve_callees};
 use crate::search::callers::find_callers_batch;
@@ -71,7 +71,7 @@ pub fn analyze_deps(
         source: e,
     })?;
 
-    let FileType::Code(lang) = detect_file_type(path) else {
+    let FileType::Code(lang) = detect_file_type_with_content(path, &content) else {
         // Non-code file: return empty deps gracefully.
         return Ok(DepsResult {
             target: path.clone(),

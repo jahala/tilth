@@ -3,7 +3,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use crate::edit::Edit;
-use tilth_core::lang::detect_file_type;
+use tilth_core::lang::detect_file_type_with_content;
 use tilth_core::lang::outline::get_outline_entries;
 use tilth_core::search::callers::{find_callers_batch, CallerMatch};
 use tilth_core::types::{is_test_file, FileType, OutlineEntry, OutlineKind};
@@ -70,7 +70,7 @@ pub(crate) fn blast_radius(
 ) -> Option<String> {
     let content = std::fs::read_to_string(path).ok()?;
 
-    let FileType::Code(lang) = detect_file_type(path) else {
+    let FileType::Code(lang) = detect_file_type_with_content(path, &content) else {
         return None;
     };
 

@@ -716,7 +716,9 @@ fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opti
         };
 
         // Each file is read in its own language, as the resolver always did.
-        let FileType::Code(file_lang) = detect_file_type(&full) else {
+        let FileType::Code(file_lang) =
+            tilth_core::lang::detect_file_type_with_content(&full, &content)
+        else {
             continue;
         };
 

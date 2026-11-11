@@ -200,7 +200,8 @@ fn read_signature_file(path: &Path, cache: &OutlineCache) -> Result<(String, u32
     })?;
     let line_count = u32::try_from(content.lines().count()).unwrap_or(u32::MAX);
 
-    let FileType::Code(lang) = detect_file_type(path) else {
+    let FileType::Code(lang) = tilth_core::lang::detect_file_type_with_content(path, &content)
+    else {
         let body = crate::read::read_file(path, None, false, cache, false)?;
         return Ok((body, line_count));
     };

@@ -5,11 +5,12 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 
 use super::file_metadata;
-use tilth_core::lang::elixir::is_elixir_definition;
+use tilth_core::lang::elixir::{is_elixir_container, is_elixir_definition};
 use tilth_core::lang::spec::{spec, DefinitionOps, DEFAULT_DEFS, DEFAULT_DEF_KINDS};
 use tilth_core::lang::treesitter::{
     extract_definition_name, extract_impl_trait, extract_impl_type, extract_implemented_interfaces,
-    is_or_body_of, node_text_simple, NodeTextMode, NAMESPACE_KINDS, PASS_THROUGH_KINDS,
+    is_local_binding, is_or_body_of, node_text_simple, NodeTextMode, NAMESPACE_KINDS,
+    PASS_THROUGH_KINDS, TYPE_KINDS, WRAPPER_KINDS,
 };
 
 use crate::search::rank;
@@ -18,7 +19,7 @@ use grep_regex::RegexMatcher;
 use grep_searcher::sinks::UTF8;
 use grep_searcher::Searcher;
 use tilth_core::error::TilthError;
-use tilth_core::lang::detect_file_type;
+use tilth_core::lang::detect_file_type_with_content;
 use tilth_core::lang::outline::{heading_text, outline_language, parse_markdown};
 use tilth_core::types::FileType;
 
@@ -238,7 +239,7 @@ fn find_definitions(
             let (file_lines, mtime) = file_metadata(path);
 
             // Try tree-sitter structural detection
-            let file_type = detect_file_type(path);
+            let file_type = detect_file_type_with_content(path, &content);
             let lang = match file_type {
                 FileType::Code(l) => Some(l),
                 _ => None,
@@ -325,15 +326,24 @@ fn find_defs_treesitter(
     let mut defs = Vec::new();
 
     walk_for_definitions(
-        root, query, path, &lines, file_lines, mtime, &mut defs, lang, 0,
+        root, None, query, path, &lines, file_lines, mtime, &mut defs, lang, 0, None,
     );
 
     defs
 }
 
 /// Recursively walk AST nodes looking for definitions of the queried symbol.
+///
+/// `depth` counts nesting levels, and the walk stops below three: a
+/// declaration nested deeper is a local, not a definition. Only levels that
+/// nest count, so wrappers, namespaces and type bodies are free (see
+/// [`adds_nesting`]). `parent` is `node`'s parent, passed down because
+/// tree-sitter finds a parent by walking from the root. `wrapper_start` is the
+/// first row of the `export` or `declare` wrapper around `node`, which a
+/// definition's range covers.
 fn walk_for_definitions(
     node: tree_sitter::Node,
+    parent: Option<tree_sitter::Node>,
     query: &str,
     path: &Path,
     lines: &[&str],
@@ -342,12 +352,44 @@ fn walk_for_definitions(
     defs: &mut Vec<Match>,
     lang: Option<tilth_core::types::Lang>,
     depth: usize,
+    wrapper_start: Option<usize>,
 ) {
     if depth > 3 {
         return;
     }
 
     let kind = node.kind();
+
+    // A wrapper is not a definition of its own: the declaration it wraps is,
+    // at the same depth. An `export` or `declare` keyword shares the
+    // declaration's line, and the range starts at it. A decorator does not:
+    // the range starts at the `def`/`class` line, as its outline entry does.
+    if WRAPPER_KINDS.contains(&kind) {
+        let start = if kind == "decorated_definition" {
+            wrapper_start
+        } else {
+            Some(wrapper_start.unwrap_or(node.start_position().row))
+        };
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            walk_for_definitions(
+                child,
+                Some(node),
+                query,
+                path,
+                lines,
+                file_lines,
+                mtime,
+                defs,
+                lang,
+                depth,
+                start,
+            );
+        }
+        return;
+    }
+    let start_row = wrapper_start.unwrap_or(node.start_position().row) as u32 + 1;
+    let end_row = node.end_position().row as u32 + 1;
 
     // Definition kinds and name/weight ops come from the per-language spec. For
     // a known language these are `spec(lang).definition_kinds` / `.definitions`
@@ -364,7 +406,7 @@ fn walk_for_definitions(
 
     if def_kinds.contains(&kind) {
         // Check if this node defines the queried symbol
-        if defines_name(node, lines, query, def_ops) {
+        if defines_name(node, lines, query, def_ops) && !is_local_binding(node) {
             let line_num = node.start_position().row as u32 + 1;
             let line_text = lines
                 .get(node.start_position().row)
@@ -378,10 +420,7 @@ fn walk_for_definitions(
                 exact: true,
                 file_lines,
                 mtime,
-                def_range: Some((
-                    node.start_position().row as u32 + 1,
-                    node.end_position().row as u32 + 1,
-                )),
+                def_range: Some((start_row, end_row)),
                 def_name: Some(query.to_string()),
                 def_weight: (def_ops.weight)(node, lines),
                 impl_target: None,
@@ -408,17 +447,17 @@ fn walk_for_definitions(
                         exact: true,
                         file_lines,
                         mtime,
-                        def_range: Some((
-                            node.start_position().row as u32 + 1,
-                            node.end_position().row as u32 + 1,
-                        )),
+                        def_range: Some((start_row, end_row)),
                         def_name: Some(format!("impl {query} for {impl_type}")),
                         def_weight: 80,
                         impl_target: Some(query.to_string()),
                     });
                 }
             }
-        } else if kind == "class_declaration" || kind == "class_definition" {
+        } else if matches!(
+            kind,
+            "class_declaration" | "class_definition" | "abstract_class_declaration"
+        ) {
             let interfaces = extract_implemented_interfaces(node, lines);
             if interfaces.iter().any(|i| i == query) {
                 let class_name = extract_definition_name(node, lines)
@@ -436,10 +475,7 @@ fn walk_for_definitions(
                     exact: true,
                     file_lines,
                     mtime,
-                    def_range: Some((
-                        node.start_position().row as u32 + 1,
-                        node.end_position().row as u32 + 1,
-                    )),
+                    def_range: Some((start_row, end_row)),
                     def_name: Some(format!("{class_name} implements {query}")),
                     def_weight: 80,
                     impl_target: Some(query.to_string()),
@@ -477,20 +513,17 @@ fn walk_for_definitions(
     }
 
     // Recurse into children (for nested definitions, class bodies, impl blocks,
-    // etc.). Namespaces and pass-through wrappers (`#ifdef`, `extern "C"`,
-    // `template <...>`) add no nesting, so they do not count toward the depth
-    // limit: a method in a class in a namespace is found like one in a
-    // top-level class.
-    let child_depth =
-        if is_or_body_of(node, NAMESPACE_KINDS) || is_or_body_of(node, PASS_THROUGH_KINDS) {
-            depth
-        } else {
-            depth + 1
-        };
+    // etc.).
+    let child_depth = if adds_nesting(node, parent, lang, lines) {
+        depth + 1
+    } else {
+        depth
+    };
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         walk_for_definitions(
             child,
+            Some(node),
             query,
             path,
             lines,
@@ -499,8 +532,32 @@ fn walk_for_definitions(
             defs,
             lang,
             child_depth,
+            None,
         );
     }
+}
+
+/// Whether the children of `node` sit one nesting level deeper than `node`.
+/// The file's root nests its top-level declarations. Namespaces, modules and
+/// pass-through wrappers (`#ifdef`, `extern "C"`, `template <...>`) add no
+/// nesting, nor does a type's body: a method of a class in a namespace, or of
+/// a class nested in another class, is found like one in a top-level class,
+/// while a declaration in a function body stays a level deeper.
+fn adds_nesting(
+    node: tree_sitter::Node,
+    parent: Option<tree_sitter::Node>,
+    lang: Option<tilth_core::types::Lang>,
+    lines: &[&str],
+) -> bool {
+    let Some(parent) = parent else {
+        return true;
+    };
+    let free = is_or_body_of(node, Some(parent), NAMESPACE_KINDS)
+        || is_or_body_of(node, Some(parent), PASS_THROUGH_KINDS)
+        || TYPE_KINDS.contains(&parent.kind())
+        || (lang == Some(tilth_core::types::Lang::Elixir)
+            && is_elixir_container(node, Some(parent), lines));
+    !free
 }
 
 /// Whether definition `node` binds the name `query`. Most definitions bind
@@ -1665,5 +1722,364 @@ func run() {
         let code = "namespace App {\n  public class Svc {\n    public void Run() {}\n  }\n}\n";
         assert_eq!(definition_lines("Svc.cs", code, "Svc"), vec![2]);
         assert_eq!(definition_lines("Svc.cs", code, "Run"), vec![3]);
+    }
+
+    /// Assert that each `(query, lines)` pair finds definitions on exactly
+    /// those lines of `fixture`, written to `file`. An empty list means the
+    /// query has usages only.
+    fn assert_definitions(file: &str, fixture: &str, cases: &[(&str, &[u32])]) {
+        for (query, expected) in cases {
+            assert_eq!(
+                definition_lines(file, fixture, query),
+                expected.to_vec(),
+                "{file}: definition lines of {query}"
+            );
+        }
+    }
+
+    /// Search `fixture`, written to `file`, and return the range of the one
+    /// definition of `query`.
+    fn definition_range(file: &str, fixture: &str, query: &str) -> Option<(u32, u32)> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(file), fixture).expect("write fixture");
+        let result = search(query, dir.path(), None, None, false).expect("search");
+        let defs: Vec<&Match> = result.matches.iter().filter(|m| m.is_definition).collect();
+        assert_eq!(
+            defs.len(),
+            1,
+            "{query}: expected one definition, got {defs:?}"
+        );
+        defs[0].def_range
+    }
+
+    #[test]
+    fn ruby_classes_modules_and_methods_are_definitions() {
+        // Instance methods, `def self.` methods, and the classes and modules
+        // that hold them, whether a class sits in a module or not.
+        let code = "module Shop
+  class Store
+    def save
+      1
+    end
+
+    def self.build
+      new
+    end
+  end
+end
+
+module Util
+  def self.slugify(s)
+    s
+  end
+end
+
+class Plain
+  def run
+  end
+end
+";
+        assert_definitions(
+            "shop.rb",
+            code,
+            &[
+                ("Shop", &[1]),
+                ("Store", &[2]),
+                ("save", &[3]),
+                ("build", &[7]),
+                ("Util", &[13]),
+                ("slugify", &[14]),
+                ("Plain", &[19]),
+                ("run", &[20]),
+            ],
+        );
+    }
+
+    #[test]
+    fn members_of_wrapped_and_namespaced_types_are_definitions() {
+        // `export`, `export default`, decorators and `namespace` wrap a
+        // declaration without nesting it, so the members inside are found
+        // like the members of a bare top-level class.
+        let ts = "export class Exported {
+  method() {}
+  static make() {}
+}
+export default class Fallback {
+  render() {}
+}
+namespace Space {
+  export function inSpace() {}
+}
+@Component({})
+export class Widget {
+  @Input() decorated() {}
+}
+";
+        assert_definitions(
+            "app.ts",
+            ts,
+            &[
+                ("Exported", &[1]),
+                ("method", &[2]),
+                ("make", &[3]),
+                ("Fallback", &[5]),
+                ("render", &[6]),
+                ("Space", &[8]),
+                ("inSpace", &[9]),
+                ("Widget", &[12]),
+                ("decorated", &[13]),
+            ],
+        );
+
+        let py = "@decorator
+def top():
+    pass
+
+class Service:
+    @property
+    def prop(self):
+        pass
+
+    @classmethod
+    def build(cls):
+        pass
+";
+        assert_definitions(
+            "svc.py",
+            py,
+            &[("top", &[2]), ("prop", &[7]), ("build", &[11])],
+        );
+
+        let rs = "mod a {
+    mod b {
+        mod c {
+            pub fn deep() {}
+        }
+    }
+}
+";
+        assert_definitions("lib.rs", rs, &[("deep", &[4])]);
+    }
+
+    #[test]
+    fn members_of_nested_types_are_definitions() {
+        // A type's body adds no nesting of its own, so a method of a nested
+        // class is found like a method of a top-level one.
+        let java = "class Outer {
+  static class Inner {
+    void innerMethod() {}
+  }
+}
+";
+        assert_definitions(
+            "Outer.java",
+            java,
+            &[("Inner", &[2]), ("innerMethod", &[3])],
+        );
+
+        let py = "class Model:
+    class Meta:
+        def options(self):
+            pass
+";
+        assert_definitions("model.py", py, &[("Meta", &[2]), ("options", &[3])]);
+
+        let kt = "class Outer {
+  companion object {
+    fun create() {}
+  }
+}
+";
+        assert_definitions("Outer.kt", kt, &[("create", &[3])]);
+
+        let ex = "defmodule Outer do
+  defmodule Inner do
+    def nested_func, do: :ok
+  end
+end
+";
+        assert_definitions("outer.ex", ex, &[("Inner", &[2]), ("nested_func", &[3])]);
+    }
+
+    #[test]
+    fn a_wrapped_declaration_is_one_definition() {
+        // The wrapper (`export`, a decorator) is not a second definition of
+        // the name it wraps. The range covers an `export` and the decorators
+        // before it; a Python definition's range starts at its `def` line,
+        // where its outline entry starts.
+        let ts = "export function once() {}\n@Component({})\nexport class Widget {\n}\n";
+        assert_definitions("app.ts", ts, &[("once", &[1]), ("Widget", &[3])]);
+        assert_eq!(definition_range("app.ts", ts, "Widget"), Some((2, 4)));
+
+        let py = "@decorator\n@other\ndef top():\n    pass\n";
+        assert_eq!(definition_range("svc.py", py, "top"), Some((3, 4)));
+    }
+
+    #[test]
+    fn function_locals_are_not_definitions() {
+        // A variable declared in a function body is local to it, however the
+        // function is wrapped. The same declaration at file or type scope is
+        // a definition.
+        let ts = "export function exported() {
+  const local = 1;
+}
+function plain() {
+  let other = 2;
+}
+export const top = () => {
+  const inArrow = 3;
+};
+class K {
+  method() {
+    const inMethod = 4;
+  }
+}
+";
+        assert_definitions(
+            "app.ts",
+            ts,
+            &[
+                ("exported", &[1]),
+                ("local", &[]),
+                ("plain", &[4]),
+                ("other", &[]),
+                ("top", &[7]),
+                ("inArrow", &[]),
+                ("inMethod", &[]),
+            ],
+        );
+
+        let sh = "setup() {\n  local_var=1\n}\nGLOBAL=2\n";
+        assert_definitions("run.sh", sh, &[("local_var", &[]), ("GLOBAL", &[4])]);
+
+        let kt = "val topLevel = 1\nfun f() {\n  val localVal = 2\n}\n";
+        assert_definitions("A.kt", kt, &[("topLevel", &[1]), ("localVal", &[])]);
+
+        let rs = "const TOP: i32 = 1;
+fn f() {
+    const LOCAL: i32 = 2;
+}
+struct S;
+impl S {
+    const ASSOC: i32 = 3;
+}
+";
+        assert_definitions(
+            "lib.rs",
+            rs,
+            &[("TOP", &[1]), ("LOCAL", &[]), ("ASSOC", &[7])],
+        );
+    }
+
+    #[test]
+    fn abstract_classes_and_their_members_are_definitions() {
+        let code = "abstract class Shape {
+  abstract area(): number;
+  describe() {}
+}
+export abstract class Base {}
+export default abstract class Fallback {}
+";
+        for file in ["shape.ts", "shape.tsx"] {
+            assert_definitions(
+                file,
+                code,
+                &[
+                    ("Shape", &[1]),
+                    ("area", &[2]),
+                    ("describe", &[3]),
+                    ("Base", &[5]),
+                    ("Fallback", &[6]),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn declarations_of_every_language_are_definitions() {
+        // One line per declaration kind the 17-language probe found reported
+        // as a usage. A member declared without a body (a trait or
+        // interface method) is a definition, as Java's and C#'s already are;
+        // only C and C++ prototypes, which repeat a definition found
+        // elsewhere, are not.
+        let rs = "macro_rules! shout { () => {} }
+pub union Bits { a: u32 }
+pub trait Speak {
+    fn required(&self);
+}
+";
+        assert_definitions(
+            "lib.rs",
+            rs,
+            &[("shout", &[1]), ("Bits", &[2]), ("required", &[4])],
+        );
+
+        let ts = "interface Api {\n  call(): void;\n}\ndeclare function ambient(): void;\n";
+        assert_definitions("api.ts", ts, &[("call", &[2]), ("ambient", &[4])]);
+
+        let go = "package p\n\ntype Reader interface {\n\tRead() error\n}\n";
+        assert_definitions("r.go", go, &[("Reader", &[3]), ("Read", &[4])]);
+
+        let java = "record Point(int x) {}\n@interface Marker {}\n";
+        assert_definitions("P.java", java, &[("Point", &[1]), ("Marker", &[2])]);
+
+        let scala = "object Registry {\n  val limit = 1\n}\ntrait Plugin {\n  def run(): Unit\n}\n";
+        assert_definitions(
+            "a.scala",
+            scala,
+            &[
+                ("Registry", &[1]),
+                ("limit", &[2]),
+                ("Plugin", &[4]),
+                ("run", &[5]),
+            ],
+        );
+
+        let c = "#define LIMIT 10\n#define MAX(a, b) ((a) > (b) ? (a) : (b))\n";
+        assert_definitions("m.c", c, &[("LIMIT", &[1]), ("MAX", &[2])]);
+
+        let cs = "namespace Shop {\n  public struct Price {}\n  public record Order(int Id);\n}\n";
+        assert_definitions(
+            "Shop.cs",
+            cs,
+            &[("Shop", &[1]), ("Price", &[2]), ("Order", &[3])],
+        );
+
+        let swift = "protocol Drawable {\n  func draw()\n}\n";
+        assert_definitions("d.swift", swift, &[("Drawable", &[1]), ("draw", &[2])]);
+
+        let kt = "class Account {\n  val balance = 0\n}\n";
+        assert_definitions("A.kt", kt, &[("balance", &[2])]);
+
+        let php = "<?php\nclass Config {\n  const VERSION = 1;\n}\n";
+        assert_definitions("c.php", php, &[("VERSION", &[3])]);
+    }
+
+    #[test]
+    fn a_header_holding_cpp_is_searched_as_cpp() {
+        // `.h` is shared by C and C++. A header with C++ syntax keeps its
+        // class templates and in-class methods; a C header keeps its C
+        // definitions.
+        let cpp = "#pragma once
+template <typename T> class Box {
+ public:
+  T get() { return T(); }
+};
+namespace geo {
+int area() { return 1; }
+}
+";
+        assert_definitions(
+            "box.h",
+            cpp,
+            &[("Box", &[2]), ("get", &[4]), ("geo", &[6]), ("area", &[7])],
+        );
+
+        let c = tilth_core::lang::c::C_DEFINITIONS_FIXTURE;
+        assert_definitions(
+            "shapes.h",
+            c,
+            &[("add", &[11]), ("point", &[4]), ("compare_fn", &[8])],
+        );
     }
 }

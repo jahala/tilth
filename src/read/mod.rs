@@ -10,7 +10,7 @@ use crate::format;
 use crate::types::{estimate_tokens, ViewMode};
 use tilth_core::cache::OutlineCache;
 use tilth_core::error::TilthError;
-use tilth_core::lang::detect_file_type;
+use tilth_core::lang::detect_file_type_with_content;
 use tilth_core::lang::outline::{heading_level, heading_text, parse_markdown};
 use tilth_core::types::FileType;
 
@@ -133,7 +133,7 @@ pub fn read_file(
     // dumping megabytes that would blow up the MCP client's timeout/memory.
     let cap = full_read_size_cap();
     if full && byte_len > cap {
-        let file_type = detect_file_type(path);
+        let file_type = detect_file_type_with_content(path, &content);
         let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
         #[allow(clippy::cast_precision_loss)] // cap and file sizes fit in f64 mantissa for display
         let cap_mb = cap as f64 / 1_000_000.0;
@@ -168,7 +168,7 @@ pub fn read_file(
     }
 
     // Large file → smart view by file type
-    let file_type = detect_file_type(path);
+    let file_type = detect_file_type_with_content(path, &content);
     let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
 
     let capped = byte_len > FILE_SIZE_CAP;

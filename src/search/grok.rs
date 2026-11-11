@@ -199,6 +199,7 @@ fn read_code_file(path: &Path) -> Result<(String, Lang), TilthError> {
     // the (near-universal) valid-UTF-8 case decodes without a second copy.
     let content = String::from_utf8(bytes)
         .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+    let lang = tilth_core::lang::refine_lang(lang, path, &content);
     Ok((content, lang))
 }
 
