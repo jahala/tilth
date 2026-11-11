@@ -444,8 +444,13 @@ fn imports_one_of(
     if !stems
         .iter()
         .any(|s| memchr::memmem::find(content.as_bytes(), s.as_bytes()).is_some())
-        || !keep(&content)
     {
+        return None;
+    }
+    // A file that names none of what `keep` wants can still pass it all on
+    // with a star statement (`export * from`), which spells no name.
+    let mentions_wanted = keep(&content);
+    if !mentions_wanted && !content.contains('*') {
         return None;
     }
     let FileType::Code(lang) = detect_file_type_with_content(file, &content) else {
@@ -454,7 +459,8 @@ fn imports_one_of(
     let mut lines = Vec::new();
     let mut statements = String::new();
     let mut via = None;
-    let mut reexports = is_reexporting_file(file);
+    let barrel_file = is_reexporting_file(file);
+    let mut reexports = barrel_file;
     let own_path = file.canonicalize().ok()?;
     for import in extract_imports(&content, lang) {
         let Some(resolved) = resolve_import(file, lang, &import) else {
@@ -473,7 +479,13 @@ fn imports_one_of(
             .take((import.end_line - import.start_line) as usize + 1)
             .collect::<Vec<_>>()
             .join("\n");
-        if !keep(&statement) {
+        // A star statement takes every name without spelling one. Passing
+        // them on (`export *`, or a star import in a package's entry file)
+        // carries the target to the file's own importers; taking them
+        // (`import * as ns`) uses the target when the file names it.
+        let star = star_statement(&statement, lang);
+        let passes_on = star.is_some_and(|reexport| reexport || barrel_file);
+        if !(keep(&statement) || passes_on || (star.is_some() && mentions_wanted)) {
             continue;
         }
         lines.push(import.start_line);
@@ -501,6 +513,33 @@ fn imports_one_of(
         via,
         reexports,
     })
+}
+
+/// Whether `statement` takes every name a module exports: `Some(true)` for
+/// a JavaScript or TypeScript `export * from`, which passes them on, and
+/// `Some(false)` for `import * as ns from` or Python's `from m import *`.
+fn star_statement(statement: &str, lang: Lang) -> Option<bool> {
+    let text = statement.trim_start();
+    match lang {
+        Lang::TypeScript | Lang::Tsx | Lang::JavaScript => {
+            let rest = |keyword: &str| {
+                text.strip_prefix(keyword)
+                    .is_some_and(|r| r.trim_start().starts_with('*'))
+            };
+            if rest("export") {
+                Some(true)
+            } else if rest("import") {
+                Some(false)
+            } else {
+                None
+            }
+        }
+        Lang::Python => text
+            .split_once(" import ")
+            .is_some_and(|(_, names)| names.trim() == "*")
+            .then_some(false),
+        _ => None,
+    }
 }
 
 /// A file whose role is to re-export its package: `index.ts`, `__init__.py`.
@@ -907,6 +946,33 @@ mod tests {
                     vec![],
                     Some("src/barrel2.ts".to_string())
                 ),
+            ]
+        );
+    }
+
+    /// `export * from` passes every name on, however many barrels deep, and
+    /// a namespace import takes them all. Neither statement names `serve`,
+    /// so a filter on names broke the chain at the second barrel and lost
+    /// the namespace importer. A namespace importer that never uses the
+    /// name still does not depend on the target.
+    #[test]
+    fn star_re_exports_chain_and_namespace_imports_are_dependents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        write(&root, "src/core/service.ts", "export function serve() { return 1; }\n");
+        write(&root, "src/core/index.ts", "export * from \"./service\";\n");
+        write(&root, "src/index.ts", "export * from \"./core\";\n");
+        write(&root, "app.ts", "import { serve } from \"./src\";\nexport const a = serve;\n");
+        write(&root, "ns.ts", "import * as core from \"./src/core\";\nexport const n = core.serve;\n");
+        write(&root, "unused.ts", "import * as core from \"./src/core\";\nexport const u = core.other;\n");
+        let found = dependents_of(&root, "src/core/service.ts");
+        assert_eq!(
+            found,
+            [
+                ("src/core/index.ts".to_string(), vec![], None),
+                ("app.ts".to_string(), vec![], Some("src/index.ts".to_string())),
+                ("ns.ts".to_string(), vec![], Some("src/core/index.ts".to_string())),
+                ("src/index.ts".to_string(), vec![], Some("src/core/index.ts".to_string())),
             ]
         );
     }
