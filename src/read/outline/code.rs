@@ -335,6 +335,43 @@ type UserId = String
         );
     }
 
+    /// A Python `from` import is an import: the summary names its module.
+    /// The outline gave the statement no entry, so the summary skipped it.
+    #[test]
+    fn import_summary_names_python_from_imports() {
+        let python = "import os\nfrom collections import OrderedDict\nfrom .local import helper\nfrom __future__ import annotations\n\ndef f():\n    pass\n";
+        let rendered = outline(python, Lang::Python, 1000);
+        assert!(
+            rendered.contains("[1-]   imports: os, collections, .local, __future__\n"),
+            "{rendered}"
+        );
+    }
+
+    /// PHP, C# and Swift summaries name each module a statement imports,
+    /// without its alias. Read off the statement's text, a PHP group was its
+    /// bare prefix and an alias stayed on the source.
+    #[test]
+    fn import_summary_reads_php_csharp_and_swift_from_the_tree() {
+        let php = "<?php\nuse App\\Models\\{User, Post};\nuse Foo\\Bar as Baz;\n\nclass A {}\n";
+        let rendered = outline(php, Lang::Php, 1000);
+        assert!(
+            rendered.contains("imports: App\\Models\\User, App\\Models\\Post, Foo\\Bar\n"),
+            "{rendered}"
+        );
+        let csharp = "using System;\nusing Json = Newtonsoft.Json;\n\nclass A {}\n";
+        let rendered = outline(csharp, Lang::CSharp, 1000);
+        assert!(
+            rendered.contains("imports: System, Newtonsoft.Json\n"),
+            "{rendered}"
+        );
+        let swift = "import Foundation\nimport struct Foo.Bar\n\nclass A {}\n";
+        let rendered = outline(swift, Lang::Swift, 1000);
+        assert!(
+            rendered.contains("imports: Foundation, Foo.Bar\n"),
+            "{rendered}"
+        );
+    }
+
     /// An export clause renders as one line, the clause as written. Read off
     /// its first line, a clause written across lines was `export {`.
     #[test]

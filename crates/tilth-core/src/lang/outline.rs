@@ -247,12 +247,14 @@ fn node_to_entry(
             let name = find_child_text(node, "name", lines)
                 .or_else(|| first_identifier_text(node, lines))
                 .unwrap_or_else(|| "<property>".into());
-            let sig = extract_signature(node, lines);
+            let sig = first_line_signature(node, lines);
             (OutlineKind::Property, name, Some(sig))
         }
 
         // Imports — collect as a group
         "import_statement"
+        | "import_from_statement"
+        | "future_import_statement"
         | "import_declaration"
         | "import"
         | "use_declaration"
@@ -405,8 +407,91 @@ fn collect_children(
     children
 }
 
-/// Extract the first line as a function signature (name + params + return type).
+/// A function's signature: its name, parameters and return type, on one
+/// line. A signature written across lines reads from its first line to
+/// where its body starts, each line trimmed and joined.
 fn extract_signature(node: tree_sitter::Node, lines: &[&str]) -> String {
+    let header = header_lines(node, lines);
+    if header.len() > 1 {
+        return join_signature_lines(&header);
+    }
+    first_line_signature(node, lines)
+}
+
+/// The non-blank lines of a function's header, trimmed: from the line it
+/// starts on to where its body starts, or to its end when it has no body
+/// (an abstract or interface method). Empty when the header fits on its
+/// first line.
+fn header_lines<'a>(node: tree_sitter::Node, lines: &[&'a str]) -> Vec<&'a str> {
+    let start_row = node.start_position().row;
+    let end = match function_body(node) {
+        Some(body) => body.start_position(),
+        // An Elixir `def f(x), do: …` is a call whose keyword body is
+        // read by `first_line_signature`.
+        None if node.kind() == "call" => return Vec::new(),
+        None => node.end_position(),
+    };
+    if end.row == start_row {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for row in start_row..=end.row.min(lines.len().saturating_sub(1)) {
+        let line = lines[row];
+        let line = if row == end.row {
+            line.get(..end.column).unwrap_or(line)
+        } else {
+            line
+        };
+        let line = line.trim();
+        if !line.is_empty() && !line.starts_with("//") {
+            out.push(line);
+        }
+    }
+    out
+}
+
+/// The node a function's body starts at: its `body` field, or the child
+/// that holds the body in grammars without one (Kotlin's `function_body`,
+/// Elixir's `do_block`).
+fn function_body(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
+    if let Some(body) = node.child_by_field_name("body") {
+        return Some(body);
+    }
+    let mut cursor = node.walk();
+    let found = node
+        .named_children(&mut cursor)
+        .find(|c| matches!(c.kind(), "function_body" | "do_block"));
+    found
+}
+
+/// Header lines joined into one: no space inside brackets, and the
+/// trailing comma a formatter puts before a closing bracket dropped, so a
+/// signature reads the same however it is wrapped. A trailing `{`, the
+/// Python `:` and a Rust `where` clause's last comma go too.
+fn join_signature_lines(header: &[&str]) -> String {
+    let mut out = String::new();
+    for part in header {
+        let closes = part.starts_with([')', ']', '>', '}']);
+        if closes && out.ends_with(',') {
+            out.pop();
+        }
+        let opens = out.ends_with(['(', '[', '<', '{']);
+        if !out.is_empty() && !closes && !opens {
+            out.push(' ');
+        }
+        out.push_str(part);
+    }
+    let trimmed = out
+        .trim_end()
+        .trim_end_matches(';')
+        .trim_end_matches('{')
+        .trim_end();
+    let trimmed = trimmed.strip_suffix(':').unwrap_or(trimmed);
+    trimmed.trim_end().trim_end_matches(',').to_string()
+}
+
+/// The signature read off the node's first line alone.
+fn first_line_signature(node: tree_sitter::Node, lines: &[&str]) -> String {
     let start_row = node.start_position().row;
     if start_row < lines.len() {
         let line = lines[start_row].trim();
@@ -500,20 +585,49 @@ fn first_identifier_text(node: tree_sitter::Node, lines: &[&str]) -> Option<Stri
     None
 }
 
-/// Extract a doc comment from the previous sibling.
+/// The doc comment above `node`: the comment right before it, and the
+/// comments directly above that one, line after line. Line comments (`//`,
+/// `///`, `#`) are one node per line, so a doc written in them is several
+/// comments; reading only the nearest kept a doc's last line alone. A
+/// blank line, or a comment that trails code, ends the doc.
 fn extract_doc(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
-    let prev = node.prev_sibling()?;
-    let kind = prev.kind();
-    if kind.contains("comment") || kind.contains("doc") {
-        let cleaned = clean_comment_text(&node_rows_text(prev, lines));
-        if cleaned.is_empty() {
-            None
+    let is_comment = |n: tree_sitter::Node| {
+        let kind = n.kind();
+        kind.contains("comment") || kind.contains("doc")
+    };
+    let starts_its_line = |n: tree_sitter::Node| {
+        let start = n.start_position();
+        lines
+            .get(start.row)
+            .and_then(|line| line.get(..start.column))
+            .is_some_and(|before| before.trim().is_empty())
+    };
+    let nearest = node.prev_sibling().filter(|p| is_comment(*p))?;
+    let mut block = vec![nearest];
+    let mut top = nearest;
+    while let Some(above) = top.prev_sibling() {
+        // A Rust line comment ends after its newline, at column 0 of the
+        // next line.
+        let end = above.end_position();
+        let last_row = if end.column == 0 && end.row > above.start_position().row {
+            end.row - 1
         } else {
-            Some(cleaned)
+            end.row
+        };
+        let adjacent = last_row + 1 == top.start_position().row;
+        if !(is_comment(above) && adjacent && starts_its_line(above) && starts_its_line(top)) {
+            break;
         }
-    } else {
-        None
+        block.push(above);
+        top = above;
     }
+    let parts: Vec<String> = block
+        .iter()
+        .rev()
+        .map(|c| clean_comment_text(&node_rows_text(*c, lines)))
+        .filter(|text| !text.is_empty())
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(" "))
 }
 
 /// Every line a node spans, joined with newlines. `node_text_simple` returns
@@ -1573,6 +1687,108 @@ mod doc_comment_tests {
         assert!(doc.starts_with("Adds two numbers."), "got: {doc:?}");
         assert!(!doc.contains('*'), "delimiters must be gone: {doc:?}");
         assert!(!doc.contains('\n'), "must be one line: {doc:?}");
+    }
+
+    /// A doc written in line comments is one comment node per line. Reading
+    /// only the nearest node kept the doc's last line: `Second sentence.`
+    /// A blank line or a comment that trails code ends the doc.
+    #[test]
+    fn a_doc_of_line_comments_keeps_every_line() {
+        assert_eq!(
+            first_doc(
+                "package p\n\n// Public does a thing.\n// Second sentence.\nfunc Public() {}\n",
+                Lang::Go
+            ),
+            Some("Public does a thing. Second sentence.".to_string())
+        );
+        assert_eq!(
+            first_doc("/// First line.\n/// Second line.\nfn f() {}\n", Lang::Rust),
+            Some("First line. Second line.".to_string())
+        );
+        assert_eq!(
+            first_doc(
+                "# Section heading\n\n# Doc of f.\n# More.\ndef f():\n    pass\n",
+                Lang::Python
+            ),
+            Some("Doc of f. More.".to_string())
+        );
+        let grouped = "package p\n\nconst (\n\tA = 1 // trails A\n\t// B is documented.\n\tB = 2\n)\n";
+        let entries = get_outline_entries(grouped, Lang::Go);
+        let b = entries.iter().find(|e| e.name == "B").expect("B");
+        assert_eq!(b.doc.as_deref(), Some("B is documented."));
+    }
+}
+
+#[cfg(test)]
+mod signature_tests {
+    use super::get_outline_entries;
+    use crate::types::Lang;
+
+    fn signature_of(src: &str, lang: Lang, name: &str) -> Option<String> {
+        fn find(entries: &[crate::types::OutlineEntry], name: &str) -> Option<String> {
+            entries.iter().find_map(|e| {
+                if e.name == name {
+                    e.signature.clone()
+                } else {
+                    find(&e.children, name)
+                }
+            })
+        }
+        find(&get_outline_entries(src, lang), name)
+    }
+
+    /// A signature written across lines reads to where the body starts.
+    /// Read off the first line alone, it was `pub fn multiline_handler(`.
+    #[test]
+    fn a_multiline_signature_is_read_whole() {
+        let rust = "pub fn multiline_handler(\n    request: &str,\n    retries: u8,\n) -> Result<usize, &'static str> {\n    Ok(1)\n}\n";
+        assert_eq!(
+            signature_of(rust, Lang::Rust, "multiline_handler").as_deref(),
+            Some("pub fn multiline_handler(request: &str, retries: u8) -> Result<usize, &'static str>")
+        );
+        let where_clause = "fn f<T>(x: T) -> T\nwhere\n    T: Clone,\n{\n    x\n}\n";
+        assert_eq!(
+            signature_of(where_clause, Lang::Rust, "f").as_deref(),
+            Some("fn f<T>(x: T) -> T where T: Clone")
+        );
+        let python = "def handler(\n    request,\n    retries: int = 3,\n) -> int:\n    return 1\n";
+        assert_eq!(
+            signature_of(python, Lang::Python, "handler").as_deref(),
+            Some("def handler(request, retries: int = 3) -> int")
+        );
+        let go = "package p\n\nfunc Serve(\n\taddr string,\n\tport int,\n) error {\n\treturn nil\n}\n";
+        assert_eq!(
+            signature_of(go, Lang::Go, "Serve").as_deref(),
+            Some("func Serve(addr string, port int) error")
+        );
+        let ts = "export async function load(\n  path: string,\n  opts: Options,\n): Promise<void> {\n}\n";
+        assert_eq!(
+            signature_of(ts, Lang::TypeScript, "load").as_deref(),
+            Some("export async function load(path: string, opts: Options): Promise<void>")
+        );
+        let java = "interface Store {\n  void save(\n      String key,\n      byte[] value);\n}\n";
+        assert_eq!(
+            signature_of(java, Lang::Java, "save").as_deref(),
+            Some("void save(String key, byte[] value)")
+        );
+    }
+
+    /// A signature that fits on its line reads as it did: to its brace,
+    /// or the whole line.
+    #[test]
+    fn a_one_line_signature_reads_as_before() {
+        assert_eq!(
+            signature_of("fn f(a: u8) -> u8 { a }\n", Lang::Rust, "f").as_deref(),
+            Some("fn f(a: u8) -> u8")
+        );
+        assert_eq!(
+            signature_of("def f(x):\n    return x\n", Lang::Python, "f").as_deref(),
+            Some("def f(x)")
+        );
+        assert_eq!(
+            signature_of("def f(x), do: x\n", Lang::Elixir, "f").as_deref(),
+            Some("def f(x)")
+        );
     }
 }
 
