@@ -597,13 +597,14 @@ division.
 gateway. The decision tree, in order:
 
 1. `metadata` and open errors → typed `TilthError::NotFound` /
-   `PermissionDenied` / `IoError` (`path_error`, one mapping for every
-   step), with a `suggest_similar` fallback (Levenshtein on directory
-   siblings).
+   `PermissionDenied` / `IoError` (`TilthError::from_io`, one mapping
+   for every step and for the edit read), with a `suggest_similar`
+   fallback (Levenshtein on directory siblings).
 2. **Directory** → `list_directory` (sorted entries, file types).
 3. **Empty file, or not a regular file** → header with
    `ViewMode::Empty`. A pipe, socket or device has no fixed contents and
-   is never opened, since opening a pipe that has no writer blocks.
+   is not opened. The path's metadata decides this before any open, so
+   an empty file shows as empty whatever its section or permissions.
 4. **`section: Some(...)` or `sections: [...]`** → `read_ranges`.
    Each range is either a line range (`"45-89"`) or a heading address
    (`"## Architecture"`, resolved by `resolve_heading`'s walk over
@@ -617,7 +618,8 @@ gateway. The decision tree, in order:
    Line ranges stream through `LineSelector`, which copies the requested
    lines out of each chunk, only counts the others and stops at the last
    requested line. A heading needs the whole text to find its lines. An
-   empty file shows as empty, whatever its ranges.
+   empty file shows as empty, whatever its well-formed ranges; a
+   malformed range fails there as on any file.
 5. **The head decides first.** `detection::read_head` reads the first
    `HEAD_WINDOW` bytes, and `is_binary` (null bytes in the first 512),
    the generated markers (`@generated`, `DO NOT EDIT`, …, or a name such
@@ -628,10 +630,11 @@ gateway. The decision tree, in order:
 6. **Log, CSV or unknown type, outlined.** Past the token threshold, or
    over the cap with `--full`, these views show only a file's first and
    last lines and its line count (`outline::EndsView`). The file streams
-   into `ends::EndsCollector`, so only the lines shown are held. A file
-   with no more lines than the view shows is then held whole by that
-   pass, and goes on to step 7 without a second read. A file whose
-   outline OGATE rejects goes on to step 7 too, which reads it whole.
+   into `ends::EndsCollector`, so only the lines shown are held, each
+   once. A file with no more lines than the view shows is then held
+   whole by that pass, and goes on to step 7 without a second read. A
+   file whose outline OGATE rejects goes on to step 7 too, which reads
+   it whole.
 7. **Full mode + oversized.** This guards `--full` on huge files. Caps
    at `TILTH_FULL_SIZE_CAP` (default in `full_read_size_cap()`); above
    the cap, returns the outline with a banner explaining how to
