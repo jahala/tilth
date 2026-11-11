@@ -138,7 +138,7 @@ recovery_test.go:22            TestPanicClean       → RecoveryWithWriter
 ...
 ```
 
-"Used by" lists the first 15 dependents and counts the rest. `--full` lists them all.
+"Used by" lists the files that call the file's names, and the files that import it without a call (`imports it`), also through a re-exporting `index.ts` or `__init__.py` (`imports it through …`). It lists the first 15 dependents and counts the rest. `--full` lists them all.
 
 In MCP mode, use the `tilth_deps` tool.
 

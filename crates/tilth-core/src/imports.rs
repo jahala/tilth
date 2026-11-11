@@ -42,22 +42,28 @@ pub fn resolve_related_files_with_content(file_path: &Path, content: &str) -> Ve
 /// imports.
 #[must_use]
 pub fn resolve_imports(file_path: &Path, lang: Lang, imports: &[Import]) -> Vec<PathBuf> {
-    let Some(dir) = file_path.parent() else {
-        return Vec::new();
-    };
-
     let mut results = Vec::new();
     for import in imports {
-        if is_external(&import.source, lang) {
-            continue;
-        }
-        if let Some(path) = resolve(dir, &import.source, lang) {
+        if let Some(path) = resolve_import(file_path, lang, import) {
             if !results.contains(&path) {
                 results.push(path);
             }
         }
     }
     results
+}
+
+/// The local file one import of the file at `file_path` names, if it
+/// resolves to one. A Python absolute import (`from pkg.mod import x`) is
+/// local when `pkg/mod.py` sits under a directory above the importer, up
+/// to its project root; `is_external` cannot tell that without the disk.
+#[must_use]
+pub fn resolve_import(file_path: &Path, lang: Lang, import: &Import) -> Option<PathBuf> {
+    let dir = file_path.parent()?;
+    if is_external(&import.source, lang) && lang != Lang::Python {
+        return None;
+    }
+    resolve(dir, &import.source, lang)
 }
 
 /// One module an import statement names.
@@ -745,7 +751,7 @@ fn resolve_js(dir: &Path, source: &str) -> Option<PathBuf> {
 fn resolve_python(dir: &Path, source: &str) -> Option<PathBuf> {
     let dots = source.bytes().take_while(|&b| b == b'.').count();
     if dots == 0 {
-        return None;
+        return resolve_python_absolute(dir, source);
     }
     // Each dot beyond the first goes up one directory.
     let mut base = dir.to_path_buf();
@@ -766,6 +772,40 @@ fn resolve_python(dir: &Path, source: &str) -> Option<PathBuf> {
     let as_pkg = base.join(&rel).join("__init__.py");
     if as_pkg.exists() {
         return Some(as_pkg);
+    }
+    None
+}
+
+/// `a.b.c` as Python finds it from a file in `dir`: `a/b/c.py` or
+/// `a/b/c/__init__.py` under `dir` or a directory above it, or under that
+/// directory's `src/` (the src layout). The nearest directory wins, as the
+/// importer's own directory comes first on Python's path. The search stops
+/// at the project root: the first directory holding `.git`,
+/// `pyproject.toml`, `setup.py` or `setup.cfg`.
+fn resolve_python_absolute(dir: &Path, source: &str) -> Option<PathBuf> {
+    const ROOT_MARKERS: [&str; 4] = [".git", "pyproject.toml", "setup.py", "setup.cfg"];
+    let mut parts = source.split('.');
+    let first = parts.next().filter(|p| !p.is_empty())?;
+    let rel: PathBuf = source.split('.').collect();
+    for ancestor in dir.ancestors() {
+        for base in [ancestor.to_path_buf(), ancestor.join("src")] {
+            // One stat rules out most bases: the top-level package or module.
+            let top = base.join(first);
+            if !top.is_dir() && !top.with_extension("py").is_file() {
+                continue;
+            }
+            let as_file = base.join(&rel).with_extension("py");
+            if as_file.is_file() {
+                return Some(as_file);
+            }
+            let as_pkg = base.join(&rel).join("__init__.py");
+            if as_pkg.is_file() {
+                return Some(as_pkg);
+            }
+        }
+        if ROOT_MARKERS.iter().any(|m| ancestor.join(m).exists()) {
+            break;
+        }
     }
     None
 }

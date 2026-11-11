@@ -543,7 +543,15 @@ machinery:
   queries against the same language stay separated.
 - **Deps** (`deps.rs`, both crates) — `analyze_deps` (`tilth-core`)
   is what `tilth_deps` runs. Returns a `DepsResult` with `Uses` (local
-  + external) and every dependent in `Used by`. `format_deps` (binary)
+  + external) and every dependent in `Used by`. A dependent calls one
+  of the file's names (at most `MAX_EXPORTED_SYMBOLS`, chosen by what
+  other files import by name, then by length; the rest are named in
+  the result), or imports the file: a walk resolves the imports of
+  every file whose text names the file's module, then follows the
+  files that re-export it (`index.ts`, `__init__.py`, `export … from`)
+  to their importers. Python absolute imports resolve against the
+  importer's directories up to the project root, and their `src/`.
+  `format_deps` (binary)
   does the human output: it lists the first 15 dependents, or all of
   them with `--full`, and says how many it left out, under a budget
   too. The external-dep stdlib
