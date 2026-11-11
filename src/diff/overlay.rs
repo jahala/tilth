@@ -8,8 +8,8 @@ use tilth_core::types::{FileType, OutlineEntry, OutlineKind};
 
 use super::matching::{build_diff_symbols, match_symbols};
 use super::{
-    ChangeType, Conflict, DiffLine, DiffLineKind, DiffSource, FileDiff, FileOverlay, FileStatus,
-    MatchConfidence, SymbolChange,
+    ChangeType, Conflict, DiffLine, DiffLineKind, FileDiff, FileOverlay, FileStatus, Hunk,
+    MatchConfidence, Side, Sides, SymbolChange,
 };
 
 // ---------------------------------------------------------------------------
@@ -18,34 +18,52 @@ use super::{
 
 /// Build a structural overlay for a single file diff.
 ///
-/// Fetches old/new content based on `source`, outlines both versions,
-/// runs three-phase symbol matching, and attributes diff hunks to functions.
-/// `repo` anchors git commands and working-tree reads when the diff targets a
-/// checkout other than the process cwd.
+/// Reads the old and new content from `sides`, outlines both versions, runs
+/// three-phase symbol matching, and gives every patch line to the innermost
+/// changed symbol that holds it. Lines outside every changed symbol, and all
+/// lines of a file with no outline, stay visible in `other_lines`. `repo`
+/// anchors git commands and working-tree reads.
 pub(crate) fn compute_overlay(
     file_diff: &FileDiff,
-    source: &DiffSource,
+    sides: &Sides,
     repo: Option<&Path>,
 ) -> FileOverlay {
-    let path = &file_diff.path;
+    let (added, removed) = count_changed_lines(&file_diff.hunks);
+    let mut overlay = FileOverlay {
+        path: file_diff.path.clone(),
+        old_path: file_diff.old_path.clone(),
+        symbol_changes: Vec::new(),
+        other_lines: Vec::new(),
+        added,
+        removed,
+        conflicts: Vec::new(),
+        new_content: None,
+    };
 
-    // Binary or generated files — empty overlay, formatter handles display.
+    // Binary or generated files: counts only, the formatter summarizes them.
     if file_diff.is_binary || file_diff.is_generated {
-        return FileOverlay {
-            path: path.clone(),
-            symbol_changes: Vec::new(),
-            attributed_hunks: Vec::new(),
-            conflicts: Vec::new(),
-            new_content: None,
-        };
+        return overlay;
     }
 
-    match file_diff.status {
-        FileStatus::Modified => compute_modified(file_diff, source, repo),
-        FileStatus::Added => compute_added(file_diff, source, repo),
-        FileStatus::Deleted => compute_deleted(file_diff, source, repo),
-        FileStatus::Renamed => compute_renamed(file_diff, source, repo),
+    let mut changes = match file_contents(file_diff, sides, repo) {
+        // When either side cannot be read, matching would report every
+        // symbol as added or deleted. Skip it; the lines still show.
+        Err(_) => Vec::new(),
+        Ok((old, new)) => {
+            let changes = symbol_changes(&file_diff.path, &old, &new);
+            if file_diff.status != FileStatus::Deleted {
+                overlay.new_content = Some(new);
+            }
+            changes
+        }
+    };
+    // A whole added or deleted file lists its declarations, not its imports.
+    if matches!(file_diff.status, FileStatus::Added | FileStatus::Deleted) {
+        changes.retain(|c| !matches!(c.kind, OutlineKind::Import | OutlineKind::Export));
     }
+    overlay.other_lines = attribute_lines(&file_diff.hunks, &mut changes);
+    overlay.symbol_changes = changes;
+    overlay
 }
 
 /// Cross-file move detection: match Deleted symbols in one file with Added
@@ -112,20 +130,23 @@ pub(crate) fn cross_file_matching(overlays: &mut [FileOverlay]) {
         }
     }
 
-    // Apply deferred mutations.
+    // Each change takes at most one mutation, so their order does not matter.
     for (oi, ci, change, confidence) in mutations {
         overlays[oi].symbol_changes[ci].change = change;
         overlays[oi].symbol_changes[ci].match_confidence = confidence;
     }
 }
 
-/// Warn when the same symbol name has multiple signature changes across files.
-pub(crate) fn signature_warnings(overlays: &[FileOverlay]) -> Vec<String> {
-    let mut counts: HashMap<String, u32> = HashMap::new();
+/// Warn when the same symbol has its signature changed in several files.
+/// Sorted, so the warnings come out in the same order every run.
+pub(crate) fn signature_warnings<'a>(
+    overlays: impl IntoIterator<Item = &'a FileOverlay>,
+) -> Vec<String> {
+    let mut counts: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
     for overlay in overlays {
         for change in &overlay.symbol_changes {
             if matches!(change.change, ChangeType::SignatureChanged) {
-                *counts.entry(change.name.clone()).or_default() += 1;
+                *counts.entry(change.qualified_name()).or_default() += 1;
             }
         }
     }
@@ -198,232 +219,112 @@ pub(crate) fn detect_conflicts(path: &Path, repo: Option<&Path>) -> Vec<Conflict
     conflicts
 }
 
+/// Added and removed lines in a file's patch.
+pub(crate) fn count_changed_lines(hunks: &[Hunk]) -> (usize, usize) {
+    let lines = || hunks.iter().flat_map(|h| &h.lines);
+    let count = |kind| lines().filter(|l| l.kind == kind).count();
+    (count(DiffLineKind::Added), count(DiffLineKind::Removed))
+}
+
 // ---------------------------------------------------------------------------
-// Per-status overlay builders
+// Symbols
 // ---------------------------------------------------------------------------
 
-fn compute_modified(file_diff: &FileDiff, source: &DiffSource, repo: Option<&Path>) -> FileOverlay {
-    let path = &file_diff.path;
-    let Ok(old_content) = get_old_content(path, file_diff.old_path.as_deref(), source, repo) else {
-        // git error fetching old side — skip symbol analysis to avoid
-        // confidently-wrong all-Added overlay.
-        return FileOverlay {
-            path: path.clone(),
-            symbol_changes: Vec::new(),
-            attributed_hunks: Vec::new(),
-            conflicts: Vec::new(),
-            new_content: None,
-        };
+/// Match the symbols of the old and new content of one file. A file that is
+/// not code, or has no outline, has none.
+fn symbol_changes(path: &Path, old: &str, new: &str) -> Vec<SymbolChange> {
+    let FileType::Code(lang) = detect_file_type_with_content(path, diff_side(old, new)) else {
+        return Vec::new();
     };
-    let Ok(new_content) = get_new_content(path, source, repo) else {
-        return FileOverlay {
-            path: path.clone(),
-            symbol_changes: Vec::new(),
-            attributed_hunks: Vec::new(),
-            conflicts: Vec::new(),
-            new_content: None,
-        };
-    };
+    let old_syms = build_diff_symbols(&get_outline_entries(old, lang), old, lang);
+    let new_syms = build_diff_symbols(&get_outline_entries(new, lang), new, lang);
+    match_symbols(&old_syms, &new_syms)
+}
 
-    let ft = detect_file_type_with_content(path, diff_side(&old_content, &new_content));
-    let (symbol_changes, attributed_hunks) = if let FileType::Code(lang) = ft {
-        let old_entries = get_outline_entries(&old_content, lang);
-        let new_entries = get_outline_entries(&new_content, lang);
-
-        if old_entries.is_empty() && new_entries.is_empty() {
-            // No grammar support or empty outlines — skip symbol analysis.
-            (Vec::new(), Vec::new())
-        } else {
-            let old_syms = build_diff_symbols(&old_entries, &old_content, lang);
-            let new_syms = build_diff_symbols(&new_entries, &new_content, lang);
-            let changes = match_symbols(&old_syms, &new_syms);
-            let attributed = attribute_hunks(&file_diff.hunks, &changes);
-            (changes, attributed)
+/// Give each patch line to the innermost changed symbol whose span holds it:
+/// a removed line by its old line number, any other line by its new one.
+/// Returns the lines no changed symbol holds. Within one hunk, a symbol (or
+/// the outside) that receives only context lines receives none.
+fn attribute_lines(hunks: &[Hunk], changes: &mut [SymbolChange]) -> Vec<DiffLine> {
+    let mut other = Vec::new();
+    for hunk in hunks {
+        let mut groups: Vec<(Option<usize>, Vec<DiffLine>)> = Vec::new();
+        for line in &hunk.lines {
+            let owner = innermost_change(changes, line);
+            match groups.iter_mut().find(|(o, _)| *o == owner) {
+                Some((_, lines)) => lines.push(line.clone()),
+                None => groups.push((owner, vec![line.clone()])),
+            }
         }
-    } else {
-        // Non-code file — no symbol analysis.
-        (Vec::new(), Vec::new())
-    };
-
-    FileOverlay {
-        path: path.clone(),
-        symbol_changes,
-        attributed_hunks,
-        conflicts: Vec::new(),
-        new_content: Some(new_content),
+        for (owner, lines) in groups {
+            if lines.iter().all(|l| l.kind == DiffLineKind::Context) {
+                continue;
+            }
+            match owner {
+                Some(i) => changes[i].lines.extend(lines),
+                None => other.extend(lines),
+            }
+        }
     }
+    other
 }
 
-fn compute_added(file_diff: &FileDiff, source: &DiffSource, repo: Option<&Path>) -> FileOverlay {
-    let path = &file_diff.path;
-    let Ok(new_content) = get_new_content(path, source, repo) else {
-        return FileOverlay {
-            path: path.clone(),
-            symbol_changes: Vec::new(),
-            attributed_hunks: Vec::new(),
-            conflicts: Vec::new(),
-            new_content: None,
-        };
-    };
-
-    let symbol_changes = entries_to_changes(&new_content, path, &ChangeType::Added);
-
-    FileOverlay {
-        path: path.clone(),
-        symbol_changes,
-        attributed_hunks: Vec::new(),
-        conflicts: Vec::new(),
-        new_content: Some(new_content),
-    }
-}
-
-fn compute_deleted(file_diff: &FileDiff, source: &DiffSource, repo: Option<&Path>) -> FileOverlay {
-    let path = &file_diff.path;
-    let Ok(old_content) = get_old_content(path, file_diff.old_path.as_deref(), source, repo) else {
-        return FileOverlay {
-            path: path.clone(),
-            symbol_changes: Vec::new(),
-            attributed_hunks: Vec::new(),
-            conflicts: Vec::new(),
-            new_content: None,
-        };
-    };
-
-    let symbol_changes = entries_to_changes(&old_content, path, &ChangeType::Deleted);
-
-    FileOverlay {
-        path: path.clone(),
-        symbol_changes,
-        attributed_hunks: Vec::new(),
-        conflicts: Vec::new(),
-        new_content: None,
-    }
-}
-
-fn compute_renamed(file_diff: &FileDiff, source: &DiffSource, repo: Option<&Path>) -> FileOverlay {
-    let path = &file_diff.path;
-    let Ok(old_content) = get_old_content(path, file_diff.old_path.as_deref(), source, repo) else {
-        return FileOverlay {
-            path: path.clone(),
-            symbol_changes: Vec::new(),
-            attributed_hunks: Vec::new(),
-            conflicts: Vec::new(),
-            new_content: None,
-        };
-    };
-    let Ok(new_content) = get_new_content(path, source, repo) else {
-        return FileOverlay {
-            path: path.clone(),
-            symbol_changes: Vec::new(),
-            attributed_hunks: Vec::new(),
-            conflicts: Vec::new(),
-            new_content: None,
-        };
-    };
-
-    let ft = detect_file_type_with_content(path, diff_side(&old_content, &new_content));
-    let (symbol_changes, attributed_hunks) = if let FileType::Code(lang) = ft {
-        let old_entries = get_outline_entries(&old_content, lang);
-        let new_entries = get_outline_entries(&new_content, lang);
-        let old_syms = build_diff_symbols(&old_entries, &old_content, lang);
-        let new_syms = build_diff_symbols(&new_entries, &new_content, lang);
-        let changes = match_symbols(&old_syms, &new_syms);
-        let attributed = attribute_hunks(&file_diff.hunks, &changes);
-        (changes, attributed)
-    } else {
-        (Vec::new(), Vec::new())
-    };
-
-    FileOverlay {
-        path: path.clone(),
-        symbol_changes,
-        attributed_hunks,
-        conflicts: Vec::new(),
-        new_content: Some(new_content),
-    }
+fn innermost_change(changes: &[SymbolChange], line: &DiffLine) -> Option<usize> {
+    changes
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| !matches!(c.change, ChangeType::Unchanged))
+        .filter_map(|(i, c)| {
+            let (start, end) = if line.kind == DiffLineKind::Removed {
+                c.old_span?
+            } else {
+                c.new_span?
+            };
+            (start <= line.line && line.line <= end).then_some((end - start, i))
+        })
+        .min()
+        .map(|(_, i)| i)
 }
 
 // ---------------------------------------------------------------------------
 // Content fetching helpers
 // ---------------------------------------------------------------------------
 
-/// Fetch the old-side content for a file diff.
-///
-/// Returns `Ok(content)` on success (including legitimately empty for new files).
-/// Returns `Err(reason)` when the git command OR a filesystem read fails — the caller should
-/// treat this as a signal that old-side content is unavailable and handle accordingly.
-fn get_old_content(
-    path: &Path,
-    old_path: Option<&Path>,
-    source: &DiffSource,
+/// The old and new content of a file. An added file has no old side and a
+/// deleted file no new side; both read as empty without asking git.
+fn file_contents(
+    file_diff: &FileDiff,
+    sides: &Sides,
     repo: Option<&Path>,
-) -> Result<String, String> {
-    let effective_path = old_path.unwrap_or(path);
-    let path_str = effective_path.to_string_lossy();
-
-    match source {
-        DiffSource::GitUncommitted | DiffSource::GitStaged => {
-            git_show(&format!("HEAD:{path_str}"), repo)
-        }
-        DiffSource::GitRef(r) => {
-            if let Some((left, _)) = r.split_once("..") {
-                git_show(&format!("{left}:{path_str}"), repo)
-            } else {
-                // `git diff HEAD~1` compares HEAD~1 (old) against HEAD (new).
-                // So old content is at the ref itself.
-                git_show(&format!("{r}:{path_str}"), repo)
-            }
-        }
-        DiffSource::Files(a, _) => {
-            std::fs::read_to_string(a).map_err(|e| format!("read {}: {e}", a.display()))
-        }
-        DiffSource::Patch(_) | DiffSource::Log(_) => Ok(String::new()),
-    }
+) -> Result<(String, String), String> {
+    let old = if file_diff.status == FileStatus::Added {
+        String::new()
+    } else {
+        let old_path = file_diff.old_path.as_deref().unwrap_or(&file_diff.path);
+        read_side(&sides.old, old_path, repo)?
+    };
+    let new = if file_diff.status == FileStatus::Deleted {
+        String::new()
+    } else {
+        read_side(&sides.new, &file_diff.path, repo)?
+    };
+    Ok((old, new))
 }
 
-/// Where the "new" side of a `GitRef` diff reads its content from.
-enum GitRefNewSide {
-    /// A range ref (`a..b`): the committed blob at the right side, via `git show`.
-    Committed(String),
-    /// A bare ref: `git diff <ref>` compares against the working tree on disk.
-    WorkingTree,
-}
-
-/// Decide how a `GitRef`'s new-side content is sourced.
-///
-/// A range ref (`a..b`) reads the committed blob at `b` via `git show b:<path>`;
-/// a bare ref reads the working tree, because `git diff <ref>` compares `<ref>`
-/// against the working tree rather than against `HEAD`.
-fn resolve_git_ref_new_side(reff: &str, path_str: &str) -> GitRefNewSide {
-    match reff.split_once("..") {
-        Some((_, right)) => GitRefNewSide::Committed(format!("{right}:{path_str}")),
-        None => GitRefNewSide::WorkingTree,
-    }
-}
-fn get_new_content(
-    path: &Path,
-    source: &DiffSource,
-    repo: Option<&Path>,
-) -> Result<String, String> {
+/// Read `path` (repository-relative) from one side of a diff.
+fn read_side(side: &Side, path: &Path, repo: Option<&Path>) -> Result<String, String> {
     let path_str = path.to_string_lossy();
-
-    match source {
-        DiffSource::GitUncommitted => {
+    match side {
+        Side::Rev(rev) => git_show(&format!("{rev}:{path_str}"), repo),
+        Side::Index => git_show(&format!(":{path_str}"), repo),
+        Side::WorkingTree => {
             let disk = on_disk(repo, path);
             std::fs::read_to_string(&disk).map_err(|e| format!("read {}: {e}", disk.display()))
         }
-        DiffSource::GitStaged => git_show(&format!(":{path_str}"), repo),
-        DiffSource::GitRef(r) => match resolve_git_ref_new_side(r, &path_str) {
-            GitRefNewSide::Committed(spec) => git_show(&spec, repo),
-            GitRefNewSide::WorkingTree => {
-                let disk = on_disk(repo, path);
-                std::fs::read_to_string(&disk).map_err(|e| format!("read {}: {e}", disk.display()))
-            }
-        },
-        DiffSource::Files(_, b) => {
-            std::fs::read_to_string(b).map_err(|e| format!("read {}: {e}", b.display()))
+        Side::File(file) => {
+            std::fs::read_to_string(file).map_err(|e| format!("read {}: {e}", file.display()))
         }
-        DiffSource::Patch(_) | DiffSource::Log(_) => Ok(String::new()),
+        Side::Unavailable => Ok(String::new()),
     }
 }
 
@@ -471,170 +372,6 @@ fn diff_side<'a>(old_content: &'a str, new_content: &'a str) -> &'a str {
     }
 }
 
-fn get_entries_for_path(path: &Path, content: &str) -> Vec<OutlineEntry> {
-    match detect_file_type_with_content(path, content) {
-        FileType::Code(lang) => get_outline_entries(content, lang),
-        _ => Vec::new(),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Hunk-to-function attribution
-// ---------------------------------------------------------------------------
-
-struct SymRange {
-    name: String,
-    start: u32,
-    end: u32,
-    is_deleted: bool,
-}
-
-/// For each symbol change that has a line range, find which diff lines from
-/// the hunks fall within that symbol. Returns `(symbol_name, lines)` pairs.
-fn attribute_hunks(
-    hunks: &[super::Hunk],
-    changes: &[SymbolChange],
-) -> Vec<(String, Vec<DiffLine>)> {
-    let mut result: Vec<(String, Vec<DiffLine>)> = Vec::new();
-
-    let active_symbols: Vec<&SymbolChange> = changes
-        .iter()
-        .filter(|c| !matches!(c.change, ChangeType::Unchanged))
-        .collect();
-
-    if active_symbols.is_empty() {
-        return result;
-    }
-
-    let mut sym_ranges: Vec<SymRange> = Vec::new();
-    for change in &active_symbols {
-        let start = change.line;
-        let end = if let Some((old_size, new_size)) = change.size_delta {
-            if matches!(change.change, ChangeType::Deleted) {
-                start + old_size.saturating_sub(1)
-            } else {
-                start + new_size.saturating_sub(1)
-            }
-        } else {
-            start
-        };
-        sym_ranges.push(SymRange {
-            name: change.name.clone(),
-            start,
-            end,
-            is_deleted: matches!(change.change, ChangeType::Deleted),
-        });
-    }
-
-    // Pre-allocate buckets for each symbol.
-    let mut buckets: Vec<Vec<DiffLine>> = (0..sym_ranges.len()).map(|_| Vec::new()).collect();
-
-    for hunk in hunks {
-        let mut old_line = hunk.old_start;
-        let mut new_line = hunk.new_start;
-
-        for diff_line in &hunk.lines {
-            match diff_line.kind {
-                DiffLineKind::Context => {
-                    // Attribute by new-file line.
-                    for (si, sr) in sym_ranges.iter().enumerate() {
-                        if !sr.is_deleted && new_line >= sr.start && new_line <= sr.end {
-                            buckets[si].push(DiffLine {
-                                kind: diff_line.kind,
-                                content: diff_line.content.clone(),
-                            });
-                        }
-                    }
-                    old_line += 1;
-                    new_line += 1;
-                }
-                DiffLineKind::Added => {
-                    // Attribute by new-file line.
-                    for (si, sr) in sym_ranges.iter().enumerate() {
-                        if !sr.is_deleted && new_line >= sr.start && new_line <= sr.end {
-                            buckets[si].push(DiffLine {
-                                kind: diff_line.kind,
-                                content: diff_line.content.clone(),
-                            });
-                        }
-                    }
-                    new_line += 1;
-                }
-                DiffLineKind::Removed => {
-                    // Attribute by old-file line.
-                    for (si, sr) in sym_ranges.iter().enumerate() {
-                        if sr.is_deleted && old_line >= sr.start && old_line <= sr.end {
-                            buckets[si].push(DiffLine {
-                                kind: diff_line.kind,
-                                content: diff_line.content.clone(),
-                            });
-                        }
-                    }
-                    old_line += 1;
-                }
-            }
-        }
-    }
-
-    // Collect non-empty buckets.
-    for (si, lines) in buckets.into_iter().enumerate() {
-        if !lines.is_empty() {
-            result.push((sym_ranges[si].name.clone(), lines));
-        }
-    }
-
-    result
-}
-
-// ---------------------------------------------------------------------------
-// Outline → SymbolChange helpers
-// ---------------------------------------------------------------------------
-
-/// Convert outline entries to symbol changes of a single type (Added or Deleted).
-fn entries_to_changes(content: &str, path: &Path, change_type: &ChangeType) -> Vec<SymbolChange> {
-    let entries = get_entries_for_path(path, content);
-    let mut changes = Vec::new();
-    collect_entries_recursive(&entries, change_type, &mut changes);
-    changes
-}
-
-fn collect_entries_recursive(
-    entries: &[OutlineEntry],
-    change_type: &ChangeType,
-    out: &mut Vec<SymbolChange>,
-) {
-    for entry in entries {
-        // Skip imports/exports — not interesting for symbol-level diff.
-        if matches!(entry.kind, OutlineKind::Import | OutlineKind::Export) {
-            continue;
-        }
-
-        let (old_sig, new_sig) = match change_type {
-            ChangeType::Added => (None, entry.signature.clone()),
-            ChangeType::Deleted => (entry.signature.clone(), None),
-            _ => (None, None),
-        };
-
-        out.push(SymbolChange {
-            name: entry.name.clone(),
-            kind: entry.kind,
-            change: change_type.clone(),
-            match_confidence: MatchConfidence::Exact,
-            line: entry.start_line,
-            old_sig,
-            new_sig,
-            size_delta: Some((
-                entry.end_line.saturating_sub(entry.start_line) + 1,
-                entry.end_line.saturating_sub(entry.start_line) + 1,
-            )),
-        });
-
-        if !entry.children.is_empty() {
-            collect_entries_recursive(&entry.children, change_type, out);
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Conflict helpers
 // ---------------------------------------------------------------------------
@@ -658,9 +395,10 @@ fn find_enclosing_function(entries: &[OutlineEntry], line: u32) -> Option<String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diff::{resolve_sides, DiffSource};
 
     #[test]
-    fn bare_git_ref_new_content_reads_working_tree() {
+    fn working_tree_side_reads_the_file_on_disk() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("sample.rs");
         std::fs::write(&file, "fn worktree_only() {}\n").unwrap();
@@ -668,73 +406,108 @@ mod tests {
         // A single ref (no `..`) diffs against the working tree, so the new
         // content must come from the file on disk — not `git show HEAD:<path>`,
         // which would return empty here and silently mis-attribute the diff.
-        let content = get_new_content(&file, &DiffSource::GitRef("HEAD".to_string()), None)
-            .expect("working-tree read must succeed");
-        assert!(
-            content.contains("worktree_only"),
-            "bare GitRef new content must be the working tree, got {content:?}"
+        let content = read_side(&Side::WorkingTree, &file, None).expect("working-tree read");
+        assert!(content.contains("worktree_only"), "{content:?}");
+    }
+
+    #[test]
+    fn revision_ranges_pick_both_sides() {
+        let sides = |r: &str| resolve_sides(&DiffSource::GitRef(r.to_string()), None).unwrap();
+        // A bare ref compares that ref with the working tree.
+        assert_eq!(
+            sides("HEAD~1"),
+            Sides {
+                old: Side::Rev("HEAD~1".into()),
+                new: Side::WorkingTree
+            }
         );
-
-        // Lock the routing decision too: a bare ref must take the working-tree branch.
-        match resolve_git_ref_new_side("HEAD", "src/lib.rs") {
-            GitRefNewSide::WorkingTree => {}
-            GitRefNewSide::Committed(spec) => {
-                panic!("bare ref must read the working tree, not `git show {spec}`")
+        // A range reads the committed blob at its right end, not the working
+        // tree; an empty end means HEAD.
+        assert_eq!(
+            sides("HEAD..feature"),
+            Sides {
+                old: Side::Rev("HEAD".into()),
+                new: Side::Rev("feature".into())
             }
-        }
+        );
+        assert_eq!(
+            sides("main.."),
+            Sides {
+                old: Side::Rev("main".into()),
+                new: Side::Rev("HEAD".into())
+            }
+        );
     }
 
     #[test]
-    fn range_git_ref_new_content_reads_committed_blob() {
-        // Dual-path lock: a RANGE ref (`a..b`) must read the committed blob at the
-        // right side via `git show b:<path>`, NOT the working tree. Without this a
-        // regression collapsing both branches into the working-tree read would pass
-        // the bare-ref test above while silently breaking range diffs.
-        match resolve_git_ref_new_side("HEAD..feature", "src/lib.rs") {
-            GitRefNewSide::Committed(spec) => {
-                assert_eq!(spec, "feature:src/lib.rs", "wrong git show spec");
-            }
-            GitRefNewSide::WorkingTree => {
-                panic!("range ref must read the committed blob, not the working tree")
-            }
-        }
-    }
-
-    #[test]
-    fn git_show_error_skips_symbol_analysis() {
-        // When get_old_content returns Err, compute_modified must return an
-        // empty overlay rather than a confidently-wrong all-Added result.
-        // Simulate with Files source pointing at a missing old-side file.
+    fn unreadable_side_skips_symbol_analysis_but_keeps_lines() {
+        // When one side cannot be read, matching would report every symbol
+        // of the other side as added or deleted. The overlay has no symbols
+        // instead, and the patch lines stay visible.
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("foo.rs");
         std::fs::write(&file, "fn new_fn() {}\n").unwrap();
-
         let missing = dir.path().join("does_not_exist.rs");
-        let result = get_old_content(
-            &file,
-            None,
-            &DiffSource::Files(missing.clone(), file.clone()),
-            None,
-        );
-        assert!(result.is_err(), "missing file path must yield Err, got Ok");
+        let sides = Sides {
+            old: Side::File(missing),
+            new: Side::File(file.clone()),
+        };
+        assert!(read_side(&sides.old, &file, None).is_err());
 
-        // Confirm that compute_modified skips symbol analysis when old side is unavailable.
         let file_diff = FileDiff {
             path: file.clone(),
             old_path: None,
             status: FileStatus::Modified,
-            hunks: Vec::new(),
+            hunks: vec![Hunk {
+                old_start: 1,
+                old_count: 1,
+                new_start: 1,
+                new_count: 1,
+                lines: vec![
+                    DiffLine {
+                        kind: DiffLineKind::Removed,
+                        line: 1,
+                        content: "fn old_fn() {}".into(),
+                    },
+                    DiffLine {
+                        kind: DiffLineKind::Added,
+                        line: 1,
+                        content: "fn new_fn() {}".into(),
+                    },
+                ],
+            }],
             is_generated: false,
             is_binary: false,
         };
-        let overlay = compute_modified(
-            &file_diff,
-            &DiffSource::Files(missing.clone(), file.clone()),
-            None,
-        );
-        assert!(
-            overlay.symbol_changes.is_empty(),
-            "overlay must be empty when old side is unavailable"
-        );
+        let overlay = compute_overlay(&file_diff, &sides, None);
+        assert!(overlay.symbol_changes.is_empty(), "{overlay:?}");
+        assert_eq!(overlay.other_lines.len(), 2, "{overlay:?}");
+        assert_eq!((overlay.added, overlay.removed), (1, 1));
+    }
+
+    #[test]
+    fn count_changed_lines_skips_context() {
+        let line = |kind| DiffLine {
+            kind,
+            line: 1,
+            content: String::new(),
+        };
+        let hunk = |lines| Hunk {
+            old_start: 1,
+            old_count: 1,
+            new_start: 1,
+            new_count: 1,
+            lines,
+        };
+        let hunks = vec![
+            hunk(vec![
+                line(DiffLineKind::Added),
+                line(DiffLineKind::Added),
+                line(DiffLineKind::Removed),
+                line(DiffLineKind::Context),
+            ]),
+            hunk(vec![line(DiffLineKind::Removed)]),
+        ];
+        assert_eq!(count_changed_lines(&hunks), (2, 2));
     }
 }

@@ -21,9 +21,9 @@ use super::{
 /// # Diff: {source_label} — N files, M modified, K added (~X tokens)
 ///
 /// ## path (N symbols)
-///   [~:sig]  fn name(old) → (new)    L42
-///   [~]      fn name                 L88  (body, 44→51 lines)
-///   [+]      fn name(sig)            L120 (new, 18 lines)
+///   [~:sig]  name — fn name(old) → fn name(new)    L42
+///   [~]      Type::name                            L88  (body, 44→51 lines)
+///   [+]      name                                  L120 (new, 18 lines)
 ///
 /// ## package-lock.json (generated, N lines changed — summarized)
 /// ```
@@ -77,12 +77,7 @@ pub(crate) fn format_overview(
         }
 
         if is_generated {
-            let changed_lines: usize = overlay
-                .attributed_hunks
-                .iter()
-                .flat_map(|(_, lines)| lines.iter())
-                .filter(|l| l.kind != DiffLineKind::Context)
-                .count();
+            let changed_lines = overlay.added + overlay.removed;
             let _ = writeln!(
                 out,
                 "## {rel_path} (generated, {changed_lines} lines changed — summarized)"
@@ -107,12 +102,7 @@ pub(crate) fn format_overview(
     }
 
     // Warnings at the bottom.
-    if !warnings.is_empty() {
-        let _ = writeln!(out);
-        for w in warnings {
-            let _ = writeln!(out, "⚠ {w}");
-        }
-    }
+    write_warnings(&mut out, warnings);
 
     // Patch in the token count now that we know the full size.
     let token_count = estimate_tokens(out.len() as u64);
@@ -142,20 +132,25 @@ pub(crate) fn format_overview(
 /// ```text
 /// # Diff: path — N symbols touched, +X/−Y lines
 ///
-/// ## [~:sig] fn name — signature changed (L42-93)
+/// ## [~:sig] Type::name — signature changed (L42-93)
 ///   BEFORE: old_sig
 ///   AFTER:  new_sig
-///   +48| added line
-///   -49| removed line
-///    50| context line
+///   +  48| added line
+///   -  49| removed line (old-file line number)
+///      50| context line
 ///
-/// ## [ ] fn unchanged_name (L100-120, unchanged)
+/// ## [ ] unchanged_name (L100-120, unchanged)
+///
+/// ## outside symbols
+///   +   3| use std::io;
 /// ```
-pub(crate) fn format_file_detail(overlay: &FileOverlay, budget: Option<u64>) -> String {
+pub(crate) fn format_file_detail(
+    overlay: &FileOverlay,
+    warnings: &[String],
+    budget: Option<u64>,
+) -> String {
     let scope = Path::new(".");
     let rel_path = rel(&overlay.path, scope);
-
-    let (insertions, deletions) = count_insertions_deletions(overlay);
 
     let sym_touched: usize = overlay
         .symbol_changes
@@ -166,53 +161,38 @@ pub(crate) fn format_file_detail(overlay: &FileOverlay, budget: Option<u64>) -> 
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "# Diff: {rel_path} — {sym_touched} symbols touched, +{insertions}/\u{2212}{deletions} lines"
+        "# Diff: {rel_path} — {sym_touched} symbols touched, +{}/\u{2212}{} lines",
+        overlay.added, overlay.removed
     );
 
-    // Build a lookup: symbol_name → attributed diff lines.
-    let hunk_map: std::collections::HashMap<&str, &Vec<DiffLine>> = overlay
-        .attributed_hunks
-        .iter()
-        .map(|(name, lines)| (name.as_str(), lines))
-        .collect();
-
     for change in &overlay.symbol_changes {
-        let line = change.line;
-        let end_line = symbol_end_line(change);
+        let (line, end_line) = change.span();
+        let name = change.qualified_name();
 
         if matches!(change.change, ChangeType::Unchanged) {
-            let _ = writeln!(
-                out,
-                "\n## [ ] {} (L{line}-{end_line}, unchanged)",
-                change.name
-            );
+            let _ = writeln!(out, "\n## [ ] {name} (L{line}-{end_line}, unchanged)");
             continue;
         }
 
         let marker = format_marker(&change.change, &change.match_confidence);
         let label = change_type_label(&change.change);
-
-        let _ = writeln!(
-            out,
-            "\n## {marker} {} — {label} (L{line}-{end_line})",
-            change.name
-        );
-
-        // Signature before/after.
-        if matches!(change.change, ChangeType::SignatureChanged) {
-            if let Some(old_sig) = &change.old_sig {
-                let _ = writeln!(out, "  BEFORE: {old_sig}");
-            }
-            if let Some(new_sig) = &change.new_sig {
-                let _ = writeln!(out, "  AFTER:  {new_sig}");
-            }
-        }
-
-        // Diff lines attributed to this symbol.
-        if let Some(lines) = hunk_map.get(change.name.as_str()) {
-            write_diff_lines(&mut out, lines, line);
-        }
+        let _ = writeln!(out, "\n## {marker} {name} — {label} (L{line}-{end_line})");
+        write_signatures(&mut out, change);
+        write_diff_lines(&mut out, &change.lines);
     }
+
+    // Lines no symbol holds: all of a text file, or imports and comments
+    // between symbols. A file with no symbols needs no heading for them.
+    if !overlay.other_lines.is_empty() {
+        if overlay.symbol_changes.is_empty() {
+            out.push('\n');
+        } else {
+            out.push_str("\n## outside symbols\n");
+        }
+        write_diff_lines(&mut out, &overlay.other_lines);
+    }
+
+    write_warnings(&mut out, warnings);
 
     if let Some(b) = budget {
         budget::apply(&out, b)
@@ -222,48 +202,58 @@ pub(crate) fn format_file_detail(overlay: &FileOverlay, budget: Option<u64>) -> 
 }
 
 /// Format detailed view of a single named function within a file's diff.
+///
+/// `fn_name` is a qualified name (`Type::method`, or `Type.method`) or a bare
+/// one. A bare name that several changed symbols share is ambiguous.
 pub(crate) fn format_function_detail(overlay: &FileOverlay, fn_name: &str) -> String {
-    let change = overlay.symbol_changes.iter().find(|c| c.name == fn_name);
+    let wanted = fn_name.replace('.', "::");
+    let qualified: Vec<&SymbolChange> = overlay
+        .symbol_changes
+        .iter()
+        .filter(|c| c.qualified_name() == wanted)
+        .collect();
+    let candidates = if qualified.is_empty() {
+        overlay
+            .symbol_changes
+            .iter()
+            .filter(|c| c.name == fn_name)
+            .collect()
+    } else {
+        qualified
+    };
 
-    let Some(change) = change else {
-        return format!(
-            "# Diff: {} — `{fn_name}` not found in diff",
-            overlay.path.display()
-        );
+    let change = match candidates.as_slice() {
+        [] => {
+            return format!(
+                "# Diff: {} — `{fn_name}` not found in diff",
+                overlay.path.display()
+            );
+        }
+        [one] => *one,
+        many => {
+            let names: Vec<String> = many.iter().map(|c| c.qualified_name()).collect();
+            return format!(
+                "# Diff: {} — `{fn_name}` is ambiguous: {}. Name one as path:Type::{fn_name}",
+                overlay.path.display(),
+                names.join(", ")
+            );
+        }
     };
 
     let marker = format_marker(&change.change, &change.match_confidence);
     let label = change_type_label(&change.change);
-    let line = change.line;
-    let end_line = symbol_end_line(change);
+    let (line, end_line) = change.span();
+    let name = change.qualified_name();
 
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "# Diff: {} — {marker} {fn_name} (L{line}-{end_line})",
+        "# Diff: {} — {marker} {name} (L{line}-{end_line})",
         overlay.path.display()
     );
-    let _ = writeln!(out, "  {fn_name} ({label})");
-
-    if matches!(change.change, ChangeType::SignatureChanged) {
-        if let Some(old_sig) = &change.old_sig {
-            let _ = writeln!(out, "  BEFORE: {old_sig}");
-        }
-        if let Some(new_sig) = &change.new_sig {
-            let _ = writeln!(out, "  AFTER:  {new_sig}");
-        }
-    }
-
-    let empty: &[DiffLine] = &[];
-    let lines = overlay
-        .attributed_hunks
-        .iter()
-        .find(|(name, _)| name == fn_name)
-        .map_or(empty, |(_, lines)| lines.as_slice());
-
-    if !lines.is_empty() {
-        write_diff_lines(&mut out, lines, line);
-    }
+    let _ = writeln!(out, "  {name} ({label})");
+    write_signatures(&mut out, change);
+    write_diff_lines(&mut out, &change.lines);
 
     out
 }
@@ -365,7 +355,7 @@ pub(crate) fn format_log(summaries: &[CommitSummary], scope: &str, budget: Optio
                     format!(
                         "{} {}",
                         format_marker(&c.change, &c.match_confidence),
-                        c.name
+                        c.qualified_name()
                     )
                 })
                 .collect();
@@ -378,22 +368,6 @@ pub(crate) fn format_log(summaries: &[CommitSummary], scope: &str, budget: Optio
     } else {
         out
     }
-}
-
-/// Count total insertions and deletions across all attributed hunks in an overlay.
-pub(crate) fn count_insertions_deletions(overlay: &FileOverlay) -> (usize, usize) {
-    let mut insertions = 0usize;
-    let mut deletions = 0usize;
-    for (_, lines) in &overlay.attributed_hunks {
-        for line in lines {
-            match line.kind {
-                DiffLineKind::Added => insertions += 1,
-                DiffLineKind::Removed => deletions += 1,
-                DiffLineKind::Context => {}
-            }
-        }
-    }
-    (insertions, deletions)
 }
 
 // ---------------------------------------------------------------------------
@@ -418,40 +392,44 @@ fn format_marker(change: &ChangeType, confidence: &MatchConfidence) -> String {
     }
 }
 
+/// Number of lines in a span.
+fn span_len((start, end): (u32, u32)) -> u32 {
+    end.saturating_sub(start) + 1
+}
+
 /// Format one symbol change as a single overview line (used inside file sections).
 fn format_symbol_line(change: &SymbolChange) -> String {
     let marker = format_marker(&change.change, &change.match_confidence);
-    let name = &change.name;
-    let line_no = change.line;
+    let (line_no, _) = change.span();
 
-    let mut s = format!("{marker:<8} {name}");
+    let mut s = format!("{marker:<8} {}", change.qualified_name());
 
-    // For signature changes, append old → new.
+    // A signature already holds the name, so it follows the name whole.
     if matches!(change.change, ChangeType::SignatureChanged) {
         if let (Some(old), Some(new)) = (&change.old_sig, &change.new_sig) {
-            let _ = write!(s, "({old}) → ({new})");
+            let _ = write!(s, " — {old} → {new}");
         }
     }
 
-    // Right-align line number at column ~50.
-    let pad = 50usize.saturating_sub(s.len());
+    // Line number at column ~50, at least two spaces after the text.
+    let pad = 50usize.saturating_sub(s.chars().count()).max(2);
     let _ = write!(s, "{:>pad$}L{line_no}", "");
 
     // Trailing annotation.
     match &change.change {
         ChangeType::BodyChanged => {
-            if let Some((old_sz, new_sz)) = change.size_delta {
-                let _ = write!(s, "  (body, {old_sz}→{new_sz} lines)");
+            if let (Some(old), Some(new)) = (change.old_span, change.new_span) {
+                let _ = write!(s, "  (body, {}→{} lines)", span_len(old), span_len(new));
             }
         }
         ChangeType::Added => {
-            if let Some((_, new_sz)) = change.size_delta {
-                let _ = write!(s, "  (new, {new_sz} lines)");
+            if let Some(new) = change.new_span {
+                let _ = write!(s, "  (new, {} lines)", span_len(new));
             }
         }
         ChangeType::Deleted => {
-            if let Some((old_sz, _)) = change.size_delta {
-                let _ = write!(s, "  (deleted, {old_sz} lines)");
+            if let Some(old) = change.old_span {
+                let _ = write!(s, "  (deleted, {} lines)", span_len(old));
             }
         }
         _ => {}
@@ -474,36 +452,37 @@ fn change_type_label(change: &ChangeType) -> &'static str {
     }
 }
 
-/// Write diff lines with +/-/space prefixes and line numbers.
-/// Line numbers track `new_line` — removed lines don't advance it.
-fn write_diff_lines(out: &mut String, lines: &[DiffLine], base_line: u32) {
-    let mut new_line = base_line;
+/// BEFORE and AFTER lines for a signature change.
+fn write_signatures(out: &mut String, change: &SymbolChange) {
+    if matches!(change.change, ChangeType::SignatureChanged) {
+        if let Some(old_sig) = &change.old_sig {
+            let _ = writeln!(out, "  BEFORE: {old_sig}");
+        }
+        if let Some(new_sig) = &change.new_sig {
+            let _ = writeln!(out, "  AFTER:  {new_sig}");
+        }
+    }
+}
+
+/// Write diff lines with +/-/space prefixes and their file line numbers: the
+/// old file's for a removed line, the new file's otherwise.
+fn write_diff_lines(out: &mut String, lines: &[DiffLine]) {
     for dl in lines {
         let prefix = match dl.kind {
             DiffLineKind::Added => '+',
             DiffLineKind::Removed => '-',
             DiffLineKind::Context => ' ',
         };
-        let _ = writeln!(out, "  {prefix}{new_line:>4}| {}", dl.content);
-        match dl.kind {
-            DiffLineKind::Added | DiffLineKind::Context => new_line += 1,
-            DiffLineKind::Removed => {} // old-file line — don't advance new counter
-        }
+        let _ = writeln!(out, "  {prefix}{:>4}| {}", dl.line, dl.content);
     }
 }
 
-/// Compute the end line for a symbol change.
-fn symbol_end_line(change: &SymbolChange) -> u32 {
-    let start = change.line;
-    if let Some((old_sz, new_sz)) = change.size_delta {
-        let sz = if matches!(change.change, ChangeType::Deleted) {
-            old_sz
-        } else {
-            new_sz
-        };
-        start + sz.saturating_sub(1)
-    } else {
-        start
+fn write_warnings(out: &mut String, warnings: &[String]) {
+    if !warnings.is_empty() {
+        let _ = writeln!(out);
+        for w in warnings {
+            let _ = writeln!(out, "⚠ {w}");
+        }
     }
 }
 
@@ -541,8 +520,11 @@ mod tests {
     fn make_overlay(path: &str, changes: Vec<SymbolChange>) -> FileOverlay {
         FileOverlay {
             path: PathBuf::from(path),
+            old_path: None,
             symbol_changes: changes,
-            attributed_hunks: Vec::new(),
+            other_lines: Vec::new(),
+            added: 0,
+            removed: 0,
             conflicts: Vec::new(),
             new_content: None,
         }
@@ -551,26 +533,30 @@ mod tests {
     fn make_change(name: &str, change: ChangeType) -> SymbolChange {
         SymbolChange {
             name: name.to_string(),
+            parent: String::new(),
             kind: OutlineKind::Function,
             change,
             match_confidence: MatchConfidence::Exact,
-            line: 42,
+            old_span: Some((42, 51)),
+            new_span: Some((42, 53)),
             old_sig: None,
             new_sig: None,
-            size_delta: Some((10, 12)),
+            lines: Vec::new(),
         }
     }
 
     fn make_sig_change(name: &str, old: &str, new: &str) -> SymbolChange {
         SymbolChange {
             name: name.to_string(),
+            parent: String::new(),
             kind: OutlineKind::Function,
             change: ChangeType::SignatureChanged,
             match_confidence: MatchConfidence::Exact,
-            line: 42,
+            old_span: Some((42, 51)),
+            new_span: Some((42, 51)),
             old_sig: Some(old.to_string()),
             new_sig: Some(new.to_string()),
-            size_delta: Some((10, 10)),
+            lines: Vec::new(),
         }
     }
 
@@ -643,23 +629,9 @@ mod tests {
     #[test]
     fn test_overview_generated() {
         let mut overlay = make_overlay("package-lock.json", vec![]);
-        overlay.attributed_hunks = vec![(
-            "top".to_string(),
-            vec![
-                DiffLine {
-                    kind: DiffLineKind::Added,
-                    content: "a".to_string(),
-                },
-                DiffLine {
-                    kind: DiffLineKind::Removed,
-                    content: "b".to_string(),
-                },
-                DiffLine {
-                    kind: DiffLineKind::Context,
-                    content: "c".to_string(),
-                },
-            ],
-        )];
+        // The counts come from the patch; a generated file has no symbols.
+        overlay.added = 1;
+        overlay.removed = 1;
         let path = overlay.path.clone();
         let meta: Vec<(&Path, bool, bool)> = vec![(&path, true, false)];
         let out = format_overview(&[overlay], &meta, &[], "HEAD", None);
@@ -754,66 +726,46 @@ mod tests {
         assert!(out.contains('→'), "missing arrow:\n{out}");
     }
 
-    // 10. File detail header — symbol count and +N/-N
+    fn line(kind: DiffLineKind, line: u32, content: &str) -> DiffLine {
+        DiffLine {
+            kind,
+            line,
+            content: content.to_string(),
+        }
+    }
+
+    // 10. File detail header — symbol count and the patch's +N/-N
     #[test]
     fn test_file_detail_header() {
         let mut overlay = make_overlay(
             "src/lib.rs",
             vec![make_change("foo", ChangeType::BodyChanged)],
         );
-        overlay.attributed_hunks = vec![(
-            "foo".to_string(),
-            vec![
-                DiffLine {
-                    kind: DiffLineKind::Added,
-                    content: "x".to_string(),
-                },
-                DiffLine {
-                    kind: DiffLineKind::Added,
-                    content: "y".to_string(),
-                },
-                DiffLine {
-                    kind: DiffLineKind::Removed,
-                    content: "z".to_string(),
-                },
-            ],
-        )];
-        let out = format_file_detail(&overlay, None);
-        assert!(out.starts_with("# Diff: src/lib.rs"), "bad header:\n{out}");
-        assert!(out.contains("+2"), "missing insertions:\n{out}");
-        assert!(out.contains('1'), "missing deletions:\n{out}");
+        overlay.added = 2;
+        overlay.removed = 1;
+        let out = format_file_detail(&overlay, &[], None);
+        assert!(
+            out.starts_with("# Diff: src/lib.rs — 1 symbols touched, +2/\u{2212}1 lines"),
+            "bad header:\n{out}"
+        );
     }
 
-    // 11. File detail — +/-/space prefixes with line numbers
+    // 11. File detail — +/-/space prefixes with each line's own number
     #[test]
     fn test_file_detail_diff_lines() {
-        let mut overlay = make_overlay(
-            "src/lib.rs",
-            vec![make_change("foo", ChangeType::BodyChanged)],
-        );
-        overlay.attributed_hunks = vec![(
-            "foo".to_string(),
-            vec![
-                DiffLine {
-                    kind: DiffLineKind::Added,
-                    content: "added line".to_string(),
-                },
-                DiffLine {
-                    kind: DiffLineKind::Removed,
-                    content: "removed line".to_string(),
-                },
-                DiffLine {
-                    kind: DiffLineKind::Context,
-                    content: "context line".to_string(),
-                },
-            ],
-        )];
-        let out = format_file_detail(&overlay, None);
-        assert!(out.contains('+'), "missing + prefix:\n{out}");
-        assert!(out.contains('-'), "missing - prefix:\n{out}");
-        assert!(out.contains("added line"), "missing added line:\n{out}");
-        assert!(out.contains("removed line"), "missing removed line:\n{out}");
-        assert!(out.contains("context line"), "missing context line:\n{out}");
+        let mut change = make_change("foo", ChangeType::BodyChanged);
+        change.lines = vec![
+            line(DiffLineKind::Removed, 44, "removed line"),
+            line(DiffLineKind::Added, 44, "added line"),
+            line(DiffLineKind::Context, 45, "context line"),
+        ];
+        let mut overlay = make_overlay("src/lib.rs", vec![change]);
+        overlay.other_lines = vec![line(DiffLineKind::Added, 3, "use x;")];
+        let out = format_file_detail(&overlay, &[], None);
+        assert!(out.contains("  -  44| removed line"), "{out}");
+        assert!(out.contains("  +  44| added line"), "{out}");
+        assert!(out.contains("     45| context line"), "{out}");
+        assert!(out.contains("## outside symbols\n  +   3| use x;"), "{out}");
     }
 
     // 12. File detail — BEFORE/AFTER labels for sig change
@@ -823,7 +775,7 @@ mod tests {
             "src/lib.rs",
             vec![make_sig_change("foo", "foo(x: i32)", "foo(x: i64)")],
         );
-        let out = format_file_detail(&overlay, None);
+        let out = format_file_detail(&overlay, &[], None);
         assert!(out.contains("BEFORE:"), "missing BEFORE:\n{out}");
         assert!(out.contains("AFTER:"), "missing AFTER:\n{out}");
         assert!(out.contains("foo(x: i32)"), "missing old sig:\n{out}");
@@ -838,7 +790,7 @@ mod tests {
             make_change("fn_unchanged", ChangeType::Unchanged),
         ];
         let overlay = make_overlay("src/lib.rs", changes);
-        let out = format_file_detail(&overlay, None);
+        let out = format_file_detail(&overlay, &[], None);
         assert!(
             out.contains("[ ] fn_unchanged"),
             "missing unchanged marker:\n{out}"
@@ -849,21 +801,38 @@ mod tests {
     // 14. Function detail — correct name and content
     #[test]
     fn test_function_detail_found() {
-        let mut overlay = make_overlay(
-            "src/lib.rs",
-            vec![make_change("my_fn", ChangeType::BodyChanged)],
-        );
-        overlay.attributed_hunks = vec![(
-            "my_fn".to_string(),
-            vec![DiffLine {
-                kind: DiffLineKind::Added,
-                content: "new code".to_string(),
-            }],
-        )];
+        let mut change = make_change("my_fn", ChangeType::BodyChanged);
+        change.lines = vec![line(DiffLineKind::Added, 43, "new code")];
+        let overlay = make_overlay("src/lib.rs", vec![change]);
         let out = format_function_detail(&overlay, "my_fn");
         assert!(out.contains("my_fn"), "missing fn name:\n{out}");
         assert!(out.contains("new code"), "missing diff content:\n{out}");
         assert!(!out.contains("not found"), "unexpected 'not found':\n{out}");
+    }
+
+    // 14b. Function detail — a bare name two types share is ambiguous; the
+    // qualified name, in either spelling, picks one.
+    #[test]
+    fn test_function_detail_qualified() {
+        let mut a = make_change("run", ChangeType::BodyChanged);
+        a.parent = "A".to_string();
+        a.lines = vec![line(DiffLineKind::Added, 3, "in A")];
+        let mut b = make_change("run", ChangeType::BodyChanged);
+        b.parent = "B".to_string();
+        b.lines = vec![line(DiffLineKind::Added, 9, "in B")];
+        let overlay = make_overlay("src/s.ts", vec![a, b]);
+        let out = format_function_detail(&overlay, "run");
+        assert!(
+            out.contains("ambiguous") && out.contains("A::run, B::run"),
+            "{out}"
+        );
+        for name in ["B::run", "B.run"] {
+            let out = format_function_detail(&overlay, name);
+            assert!(
+                out.contains("in B") && !out.contains("in A"),
+                "{name}:\n{out}"
+            );
+        }
     }
 
     // 15. Function detail — "not found" message
@@ -914,44 +883,5 @@ mod tests {
         assert!(out.contains("@alice"), "missing author:\n{out}");
         assert!(out.contains("[+]"), "missing marker:\n{out}");
         assert!(out.contains("foo"), "missing fn name:\n{out}");
-    }
-
-    // 18. count_insertions_deletions — correct counting
-    #[test]
-    fn test_count_insertions_deletions() {
-        let mut overlay = make_overlay("src/lib.rs", vec![]);
-        overlay.attributed_hunks = vec![
-            (
-                "fn_a".to_string(),
-                vec![
-                    DiffLine {
-                        kind: DiffLineKind::Added,
-                        content: "a".to_string(),
-                    },
-                    DiffLine {
-                        kind: DiffLineKind::Added,
-                        content: "b".to_string(),
-                    },
-                    DiffLine {
-                        kind: DiffLineKind::Removed,
-                        content: "c".to_string(),
-                    },
-                    DiffLine {
-                        kind: DiffLineKind::Context,
-                        content: "d".to_string(),
-                    },
-                ],
-            ),
-            (
-                "fn_b".to_string(),
-                vec![DiffLine {
-                    kind: DiffLineKind::Removed,
-                    content: "e".to_string(),
-                }],
-            ),
-        ];
-        let (ins, del) = count_insertions_deletions(&overlay);
-        assert_eq!(ins, 2, "insertions: {ins}");
-        assert_eq!(del, 2, "deletions: {del}");
     }
 }
