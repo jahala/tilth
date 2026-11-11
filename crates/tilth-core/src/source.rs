@@ -420,11 +420,8 @@ fn find_mention(text: &[u8], from: usize, word: &[u8]) -> Option<Range<usize>> {
     memchr::memmem::find_iter(text.get(from..)?, word)
         .map(|at| from + at..from + at + word.len())
         .find(|hit| {
-            let joined_before = is_ident(first)
-                && hit
-                    .start
-                    .checked_sub(1)
-                    .is_some_and(|i| is_ident(text[i]));
+            let joined_before =
+                is_ident(first) && hit.start.checked_sub(1).is_some_and(|i| is_ident(text[i]));
             let joined_after = is_ident(last) && text.get(hit.end).copied().is_some_and(is_ident);
             !joined_before && !joined_after
         })
@@ -491,7 +488,13 @@ mod tests {
     #[test]
     fn a_cut_between_windows_changes_no_answer() {
         use crate::test_readers::OneByte;
-        for text in ["needle", "xneedle", "needlex", "needle_v2 needle", "needle_v2 xneedle"] {
+        for text in [
+            "needle",
+            "xneedle",
+            "needlex",
+            "needle_v2 needle",
+            "needle_v2 xneedle",
+        ] {
             let input = |at: usize, room: usize| {
                 let mut input = vec![b' '; at];
                 input.extend_from_slice(text.as_bytes());
@@ -502,7 +505,11 @@ mod tests {
             // Reads of a byte cut after every byte once the first 512 are in.
             for at in (0..4).chain(500..530) {
                 let input = input(at, 8);
-                assert_eq!(mention_in(OneByte(&input), "needle"), whole, "{text:?} at {at}");
+                assert_eq!(
+                    mention_in(OneByte(&input), "needle"),
+                    whole,
+                    "{text:?} at {at}"
+                );
             }
             // Whole reads cut every `STREAM_CHUNK` bytes, given room past the text.
             for at in (1..=3).flat_map(|k| k * STREAM_CHUNK - 20..=k * STREAM_CHUNK + 4) {

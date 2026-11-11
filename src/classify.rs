@@ -252,8 +252,8 @@ fn is_regex_shaped(query: &str) -> bool {
             }
             b'+' if matches!(prev, Some(b'.' | b']' | b')')) => return true,
             b'{' if is_repeat_count(&b[i + 1..]) => {
-                let after_dot = prev == Some(b'.')
-                    && i.checked_sub(2).map(|j| b[j]).is_some_and(name_char);
+                let after_dot =
+                    prev == Some(b'.') && i.checked_sub(2).map(|j| b[j]).is_some_and(name_char);
                 if after_dot || matches!(prev, Some(b']' | b')')) {
                     return true;
                 }

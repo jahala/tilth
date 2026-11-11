@@ -814,7 +814,10 @@ mod tests {
             dir.path().display()
         );
         assert_eq!(missing_scope_hint(&raw, &raw, Path::new("/")), nearest);
-        assert_eq!(scope_hint(&raw, &raw, dir.path(), Some(dir.path())), nearest);
+        assert_eq!(
+            scope_hint(&raw, &raw, dir.path(), Some(dir.path())),
+            nearest
+        );
         // A checkout at home is no project either.
         std::fs::create_dir(dir.path().join(".git")).unwrap();
         let elsewhere = tempfile::tempdir().expect("tempdir");

@@ -875,7 +875,11 @@ mod tests {
         let out = read_args(&serde_json::json!({ "paths": names }));
         for path in &names {
             let alone = read_args(&serde_json::json!({ "path": path }));
-            assert!(out.contains(&alone), "{path} changed in the batch:\n{}", tail(&out));
+            assert!(
+                out.contains(&alone),
+                "{path} changed in the batch:\n{}",
+                tail(&out)
+            );
         }
     }
 
@@ -899,7 +903,12 @@ mod tests {
         }));
         let alone = read_args(&serde_json::json!({ "path": small.to_str().unwrap() }));
         assert!(out.contains(&alone), "{}", tail(&out));
-        assert_eq!(out.matches("> outline cut to fit the budget").count(), 1, "{}", tail(&out));
+        assert_eq!(
+            out.matches("> outline cut to fit the budget").count(),
+            1,
+            "{}",
+            tail(&out)
+        );
         let tokens = crate::types::estimate_tokens(out.len() as u64);
         assert!(tokens <= crate::budget::DEFAULT_BUDGET, "{tokens} tokens");
         assert!(!out.contains("... truncated"), "{}", tail(&out));
