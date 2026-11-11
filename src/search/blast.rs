@@ -83,13 +83,23 @@ pub(crate) fn blast_radius(
     let symbol_names: HashSet<String> = touched.iter().map(|t| t.name.clone()).collect();
 
     // Calls from the edited file itself are not part of its blast radius.
+    // The walk counts every call site toward its bound, so the bound is
+    // raised by the file's own calls: it then stops after `BLAST_STOP_AFTER`
+    // sites of other files, wherever in the walk the edited file comes.
     let canonical = path.canonicalize().ok()?;
+    let own_calls: usize = find_callers_batch(&symbol_names, &canonical, bloom, None, None, |s| {
+        s.len()
+    })
+    .ok()?
+    .per_file
+    .iter()
+    .sum();
     let walk = find_callers_batch(
         &symbol_names,
         scope,
         bloom,
         None,
-        Some(BLAST_STOP_AFTER),
+        Some(BLAST_STOP_AFTER + own_calls),
         |sites| {
             let mut file = FileCallers::default();
             for (symbol, m) in sites {
@@ -181,6 +191,15 @@ fn format_blast_radius(
             .map(|c| c.total)
             .sum();
         if total == 0 {
+            // The walk stopped before it may have reached this symbol's
+            // callers; no line would read as "no callers".
+            if partial {
+                let _ = writeln!(
+                    out,
+                    "{}: callers not counted (the search stopped at {BLAST_STOP_AFTER} call sites)",
+                    ts.name
+                );
+            }
             continue;
         }
 
@@ -405,5 +424,50 @@ mod tests {
             .unwrap();
         assert!((PROD_CALLERS_LISTED..=120).contains(&n), "{out}");
         assert!(out.contains("  ... and at least "), "{out}");
+    }
+
+    /// A walk that stops at the bound may never reach a touched symbol's
+    /// callers. Leaving that symbol out reads as "no callers".
+    #[test]
+    fn a_symbol_the_stopped_walk_found_no_calls_for_is_not_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("lib.rs");
+        std::fs::write(
+            &lib,
+            "pub fn target(x: u32) -> u32 {\n    x\n}\n\npub fn quiet(x: u32) -> u32 {\n    x\n}\n",
+        )
+        .unwrap();
+        let calls = "fn caller() {\n    target(1);\n    target(2);\n    target(3);\n}\n";
+        for i in 0..40 {
+            std::fs::write(dir.path().join(format!("c{i:02}.rs")), calls).unwrap();
+        }
+        let bloom = tilth_core::index::bloom::BloomFilterCache::new();
+        let scope = dir.path().canonicalize().unwrap();
+        let out = blast_radius(&lib, &[make_edit(1, 5)], &scope, &bloom).expect("blast radius");
+        assert!(out.contains("target: at least "), "{out}");
+        assert!(out.contains("quiet: callers not counted"), "{out}");
+    }
+
+    /// Calls inside the edited file are no part of its blast radius, so
+    /// they must not use up the bound before the walk reaches other files.
+    #[test]
+    fn calls_in_the_edited_file_do_not_count_toward_the_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("lib.rs");
+        let mut body = String::from("pub fn target(x: u32) -> u32 {\n    x\n}\n\nfn local() {\n");
+        for i in 0..60 {
+            body.push_str(&format!("    target({i});\n"));
+        }
+        body.push_str("}\n");
+        std::fs::write(&lib, body).unwrap();
+        std::fs::write(
+            dir.path().join("other.rs"),
+            "fn caller() {\n    target(1);\n}\n",
+        )
+        .unwrap();
+        let bloom = tilth_core::index::bloom::BloomFilterCache::new();
+        let scope = dir.path().canonicalize().unwrap();
+        let out = blast_radius(&lib, &[make_edit(1, 1)], &scope, &bloom).expect("blast radius");
+        assert!(out.contains("target: 1 caller\n"), "{out}");
     }
 }

@@ -845,9 +845,22 @@ fn compute_blast(overlays: &[FileOverlay], scope: &Path) -> Vec<String> {
             *counts.entry(target).or_default() += n;
         }
     }
+    // A walk that stopped may never have reached a symbol's callers.
+    if walk.reached_bound {
+        for name in sig_changed {
+            counts.entry(name).or_default();
+        }
+    }
     counts
         .into_iter()
         .map(|(name, count)| {
+            if count == 0 {
+                return format!(
+                    "blast: `{name}` signature changed — callers not counted (the search \
+                     stopped at {} call sites)",
+                    crate::search::blast::BLAST_STOP_AFTER
+                );
+            }
             format!(
                 "blast: `{name}` signature changed — {at_least}{count} caller{} may need updating",
                 if count == 1 { "" } else { "s" }
@@ -2185,6 +2198,37 @@ diff --git a/src/main.rs b/src/main.rs
         // the way a two-sided diff does.
         let err = resolve_source(Some("HEAD^@"), None, None, None, None).unwrap_err();
         assert!(err.contains("^!"), "{err}");
+    }
+
+    /// When the blast search stops at its bound, a changed symbol it found
+    /// no call for may have callers it never reached. It says so, where no
+    /// line would read as "no callers".
+    #[test]
+    fn diff_blast_that_stopped_says_which_symbols_it_did_not_count() {
+        let calls = "fn caller() {\n    hello();\n    hello();\n    hello();\n}\n";
+        let mut files = vec![(
+            "src/main.rs".to_string(),
+            "fn hello() {\n    1;\n}\n\nfn quiet() {\n    2;\n}\n".to_string(),
+        )];
+        for i in 0..40 {
+            files.push((format!("src/c{i:02}.rs"), calls.to_string()));
+        }
+        let files: Vec<(&str, &str)> = files.iter().map(|(p, c)| (p.as_str(), c.as_str())).collect();
+        let dir = repo_with(&files);
+        write_files(
+            dir.path(),
+            &[(
+                "src/main.rs",
+                "fn hello(n: u8) {\n    1;\n}\n\nfn quiet(n: u8) {\n    2;\n}\n",
+            )],
+        );
+        let out = diff(&DiffSource::GitUncommitted, Some(dir.path()), None, None, true, 0, None)
+            .unwrap();
+        assert!(out.contains("blast: `hello` signature changed — at least "), "{out}");
+        assert!(
+            out.contains("blast: `quiet` signature changed — callers not counted"),
+            "{out}"
+        );
     }
 
     /// Blast counts the callers under the caller's root, not under the whole
