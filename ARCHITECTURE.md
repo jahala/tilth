@@ -427,11 +427,13 @@ The biggest production-only file in the subsystem. Three layers stacked:
      Go, C, C++ and Elixir. The walk stops three nesting levels down, so
      declarations nested deeper are locals. Only real nesting counts:
      `WRAPPER_KINDS` (`export`, decorators, `declare`), namespaces and
-     modules, pass-through nodes (`#ifdef`, `extern "C"`, templates) and
-     the body of a `TYPE_KINDS` node are free (Python's root `module`
-     is no type). A variable declared in a function body
+     modules, pass-through nodes (`#ifdef`, `extern "C"`, templates),
+     a statement at the top of a file that defines nothing (`if`, `try`,
+     `with`), and the body of a `TYPE_KINDS` node are free (Python's root
+     `module` is no type). A variable declared in a function body
      (`is_local_binding`) is never a definition; in Bash only `local`,
-     `declare` and `typeset` make one local. A wrapper is not a
+     `declare` and `typeset` make one local, and a flag with `g` in it
+     (`-g`, `-gA`) makes it global. A wrapper is not a
      definition of its own; the declaration it wraps is. A definition's
      line is the line of its name, and its range opens with the
      decorators or attributes beside it (`treesitter::decorators_start`),
@@ -446,7 +448,7 @@ The biggest production-only file in the subsystem. Three layers stacked:
      class in a C++ out-of-line declarator) followed by its own name, so
      an Elixir `defmodule MyApp.Accounts` or a Ruby `class Admin::User`
      is found by its full name. `Self`, `self`, `this` and `cls` match
-     any owner. A top-level definition also matches when the qualifier
+     any owner, and never a definition with none. A top-level definition also matches when the qualifier
      names its module (`scope::names_module`: the file's stem, its
      directory, or a Go package clause), as in `gin.New`. Its usages are
      the qualified text itself. When nothing matches, the definitions
