@@ -342,10 +342,7 @@ fn read_side(side: &Side, path: &Path, repo: Option<&Path>) -> Result<String, St
 /// other than the process cwd they must be joined under it before any
 /// filesystem access.
 fn on_disk(repo: Option<&Path>, path: &Path) -> PathBuf {
-    match repo {
-        Some(r) => r.join(path),
-        None => path.to_path_buf(),
-    }
+    repo.map_or_else(|| path.to_path_buf(), |r| r.join(path))
 }
 
 pub(super) fn git_show(spec: &str, repo: Option<&Path>) -> Result<String, String> {
@@ -450,7 +447,7 @@ mod tests {
         assert!(read_side(&sides.old, &file, None).is_err());
 
         let file_diff = FileDiff {
-            path: file.clone(),
+            path: file,
             old_path: None,
             status: FileStatus::Modified,
             hunks: vec![Hunk {

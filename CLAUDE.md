@@ -91,6 +91,7 @@ src/
   overview.rs          Project fingerprint for MCP initialization (manifest, languages, modules, deps, git). Instant orientation without a tool call.
   timeout.rs           Per-request wall-clock timeout for sync tool calls — worker thread + bounded channel, tracks abandoned threads on expiry.
   util.rs              atomic_write_bytes() — shared by edit.rs and install.rs.
+  diag.rs              The one stderr sink: emit(). clippy.toml forbids std::io::stderr elsewhere.
   types.rs             Binary-only types (QueryType, ViewMode, Match, SearchResult, FacetTotals) and estimate_tokens().
 npm/                   npm wrapper — postinstall downloads binary, run.js proxies to it.
 scripts/fixtures/      setup_repos.py clones four real-world repos at pinned commits (README examples, speed table, parity checks).
@@ -114,6 +115,10 @@ cargo install --path .       # install to ~/.cargo/bin/tilth
 cargo publish --dry-run -p tilth-core  # the library packages on its own
 python3 scripts/check/output_parity.py --base OLD --new NEW --repos <fixture repos>  # byte-for-byte output parity of two tilth builds
 ```
+
+The toolchain is pinned in `rust-toolchain.toml`, and CI and the release build install it from there. Clippy's lints change between releases, so bumping it is a deliberate PR that re-runs clippy. The file lists no components, so release builds skip clippy and rustfmt; the CI check job and a local checkout add them with `rustup component add clippy rustfmt`.
+
+Lints live in `[workspace.lints]` in the root `Cargo.toml` (pedantic, a nursery subset, and restrictions on unwrap, expect, print and unsafe). `clippy.toml` exempts `#[test]` functions and `#[cfg(test)]` modules from the unwrap, expect, print and dbg lints, and nothing else: a helper function in `tests/*.rs` needs its own `#[expect]`. An exception is an `#[expect(lint, reason = "...")]` on the item or statement it excuses, never an `allow`: `allow_attributes` fails the build. A temporary exception's reason names its tracking issue, as in `reason = "split by responsibility in #315"`. A permanent one starts with `by design: `. `tests/expect_reasons.rs` fails on any other reason. Results go to stdout through `write_stdout` (CLI) or the MCP transport's writer, and diagnostics through `diag::emit`; `clippy.toml` forbids `std::io::stdout` and `std::io::stderr` everywhere else.
 
 CI runs `fmt --all --check`, `clippy --workspace --all-targets -D warnings`, `cargo test --workspace` and the tilth-core publish dry-run on every push/PR.
 

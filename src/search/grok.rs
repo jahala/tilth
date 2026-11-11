@@ -331,7 +331,10 @@ fn read_delegate_content(
 
 /// Per-section truncation caps. Defaults are strict — the point is to save context.
 #[derive(Debug, Clone, Copy)]
-#[allow(clippy::struct_field_names)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "by design: each field is a cap, and max_ names that"
+)]
 pub struct GrokCaps {
     pub max_callees: usize,
     pub max_callers: usize,
@@ -428,6 +431,7 @@ pub struct GrokResult {
 /// callees walk happen against the live filesystem — they each carry their own
 /// TOCTOU window, but stitching them into one bundle is bounded by the call
 /// duration and acceptable for an interactive code-intelligence tool.
+#[expect(clippy::too_many_lines, reason = "split by responsibility in #315")]
 pub fn grok(
     target_spec: &str,
     scope: &Path,
@@ -535,7 +539,6 @@ pub fn grok(
     let total_callers = all.total_callers;
     let total_tests = all.total_tests;
     let prod_callers: Vec<CallerMatch> = all.callers.into_iter().map(|(_, m)| m).collect();
-    let test_callers: Vec<CallerMatch> = all.tests.into_iter().map(|(_, m)| m).collect();
 
     // --- Siblings ----------------------------------------------------------
     let siblings_all = collect_siblings(&entries, &target);
@@ -554,9 +557,10 @@ pub fn grok(
     let mut siblings = siblings_all;
     siblings.truncate(caps.max_siblings);
 
-    let mut tests: Vec<TestMatch> = test_callers
+    let mut tests: Vec<TestMatch> = all
+        .tests
         .into_iter()
-        .map(|m| TestMatch {
+        .map(|(_, m)| TestMatch {
             path: m.path,
             line: m.line,
             test_name: m.calling_function,
@@ -758,6 +762,10 @@ fn slice_body(content: &str, start_line: u32, end_line: u32, max_lines: usize) -
 /// Sections are skipped when empty. Pre-truncation totals are surfaced in the
 /// section heading when capping happened (e.g. `## callers (5 of 23)`).
 #[must_use]
+#[expect(
+    clippy::too_many_lines,
+    reason = "renderers become functions of a result model in #311"
+)]
 pub fn format_grok(result: &GrokResult, scope: &Path) -> String {
     let mut out = String::new();
     let target_rel = display_rel(&result.target.path, scope);
@@ -1032,14 +1040,10 @@ fn collect_siblings(entries: &[OutlineEntry], target: &ResolvedTarget) -> Vec<Si
             .any(|c| c.start_line == target.start_line && c.name == target.name)
     });
 
-    let candidates: Vec<&OutlineEntry> = if let Some(p) = parent {
-        p.children.iter().collect()
-    } else {
-        entries.iter().collect()
-    };
+    let candidates = parent.map_or(entries, |p| p.children.as_slice());
 
     let mut out: Vec<SiblingEntry> = candidates
-        .into_iter()
+        .iter()
         .filter(|e| !matches!(e.kind, OutlineKind::Import | OutlineKind::Export))
         .filter(|e| !(e.start_line == target.start_line && e.name == target.name))
         .map(|e| SiblingEntry {

@@ -397,6 +397,10 @@ fn run_git_diff(source: &DiffSource, sides: &Sides, repo: Option<&Path>) -> Resu
         DiffSource::Patch(path) => {
             // A patch may come through a pipe, as `--patch <(git diff)`
             // hands it over, so this read waits for the writer on purpose.
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "by design: a patch may come through a pipe, so this read waits for its writer"
+            )]
             let content = std::fs::read_to_string(path)
                 .map_err(|e| format!("failed to read patch file: {e}"))?;
             return Ok(content);
@@ -564,10 +568,10 @@ pub fn diff(
 
     let label = source_label(source);
     let mut output = if detail {
-        match detail_fn {
-            Some(f) => format::format_function_detail(&overlays[0], f),
-            None => format::format_file_detail(&overlays[0], &warnings, budget),
-        }
+        detail_fn.map_or_else(
+            || format::format_file_detail(&overlays[0], &warnings, budget),
+            |f| format::format_function_detail(&overlays[0], f),
+        )
     } else {
         format::format_overview(&overlays, &warnings, &label, budget)
     };
@@ -992,6 +996,10 @@ fn diff_log(
 pub(crate) static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "by design: tests read the files they check directly"
+)]
 mod tests {
     use super::*;
     use std::fs;
@@ -1522,7 +1530,7 @@ diff --git a/src/main.rs b/src/main.rs
 
         let result = run_diff_in(
             dir.path(),
-            &DiffSource::Patch(patch.clone()),
+            &DiffSource::Patch(patch),
             None,
             None,
             false,

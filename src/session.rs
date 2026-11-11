@@ -20,7 +20,7 @@ pub struct Session {
 
 impl Session {
     pub fn new() -> Self {
-        Session {
+        Self {
             reads: AtomicUsize::new(0),
             searches: AtomicUsize::new(0),
             symbols: Mutex::new(HashMap::new()),
@@ -60,35 +60,12 @@ impl Session {
 
         let mut out = format!("Files read: {reads} | Searches: {searches}");
 
-        // Top symbols
-        let syms = self
-            .symbols
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !syms.is_empty() {
-            let mut sorted: Vec<_> = syms.iter().collect();
-            sorted.sort_by(|a, b| b.1.cmp(a.1));
-            let top: Vec<String> = sorted
-                .iter()
-                .take(5)
-                .map(|(name, count)| format!("{name} ({count})"))
-                .collect();
+        let top = top_five(&self.symbols);
+        if !top.is_empty() {
             let _ = write!(out, "\nTop queries: {}", top.join(", "));
         }
-
-        // Hot paths
-        let dirs = self
-            .dir_hits
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !dirs.is_empty() {
-            let mut sorted: Vec<_> = dirs.iter().collect();
-            sorted.sort_by(|a, b| b.1.cmp(a.1));
-            let top: Vec<String> = sorted
-                .iter()
-                .take(5)
-                .map(|(dir, count)| format!("{dir} ({count})"))
-                .collect();
+        let top = top_five(&self.dir_hits);
+        if !top.is_empty() {
             let _ = write!(out, "\nHot paths: {}", top.join(", "));
         }
 
@@ -146,10 +123,7 @@ impl Session {
             .expanded
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match expanded.insert(key, mtime) {
-            Some(previous) => previous == mtime,
-            None => false,
-        }
+        expanded.insert(key, mtime) == Some(mtime)
     }
 }
 
@@ -157,4 +131,18 @@ impl Default for Session {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The five highest counts, as `key (count)`, highest first.
+fn top_five(counts: &Mutex<HashMap<String, usize>>) -> Vec<String> {
+    let counts = counts
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut sorted: Vec<(&String, &usize)> = counts.iter().collect();
+    sorted.sort_by_key(|&(_, &count)| std::cmp::Reverse(count));
+    sorted
+        .into_iter()
+        .take(5)
+        .map(|(key, count)| format!("{key} ({count})"))
+        .collect()
 }

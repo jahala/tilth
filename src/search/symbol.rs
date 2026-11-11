@@ -340,16 +340,19 @@ fn matches_in_file(path: &Path, wanted: Wanted, usage: &RegexMatcher) -> Scan {
 
     let (file_lines, mtime) = file_metadata(path);
 
+    // A file that is not UTF-8 yields no definitions; one decoding rule in #308.
     let FileDefs {
         mut matches,
         others,
-    } = match std::str::from_utf8(bytes) {
-        Ok(content) => definitions_in(path, wanted, content, file_lines, mtime),
-        Err(_) => FileDefs::default(),
-    };
+    } = std::str::from_utf8(bytes).map_or_else(
+        |_| FileDefs::default(),
+        |content| definitions_in(path, wanted, content, file_lines, mtime),
+    );
     let def_count = matches.len();
 
     let mut searcher = Searcher::new();
+    // The UTF8 sink ends this file's usage scan at its first matching line
+    // that is not UTF-8, and the error is dropped here: #308.
     let _ = searcher.search_slice(
         usage,
         bytes,
@@ -473,6 +476,11 @@ fn find_defs_treesitter(
 /// tree-sitter finds a parent by walking from the root. `wrapper_start` is the
 /// first row of the `export` or `declare` wrapper around `node`, which a
 /// definition's range covers.
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "a WalkCtx struct and a split in #315"
+)]
 fn walk_for_definitions(
     node: tree_sitter::Node,
     parent: Option<tree_sitter::Node>,
@@ -500,7 +508,7 @@ fn walk_for_definitions(
         let start = if kind == "decorated_definition" {
             wrapper_start
         } else {
-            Some(wrapper_start.unwrap_or(node.start_position().row))
+            Some(wrapper_start.unwrap_or_else(|| node.start_position().row))
         };
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
@@ -524,7 +532,7 @@ fn walk_for_definitions(
     // A definition's range starts at its wrapper or at the decorators beside
     // it, whichever is first: an expanded result shows a route's decorator.
     let start_row = || {
-        let own = wrapper_start.unwrap_or(node.start_position().row);
+        let own = wrapper_start.unwrap_or_else(|| node.start_position().row);
         decorators_start(node).map_or(own, |d| d.min(own)) as u32 + 1
     };
 
@@ -533,13 +541,11 @@ fn walk_for_definitions(
     // (the shared defaults, except where a language such as Elixir or Go
     // carries its own); when `lang` is unknown we fall back to the shared
     // defaults.
-    let (def_kinds, def_ops): (&[&str], &DefinitionOps) = match lang {
-        Some(l) => {
+    let (def_kinds, def_ops): (&[&str], &DefinitionOps) =
+        lang.map_or((DEFAULT_DEF_KINDS, &DEFAULT_DEFS), |l| {
             let s = spec(l);
             (s.definition_kinds, &s.definitions)
-        }
-        None => (DEFAULT_DEF_KINDS, &DEFAULT_DEFS),
-    };
+        });
 
     let query = wanted.name;
     if def_kinds.contains(&kind) {
@@ -755,7 +761,7 @@ fn name_row(node: tree_sitter::Node) -> usize {
     ["name", "identifier", "declarator"]
         .iter()
         .find_map(|field| node.child_by_field_name(field))
-        .map_or(node.start_position().row, |n| n.start_position().row)
+        .map_or_else(|| node.start_position().row, |n| n.start_position().row)
 }
 
 /// Whether definition `node` binds the name `query`. Most definitions bind
@@ -870,7 +876,6 @@ fn find_defs_markdown_buf(
     defs
 }
 
-#[allow(clippy::too_many_arguments)]
 fn walk_md_sections(
     node: tree_sitter::Node,
     lines: &[&str],
@@ -894,7 +899,6 @@ fn walk_md_sections(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn emit_md_section_match(
     section: tree_sitter::Node,
     lines: &[&str],

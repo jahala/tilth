@@ -65,6 +65,27 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
+/// Compact token count for directory rollups, as in `12.3k` and `1.2M`.
+/// The `tilth_list` tree and the codebase map both use it.
+///
+/// The k→M switchover triggers at `999_950` rather than `1_000_000` so values
+/// that would round to `"1000.0k"` under `{:.1}` formatting roll cleanly into
+/// the M tier (`"1.0M"`) instead of producing four-digit k labels.
+pub(crate) fn fmt_tokens(n: u64) -> String {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "by design: display only, rounded to one decimal"
+    )]
+    let f = n as f64;
+    if f >= 999_950.0 {
+        format!("{:.1}M", f / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", f / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
 /// Prefix each line with its 1-indexed line number, right-aligned.
 pub fn number_lines(content: &str, start: u32) -> String {
     let lines: Vec<&str> = content.lines().collect();
@@ -129,6 +150,29 @@ pub(crate) fn rel(path: &Path, scope: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fmt_tokens_thresholds() {
+        assert_eq!(fmt_tokens(0), "0");
+        assert_eq!(fmt_tokens(999), "999");
+        assert_eq!(fmt_tokens(1_000), "1.0k");
+        assert_eq!(fmt_tokens(12_345), "12.3k");
+        assert_eq!(fmt_tokens(1_000_000), "1.0M");
+        assert_eq!(fmt_tokens(2_500_000), "2.5M");
+    }
+
+    /// Boundary: values that would round to "1000.0k" under `{:.1}`
+    /// formatting must roll over to the M tier instead of producing a
+    /// four-digit k label.
+    #[test]
+    fn fmt_tokens_rolls_over_at_999_950() {
+        // Just below the rollover boundary — still formats as k.
+        assert_eq!(fmt_tokens(999_949), "999.9k");
+        // At and above the boundary — formats as M, not "1000.0k".
+        assert_eq!(fmt_tokens(999_950), "1.0M");
+        assert_eq!(fmt_tokens(999_999), "1.0M");
+        assert_eq!(fmt_tokens(1_499_999), "1.5M");
+    }
 
     #[test]
     fn format_size_covers_every_tier() {

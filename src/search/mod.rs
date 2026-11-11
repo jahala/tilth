@@ -211,10 +211,10 @@ pub(crate) fn owner_candidates(
         .take(SHOWN)
         .map(|o| {
             let place = format!("{}:{}", rel(&o.path, scope), o.line);
-            match &o.owner {
-                Some(owner) => format!("{owner}{sep}{name} ({place})"),
-                None => format!("{name} ({place})"),
-            }
+            o.owner.as_ref().map_or_else(
+                || format!("{name} ({place})"),
+                |owner| format!("{owner}{sep}{name} ({place})"),
+            )
         })
         .collect();
     if others.len() > SHOWN {
@@ -269,14 +269,11 @@ pub(crate) fn names_phrase<'a>(names: impl IntoIterator<Item = &'a str>) -> Stri
 
 /// Get `file_lines` estimate and mtime from metadata. One `stat()` per file.
 pub(crate) fn file_metadata(path: &Path) -> (u32, SystemTime) {
-    match std::fs::metadata(path) {
-        Ok(meta) => {
-            let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-            let est_lines = (meta.len() / 40).max(1) as u32;
-            (est_lines, mtime)
-        }
-        Err(_) => (0, SystemTime::UNIX_EPOCH),
-    }
+    std::fs::metadata(path).map_or((0, SystemTime::UNIX_EPOCH), |meta| {
+        let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        let est_lines = (meta.len() / 40).max(1) as u32;
+        (est_lines, mtime)
+    })
 }
 
 /// Dispatch search by query type. `full` is the caller's `--full`, with the
@@ -294,6 +291,10 @@ pub fn search_symbol(
     format_search_result(&result, cache, None, &bloom, 0, None)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "per-call options become one Request in #307"
+)]
 pub fn search_symbol_expanded(
     query: &str,
     scope: &Path,
@@ -310,6 +311,10 @@ pub fn search_symbol_expanded(
     format_search_result(&result, cache, Some(session), bloom, expand, budget)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "per-call options become one Request in #307"
+)]
 pub fn search_multi_symbol_expanded(
     queries: &[&str],
     scope: &Path,
@@ -409,6 +414,10 @@ pub fn search_regex(
     format_search_result(&result, cache, None, &bloom, 0, None)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "per-call options become one Request in #307"
+)]
 pub fn search_content_expanded(
     query: &str,
     scope: &Path,
@@ -427,6 +436,10 @@ pub fn search_content_expanded(
 }
 
 /// Expanded regex search — takes raw pattern, no slash wrapping needed.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "per-call options become one Request in #307"
+)]
 pub fn search_regex_expanded(
     pattern: &str,
     scope: &Path,
@@ -513,6 +526,10 @@ fn write_hidden_tail(out: &mut String, shown: usize, total: usize, kind: &str) {
 /// Format match entries with optional expansion.
 /// Groups consecutive usage matches in the same enclosing function to reduce token noise.
 /// Shared expand state enables cross-query dedup in multi-symbol search.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "renderers become functions of a result model in #311"
+)]
 fn format_matches(
     matches: &[Match],
     scope: &Path,
@@ -704,6 +721,11 @@ fn boost_query(m: &Match) -> Option<&str> {
 }
 
 /// Format a single match entry (unchanged from original behavior).
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "renderers become functions of a result model in #311"
+)]
 fn format_single_match(
     m: &Match,
     scope: &Path,
@@ -1150,6 +1172,11 @@ fn basename_file_outline(
     ))
 }
 
+#[expect(
+    clippy::too_many_lines,
+    clippy::unnecessary_wraps,
+    reason = "renderers become functions of a result model in #311"
+)]
 fn format_search_result(
     result: &SearchResult,
     cache: &OutlineCache,
@@ -1389,7 +1416,7 @@ fn expand_match(m: &Match, scope: &Path) -> Option<(String, String)> {
     } else {
         let (s, e) = m
             .def_range
-            .unwrap_or((m.line.saturating_sub(10), m.line.saturating_add(10)));
+            .unwrap_or_else(|| (m.line.saturating_sub(10), m.line.saturating_add(10)));
         (s.max(1), e.min(total))
     };
 
@@ -1503,6 +1530,8 @@ fn get_outline_str(path: &std::path::Path, cache: &OutlineCache) -> Option<std::
     // The cache is shared with read and map, so the language comes from the
     // content as theirs does: a `.h` holding C++ is C++.
     Some(cache.get_or_compute(path, mtime, || {
+        // An unreadable file gets an empty outline, so its matches show no
+        // outline context; the matches themselves are reported either way.
         let content = tilth_core::source::read_source(path).unwrap_or_default();
         let file_type = tilth_core::lang::detect_file_type_with_content(path, &content);
         read::outline::generate(path, file_type, &content, content.as_bytes(), false)
@@ -1660,6 +1689,10 @@ fn extract_line_range(line: &str) -> Option<(u32, u32)> {
 }
 
 /// Format glob search results (file list with previews).
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "renderers become functions of a result model in #311"
+)]
 fn format_glob_result(result: &glob::GlobResult, scope: &Path) -> Result<String, TilthError> {
     let header = format!(
         "# Glob: \"{}\" in {} — {} files",
@@ -1693,6 +1726,10 @@ fn format_glob_result(result: &glob::GlobResult, scope: &Path) -> Result<String,
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "by design: tests read the files they check directly"
+)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
@@ -1769,14 +1806,14 @@ mod tests {
         )
         .expect("callers toml failed");
         let rs_callers: Vec<_> = rs_callers.per_file.into_iter().flatten().collect();
-        let toml_callers: Vec<_> = toml_callers.per_file.into_iter().flatten().collect();
+        let toml_has_callers = toml_callers.per_file.into_iter().flatten().next().is_some();
 
         assert!(
             !rs_callers.is_empty(),
             "*.rs should find callers of 'walker'"
         );
         assert!(
-            toml_callers.is_empty(),
+            !toml_has_callers,
             "*.toml should not find callers of 'walker'"
         );
         for (_, c) in &rs_callers {
@@ -1942,7 +1979,7 @@ mod tests {
         std::fs::write(&p, "class Foo {\n  bar() {\n    const x = 1;\n  }\n}\n").unwrap();
 
         let m = Match {
-            path: p.clone(),
+            path: p,
             line: 3,
             text: "    const x = 1;".to_string(),
             is_definition: false,
@@ -1993,7 +2030,7 @@ mod tests {
         std::fs::write(&p, src).unwrap();
 
         let m = Match {
-            path: p.clone(),
+            path: p,
             line: 4,
             text: "    pub fn exit_code(&self) -> i32 {".to_string(),
             is_definition: true,
@@ -2113,7 +2150,7 @@ mod tests {
         // Mimic the `Match` `find_defs_markdown_buf` would produce for a
         // markdown-heading def: weight 30, def_range covers the section span.
         let m = Match {
-            path: p.clone(),
+            path: p,
             line: 3, // `## Session 50`
             text: "## Session 50".to_string(),
             is_definition: true,
@@ -2171,7 +2208,7 @@ mod tests {
         std::fs::write(&p, &content).unwrap();
 
         let m = Match {
-            path: p.clone(),
+            path: p,
             line: 1,
             text: "## Big Section".to_string(),
             is_definition: true,
@@ -2243,7 +2280,7 @@ mod tests {
         std::fs::write(&p, &content).unwrap();
 
         let m = Match {
-            path: p.clone(),
+            path: p,
             line: 1,
             text: "## Big Section".to_string(),
             is_definition: true,

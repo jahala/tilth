@@ -23,14 +23,15 @@ pub fn fingerprint(root: &Path) -> String {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fingerprint_inner(root)));
     let elapsed = start.elapsed();
     if elapsed.as_millis() > 250 {
-        eprintln!(
+        crate::diag::emit(format_args!(
             "[tilth] fingerprint took {}ms (>250ms budget)",
             elapsed.as_millis()
-        );
+        ));
     }
     result.unwrap_or_default()
 }
 
+#[expect(clippy::too_many_lines, reason = "split by responsibility in #315")]
 fn fingerprint_inner(root: &Path) -> String {
     let mut lines: Vec<String> = Vec::new();
 
@@ -165,7 +166,9 @@ fn fingerprint_inner(root: &Path) -> String {
             }
 
             // Hot files (only for projects with local imports)
-            if let Some(hot) = hot_files(root, &walk, primary_lang) {
+            if let Some(hot) =
+                hot_files(root, &walk, primary_lang, Instant::now() + HOT_FILES_BUDGET)
+            {
                 lines.push(format!("  hot (× = importers): {hot}"));
             }
 
@@ -182,9 +185,9 @@ fn fingerprint_inner(root: &Path) -> String {
             // Manifest line
             let mut manifest_line = format!("  manifest: {manifest}");
             if let Some(name) = &info.name {
-                write!(manifest_line, " ({name}").unwrap();
+                let _ = write!(manifest_line, " ({name}");
                 if let Some(version) = &info.version {
-                    write!(manifest_line, " v{version}").unwrap();
+                    let _ = write!(manifest_line, " v{version}");
                 }
                 manifest_line.push(')');
             }
@@ -192,7 +195,7 @@ fn fingerprint_inner(root: &Path) -> String {
         }
     } else {
         // No manifest — still show hot, git, tests
-        if let Some(hot) = hot_files(root, &walk, primary_lang) {
+        if let Some(hot) = hot_files(root, &walk, primary_lang, Instant::now() + HOT_FILES_BUDGET) {
             lines.push(format!("  hot (× = importers): {hot}"));
         }
         if let Some(git) = git_context(root) {
@@ -242,6 +245,10 @@ fn lang_display_name(lang: Lang) -> &'static str {
 // File walk (depth 2)
 // ---------------------------------------------------------------------------
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "by design: one flag per test-directory convention, read by test_style"
+)]
 struct WalkResult {
     lang_counts: HashMap<Lang, usize>,
     /// Top-level dirs → per-language file counts
@@ -290,7 +297,7 @@ fn walk_files(root: &Path) -> WalkResult {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "a WalkCtx struct in #315")]
 fn walk_dir(
     dir: &Path,
     root: &Path,
@@ -589,6 +596,9 @@ fn git_output(root: &Path, args: &[&str]) -> Option<String> {
             }
             Ok(None) => {
                 if Instant::now() >= deadline {
+                    // Best effort, like the rest of this function: kill fails
+                    // only if git exited in the meantime, and the wait then
+                    // just reaps it.
                     let _ = child.kill();
                     let _ = child.wait();
                     return None;
@@ -692,9 +702,19 @@ fn test_style(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opt
 // Hot files — most imported local files
 // ---------------------------------------------------------------------------
 
-fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Option<String> {
+/// How long the hot-files pass may read imports: a share of the
+/// fingerprint's 250 ms budget.
+const HOT_FILES_BUDGET: Duration = Duration::from_millis(100);
+
+/// The most imported local files, from the imports of the smallest code
+/// files read before `deadline`.
+fn hot_files(
+    root: &Path,
+    walk: &WalkResult,
+    primary_lang: Option<Lang>,
+    deadline: Instant,
+) -> Option<String> {
     primary_lang?; // require a detected language
-    let start = Instant::now();
 
     // Sort by size (smallest first) and take first 100
     let mut files: Vec<&(String, u64)> = walk.code_files.iter().collect();
@@ -708,7 +728,7 @@ fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opti
     let mut all_import_sources: Vec<String> = Vec::new();
 
     for (rel_path, _) in &files {
-        if start.elapsed().as_millis() > 100 {
+        if Instant::now() >= deadline {
             break;
         }
         let full = root.join(rel_path);
@@ -797,11 +817,10 @@ fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opti
                 .max_by(|(a_sym, a_c), (b_sym, b_c)| a_c.cmp(b_c).then(b_sym.cmp(a_sym)))
                 .map(|(sym, _)| sym);
 
-            if let Some(sym) = top_sym {
-                format!("{rel_str}({sym}) ×{count}")
-            } else {
-                format!("{rel_str} ×{count}")
-            }
+            top_sym.map_or_else(
+                || format!("{rel_str} ×{count}"),
+                |sym| format!("{rel_str}({sym}) ×{count}"),
+            )
         })
         .collect();
 
@@ -859,10 +878,27 @@ mod tests {
             .unwrap();
         }
         let walk = walk_files(tmp.path());
-        let hot = hot_files(tmp.path(), &walk, Some(Lang::Rust));
+        let later = Instant::now() + Duration::from_secs(3600);
+        let hot = hot_files(tmp.path(), &walk, Some(Lang::Rust), later);
         assert_eq!(
             hot.as_deref(),
             Some("src/other.rs ×2, src/types.rs(Outline) ×2")
+        );
+    }
+
+    /// The deadline is the caller's, so a test sets one a loaded machine
+    /// cannot miss. One already past reads no file.
+    #[test]
+    fn hot_files_stop_at_the_deadline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("types.rs"), "pub struct Outline;\n").unwrap();
+        fs::write(src.join("a.rs"), "use crate::types::Outline;\n").unwrap();
+        let walk = walk_files(tmp.path());
+        assert_eq!(
+            hot_files(tmp.path(), &walk, Some(Lang::Rust), Instant::now()),
+            None
         );
     }
 

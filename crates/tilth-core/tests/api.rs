@@ -59,6 +59,10 @@ const SAMPLES: &[Sample] = &[
     },
 ];
 
+#[expect(
+    clippy::unwrap_used,
+    reason = "by design: a test helper, where a panic is the test failure"
+)]
 fn line_of(source: &str, needle: &str) -> u32 {
     let idx = source
         .lines()
@@ -354,7 +358,8 @@ fn dependency_analysis_runs_on_a_file_in_scope() {
     let used_by: &Vec<Dependent> = &result.used_by;
     assert_eq!(used_by.len(), 1, "{used_by:?}");
     assert_eq!(used_by[0].path.file_name().unwrap(), "b.rs");
-    let _uses: &Vec<LocalDep> = &result.uses_local;
+    let uses: &Vec<LocalDep> = &result.uses_local;
+    assert!(uses.is_empty(), "a.rs imports nothing: {uses:?}");
 }
 
 #[test]

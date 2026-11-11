@@ -120,6 +120,10 @@ fn open_append(path: &Path) -> std::io::Result<fs::File> {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "by design: tests read the files they check directly"
+)]
 mod tests {
     use super::*;
 

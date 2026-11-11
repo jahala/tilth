@@ -674,7 +674,10 @@ pub(crate) fn definition_weight(kind: &str) -> u16 {
 /// query_str_ptr)` so that distinct query strings for the same language are
 /// stored under separate keys. We avoid `Language::name()` because ABI < 15
 /// grammars (e.g. tree-sitter-kotlin-ng) return `None`.
-#[allow(clippy::type_complexity)]
+#[expect(
+    clippy::type_complexity,
+    reason = "by design: a key tuple and a map under a lock; a type alias would only rename it"
+)]
 static QUERY_CACHE: LazyLock<Mutex<HashMap<(usize, usize, usize), tree_sitter::Query>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -698,14 +701,14 @@ pub fn with_query<R>(
     let mut cache = QUERY_CACHE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let query = match cache.entry(key) {
-        Entry::Occupied(e) => e.into_mut(),
+    // `f` borrows the query from the cache, so the lock is held while it runs.
+    match cache.entry(key) {
+        Entry::Occupied(e) => Some(f(e.get())),
         Entry::Vacant(e) => {
-            let q = tree_sitter::Query::new(ts_lang, query_str).ok()?;
-            e.insert(q)
+            let query = tree_sitter::Query::new(ts_lang, query_str).ok()?;
+            Some(f(e.insert(query)))
         }
-    };
-    Some(f(query))
+    }
 }
 
 #[cfg(test)]

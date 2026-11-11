@@ -149,7 +149,7 @@ fn resolve_scope_at(
         let project = root
             .filter(|r| r.is_absolute())
             .or(cwd)
-            .unwrap_or(std::path::Path::new("."));
+            .unwrap_or_else(|| std::path::Path::new("."));
         let hint = crate::missing_scope_hint(&raw, &resolved, project);
         return match root {
             Some(r) if r.is_absolute() => Ok((
@@ -179,10 +179,7 @@ pub(super) fn resolve_read_path(
 }
 
 pub(super) fn apply_budget(output: &str, budget: Option<u64>) -> String {
-    match budget {
-        Some(b) => crate::budget::apply(output, b),
-        None => crate::budget::apply(output, crate::budget::DEFAULT_BUDGET),
-    }
+    crate::budget::apply(output, budget.unwrap_or(crate::budget::DEFAULT_BUDGET))
 }
 
 #[cfg(test)]

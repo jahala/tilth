@@ -38,6 +38,10 @@ pub fn search(
 /// The display cap and the per-file collection bound are the same number in
 /// production. They are separate parameters so a test can raise one without
 /// the other and show that the bound leaves the displayed set untouched.
+#[expect(
+    clippy::too_many_lines,
+    reason = "reading goes through one Source in #308"
+)]
 fn search_capped(
     pattern: &str,
     scope: &Path,
@@ -135,6 +139,8 @@ fn search_capped(
             let mut file_matches = Vec::new();
             let mut searcher = Searcher::new();
 
+            // The UTF8 sink ends this file's search at its first matched line
+            // that is not UTF-8, and the error is dropped here: #308.
             let _ = searcher.search_slice(
                 matcher,
                 bytes,

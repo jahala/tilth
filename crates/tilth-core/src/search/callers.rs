@@ -62,9 +62,10 @@ pub struct CallerWalk<T> {
 /// their count is a lower bound: the walk stops once it has found that many
 /// call sites, and `reached_bound` tells the caller so. Which files it
 /// reached first then depends on thread timing.
-// The std hasher is part of the signature dependents pin; a generic hasher
-// would change it for every caller.
-#[allow(clippy::implicit_hasher)]
+#[expect(
+    clippy::implicit_hasher,
+    reason = "by design: the std hasher is part of the signature dependents pin; a generic one would change it for every caller"
+)]
 pub fn find_callers_batch<T, F>(
     targets: &HashSet<String>,
     scope: &Path,
@@ -101,7 +102,10 @@ where
 /// A call site names a method without its type (`x.run()`), so a name that
 /// several types define cannot be traced to one of them by name alone; one
 /// walk tells both where the name is called and how many types define it.
-#[allow(clippy::implicit_hasher)]
+#[expect(
+    clippy::implicit_hasher,
+    reason = "by design: the std hasher is part of the signature, as in find_callers_batch"
+)]
 pub fn find_callers_and_owners<T, F>(
     targets: &HashSet<String>,
     owner_names: &HashSet<String>,

@@ -73,6 +73,7 @@ pub struct Dependent {
 /// Phase 1: Extract exported symbols from the outline.
 /// Phase 2: Forward dependencies — what this file uses.
 /// Phase 3: Reverse dependencies — what uses this file.
+#[expect(clippy::too_many_lines, reason = "split by responsibility in #315")]
 pub fn analyze_deps(
     path: &Path,
     scope: &Path,
@@ -358,7 +359,7 @@ fn with_reexport_importers(
         let canonical = importer
             .path
             .canonicalize()
-            .unwrap_or(importer.path.clone());
+            .unwrap_or_else(|_| importer.path.clone());
         if !seen.insert(canonical.clone()) {
             continue;
         }
@@ -375,7 +376,7 @@ fn with_reexport_importers(
             let canonical = importer
                 .path
                 .canonicalize()
-                .unwrap_or(importer.path.clone());
+                .unwrap_or_else(|_| importer.path.clone());
             if !seen.insert(canonical.clone()) {
                 continue;
             }
@@ -490,10 +491,8 @@ fn imports_one_of(
             ImportScan::No
         };
     }
-    match importer_from(file, targets, stems, names, keep, through) {
-        Some(importer) => ImportScan::Importer(importer),
-        None => ImportScan::No,
-    }
+    importer_from(file, targets, stems, names, keep, through)
+        .map_or(ImportScan::No, ImportScan::Importer)
 }
 
 /// `file`, under the size cap, as an `Importer` of one of `targets`.

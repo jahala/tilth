@@ -72,10 +72,7 @@ pub fn read_source(path: &Path) -> io::Result<String> {
 ///
 /// Returns the open's or the read's I/O error.
 pub fn read(path: &Path) -> io::Result<Vec<u8>> {
-    match OpenFile::open(path)? {
-        Some(mut file) => file.read_all(),
-        None => Ok(Vec::new()),
-    }
+    OpenFile::open(path)?.map_or_else(|| Ok(Vec::new()), |mut file| file.read_all())
 }
 
 /// The text of the file at `path`, as [`std::fs::read_to_string`] gives
@@ -86,10 +83,7 @@ pub fn read(path: &Path) -> io::Result<Vec<u8>> {
 /// Returns the open's or the read's I/O error, and an
 /// [`io::ErrorKind::InvalidData`] error for text that is not UTF-8.
 pub fn read_to_string(path: &Path) -> io::Result<String> {
-    match OpenFile::open(path)? {
-        Some(mut file) => file.read_to_string(),
-        None => Ok(String::new()),
-    }
+    OpenFile::open(path)?.map_or_else(|| Ok(String::new()), |mut file| file.read_to_string())
 }
 
 /// A file open for reading, with its handle's metadata. Every read of it
@@ -194,6 +188,10 @@ fn open_for_reading(path: &Path) -> io::Result<File> {
 }
 
 #[cfg(not(unix))]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "by design: the one open path itself, where no pipe can block the open"
+)]
 fn open_for_reading(path: &Path) -> io::Result<File> {
     File::open(path)
 }

@@ -208,9 +208,15 @@ fn full_skipped_view(
     cap: u64,
     outline: &str,
 ) -> String {
-    #[allow(clippy::cast_precision_loss)] // cap and file sizes fit in f64 mantissa for display
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "by design: display only; file sizes fit the f64 mantissa"
+    )]
     let cap_mb = cap as f64 / 1_000_000.0;
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "by design: display only; file sizes fit the f64 mantissa"
+    )]
     let file_mb = byte_len as f64 / 1_000_000.0;
     let header = format::file_header(path, byte_len, line_count, ViewMode::Outline);
     format!(
@@ -251,6 +257,10 @@ fn outline_view(
 /// outline that does not fit is cut to fit, saying what it left out. With
 /// `full` or a `section`, the content is what was asked for, and the
 /// caller's budget cut applies to it as before.
+#[expect(
+    clippy::too_many_lines,
+    reason = "reading goes through one Source in #308"
+)]
 pub fn read_file(
     path: &Path,
     section: Option<&str>,
@@ -501,7 +511,6 @@ fn resolve_heading(buf: &[u8], heading: &str) -> Option<(usize, usize)> {
     let tree = parse_markdown(content)?;
     let lines: Vec<&str> = content.lines().collect();
 
-    #[allow(clippy::cast_possible_truncation)]
     let level = query_level as u8;
     find_section(tree.root_node(), &lines, level, query_text)
 }
@@ -795,9 +804,9 @@ fn collect_blocks(
     };
     let resolved: Vec<Result<(usize, usize), TilthError>> = ranges
         .iter()
-        .map(|range| match &text {
-            Some(text) => resolve_range(text, range),
-            None => line_range(range),
+        .map(|range| {
+            text.as_ref()
+                .map_or_else(|| line_range(range), |text| resolve_range(text, range))
         })
         .collect();
 
@@ -914,7 +923,7 @@ impl LineSelector {
                 .map(|&(end, _)| end.saturating_add(1))
                 .chain(self.waiting.last().map(|&(start, ..)| start))
                 .min()
-                .unwrap_or(self.last.saturating_add(1));
+                .unwrap_or_else(|| self.last.saturating_add(1));
             let mut crossed = 0;
             let mut to = None;
             for at in breaks.by_ref() {
@@ -977,13 +986,9 @@ fn list_directory(path: &Path) -> Result<String, TilthError> {
         let suffix = match ft {
             Some(t) if t.is_dir() => "/".to_string(),
             Some(t) if t.is_symlink() => " →".to_string(),
-            _ => match meta {
-                Some(m) => {
-                    let tokens = estimate_tokens(m.len());
-                    format!("  ({tokens} tokens)")
-                }
-                None => String::new(),
-            },
+            _ => meta.map_or_else(String::new, |m| {
+                format!("  ({} tokens)", estimate_tokens(m.len()))
+            }),
         };
         entries.push(format!("  {name}{suffix}"));
     }

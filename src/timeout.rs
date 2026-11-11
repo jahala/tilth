@@ -202,6 +202,8 @@ where
         // even if work() panics after the main thread has already timed out.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
         if let Ok(val) = result {
+            // The send fails only when the caller stopped waiting after its
+            // timeout; the result is then unwanted and is dropped with it.
             let _ = tx.send(val);
         }
         // tx is dropped here on panic, so main thread gets RecvError.
@@ -217,6 +219,9 @@ where
     select! {
         recv(rx) -> msg => match msg {
             Ok(result) => {
+                // The worker has delivered its result and only has its own
+                // bookkeeping left. Joining just waits for that; it catches
+                // its own panics, so the join has no error to report.
                 let _ = handle.join();
                 Ok(result)
             }
@@ -231,10 +236,10 @@ where
                 let n = tracker.record_timeout();
                 coord.ack_timeout();
                 if n == ABANDONED_THREAD_WARN {
-                    eprintln!(
+                    crate::diag::emit(format_args!(
                         "tilth: warning: {n} abandoned threads still running. \
                          Consider reducing scope or increasing TILTH_TIMEOUT."
-                    );
+                    ));
                 }
             }
             Err(SpawnFailure::Timeout)

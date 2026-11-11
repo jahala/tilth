@@ -4,6 +4,7 @@
 //! (`callees::extract_callee_names`) — they share both the query strings
 //! and the compiled-query cache.
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 
@@ -44,12 +45,14 @@ pub(super) fn with_callee_query<R>(
     let mut cache = QUERY_CACHE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let std::collections::hash_map::Entry::Vacant(e) = cache.entry(key) {
-        let query = tree_sitter::Query::new(ts_lang, query_str).ok()?;
-        e.insert(query);
+    // `f` borrows the query from the cache, so the lock is held while it runs.
+    match cache.entry(key) {
+        Entry::Occupied(e) => Some(f(e.get())),
+        Entry::Vacant(e) => {
+            let query = tree_sitter::Query::new(ts_lang, query_str).ok()?;
+            Some(f(e.insert(query)))
+        }
     }
-    // Safety: we just inserted if absent, so the key is always present here.
-    Some(f(cache.get(&key).expect("just inserted")))
 }
 
 #[cfg(test)]
