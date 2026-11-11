@@ -145,22 +145,11 @@ fn stream(
     read_chunks(rest, &mut buf, each)
 }
 
-/// The error tilth reports for an I/O failure on `path`. One home for the
-/// mapping, so a read fails the same way whichever step hit the error.
+/// The error a read reports for an I/O failure on `path`, so a read fails
+/// the same way whichever step hit the error. A missing path names a
+/// similar one.
 fn path_error(path: &Path, source: io::Error) -> TilthError {
-    match source.kind() {
-        io::ErrorKind::NotFound => TilthError::NotFound {
-            path: path.to_path_buf(),
-            suggestion: suggest_similar(path),
-        },
-        io::ErrorKind::PermissionDenied => TilthError::PermissionDenied {
-            path: path.to_path_buf(),
-        },
-        _ => TilthError::IoError {
-            path: path.to_path_buf(),
-            source,
-        },
-    }
+    TilthError::from_io(path, source, || suggest_similar(path))
 }
 
 /// Open `path` through [`OpenFile`], the one open path of every read, with
