@@ -19,17 +19,27 @@ const _: () = assert!(
     "HEAD_WINDOW must cover every content check"
 );
 
-/// The first [`HEAD_WINDOW`] bytes of `reader`, or all of it if shorter. A
-/// bare `read` may return fewer bytes than asked before the end, so this
-/// keeps reading until the window is full or the input ends.
+/// The first `len` bytes of `reader`, or all of it if shorter. A bare `read`
+/// may return fewer bytes than asked before the end, so this keeps reading
+/// until `len` bytes are in or the input ends.
+///
+/// # Errors
+///
+/// Returns the reader's I/O error.
+pub fn read_prefix(reader: impl Read, len: usize) -> io::Result<Vec<u8>> {
+    let mut prefix = Vec::with_capacity(len);
+    reader.take(len as u64).read_to_end(&mut prefix)?;
+    Ok(prefix)
+}
+
+/// The first [`HEAD_WINDOW`] bytes of `reader`: enough for every content
+/// check in this module.
 ///
 /// # Errors
 ///
 /// Returns the reader's I/O error.
 pub fn read_head(reader: impl Read) -> io::Result<Vec<u8>> {
-    let mut head = Vec::with_capacity(HEAD_WINDOW);
-    reader.take(HEAD_WINDOW as u64).read_to_end(&mut head)?;
-    Ok(head)
+    read_prefix(reader, HEAD_WINDOW)
 }
 
 /// Any null byte in the first [`BINARY_WINDOW`] bytes → binary.

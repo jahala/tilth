@@ -123,6 +123,57 @@ fn open_append(path: &Path) -> std::io::Result<fs::File> {
 mod tests {
     use super::*;
 
+    /// `tilth_read` runs while `tilth_write` replaces the same file, back and
+    /// forth between two versions. Every read must succeed and show one whole
+    /// version. The reader starts only after the writer's first replace and
+    /// the writer keeps replacing until the reader is done, so every read
+    /// overlaps a writer that is running.
+    #[test]
+    fn a_read_during_an_overwrite_sees_one_whole_version() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("f.rs");
+        let first = "fn alpha() {}\n".repeat(200);
+        let second = "fn beta() {}\n".repeat(300);
+        write_overwrite(&p, &first, false).unwrap();
+        let cache = tilth_core::cache::OutlineCache::new();
+        let replaced = AtomicUsize::new(0);
+        let reader_done = AtomicBool::new(false);
+
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                while !reader_done.load(Ordering::SeqCst) {
+                    let next = if replaced.load(Ordering::SeqCst).is_multiple_of(2) {
+                        &second
+                    } else {
+                        &first
+                    };
+                    write_overwrite(&p, next, true).unwrap();
+                    replaced.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+            while replaced.load(Ordering::SeqCst) == 0 {
+                std::thread::yield_now();
+            }
+            for _ in 0..200 {
+                let read = crate::read::read_file(&p, None, true, &cache, false, None);
+                let out = match read {
+                    Ok(out) => out,
+                    Err(e) => {
+                        reader_done.store(true, Ordering::SeqCst);
+                        panic!("a read during a concurrent overwrite failed: {e}");
+                    }
+                };
+                if !(out.ends_with(first.as_str()) || out.ends_with(second.as_str())) {
+                    reader_done.store(true, Ordering::SeqCst);
+                    panic!("a read showed neither whole version:\n{out}");
+                }
+            }
+            reader_done.store(true, Ordering::SeqCst);
+        });
+    }
+
     /// A concurrent reader must never observe a half-written file. The
     /// in-place `O_TRUNC` rewrite this replaced exposed a zero-length window
     /// on every overwrite.

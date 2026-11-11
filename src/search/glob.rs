@@ -124,13 +124,14 @@ fn file_preview(path: &Path) -> Option<String> {
     Some(format!("~{tokens} tokens"))
 }
 
-/// Classify by content the way the read path does, from the same head.
+/// Classify by content with the read path's rule, reading only the bytes
+/// that rule looks at.
 fn is_binary_file(path: &Path) -> bool {
-    use tilth_core::lang::detection::{is_binary, read_head};
+    use tilth_core::lang::detection::{is_binary, read_prefix, BINARY_WINDOW};
     let Ok(file) = std::fs::File::open(path) else {
         return false;
     };
-    read_head(file).is_ok_and(|head| is_binary(&head))
+    read_prefix(file, BINARY_WINDOW).is_ok_and(|prefix| is_binary(&prefix))
 }
 
 #[cfg(test)]

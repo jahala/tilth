@@ -10,6 +10,7 @@
 //! against the file on disk.
 
 use std::io::{self, Read};
+use std::ops::ControlFlow;
 use std::path::Path;
 
 const BOM: &str = "\u{feff}";
@@ -47,41 +48,107 @@ pub fn read_source(path: &Path) -> io::Result<String> {
     Ok(text)
 }
 
-/// How many bytes [`stream_contains`] reads at a time.
-const STREAM_CHUNK: usize = 64 * 1024;
+/// How many bytes a streamed read hands over at a time. A buffer of this
+/// size is all the memory a streamed read needs, whatever the input's size.
+pub const STREAM_CHUNK: usize = 64 * 1024;
 
-/// Whether `reader` holds `needle` anywhere. It reads in bounded chunks, so
-/// memory stays at one chunk whatever the input's size, and it stops at the
-/// first match. The last `needle.len() - 1` bytes of each chunk carry over,
-/// so a match split across two reads is still found. An empty needle is in
-/// every input.
+/// Read `reader` into `buf` one chunk at a time and hand each chunk to
+/// `each`, until the input ends or `each` returns [`ControlFlow::Break`].
+/// This is the one streamed-read loop: line counting, section reads and
+/// substring scans all run on it. An interrupted read is retried.
 ///
 /// # Errors
 ///
-/// Returns the reader's I/O error. An interrupted read is retried.
-pub fn stream_contains(mut reader: impl Read, needle: &[u8]) -> io::Result<bool> {
-    if needle.is_empty() {
-        return Ok(true);
-    }
-    let finder = memchr::memmem::Finder::new(needle);
-    let carry_max = needle.len() - 1;
-    let mut buf = vec![0u8; carry_max + STREAM_CHUNK];
-    let mut filled = 0;
+/// Returns the reader's I/O error.
+pub fn read_chunks(
+    mut reader: impl Read,
+    buf: &mut [u8],
+    mut each: impl FnMut(&[u8]) -> ControlFlow<()>,
+) -> io::Result<()> {
     loop {
-        let read = match reader.read(&mut buf[filled..]) {
-            Ok(0) => return Ok(false),
+        let read = match reader.read(buf) {
+            Ok(0) => return Ok(()),
             Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         };
-        filled += read;
-        if finder.find(&buf[..filled]).is_some() {
+        if each(&buf[..read]).is_break() {
+            return Ok(());
+        }
+    }
+}
+
+/// Finds one fixed byte string in streamed inputs. It keeps its buffers
+/// between inputs, so a walk that checks thousands of files makes one of
+/// these per thread instead of allocating per file.
+pub struct StreamFinder {
+    finder: memchr::memmem::Finder<'static>,
+    buf: Vec<u8>,
+    /// The last `needle.len() - 1` bytes seen, where a match that continues
+    /// into the next chunk can start.
+    tail: Vec<u8>,
+    /// `tail` followed by the start of the next chunk: the only bytes a match
+    /// spanning two chunks can occupy.
+    seam: Vec<u8>,
+}
+
+impl StreamFinder {
+    /// A finder for `needle`.
+    #[must_use]
+    pub fn new(needle: &[u8]) -> Self {
+        Self {
+            finder: memchr::memmem::Finder::new(needle).into_owned(),
+            buf: vec![0; STREAM_CHUNK],
+            tail: Vec::new(),
+            seam: Vec::new(),
+        }
+    }
+
+    /// Whether `reader` holds the needle anywhere. It stops at the first
+    /// match, and a match split across two reads is still found. An empty
+    /// needle is in every input.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reader's I/O error.
+    pub fn contains(&mut self, reader: impl Read) -> io::Result<bool> {
+        let overlap = self.finder.needle().len().saturating_sub(1);
+        if self.finder.needle().is_empty() {
             return Ok(true);
         }
-        let carry = carry_max.min(filled);
-        buf.copy_within(filled - carry..filled, 0);
-        filled = carry;
+        let Self {
+            finder,
+            buf,
+            tail,
+            seam,
+        } = self;
+        tail.clear();
+        let mut found = false;
+        read_chunks(reader, buf, |chunk| {
+            seam.clear();
+            seam.extend_from_slice(tail);
+            seam.extend_from_slice(&chunk[..chunk.len().min(overlap)]);
+            if finder.find(seam).is_some() || finder.find(chunk).is_some() {
+                found = true;
+                return ControlFlow::Break(());
+            }
+            tail.extend_from_slice(&chunk[chunk.len().saturating_sub(overlap)..]);
+            let excess = tail.len().saturating_sub(overlap);
+            tail.drain(..excess);
+            ControlFlow::Continue(())
+        })?;
+        Ok(found)
     }
+}
+
+/// Whether `reader` holds `needle`: a one-off [`StreamFinder`]. A caller
+/// that checks many inputs keeps a `StreamFinder` instead.
+///
+/// # Errors
+///
+/// Returns the reader's I/O error.
+pub fn stream_contains(reader: impl Read, needle: &[u8]) -> io::Result<bool> {
+    StreamFinder::new(needle).contains(reader)
 }
 
 #[cfg(test)]
@@ -143,5 +210,16 @@ mod tests {
             }
         }
         assert!(stream_contains(ThenFail(false), b"needle").unwrap());
+    }
+
+    #[test]
+    fn a_reused_finder_starts_each_input_fresh() {
+        // The tail of one input must never join the head of the next: a file
+        // ending in "nee" and one starting with "dle" do not make "needle".
+        let mut finder = StreamFinder::new(b"needle");
+        assert!(!finder.contains(&b"xx nee"[..]).unwrap());
+        assert!(!finder.contains(&b"dle xx"[..]).unwrap());
+        assert!(finder.contains(&b"a needle"[..]).unwrap());
+        assert!(!finder.contains(&b"none"[..]).unwrap());
     }
 }

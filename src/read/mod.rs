@@ -3,6 +3,7 @@ pub mod outline;
 use std::fmt::Write;
 use std::fs;
 use std::io::Read;
+use std::ops::ControlFlow;
 use std::path::Path;
 
 use crate::format;
@@ -12,6 +13,7 @@ use tilth_core::error::TilthError;
 use tilth_core::lang::detect_file_type_with_content;
 use tilth_core::lang::detection;
 use tilth_core::lang::outline::{heading_level, heading_text, parse_markdown};
+use tilth_core::source::{read_chunks, STREAM_CHUNK};
 use tilth_core::source::{strip_bom, strip_bom_bytes};
 use tilth_core::types::FileType;
 
@@ -73,21 +75,17 @@ impl LineCounter {
 }
 
 /// The line count of a file whose first bytes are `head` and the rest of
-/// which `rest` yields. The rest is read in bounded chunks and dropped, so a
-/// view that only needs the count never holds the file in memory.
-fn count_lines_streaming(head: &[u8], mut rest: impl Read) -> std::io::Result<u32> {
-    const CHUNK: usize = 64 * 1024;
+/// which `rest` yields. The rest streams through one buffer and is dropped,
+/// so a view that needs only the count never holds the file in memory.
+fn count_lines_streaming(head: &[u8], rest: impl Read) -> std::io::Result<u32> {
     let mut counter = LineCounter::default();
     counter.feed(head);
-    let mut buf = vec![0u8; CHUNK];
-    loop {
-        match rest.read(&mut buf) {
-            Ok(0) => return Ok(counter.lines()),
-            Ok(n) => counter.feed(&buf[..n]),
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
-        }
-    }
+    let mut buf = vec![0u8; STREAM_CHUNK];
+    read_chunks(rest, &mut buf, |chunk| {
+        counter.feed(chunk);
+        ControlFlow::Continue(())
+    })?;
+    Ok(counter.lines())
 }
 
 /// Main entry point for read mode. Routes through the decision tree.
@@ -131,6 +129,15 @@ pub fn read_file(
         return list_directory(path);
     }
 
+    let io_error = |source| TilthError::IoError {
+        path: path.to_path_buf(),
+        source,
+    };
+    let mut file = fs::File::open(path).map_err(io_error)?;
+    // Everything below describes the file this handle reads: its size, its
+    // emptiness and the mtime the outline is cached under, even if a rename
+    // replaced the path after the metadata call above.
+    let meta = file.metadata().map_err(io_error)?;
     let byte_len = meta.len();
 
     // An empty file prints its header only.
@@ -142,15 +149,6 @@ pub fn read_file(
     if let Some(range) = section {
         return read_ranges(path, &[range], edit_mode);
     }
-
-    let io_error = |source| TilthError::IoError {
-        path: path.to_path_buf(),
-        source,
-    };
-    let mut file = fs::File::open(path).map_err(io_error)?;
-    // The size of the file this handle reads, so the checks below describe
-    // that file even if it was replaced after the metadata call above.
-    let byte_len = file.metadata().map_err(io_error)?.len();
 
     // The binary, generated and minified checks look only at the head. A
     // file they settle costs that small read plus a streamed line count, so
@@ -601,40 +599,36 @@ fn collect_blocks(
             reason: "at least one range is required".into(),
         });
     }
-
     let io_error = |source| TilthError::IoError {
         path: path.to_path_buf(),
         source,
     };
-    // A heading anchor needs the whole text to find its section. Line ranges
-    // do not, so they stream: a few lines of a huge log cost those lines.
-    if ranges.iter().all(|range| !range.starts_with('#')) {
-        let file = fs::File::open(path).map_err(io_error)?;
-        return stream_line_blocks(std::io::BufReader::new(file), ranges, edit_mode).map_err(|e| {
-            match e {
-                StreamError::Io(source) => io_error(source),
-                StreamError::Range(e) => e,
-            }
-        });
-    }
-    let bytes = fs::read(path).map_err(io_error)?;
-    let buf = &bytes[..];
 
-    // `line_offsets[i]` is the byte where line `i + 1` starts. A final
-    // newline leaves a trailing offset at `buf.len()` that starts no line,
-    // so the line count comes from `count_lines`, not from this table.
-    let mut line_offsets: Vec<usize> = vec![0];
-    for pos in memchr::memchr_iter(b'\n', buf) {
-        line_offsets.push(pos + 1);
+    // A heading anchor needs the text to find its lines. Line ranges do not,
+    // so without one the file streams and is never held in memory.
+    let text = if ranges.iter().any(|range| range.starts_with('#')) {
+        Some(fs::read(path).map_err(io_error)?)
+    } else {
+        None
+    };
+    let resolved: Vec<Result<(usize, usize), TilthError>> = ranges
+        .iter()
+        .map(|range| match &text {
+            Some(text) => resolve_range(text, range),
+            None => line_range(range),
+        })
+        .collect();
+    let (selected, total) = match &text {
+        Some(text) => select_lines(&text[..], &resolved),
+        None => select_lines(fs::File::open(path).map_err(io_error)?, &resolved),
     }
-    let total = count_lines(buf) as usize;
+    .map_err(io_error)?;
 
     let mut blocks: Vec<Block> = Vec::with_capacity(ranges.len());
     let mut total_bytes: u64 = 0;
     let mut total_lines: u32 = 0;
-
-    for range in ranges {
-        let (start, end) = resolve_range(buf, range)?;
+    for ((range, resolved), selected) in ranges.iter().zip(resolved).zip(selected) {
+        let (start, end) = resolved?;
         if start > total {
             return Err(TilthError::InvalidQuery {
                 query: (*range).to_string(),
@@ -642,88 +636,8 @@ fn collect_blocks(
             });
         }
         // An end past the last line clamps to it.
-        let s = start - 1;
-        let e = end.min(total);
-        let start_byte = line_offsets[s];
-        let end_byte = if e < line_offsets.len() {
-            line_offsets[e]
-        } else {
-            buf.len()
-        };
-        let selected = String::from_utf8_lossy(&buf[start_byte..end_byte]);
-        total_bytes += selected.len() as u64;
-        total_lines += (e - s) as u32;
-        let formatted = if edit_mode {
-            format::hashlines(&selected, start as u32)
-        } else {
-            format::number_lines(&selected, start as u32)
-        };
-        blocks.push(Block {
-            start,
-            end: e,
-            text: formatted,
-        });
-    }
-
-    Ok((blocks, total_bytes, total_lines))
-}
-
-/// Why [`stream_line_blocks`] failed: reading, or a range the file cannot
-/// serve.
-enum StreamError {
-    Io(std::io::Error),
-    Range(TilthError),
-}
-
-/// [`collect_blocks`] for line ranges only, reading the file one line at a
-/// time and keeping only the lines a range asks for. Ranges are honoured in
-/// the order given, and an invalid range fails the call with the same error,
-/// in the same order, as the in-memory path.
-fn stream_line_blocks(
-    mut reader: impl std::io::BufRead,
-    ranges: &[&str],
-    edit_mode: bool,
-) -> Result<(Vec<Block>, u64, u32), StreamError> {
-    let parsed: Vec<Result<(usize, usize), TilthError>> =
-        ranges.iter().map(|range| line_range(range)).collect();
-    let mut selected: Vec<Vec<u8>> = vec![Vec::new(); ranges.len()];
-
-    // Each `read_until` chunk is one line, a final unterminated one
-    // included, so `total` counts lines the way `count_lines` does.
-    let mut total = 0usize;
-    let mut line = Vec::new();
-    loop {
-        line.clear();
-        if reader
-            .read_until(b'\n', &mut line)
-            .map_err(StreamError::Io)?
-            == 0
-        {
-            break;
-        }
-        total += 1;
-        for (range, kept) in parsed.iter().zip(&mut selected) {
-            if let Ok((start, end)) = range {
-                if (*start..=*end).contains(&total) {
-                    kept.extend_from_slice(&line);
-                }
-            }
-        }
-    }
-
-    let mut blocks = Vec::with_capacity(ranges.len());
-    let mut total_bytes: u64 = 0;
-    let mut total_lines: u32 = 0;
-    for ((range, parsed), kept) in ranges.iter().zip(parsed).zip(selected) {
-        let (start, end) = parsed.map_err(StreamError::Range)?;
-        if start > total {
-            return Err(StreamError::Range(TilthError::InvalidQuery {
-                query: (*range).to_string(),
-                reason: format!("starts past the end of the file, which has {total} lines"),
-            }));
-        }
         let end = end.min(total);
-        let text = String::from_utf8_lossy(&kept);
+        let text = String::from_utf8_lossy(&selected);
         total_bytes += text.len() as u64;
         total_lines += (end - (start - 1)) as u32;
         let formatted = if edit_mode {
@@ -738,6 +652,67 @@ fn stream_line_blocks(
         });
     }
     Ok((blocks, total_bytes, total_lines))
+}
+
+/// The bytes of each requested line range, read from `reader` in chunks.
+/// Lines are sliced out of each chunk as they pass, so a line no range asks
+/// for is counted and dropped, never held, however long it is. The read
+/// stops once the last requested line is in. `ranges` holds each range or
+/// the error that rejected it; only valid ranges select lines.
+///
+/// Returns the selected bytes per range and the file's line count, counted
+/// the way [`count_lines`] counts. When the read stopped early the count is
+/// the last requested line, which is all any range can need: every valid
+/// range starts and ends at or before it.
+fn select_lines(
+    reader: impl Read,
+    ranges: &[Result<(usize, usize), TilthError>],
+) -> std::io::Result<(Vec<Vec<u8>>, usize)> {
+    let mut selected = vec![Vec::new(); ranges.len()];
+    let Some(last) = ranges
+        .iter()
+        .filter_map(|range| range.as_ref().ok().map(|&(_, end)| end))
+        .max()
+    else {
+        return Ok((selected, 0));
+    };
+
+    let mut line = 1usize;
+    let mut unterminated = false;
+    let mut stopped = false;
+    let mut buf = vec![0u8; STREAM_CHUNK];
+    read_chunks(reader, &mut buf, |chunk| {
+        let mut pos = 0;
+        while pos < chunk.len() {
+            let newline = memchr::memchr(b'\n', &chunk[pos..]);
+            let end = newline.map_or(chunk.len(), |i| pos + i + 1);
+            for (range, bytes) in ranges.iter().zip(&mut selected) {
+                if let Ok((start, stop)) = range {
+                    if (*start..=*stop).contains(&line) {
+                        bytes.extend_from_slice(&chunk[pos..end]);
+                    }
+                }
+            }
+            pos = end;
+            if newline.is_none() {
+                unterminated = true;
+            } else {
+                unterminated = false;
+                if line == last {
+                    stopped = true;
+                    return ControlFlow::Break(());
+                }
+                line += 1;
+            }
+        }
+        ControlFlow::Continue(())
+    })?;
+    let total = if stopped {
+        last
+    } else {
+        line - 1 + usize::from(unterminated)
+    };
+    Ok((selected, total))
 }
 
 /// Parse "45-89" into (45, 89). 1-indexed.
@@ -1460,6 +1435,56 @@ mod tests {
                 "{content:?} section should cover {lines} lines: {all}"
             );
         }
+    }
+
+    /// The range read stops once its last requested line is in. The reader
+    /// fails if it is read again after that, so a successful result proves
+    /// the rest of the file was never read.
+    #[test]
+    fn select_lines_stops_after_the_last_requested_line() {
+        struct ThenFail(bool);
+        impl Read for ThenFail {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                if self.0 {
+                    return Err(std::io::Error::other("read past the last requested line"));
+                }
+                self.0 = true;
+                let chunk = b"a\nb\nc\nd\n";
+                out[..chunk.len()].copy_from_slice(chunk);
+                Ok(chunk.len())
+            }
+        }
+        let (selected, total) = select_lines(ThenFail(false), &[Ok((2, 3))]).unwrap();
+        assert_eq!(selected[0], b"b\nc\n");
+        assert_eq!(total, 3);
+    }
+
+    /// Lines that arrive split across reads are sliced the same as from one
+    /// buffer, and the count matches `count_lines`, a final line with no
+    /// newline included.
+    #[test]
+    fn select_lines_is_the_same_one_byte_at_a_time() {
+        struct OneByte<'a>(&'a [u8]);
+        impl Read for OneByte<'_> {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                let Some((&first, rest)) = self.0.split_first() else {
+                    return Ok(0);
+                };
+                out[0] = first;
+                self.0 = rest;
+                Ok(1)
+            }
+        }
+        let text = b"one\ntwo\n\nfour\nfive";
+        let ranges = [Ok((2, 4)), Ok((5, 9)), Ok((1, 1))];
+        let (whole, whole_total) = select_lines(&text[..], &ranges).unwrap();
+        let (split, split_total) = select_lines(OneByte(text), &ranges).unwrap();
+        assert_eq!(whole, split);
+        assert_eq!(whole_total, split_total);
+        assert_eq!(split_total, count_lines(text) as usize);
+        assert_eq!(split[0], b"two\n\nfour\n");
+        assert_eq!(split[1], b"five");
+        assert_eq!(split[2], b"one\n");
     }
 
     /// Line ranges are read by streaming the file. The slices must be the
