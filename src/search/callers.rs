@@ -251,6 +251,19 @@ fn write_caller_bucket(
     }
 }
 
+/// What the second-hop walk keeps.
+#[derive(Default)]
+struct Hop2 {
+    /// Distinct calling functions per file, summed over files.
+    unique_total: usize,
+    /// The first `IMPACT_MAX_RESULTS` sites, one per function per file, as
+    /// (name called, site).
+    listed: Vec<(String, CallerMatch)>,
+    /// Call sites of each method name several types define, which no
+    /// function is listed for.
+    unattributed: HashMap<String, usize>,
+}
+
 /// Adaptive 2nd-hop impact analysis, shared by single- and multi-target
 /// callers search (extracted so multi-target reuses this exact block per
 /// target bucket instead of re-implementing it — PR #138 review HIGH
@@ -290,21 +303,40 @@ fn write_second_hop_impact(
             .then_with(|| a.line.cmp(&b.line))
     };
     // A label names its owner (`Service.run`); a call site names the method
-    // alone (`s.run()`), so the second hop looks for the bare names.
-    let hop2_targets: HashSet<String> = all_caller_names
-        .iter()
-        .map(|label| {
-            tilth_core::search::scope::split_qualified(label)
-                .1
-                .to_string()
-        })
+    // alone (`s.run()`), so the second hop looks for the bare names. A site
+    // of a method name that several types define could reach any of them,
+    // so those sites are counted apart instead of listed as affected.
+    let mut hop2_targets: HashSet<String> = HashSet::new();
+    let mut method_names: HashSet<String> = HashSet::new();
+    for label in all_caller_names {
+        let (owner, name) = tilth_core::search::scope::split_qualified(label);
+        hop2_targets.insert(name.to_string());
+        if owner.is_some() {
+            method_names.insert(name.to_string());
+        }
+    }
+    let Ok(owners) =
+        tilth_core::search::callers::definition_owners(&method_names, scope, bloom, glob)
+    else {
+        return;
+    };
+    let ambiguous: HashMap<String, usize> = owners
+        .into_iter()
+        .filter(|(_, types)| types.len() > 1)
+        .map(|(name, types)| (name, types.len()))
         .collect();
-    let first: Mutex<(usize, Vec<(String, CallerMatch)>)> = Mutex::new((0, Vec::new()));
+
+    let first: Mutex<Hop2> = Mutex::new(Hop2::default());
     let walked = find_callers_batch(&hop2_targets, scope, bloom, glob, None, |sites| {
         let mut seen: HashSet<String> = HashSet::new();
         let mut file_first: Vec<(String, CallerMatch)> = Vec::new();
+        let mut file_unattributed: HashMap<String, usize> = HashMap::new();
         for (via, m) in sites {
             if hop1_locations.contains(&(m.path.clone(), m.line)) {
+                continue;
+            }
+            if ambiguous.contains_key(&via) {
+                *file_unattributed.entry(via).or_default() += 1;
                 continue;
             }
             if seen.insert(m.calling_function.clone()) && file_first.len() < IMPACT_MAX_RESULTS {
@@ -314,18 +346,25 @@ fn write_second_hop_impact(
         let mut first = first
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        first.0 += seen.len();
-        first.1.extend(file_first);
-        first.1.sort_by(hop2_order);
-        first.1.truncate(IMPACT_MAX_RESULTS);
+        first.unique_total += seen.len();
+        first.listed.extend(file_first);
+        first.listed.sort_by(hop2_order);
+        first.listed.truncate(IMPACT_MAX_RESULTS);
+        for (via, n) in file_unattributed {
+            *first.unattributed.entry(via).or_default() += n;
+        }
     });
     if walked.is_err() {
         return;
     }
-    let (unique_total, hop2) = first
+    let Hop2 {
+        unique_total,
+        listed: hop2,
+        unattributed,
+    } = first
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if unique_total == 0 {
+    if unique_total == 0 && unattributed.is_empty() {
         return;
     }
 
@@ -345,6 +384,19 @@ fn write_second_hop_impact(
             output,
             "  ... and {} more",
             unique_total - IMPACT_MAX_RESULTS
+        );
+    }
+
+    let mut unattributed: Vec<(&String, usize, usize)> = ambiguous
+        .iter()
+        .filter_map(|(name, types)| Some((name, unattributed.get(name).copied()?, *types)))
+        .collect();
+    unattributed.sort();
+    for (name, sites, types) in unattributed {
+        let _ = writeln!(
+            output,
+            "  {name}: {sites} call site{}, not attributed ({types} types define it)",
+            if sites == 1 { "" } else { "s" },
         );
     }
 
@@ -761,5 +813,52 @@ mod tests {
             .nth(1)
             .unwrap_or_else(|| panic!("no 2nd-hop block:\n{result}"));
         assert!(impact.contains("app.ts:1"), "{result}");
+    }
+
+    /// A call names a method without its type, so when several types define
+    /// that name the second hop cannot tell whose method a site reaches.
+    /// Every class whose `__init__` calls `super().__init__()` would be
+    /// listed as affected. The sites are counted on one line instead, and
+    /// the real chain keeps its place.
+    #[test]
+    fn second_hop_counts_a_method_several_types_define_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let bloom = BloomFilterCache::new();
+        std::fs::write(
+            dir.path().join("routes.py"),
+            "def target():\n    return 1\n\n\
+             class Route:\n    def __init__(self):\n        target()\n\n\
+             def helper():\n    return target()\n\n\
+             def app():\n    return helper()\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("models.py"),
+            "class Base:\n    def __init__(self):\n        pass\n\n\
+             class First(Base):\n    def __init__(self):\n        super().__init__()\n\n\
+             class Second(Base):\n    def __init__(self):\n        super().__init__()\n",
+        )
+        .unwrap();
+
+        let result =
+            search_callers_expanded("target", dir.path(), &bloom, 0, None, None, false).unwrap();
+
+        assert!(result.contains("[caller: Route.__init__]"), "{result}");
+        let impact = result
+            .split("-- impact (2nd hop) --")
+            .nth(1)
+            .unwrap_or_else(|| panic!("no 2nd-hop block:\n{result}"));
+        assert!(impact.contains("app "), "{result}");
+        assert!(impact.contains("-> helper"), "{result}");
+        assert!(!impact.contains("First.__init__"), "{result}");
+        assert!(!impact.contains("Second.__init__"), "{result}");
+        assert!(
+            impact.contains("__init__: 2 call sites, not attributed (4 types define it)"),
+            "{result}"
+        );
+        assert!(
+            impact.contains("3 functions affected across 2 hops."),
+            "{result}"
+        );
     }
 }

@@ -338,6 +338,23 @@ fn name_text(node: tree_sitter::Node, lines: &[&str]) -> String {
     node_text_simple(node, lines, NodeTextMode::Full)
 }
 
+/// A member declared without a body: a trait or interface method, an
+/// abstract method, a TS overload or `declare function`, or a bodiless Java
+/// or C# `method_declaration`. It names a member but holds no code a call
+/// could run.
+#[must_use]
+pub fn is_bodiless_declaration(node: tree_sitter::Node) -> bool {
+    match node.kind() {
+        "function_signature_item"
+        | "method_signature"
+        | "abstract_method_signature"
+        | "function_signature"
+        | "protocol_function_declaration" => true,
+        "method_declaration" => node.child_by_field_name("body").is_none(),
+        _ => false,
+    }
+}
+
 /// Extract the name defined by a tree-sitter definition node.
 ///
 /// Walks standard field names (`name`, `identifier`, `declarator`), follows

@@ -2,7 +2,7 @@
 //! found with one parallel walk, a bloom and byte pre-filter, and a
 //! tree-sitter pass over the files that survive.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -11,6 +11,7 @@ use streaming_iterator::StreamingIterator;
 
 use crate::error::TilthError;
 use crate::lang::outline::outline_language;
+use crate::lang::treesitter::is_bodiless_declaration;
 use crate::lang::{detect_file_type, detect_file_type_with_content};
 use crate::types::FileType;
 
@@ -174,6 +175,122 @@ where
     })
 }
 
+/// The types that define each of `names` under `scope`: for each name, the
+/// distinct owners (see [`super::scope::definition_owner`]) of its
+/// definitions, the same owners caller labels carry. A definition with no
+/// owner, such as a plain function, adds none, and neither does a member
+/// declared without a body (a trait or interface method): a call through
+/// it runs an implementor's body, whose type is counted. Names no type
+/// defines are left out.
+///
+/// A call site names a method without its type (`x.run()`), so a name that
+/// several types define cannot be traced to one of them by name alone.
+/// Files over the size cap are not parsed, as in [`find_callers_batch`].
+// The std hasher is part of the signature, as in `find_callers_batch`.
+#[allow(clippy::implicit_hasher)]
+pub fn definition_owners(
+    names: &HashSet<String>,
+    scope: &Path,
+    bloom: &crate::index::bloom::BloomFilterCache,
+    glob: Option<&str>,
+) -> Result<HashMap<String, BTreeSet<String>>, TilthError> {
+    let found: Mutex<HashMap<String, BTreeSet<String>>> = Mutex::new(HashMap::new());
+    if names.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let walker = super::walk::walker(scope, glob)?;
+
+    walker.run(|| {
+        let found = &found;
+        Box::new(move |entry| {
+            let Ok(entry) = entry else {
+                return ignore::WalkState::Continue;
+            };
+            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+                return ignore::WalkState::Continue;
+            }
+            let path = entry.path();
+            let Some((content, _mtime)) = super::bloom_walk::read_with_bloom_check(
+                path,
+                names,
+                bloom,
+                crate::source::MAX_FILE_SIZE,
+            ) else {
+                return ignore::WalkState::Continue;
+            };
+            if !names
+                .iter()
+                .any(|n| memchr::memmem::find(content.as_bytes(), n.as_bytes()).is_some())
+            {
+                return ignore::WalkState::Continue;
+            }
+            let FileType::Code(lang) = detect_file_type_with_content(path, &content) else {
+                return ignore::WalkState::Continue;
+            };
+            let Some(ts_lang) = outline_language(lang) else {
+                return ignore::WalkState::Continue;
+            };
+            let owners = owners_in_file(&content, names, &ts_lang, lang);
+            if !owners.is_empty() {
+                let mut found = found
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                for (name, owner) in owners {
+                    found.entry(name).or_default().insert(owner);
+                }
+            }
+            ignore::WalkState::Continue
+        })
+    });
+
+    Ok(found
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner))
+}
+
+/// The (name, owner) pair of each owned definition of one of `names` in a
+/// file's content.
+fn owners_in_file(
+    content: &str,
+    names: &HashSet<String>,
+    ts_lang: &tree_sitter::Language,
+    lang: crate::types::Lang,
+) -> Vec<(String, String)> {
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(ts_lang).is_err() {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(content, None) else {
+        return Vec::new();
+    };
+    let lines: Vec<&str> = content.lines().collect();
+    let mut owners = Vec::new();
+    let mut cursor = tree.walk();
+    loop {
+        let node = cursor.node();
+        if let Some(name) = super::scope::definition_name(node, &lines, lang) {
+            if names.contains(&name) && !is_bodiless_declaration(node) {
+                if let Some(owner) = super::scope::definition_owner(node, &lines, lang) {
+                    owners.push((name, owner));
+                }
+            }
+        }
+        if cursor.goto_first_child() || cursor.goto_next_sibling() {
+            continue;
+        }
+        let mut done = true;
+        while cursor.goto_parent() {
+            if cursor.goto_next_sibling() {
+                done = false;
+                break;
+            }
+        }
+        if done {
+            return owners;
+        }
+    }
+}
+
 /// Is `path` a code file the walk would parse, over the size cap, whose text
 /// holds one of `targets`?
 fn oversized_code_holding(path: &Path, targets: &HashSet<String>) -> bool {
@@ -322,6 +439,28 @@ fn find_enclosing_function(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each name maps to the types whose definitions of it a caller label
+    /// would name. A plain function of the same name adds no type, and
+    /// neither does a trait method declared without a body.
+    #[test]
+    fn definition_owners_lists_the_types_that_define_a_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("m.rs"),
+            "struct A;\nstruct B;\nimpl A { fn new() -> A { A } }\n\
+             impl B { fn new() -> B { B } fn only() {} }\nfn new() {}\nfn free() {}\n\
+             trait Run { fn only(&self); }\n",
+        )
+        .unwrap();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let names: HashSet<String> = ["new", "only", "free"].map(String::from).into();
+        let owners = definition_owners(&names, dir.path(), &bloom, None).unwrap();
+        let of = |n: &str| owners.get(n).map(|o| o.iter().cloned().collect::<Vec<_>>());
+        assert_eq!(of("new"), Some(vec!["A".to_string(), "B".to_string()]));
+        assert_eq!(of("only"), Some(vec!["B".to_string()]));
+        assert_eq!(of("free"), None);
+    }
 
     /// The bloom pre-filter must never hide a file that holds a call site. A
     /// quote inside a triple-quoted string, or an apostrophe in a `#` comment,

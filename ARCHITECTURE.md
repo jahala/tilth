@@ -540,7 +540,11 @@ machinery:
   nearest enclosing definition that is not a local variable, qualified
   by its owner (`Service.run`, `Context.reset`): a call in
   `const result = target()` inside `outer` is labelled `outer`. The 2nd
-  hop looks for the bare names of these labels. When the walk returns
+  hop looks for the bare names of these labels. A call names a method
+  without its type, so a method name that more than one type defines
+  (`callers::definition_owners`) cannot be traced by name: its sites
+  are counted on one line (`__init__: 21 call sites, not attributed (52
+  types define it)`) and left out of the functions affected. When the walk returns
   empty, a small `target_seen_in_scope` helper in the binary does an mmap-based
   literal scan so `no_callers_message` can distinguish typo from
   "real symbol with no direct callers" (indirect dispatch, dead code,

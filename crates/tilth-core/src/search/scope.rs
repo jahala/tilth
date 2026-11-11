@@ -42,19 +42,7 @@ pub(super) fn walk_to_enclosing_definition<'a>(
 ) -> Option<(tree_sitter::Node<'a>, String, (u32, u32))> {
     let mut current = Some(node);
     while let Some(n) = current {
-        let def_name = if matches!(lang, Lang::JavaScript | Lang::TypeScript | Lang::Tsx)
-            && FUNCTION_VALUE_KINDS.contains(&n.kind())
-        {
-            function_value_name(n, lines)
-        } else if DEFINITION_KINDS.contains(&n.kind()) && !is_local_binding(n) {
-            extract_definition_name(n, lines)
-        } else if lang == Lang::Elixir && is_elixir_definition(n, lines) {
-            extract_elixir_definition_name(n, lines)
-        } else {
-            None
-        };
-
-        if let Some(name) = def_name {
+        if let Some(name) = definition_name(n, lines, lang) {
             let range = (
                 n.start_position().row as u32 + 1,
                 n.end_position().row as u32 + 1,
@@ -68,6 +56,28 @@ pub(super) fn walk_to_enclosing_definition<'a>(
         current = n.parent();
     }
     None
+}
+
+/// The name `node` defines, if it is a definition a caller label can name:
+/// a definition that is not a local binding, a named or bound JavaScript
+/// function value, or an Elixir `def`. The label is this name, qualified
+/// with the [`definition_owner`].
+pub(super) fn definition_name(
+    node: tree_sitter::Node,
+    lines: &[&str],
+    lang: Lang,
+) -> Option<String> {
+    if matches!(lang, Lang::JavaScript | Lang::TypeScript | Lang::Tsx)
+        && FUNCTION_VALUE_KINDS.contains(&node.kind())
+    {
+        function_value_name(node, lines)
+    } else if DEFINITION_KINDS.contains(&node.kind()) && !is_local_binding(node) {
+        extract_definition_name(node, lines)
+    } else if lang == Lang::Elixir && is_elixir_definition(node, lines) {
+        extract_elixir_definition_name(node, lines)
+    } else {
+        None
+    }
 }
 
 /// JavaScript and TypeScript functions written as values.
