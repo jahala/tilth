@@ -278,7 +278,7 @@ fn owners_in_tree(
 
 /// Is `path` a code file the walk would parse, over the size cap, whose text
 /// mentions one of `words` as a whole identifier? `renew` is no call of
-/// `new`. The check streams the file, so its size costs no memory.
+/// `new`. The check streams the file, so any size costs a few chunks.
 #[must_use]
 pub fn oversized_code_holding(path: &Path, words: &[&str]) -> bool {
     let too_big = std::fs::metadata(path).is_ok_and(|m| m.len() > crate::source::MAX_FILE_SIZE);
