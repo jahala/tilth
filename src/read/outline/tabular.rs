@@ -8,7 +8,7 @@ pub fn outline(content: &str, _max_lines: usize) -> String {
     }
 
     // Count lines via memchr — O(n) SIMD scan, no Vec allocation
-    let total = memchr::memchr_iter(b'\n', buf).count() + 1;
+    let total = crate::read::count_lines(buf) as usize;
 
     // We still need to index into lines for head/tail display,
     // but only collect offsets, not full line slices

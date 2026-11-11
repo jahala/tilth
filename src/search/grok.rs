@@ -197,8 +197,10 @@ fn read_code_file(path: &Path) -> Result<(String, Lang), TilthError> {
     }
     // Try the strict conversion first: it takes ownership of the buffer, so
     // the (near-universal) valid-UTF-8 case decodes without a second copy.
-    let content = String::from_utf8(bytes)
+    let mut content = String::from_utf8(bytes)
         .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+    let bom = content.len() - tilth_core::source::strip_bom(&content).len();
+    content.drain(..bom);
     let lang = tilth_core::lang::refine_lang(lang, path, &content);
     Ok((content, lang))
 }
@@ -318,7 +320,7 @@ fn read_delegate_content(
     if callee_file == target_path {
         Some(target_content.to_string())
     } else if std::fs::metadata(callee_file).is_ok_and(|m| m.len() <= cap) {
-        fs::read_to_string(callee_file).ok()
+        tilth_core::source::read_source(callee_file).ok()
     } else {
         None
     }
@@ -555,7 +557,7 @@ pub fn grok(
                 &callee.file,
                 &target.path,
                 &content,
-                tilth_core::search::bloom_walk::MAX_FILE_SIZE,
+                tilth_core::source::MAX_FILE_SIZE,
             );
             callee_content.map(|cc| {
                 // Build a minimal ResolvedTarget so body_with_dedup can handle dedup.

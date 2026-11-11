@@ -35,11 +35,16 @@ pub fn classify(query: &str, scope: &Path) -> QueryType {
 
     // 1. Glob — check first because globs can contain path separators.
     //    But only if no spaces: real globs don't have spaces, content like "import { X }" does.
+    //    Glob characters in a shape no file name carries (`Searcher.*Builder`,
+    //    `[0-9]+`) make the query a regex: listing files for it always found none.
     if !query.contains(' ')
         && query
             .bytes()
             .any(|b| matches!(b, b'*' | b'?' | b'{' | b'['))
     {
+        if is_regex_shaped(query) {
+            return QueryType::Regex(query.into());
+        }
         return QueryType::Glob(query.into());
     }
 
@@ -207,6 +212,59 @@ fn has_regex_metachar(s: &str) -> bool {
     })
 }
 
+/// Does a query that carries glob characters use syntax that only a regex
+/// has? Each signal is something a file glob never needs:
+///
+/// - `|` alternation, `^` at the start or `$` at the end;
+/// - `.*` or `.?` with name characters on both sides (`Searcher.*Builder`).
+///   `Cargo.*`, `*.test.*`, `.*rc` and `foo.*.bak` are file globs, because
+///   there the dot starts an extension or a dotfile;
+/// - a `+` or `{n}` / `{n,m}` quantifier after `.`, `]` or `)`;
+/// - a backslash escape (`\w`, `\(`, `\.`), except on Windows, where a
+///   backslash separates path components.
+///
+/// Parentheses alone do not count: `app/(auth)/*.tsx` is a route-group glob.
+fn is_regex_shaped(query: &str) -> bool {
+    let b = query.as_bytes();
+    let name_char = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    if b.contains(&b'|') || b.first() == Some(&b'^') || b.last() == Some(&b'$') {
+        return true;
+    }
+    for i in 0..b.len() {
+        let prev = i.checked_sub(1).map(|j| b[j]);
+        let next = b.get(i + 1).copied();
+        match b[i] {
+            b'.' if matches!(next, Some(b'*' | b'?'))
+                && prev.is_some_and(name_char)
+                && b.get(i + 2).copied().is_some_and(name_char) =>
+            {
+                return true;
+            }
+            b'+' if matches!(prev, Some(b'.' | b']' | b')')) => return true,
+            b'{' if matches!(prev, Some(b'.' | b']' | b')')) && is_repeat_count(&b[i + 1..]) => {
+                return true;
+            }
+            b'\\' if !cfg!(windows) && next.is_some_and(|c| c.is_ascii_graphic()) => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// `rest` starts right after a `{`: is it `n}` or `n,m}`, a regex repeat count?
+fn is_repeat_count(rest: &[u8]) -> bool {
+    let Some(close) = rest.iter().position(|&c| c == b'}') else {
+        return false;
+    };
+    let mut parts = rest[..close].split(|&c| c == b',');
+    let min = parts.next().unwrap_or_default();
+    let max = parts.next().unwrap_or_default();
+    !min.is_empty()
+        && min.iter().all(u8::is_ascii_digit)
+        && max.iter().all(u8::is_ascii_digit)
+        && parts.next().is_none()
+}
+
 /// Identifier check without regex: first byte is [a-zA-Z_$@],
 /// rest are [a-zA-Z0-9_$\.\-]. Tight loop over bytes.
 pub fn is_identifier(s: &str) -> bool {
@@ -296,6 +354,70 @@ mod tests {
             QueryType::Glob(_)
         ));
         assert!(matches!(classify("{a,b}.js", &scope), QueryType::Glob(_)));
+    }
+
+    /// A query with glob characters that no file name would carry is a
+    /// regex. `Searcher.*Builder` used to list "0 files" while
+    /// `/Searcher.*Builder/` found the matches.
+    #[test]
+    fn regex_shaped_queries_are_not_globs() {
+        let scope = PathBuf::from(".");
+        for query in [
+            "Searcher.*Builder",
+            "impl.*for",
+            "foo.?bar",
+            "[0-9]+",
+            #[cfg(not(windows))]
+            "handle[A-Z]\\w+",
+            #[cfg(not(windows))]
+            "Err\\(.*\\)",
+            "get(User|Account)*",
+            "^test_*",
+            #[cfg(not(windows))]
+            "log\\.[a-z]*",
+            "fn.+main*",
+            "[0-9]{3}*",
+        ] {
+            assert!(
+                matches!(classify(query, &scope), QueryType::Regex(ref p) if p == query),
+                "{query:?} should be a regex, got {:?}",
+                classify(query, &scope)
+            );
+        }
+    }
+
+    /// File globs stay globs, including the shapes that share characters
+    /// with regex: an extension wildcard after a dot, a dotfile prefix and
+    /// route-group parentheses.
+    #[test]
+    fn file_globs_stay_globs() {
+        let scope = PathBuf::from(".");
+        for query in [
+            "*.rs",
+            "**/*.rs",
+            "src/**/*.ts",
+            "*.{rs,ts}",
+            "*_test.go",
+            "test_*.py",
+            "Cargo.*",
+            "*.test.*",
+            "*.*",
+            ".*rc",
+            "src/.*rc",
+            "foo.*.bak",
+            "[Mm]akefile",
+            "*.[ch]",
+            "file?.txt",
+            "app/(auth)/*.tsx",
+            "include/c++/*",
+            "TODO.*",
+        ] {
+            assert!(
+                matches!(classify(query, &scope), QueryType::Glob(_)),
+                "{query:?} should stay a glob, got {:?}",
+                classify(query, &scope)
+            );
+        }
     }
 
     #[test]

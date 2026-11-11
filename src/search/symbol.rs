@@ -1,5 +1,4 @@
-use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::SystemTime;
@@ -97,8 +96,12 @@ pub fn search(
         },
     );
 
-    let defs = defs?;
-    let usages = usages?;
+    let (defs, skipped_defs) = defs?;
+    let (usages, skipped_usages) = usages?;
+    let mut skipped_large = skipped_defs;
+    skipped_large.extend(skipped_usages);
+    skipped_large.sort();
+    skipped_large.dedup();
 
     // Deduplicate: remove usage matches that overlap with definition matches.
     // Linear scan — max ~30 defs from EARLY_QUIT_THRESHOLD, no allocation needed.
@@ -153,6 +156,7 @@ pub fn search(
         definitions: def_count,
         usages: usage_count,
         facet_totals: totals,
+        skipped_large,
     })
 }
 
@@ -169,8 +173,9 @@ fn find_definitions(
     scope: &Path,
     glob: Option<&str>,
     early_quit_threshold: usize,
-) -> Result<Vec<Match>, TilthError> {
+) -> Result<(Vec<Match>, Vec<PathBuf>), TilthError> {
     let matches: Mutex<Vec<Match>> = Mutex::new(Vec::new());
+    let skipped_large: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
     // Relaxed is correct: walker.run() joins all threads before we read the final value.
     // Early-quit checks are approximate by design — one extra iteration is harmless.
     let found_count = AtomicUsize::new(0);
@@ -180,6 +185,7 @@ fn find_definitions(
 
     walker.run(|| {
         let matches = &matches;
+        let skipped_large = &skipped_large;
         let found_count = &found_count;
 
         Box::new(move |entry| {
@@ -210,7 +216,12 @@ fn find_definitions(
             // Skip oversized files — avoid tree-sitter parsing multi-MB minified bundles
             let file_size = match std::fs::metadata(path) {
                 Ok(meta) => {
-                    if meta.len() > 500_000 {
+                    if meta.len() > tilth_core::source::MAX_FILE_SIZE {
+                        if super::oversized_holds(path, |b| {
+                            memchr::memmem::find(b, needle).is_some()
+                        }) {
+                            super::record(skipped_large, path);
+                        }
                         return ignore::WalkState::Continue;
                     }
                     meta.len()
@@ -219,7 +230,7 @@ fn find_definitions(
             };
 
             // Single read: read file once, use buffer for both check and parse
-            let Ok(content) = fs::read_to_string(path) else {
+            let Ok(content) = tilth_core::source::read_source(path) else {
                 return ignore::WalkState::Continue;
             };
 
@@ -296,9 +307,12 @@ fn find_definitions(
         })
     });
 
-    Ok(matches
-        .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner))
+    Ok((
+        matches
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        super::sorted(skipped_large),
+    ))
 }
 
 /// Tree-sitter structural definition detection.
@@ -620,8 +634,9 @@ fn find_usages(
     scope: &Path,
     glob: Option<&str>,
     early_quit_threshold: usize,
-) -> Result<Vec<Match>, TilthError> {
+) -> Result<(Vec<Match>, Vec<PathBuf>), TilthError> {
     let matches: Mutex<Vec<Match>> = Mutex::new(Vec::new());
+    let skipped_large: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
     // Relaxed: same reasoning as find_definitions — approximate early-quit, joined before read
     let found_count = AtomicUsize::new(0);
 
@@ -629,6 +644,7 @@ fn find_usages(
 
     walker.run(|| {
         let matches = &matches;
+        let skipped_large = &skipped_large;
         let found_count = &found_count;
 
         Box::new(move |entry| {
@@ -659,7 +675,10 @@ fn find_usages(
             // Skip oversized files
             let file_size = match std::fs::metadata(path) {
                 Ok(meta) => {
-                    if meta.len() > 500_000 {
+                    if meta.len() > tilth_core::source::MAX_FILE_SIZE {
+                        if super::oversized_holds(path, |b| super::has_match(matcher, b)) {
+                            super::record(skipped_large, path);
+                        }
                         return ignore::WalkState::Continue;
                     }
                     meta.len()
@@ -672,11 +691,12 @@ fn find_usages(
             let Ok(bytes) = std::fs::read(path) else {
                 return ignore::WalkState::Continue;
             };
+            let bytes = tilth_core::source::strip_bom_bytes(&bytes);
 
-            // Catch unmarked minified bundles between 100KB and 500KB — they
+            // Catch unmarked minified bundles under the size cap — they
             // were not skipped by the filename check or the size cap above.
             if file_size >= tilth_core::lang::detection::MINIFIED_CHECK_THRESHOLD
-                && tilth_core::lang::detection::is_minified_by_content(&bytes)
+                && tilth_core::lang::detection::is_minified_by_content(bytes)
             {
                 return ignore::WalkState::Continue;
             }
@@ -688,7 +708,7 @@ fn find_usages(
 
             let _ = searcher.search_slice(
                 matcher,
-                &bytes,
+                bytes,
                 UTF8(|line_num, line| {
                     file_matches.push(Match {
                         path: path.to_path_buf(),
@@ -719,9 +739,12 @@ fn find_usages(
         })
     });
 
-    Ok(matches
-        .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner))
+    Ok((
+        matches
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        super::sorted(skipped_large),
+    ))
 }
 
 /// Markdown heading definition detector.

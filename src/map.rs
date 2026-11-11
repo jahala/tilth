@@ -53,7 +53,7 @@ pub fn generate(scope: &Path, depth: usize, budget: Option<u64>, cache: &Outline
                 let outline_str = cache.get_or_compute(path, mtime, || {
                     // Best-effort: an unreadable file contributes no outline symbols rather than
                     // aborting the map. Errors are intentionally swallowed here.
-                    let content = std::fs::read_to_string(path).unwrap_or_default();
+                    let content = tilth_core::source::read_source(path).unwrap_or_default();
                     let buf = content.as_bytes();
                     let file_type = detect_file_type_with_content(path, &content);
                     outline::generate(path, file_type, &content, buf, true)

@@ -179,7 +179,9 @@ fn main() {
 
     // Shell completions
     if let Some(shell) = cli.completions {
-        clap_complete::generate(shell, &mut Cli::command(), "tilth", &mut io::stdout());
+        let mut script = Vec::new();
+        clap_complete::generate(shell, &mut Cli::command(), "tilth", &mut script);
+        write_stdout(&String::from_utf8_lossy(&script));
         return;
     }
 
@@ -199,7 +201,7 @@ fn main() {
                     eprintln!("No project fingerprint could be generated.");
                     process::exit(1);
                 }
-                println!("{output}");
+                write_stdout(&output);
             }
             Command::Grok {
                 target,
@@ -270,15 +272,13 @@ fn main() {
         if cli.no_overview {
             std::env::set_var("TILTH_NO_OVERVIEW", "1");
         }
-        // Pass --scope to MCP if it's not the default "."
+        // Pass --scope to MCP if it's not the default ".". A scope that is
+        // not a directory stops the launch: the server used to ignore it
+        // and serve the directory it happened to start in.
         let mcp_scope = if cli.scope.as_os_str() == "." {
             None
         } else {
-            Some(
-                cli.scope
-                    .canonicalize()
-                    .unwrap_or_else(|_| cli.scope.clone()),
-            )
+            Some(cli_scope(cli.scope, FileScopeHint::Directory).unwrap_or_else(|e| usage_exit(&e)))
         };
         if let Err(e) = tilth::mcp::run(cli.edit, mcp_scope.as_deref()) {
             eprintln!("mcp error: {e}");
@@ -410,10 +410,20 @@ fn main() {
 }
 
 /// Canonicalize `--scope`, refusing a file the same way the MCP tools do.
-/// A path that does not exist passes through unchanged, as before.
+/// A directory that does not exist is refused too, with the close existing
+/// directories named. It used to walk nothing and answer "0 matches" with
+/// exit 0, which read as a real result. The MCP tools fall back to `root`
+/// with the same hint instead, because there a typo still finds the answer.
 fn cli_scope(raw: PathBuf, hint: FileScopeHint) -> Result<PathBuf, String> {
     let scope = raw.canonicalize().unwrap_or_else(|_| raw.clone());
     tilth::refuse_file_scope(&raw, &scope, hint)?;
+    if !scope.is_dir() {
+        return Err(format!(
+            "scope \"{}\" is not a valid directory. {}",
+            raw.display(),
+            tilth::missing_scope_hint(&raw, &scope)
+        ));
+    }
     Ok(scope)
 }
 
@@ -436,10 +446,9 @@ fn emit_result(
                     "query": query,
                     "output": output,
                 });
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&json)
-                        .expect("serde_json::Value is always serializable")
+                write_stdout(
+                    &serde_json::to_string_pretty(&json)
+                        .expect("serde_json::Value is always serializable"),
                 );
             } else {
                 emit_output(&output, is_tty);
@@ -472,15 +481,34 @@ fn emit_output(output: &str, is_tty: bool) {
         }
     }
 
-    // Conventional CLI output ends with a newline so the next shell prompt
-    // starts on its own line. Most internal formatters terminate with `\n`,
-    // but the search-result footer (e.g. `(~507 tokens)`) and a few other
-    // paths do not — guard at the sink rather than auditing every formatter.
-    print!("{output}");
-    if !output.ends_with('\n') {
-        println!();
+    write_stdout(output);
+}
+
+/// Write a whole response to stdout, the one sink every CLI path prints
+/// through. A reader that went away early (`tilth big.rs --full | head -1`)
+/// ends the run quietly with exit 0, as Unix tools do. `print!` panicked
+/// there instead and aborted with exit 134. Any other write failure, such
+/// as a full disk, is reported and exits 1.
+fn write_stdout(output: &str) {
+    if let Err(e) = write_output(&mut io::stdout().lock(), output) {
+        if e.kind() == io::ErrorKind::BrokenPipe {
+            process::exit(0);
+        }
+        let _ = writeln!(io::stderr(), "output error: {e}");
+        process::exit(1);
     }
-    let _ = io::stdout().flush();
+}
+
+/// Conventional CLI output ends with a newline so the next shell prompt
+/// starts on its own line. Most internal formatters terminate with `\n`,
+/// but the search-result footer (e.g. `(~507 tokens)`) and a few other
+/// paths do not — guard at the sink rather than auditing every formatter.
+fn write_output(writer: &mut impl Write, output: &str) -> io::Result<()> {
+    writer.write_all(output.as_bytes())?;
+    if !output.ends_with('\n') {
+        writer.write_all(b"\n")?;
+    }
+    writer.flush()
 }
 
 fn terminal_height() -> usize {
@@ -586,6 +614,64 @@ mod tests {
         // handling, but cli.full stays false. compute_expand must return 0.
         let cli_full = false; // user did NOT pass --full
         assert_eq!(compute_expand(None, cli_full), 0);
+    }
+
+    /// A sink that fails after `room` bytes, or on flush.
+    struct FullSink {
+        room: usize,
+        fail_flush: bool,
+    }
+
+    impl Write for FullSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.room == 0 {
+                return Err(io::ErrorKind::StorageFull.into());
+            }
+            let n = buf.len().min(self.room);
+            self.room -= n;
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if self.fail_flush {
+                return Err(io::ErrorKind::StorageFull.into());
+            }
+            Ok(())
+        }
+    }
+
+    /// A failure in the body, the trailing newline or the flush reaches the
+    /// caller, so `write_stdout` can report it instead of exiting 0 on a
+    /// truncated response.
+    #[test]
+    fn write_output_returns_every_write_failure() {
+        for (room, fail_flush) in [(0, false), (2, false), (4, false), (usize::MAX, true)] {
+            let mut sink = FullSink { room, fail_flush };
+            let err = write_output(&mut sink, "body").unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::StorageFull, "room {room}");
+        }
+    }
+
+    #[test]
+    fn write_output_ends_with_exactly_one_newline() {
+        for output in ["body", "body\n"] {
+            let mut bytes = Vec::new();
+            write_output(&mut bytes, output).unwrap();
+            assert_eq!(bytes, b"body\n");
+        }
+    }
+
+    /// A mistyped `--scope` used to search nothing and print "0 matches"
+    /// with exit 0. It is a usage error that names the close directory.
+    #[test]
+    fn cli_scope_refuses_a_missing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("binding")).unwrap();
+        let err = cli_scope(dir.path().join("bindng"), FileScopeHint::Glob).unwrap_err();
+        assert!(
+            err.contains("is not a valid directory") && err.contains("binding\"?"),
+            "unexpected refusal: {err}"
+        );
     }
 
     /// #195: `--scope <file>` gets the same refusal as the MCP tools. It used

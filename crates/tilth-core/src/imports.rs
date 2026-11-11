@@ -2,7 +2,6 @@
 //! to local file paths (the MCP layer's related-file hint, deps, callees).
 
 use std::collections::HashMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
@@ -25,7 +24,7 @@ pub fn resolve_related_files(file_path: &Path, cache: &crate::cache::OutlineCach
     }
     // The cache holds no tree for this file (no grammar, or over its size
     // cap): read it and parse here.
-    let Ok(content) = fs::read_to_string(file_path) else {
+    let Ok(content) = crate::source::read_source(file_path) else {
         return Vec::new();
     };
     resolve_related_files_with_content(file_path, &content)
