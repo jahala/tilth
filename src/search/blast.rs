@@ -87,13 +87,12 @@ pub(crate) fn blast_radius(
     // raised by the file's own calls: it then stops after `BLAST_STOP_AFTER`
     // sites of other files, wherever in the walk the edited file comes.
     let canonical = path.canonicalize().ok()?;
-    let own_calls: usize = find_callers_batch(&symbol_names, &canonical, bloom, None, None, |s| {
-        s.len()
-    })
-    .ok()?
-    .per_file
-    .iter()
-    .sum();
+    let own_calls: usize =
+        find_callers_batch(&symbol_names, &canonical, bloom, None, None, |s| s.len())
+            .ok()?
+            .per_file
+            .iter()
+            .sum();
     let walk = find_callers_batch(
         &symbol_names,
         scope,
@@ -458,10 +457,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let lib = dir.path().join("lib.rs");
         std::fs::write(&lib, "pub fn target(x: u32) -> u32 {\n    x\n}\n").unwrap();
-        std::fs::write(dir.path().join("c.rs"), "fn caller() {\n    target(1);\n}\n").unwrap();
+        std::fs::write(
+            dir.path().join("c.rs"),
+            "fn caller() {\n    target(1);\n}\n",
+        )
+        .unwrap();
         let limit = usize::try_from(tilth_core::source::MAX_FILE_SIZE).unwrap();
         let pad = "// padding line to push the file over the size limit\n".repeat(limit / 50 + 1);
-        std::fs::write(dir.path().join("big.rs"), format!("{pad}fn b() {{ target(2); }}\n")).unwrap();
+        std::fs::write(
+            dir.path().join("big.rs"),
+            format!("{pad}fn b() {{ target(2); }}\n"),
+        )
+        .unwrap();
         let bloom = tilth_core::index::bloom::BloomFilterCache::new();
         let scope = dir.path().canonicalize().unwrap();
         let out = blast_radius(&lib, &[make_edit(1, 1)], &scope, &bloom).expect("blast radius");
@@ -477,7 +484,7 @@ mod tests {
         let lib = dir.path().join("lib.rs");
         let mut body = String::from("pub fn target(x: u32) -> u32 {\n    x\n}\n\nfn local() {\n");
         for i in 0..60 {
-            body.push_str(&format!("    target({i});\n"));
+            let _ = writeln!(body, "    target({i});");
         }
         body.push_str("}\n");
         std::fs::write(&lib, body).unwrap();

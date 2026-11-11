@@ -834,33 +834,36 @@ fn resolve_python_absolute(dir: &Path, source: &str) -> Option<PathBuf> {
     let root = dir
         .ancestors()
         .find(|a| ROOT_MARKERS.iter().any(|m| a.join(m).exists()));
+    // The directories on the path, nearest first.
+    let mut on_path = Vec::new();
     for ancestor in dir.ancestors() {
         let at_root = Some(ancestor) == root;
         if at_root || !ancestor.join("__init__.py").is_file() {
-            for base in [ancestor.to_path_buf(), ancestor.join("src")] {
-                // One stat rules out most bases: the top-level package or module.
-                let top = base.join(first);
-                if !top.is_dir() && !top.with_extension("py").is_file() {
-                    continue;
-                }
-                let as_file = base.join(&rel).with_extension("py");
-                if as_file.is_file() {
-                    return Some(as_file);
-                }
-                let as_pkg = base.join(&rel).join("__init__.py");
-                if as_pkg.is_file() {
-                    return Some(as_pkg);
-                }
-            }
+            on_path.push(ancestor);
             if root.is_none() {
-                return None;
+                break;
             }
         }
         if at_root {
             break;
         }
     }
-    None
+    on_path
+        .into_iter()
+        .flat_map(|dir| [dir.to_path_buf(), dir.join("src")])
+        .find_map(|base| {
+            // One stat rules out most bases: the top-level package or module.
+            let top = base.join(first);
+            if !top.is_dir() && !top.with_extension("py").is_file() {
+                return None;
+            }
+            let as_file = base.join(&rel).with_extension("py");
+            if as_file.is_file() {
+                return Some(as_file);
+            }
+            let as_pkg = base.join(&rel).join("__init__.py");
+            as_pkg.is_file().then_some(as_pkg)
+        })
 }
 
 // --- C/C++ ---
@@ -948,10 +951,16 @@ mod tests {
                 ("pkg/sub/__init__.py", "def helper():\n    pass\n"),
                 ("pkg/sub/mod.py", ""),
                 ("pkg/a.py", "from pkg.sub import mod\nfrom . import other\n"),
-                ("pkg/b.py", "from pkg.sub import (\n    mod as m,\n    helper,\n)\n"),
+                (
+                    "pkg/b.py",
+                    "from pkg.sub import (\n    mod as m,\n    helper,\n)\n",
+                ),
             ],
         );
-        assert_eq!(python_related(&root, "pkg/a.py"), ["pkg/sub/mod.py", "pkg/other.py"]);
+        assert_eq!(
+            python_related(&root, "pkg/a.py"),
+            ["pkg/sub/mod.py", "pkg/other.py"]
+        );
         assert_eq!(
             python_related(&root, "pkg/b.py"),
             ["pkg/sub/mod.py", "pkg/sub/__init__.py"]
@@ -983,8 +992,14 @@ mod tests {
                 ("loose/inner/pkg2/a.py", "import util\nimport pkg2\n"),
             ],
         );
-        assert_eq!(python_related(&root.join("proj"), "pkg/a.py"), ["pkg/util.py"]);
-        assert_eq!(python_related(&root.join("proj"), "scripts/run.py"), ["scripts/helper.py"]);
+        assert_eq!(
+            python_related(&root.join("proj"), "pkg/a.py"),
+            ["pkg/util.py"]
+        );
+        assert_eq!(
+            python_related(&root.join("proj"), "scripts/run.py"),
+            ["scripts/helper.py"]
+        );
         assert_eq!(
             python_related(&root.join("loose"), "inner/pkg2/a.py"),
             ["inner/pkg2/__init__.py"]

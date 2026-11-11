@@ -1359,12 +1359,28 @@ mod tests {
     #[test]
     fn doc_headings_do_not_make_a_target_ambiguous() {
         let tmp = tempfile::tempdir().unwrap();
-        write_fixture(tmp.path(), "lib.rs", "pub fn render_page() -> u32 {\n    1\n}\n");
-        write_fixture(tmp.path(), "README.md", "# Docs\n\n## render_page\n\nText.\n");
-        write_fixture(tmp.path(), "GUIDE.md", "# More\n\n## render_page\n\nMore.\n");
+        write_fixture(
+            tmp.path(),
+            "lib.rs",
+            "pub fn render_page() -> u32 {\n    1\n}\n",
+        );
+        write_fixture(
+            tmp.path(),
+            "README.md",
+            "# Docs\n\n## render_page\n\nText.\n",
+        );
+        write_fixture(
+            tmp.path(),
+            "GUIDE.md",
+            "# More\n\n## render_page\n\nMore.\n",
+        );
         let target = grok_target(tmp.path(), "render_page").unwrap();
         assert_eq!(target.other_def_count, 0);
-        write_fixture(tmp.path(), "other.rs", "pub fn render_page() -> u32 {\n    2\n}\n");
+        write_fixture(
+            tmp.path(),
+            "other.rs",
+            "pub fn render_page() -> u32 {\n    2\n}\n",
+        );
         let target = grok_target(tmp.path(), "render_page").unwrap();
         assert_eq!(target.other_def_count, 1);
     }

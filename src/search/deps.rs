@@ -25,9 +25,7 @@ const MAX_DEPENDENTS: usize = 15;
 /// Whenever dependents are left out, a line says how many.
 pub fn format_deps(result: &DepsResult, scope: &Path, budget: Option<usize>, full: bool) -> String {
     // The result's paths are canonical; shown relative to the same scope.
-    let scope = &scope
-        .canonicalize()
-        .unwrap_or_else(|_| scope.to_path_buf());
+    let scope = &scope.canonicalize().unwrap_or_else(|_| scope.to_path_buf());
     let dep_count = result.used_by.len();
     let listed = if full {
         dep_count
@@ -404,7 +402,10 @@ mod tests {
             d.import_lines.clear();
         }
         let out = format_deps(&result, Path::new("/r"), None, false);
-        assert!(out.contains("20 dependents, 12 of them by name only"), "{out}");
+        assert!(
+            out.contains("20 dependents, 12 of them by name only"),
+            "{out}"
+        );
         assert!(out.contains("> By name only:"), "{out}");
         let all_imported = format_deps(&twenty_dependents(), Path::new("/r"), None, false);
         assert!(!all_imported.contains("by name only"), "{all_imported}");

@@ -624,11 +624,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let limit = usize::try_from(crate::source::MAX_FILE_SIZE).unwrap();
         let pad = "// padding line to push the file over the size limit\n".repeat(limit / 50 + 1);
-        std::fs::write(dir.path().join("word.rs"), format!("{pad}fn a() {{ new(); }}\n")).unwrap();
-        std::fs::write(dir.path().join("part.rs"), format!("{pad}fn b() {{ renew(); }}\n")).unwrap();
+        std::fs::write(
+            dir.path().join("word.rs"),
+            format!("{pad}fn a() {{ new(); }}\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("part.rs"),
+            format!("{pad}fn b() {{ renew(); }}\n"),
+        )
+        .unwrap();
         let bloom = crate::index::bloom::BloomFilterCache::new();
         let targets: HashSet<String> = std::iter::once("new".to_string()).collect();
-        let walk = find_callers_batch(&targets, dir.path(), &bloom, None, None, |s| s.len()).unwrap();
+        let walk =
+            find_callers_batch(&targets, dir.path(), &bloom, None, None, |s| s.len()).unwrap();
         let names: Vec<_> = walk
             .skipped_large
             .iter()

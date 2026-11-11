@@ -54,7 +54,10 @@ pub(crate) fn parse_unified_diff(raw: &str) -> Vec<FileDiff> {
 
     for line in raw.lines() {
         // ── Hunk body, counted ──────────────────────────────────────────────
-        if let Some(hunk) = current_hunk.as_mut().filter(|_| old_left > 0 || new_left > 0) {
+        if let Some(hunk) = current_hunk
+            .as_mut()
+            .filter(|_| old_left > 0 || new_left > 0)
+        {
             // An empty line is a blank context line whose space was stripped.
             let body = match line.as_bytes().first() {
                 Some(b'+') => Some((DiffLineKind::Added, &line[1..])),

@@ -247,7 +247,8 @@ pub fn analyze_deps(
     // does not depend on the target.
     let mut every_name = searched;
     every_name.extend(unsearched.iter().cloned());
-    let importers = with_reexport_importers(path, direct, scope, &every_name, &mut skipped_importers)?;
+    let importers =
+        with_reexport_importers(path, direct, scope, &every_name, &mut skipped_importers)?;
     // A big file that names the target's module was not read for imports.
     let mut skipped_large = skipped_large;
     skipped_large.extend(skipped_importers);
@@ -481,8 +482,8 @@ fn imports_one_of(
         return ImportScan::No;
     };
     if meta.len() > crate::source::MAX_FILE_SIZE {
-        let names_a_module = std::fs::read(file)
-            .is_ok_and(|bytes| stems.iter().any(|stem| mentions(&bytes, stem)));
+        let names_a_module =
+            std::fs::read(file).is_ok_and(|bytes| stems.iter().any(|stem| mentions(&bytes, stem)));
         return if names_a_module {
             ImportScan::TooLarge
         } else {
@@ -948,8 +949,16 @@ mod tests {
         let real = tmp.path().canonicalize().unwrap().join("real");
         write(&real, "src/service.ts", "export function serve() { return 1; }\nexport function twice() { return serve() + serve(); }\n");
         write(&real, "src/index.ts", "export * from \"./service\";\n");
-        write(&real, "c.ts", "import { serve } from \"./src\";\nexport const s = serve;\n");
-        write(&real, "d.ts", "import { serve } from \"./src/service\";\nexport const t = 1;\n");
+        write(
+            &real,
+            "c.ts",
+            "import { serve } from \"./src\";\nexport const s = serve;\n",
+        );
+        write(
+            &real,
+            "d.ts",
+            "import { serve } from \"./src/service\";\nexport const t = 1;\n",
+        );
         let link = tmp.path().join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
         let found = dependents_of(&link, "src/service.ts");
@@ -1021,20 +1030,48 @@ mod tests {
     fn star_re_exports_chain_and_namespace_imports_are_dependents() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
-        write(&root, "src/core/service.ts", "export function serve() { return 1; }\n");
+        write(
+            &root,
+            "src/core/service.ts",
+            "export function serve() { return 1; }\n",
+        );
         write(&root, "src/core/index.ts", "export * from \"./service\";\n");
         write(&root, "src/index.ts", "export * from \"./core\";\n");
-        write(&root, "app.ts", "import { serve } from \"./src\";\nexport const a = serve;\n");
-        write(&root, "ns.ts", "import * as core from \"./src/core\";\nexport const n = core.serve;\n");
-        write(&root, "unused.ts", "import * as core from \"./src/core\";\nexport const u = core.other;\n");
+        write(
+            &root,
+            "app.ts",
+            "import { serve } from \"./src\";\nexport const a = serve;\n",
+        );
+        write(
+            &root,
+            "ns.ts",
+            "import * as core from \"./src/core\";\nexport const n = core.serve;\n",
+        );
+        write(
+            &root,
+            "unused.ts",
+            "import * as core from \"./src/core\";\nexport const u = core.other;\n",
+        );
         let found = dependents_of(&root, "src/core/service.ts");
         assert_eq!(
             found,
             [
                 ("src/core/index.ts".to_string(), vec![], None),
-                ("app.ts".to_string(), vec![], Some("src/index.ts".to_string())),
-                ("ns.ts".to_string(), vec![], Some("src/core/index.ts".to_string())),
-                ("src/index.ts".to_string(), vec![], Some("src/core/index.ts".to_string())),
+                (
+                    "app.ts".to_string(),
+                    vec![],
+                    Some("src/index.ts".to_string())
+                ),
+                (
+                    "ns.ts".to_string(),
+                    vec![],
+                    Some("src/core/index.ts".to_string())
+                ),
+                (
+                    "src/index.ts".to_string(),
+                    vec![],
+                    Some("src/core/index.ts".to_string())
+                ),
             ]
         );
     }

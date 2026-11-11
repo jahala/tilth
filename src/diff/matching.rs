@@ -590,7 +590,9 @@ fn body_start(node: tree_sitter::Node) -> Option<usize> {
     }
     let closing_end = node
         .child(node.child_count().checked_sub(1)?)
-        .filter(|last| last.kind() == "end" && matches!(node.kind(), "method" | "singleton_method"));
+        .filter(|last| {
+            last.kind() == "end" && matches!(node.kind(), "method" | "singleton_method")
+        });
     closing_end.map(|end| end.start_byte())
 }
 
@@ -996,7 +998,11 @@ mod tests {
     #[test]
     fn trait_impls_of_one_type_keep_their_trait() {
         let base = "struct Foo;\n\nimpl From<A> for Foo {\n    fn from(_: A) -> Foo {\n        Foo\n    }\n}\n\nimpl From<B> for Foo {\n    fn from(_: B) -> Foo {\n        Foo\n    }\n}\n\nimpl Foo {\n    fn new() -> Foo {\n        Foo\n    }\n}\n";
-        let edited = base.replacen("        Foo\n    }\n}\n\nimpl Foo", "        { Foo }\n    }\n}\n\nimpl Foo", 1);
+        let edited = base.replacen(
+            "        Foo\n    }\n}\n\nimpl Foo",
+            "        { Foo }\n    }\n}\n\nimpl Foo",
+            1,
+        );
         let changes = changes_for(Lang::Rust, base, &edited);
         let named = |q: &str| {
             changes
@@ -1004,10 +1010,19 @@ mod tests {
                 .find(|c| c.qualified_name() == q)
                 .unwrap_or_else(|| panic!("no {q} in {changes:#?}"))
         };
-        assert!(matches!(named("<Foo as From<A>>::from").change, ChangeType::Unchanged));
-        assert!(matches!(named("<Foo as From<B>>::from").change, ChangeType::BodyChanged));
+        assert!(matches!(
+            named("<Foo as From<A>>::from").change,
+            ChangeType::Unchanged
+        ));
+        assert!(matches!(
+            named("<Foo as From<B>>::from").change,
+            ChangeType::BodyChanged
+        ));
         assert!(matches!(named("Foo::new").change, ChangeType::Unchanged));
-        assert!(matches!(named("impl From<B> for Foo").change, ChangeType::BodyChanged));
+        assert!(matches!(
+            named("impl From<B> for Foo").change,
+            ChangeType::BodyChanged
+        ));
     }
 
     /// A C++ constructor's initializer list and the `end` of an empty Ruby
@@ -1017,11 +1032,15 @@ mod tests {
         let cpp = "A::A(int x) : x_(x) {\n}\n";
         let changes = changes_for(Lang::Cpp, cpp, &cpp.replace("x_(x)", "x_(x + 1)"));
         assert!(
-            changes.iter().all(|c| !matches!(c.change, ChangeType::SignatureChanged)),
+            changes
+                .iter()
+                .all(|c| !matches!(c.change, ChangeType::SignatureChanged)),
             "{changes:#?}"
         );
         assert!(
-            changes.iter().any(|c| matches!(c.change, ChangeType::BodyChanged)),
+            changes
+                .iter()
+                .any(|c| matches!(c.change, ChangeType::BodyChanged)),
             "{changes:#?}"
         );
 
@@ -1528,4 +1547,3 @@ mod tests {
         }
     }
 }
-

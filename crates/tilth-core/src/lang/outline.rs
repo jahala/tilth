@@ -1801,7 +1801,12 @@ mod doc_comment_tests {
             "TIMEOUT = 3  # seconds\ndef fetch():\n    return TIMEOUT\n\n# Section: helpers\n\ndef helper():\n    return 1\n",
             Lang::Python,
         );
-        let doc = |name: &str| entries.iter().find(|e| e.name == name).and_then(|e| e.doc.clone());
+        let doc = |name: &str| {
+            entries
+                .iter()
+                .find(|e| e.name == name)
+                .and_then(|e| e.doc.clone())
+        };
         assert_eq!(doc("fetch"), None);
         assert_eq!(doc("helper"), None);
         assert_eq!(first_doc("// note\n\nfn f() {}\n", Lang::Rust), None);

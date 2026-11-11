@@ -235,10 +235,9 @@ pub fn resolve_source(
 /// `X^-` are `X^..X`, and `X^-N` is `X^N..X`. `X^@` names every parent of
 /// `X` and no second side, so it is refused. Any other revision is kept.
 fn expand_parent_shorthand(rev: &str) -> Result<String, String> {
-    if rev.ends_with("^@") {
+    if let Some(commit) = rev.strip_suffix("^@") {
         return Err(format!(
-            "'{rev}' names every parent of a commit; use {}^! to see what the commit changed",
-            &rev[..rev.len() - 2]
+            "'{rev}' names every parent of a commit; use {commit}^! to see what the commit changed"
         ));
     }
     if let Some(commit) = rev.strip_suffix("^!") {
@@ -936,9 +935,9 @@ fn diff_log(
                     ));
                 }
                 for overlay in &mut overlays {
-                    overlay.symbol_changes.retain(|c| {
-                        !matches!(c.change, ChangeType::Unchanged) && c.answers_to(f)
-                    });
+                    overlay
+                        .symbol_changes
+                        .retain(|c| !matches!(c.change, ChangeType::Unchanged) && c.answers_to(f));
                 }
                 overlays.retain(|o| !o.symbol_changes.is_empty());
             }
@@ -2169,8 +2168,12 @@ diff --git a/src/main.rs b/src/main.rs
         let dir = repo_with(&[("src/service.ts", TWO_RUNS)]);
         let changed = TWO_RUNS.replacen("value = 1", "value = 2", 1);
         write_files(dir.path(), &[("src/service.ts", &changed)]);
-        let out = diff_at(dir.path(), &DiffSource::GitUncommitted, Some("src/service.ts:run"))
-            .unwrap();
+        let out = diff_at(
+            dir.path(),
+            &DiffSource::GitUncommitted,
+            Some("src/service.ts:run"),
+        )
+        .unwrap();
         assert!(!out.contains("ambiguous"), "{out}");
         assert!(out.contains("A::run") && out.contains("value = 2"), "{out}");
     }
@@ -2212,7 +2215,10 @@ diff --git a/src/main.rs b/src/main.rs
         for i in 0..40 {
             files.push((format!("src/c{i:02}.rs"), calls.to_string()));
         }
-        let files: Vec<(&str, &str)> = files.iter().map(|(p, c)| (p.as_str(), c.as_str())).collect();
+        let files: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(p, c)| (p.as_str(), c.as_str()))
+            .collect();
         let dir = repo_with(&files);
         write_files(
             dir.path(),
@@ -2221,9 +2227,20 @@ diff --git a/src/main.rs b/src/main.rs
                 "fn hello(n: u8) {\n    1;\n}\n\nfn quiet(n: u8) {\n    2;\n}\n",
             )],
         );
-        let out = diff(&DiffSource::GitUncommitted, Some(dir.path()), None, None, true, 0, None)
-            .unwrap();
-        assert!(out.contains("blast: `hello` signature changed — at least "), "{out}");
+        let out = diff(
+            &DiffSource::GitUncommitted,
+            Some(dir.path()),
+            None,
+            None,
+            true,
+            0,
+            None,
+        )
+        .unwrap();
+        assert!(
+            out.contains("blast: `hello` signature changed — at least "),
+            "{out}"
+        );
         assert!(
             out.contains("blast: `quiet` signature changed — callers not counted"),
             "{out}"
@@ -2266,10 +2283,26 @@ diff --git a/src/main.rs b/src/main.rs
             ("src/main.rs", "fn hello() {\n    1;\n}\n"),
             ("src/big.rs", &big),
         ]);
-        write_files(dir.path(), &[("src/main.rs", "fn hello(n: u8) {\n    1;\n}\n")]);
-        let out = diff(&DiffSource::GitUncommitted, Some(dir.path()), None, None, true, 0, None)
-            .unwrap();
-        assert!(out.contains("⚠ blast: 1 file over 500 KB contains the query and was not searched: src/big.rs"), "{out}");
+        write_files(
+            dir.path(),
+            &[("src/main.rs", "fn hello(n: u8) {\n    1;\n}\n")],
+        );
+        let out = diff(
+            &DiffSource::GitUncommitted,
+            Some(dir.path()),
+            None,
+            None,
+            true,
+            0,
+            None,
+        )
+        .unwrap();
+        assert!(
+            out.contains(
+                "⚠ blast: 1 file over 500 KB contains the query and was not searched: src/big.rs"
+            ),
+            "{out}"
+        );
     }
 
     /// Blast counts the callers under the caller's root, not under the whole
@@ -2312,12 +2345,18 @@ diff --git a/src/main.rs b/src/main.rs
         )]);
         write_files(
             dir.path(),
-            &[("src/a.rs", "fn alpha() {\n    2\n}\n\nfn beta() {\n    1\n}\n")],
+            &[(
+                "src/a.rs",
+                "fn alpha() {\n    2\n}\n\nfn beta() {\n    1\n}\n",
+            )],
         );
         commit_all(dir.path(), "touch alpha");
         write_files(
             dir.path(),
-            &[("src/a.rs", "fn alpha() {\n    2\n}\n\nfn beta() {\n    2\n}\n")],
+            &[(
+                "src/a.rs",
+                "fn alpha() {\n    2\n}\n\nfn beta() {\n    2\n}\n",
+            )],
         );
         commit_all(dir.path(), "touch beta");
         let out = diff_at(
@@ -2327,7 +2366,10 @@ diff --git a/src/main.rs b/src/main.rs
         )
         .unwrap();
         assert!(out.contains("1 commit,"), "{out}");
-        assert!(out.contains("touch beta") && !out.contains("touch alpha"), "{out}");
+        assert!(
+            out.contains("touch beta") && !out.contains("touch alpha"),
+            "{out}"
+        );
         assert!(out.contains("[~] beta") && !out.contains("alpha"), "{out}");
         let err = diff_at(
             dir.path(),
