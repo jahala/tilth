@@ -70,9 +70,7 @@ pub fn fit(outline: &str, names: Option<String>, room: u64) -> String {
     let lines_text = names.unwrap_or_else(|| outline.to_string());
     // A view without `[n]` entries (head and tail, a log, test structure)
     // is counted in lines.
-    let has_entries = lines_text
-        .lines()
-        .any(|l| l.trim_start().starts_with('['));
+    let has_entries = lines_text.lines().any(|l| l.trim_start().starts_with('['));
     let is_entry = |line: &str| !has_entries || line.trim_start().starts_with('[');
     let unit = if has_entries { "entries" } else { "lines" };
     let total = lines_text.lines().filter(|l| is_entry(l)).count();

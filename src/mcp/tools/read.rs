@@ -183,8 +183,15 @@ pub(in crate::mcp) fn tool_read(
             .map(|(body, _, _)| body)
             .map_err(|e| e.to_string())?
     } else {
-        crate::read::read_file(&path, section, force_full, cache, edit_mode, Some(file_budget))
-            .map_err(|e| e.to_string())?
+        crate::read::read_file(
+            &path,
+            section,
+            force_full,
+            cache,
+            edit_mode,
+            Some(file_budget),
+        )
+        .map_err(|e| e.to_string())?
     };
     output.push_str(&related_hint);
 
@@ -729,7 +736,11 @@ mod tests {
             "path": path.to_str().unwrap(),
             "budget": 24_000,
         }));
-        assert!(out.contains("> outline cut to fit the budget"), "{}", tail(&out));
+        assert!(
+            out.contains("> outline cut to fit the budget"),
+            "{}",
+            tail(&out)
+        );
         assert!(out.contains("> Related: "), "{}", tail(&out));
         assert!(!out.contains("... truncated"), "{}", tail(&out));
     }
@@ -745,7 +756,12 @@ mod tests {
             "paths": [a.to_str().unwrap(), b.to_str().unwrap()],
         }));
         assert!(out.contains("b.js"), "{}", tail(&out));
-        assert_eq!(out.matches("> outline cut to fit the budget").count(), 2, "{}", tail(&out));
+        assert_eq!(
+            out.matches("> outline cut to fit the budget").count(),
+            2,
+            "{}",
+            tail(&out)
+        );
         assert!(!out.contains("... truncated"), "{}", tail(&out));
     }
 

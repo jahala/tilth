@@ -2648,7 +2648,11 @@ impl OutlineCache {
             "big.js",
             &format!("export function bigHelper(x) {{ return x; }}\n{pad}"),
         );
-        write_fixture(tmp.path(), "small.js", "export function small(x) { return x; }\n");
+        write_fixture(
+            tmp.path(),
+            "small.js",
+            "export function small(x) { return x; }\n",
+        );
         write_fixture(
             tmp.path(),
             "a.js",
@@ -2667,6 +2671,9 @@ impl OutlineCache {
             rendered.contains("bigHelper            big.js, over 500 KB, not parsed"),
             "{rendered}"
         );
-        assert!(rendered.contains("outside              extern"), "{rendered}");
+        assert!(
+            rendered.contains("outside              extern"),
+            "{rendered}"
+        );
     }
 }

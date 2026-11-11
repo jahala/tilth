@@ -294,10 +294,7 @@ fn repeat_count(rest: &[u8]) -> Option<RepeatCount> {
     let min = parts.next().unwrap_or_default();
     let max = parts.next();
     let digits = |p: &[u8]| p.iter().all(u8::is_ascii_digit);
-    let valid = !min.is_empty()
-        && digits(min)
-        && max.is_none_or(digits)
-        && parts.next().is_none();
+    let valid = !min.is_empty() && digits(min) && max.is_none_or(digits) && parts.next().is_none();
     valid.then(|| RepeatCount {
         len: close + 1,
         two_numbers: max.is_some_and(|m| !m.is_empty()),
