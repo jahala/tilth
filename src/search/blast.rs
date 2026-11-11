@@ -123,16 +123,19 @@ pub(crate) fn blast_radius(
     .ok()?;
     let files = walk.per_file;
 
-    if files.iter().all(|f| f.by_symbol.is_empty() && f.tests == 0) {
+    if files.iter().all(|f| f.by_symbol.is_empty() && f.tests == 0) && walk.skipped_large.is_empty()
+    {
         return None;
     }
 
-    Some(format_blast_radius(
-        &touched,
-        &files,
-        walk.reached_bound,
-        scope,
-    ))
+    // A file skipped for size may hold callers the counts miss.
+    let mut out = format_blast_radius(&touched, &files, walk.reached_bound, scope);
+    let note = crate::search::skipped_files_note(&walk.skipped_large, scope);
+    if !note.is_empty() {
+        out.push_str(note.trim_start_matches('\n'));
+        out.push('\n');
+    }
+    Some(out)
 }
 
 /// Call sites after which a blast walk stops. Blast runs on every write
@@ -446,6 +449,24 @@ mod tests {
         let out = blast_radius(&lib, &[make_edit(1, 5)], &scope, &bloom).expect("blast radius");
         assert!(out.contains("target: at least "), "{out}");
         assert!(out.contains("quiet: callers not counted"), "{out}");
+    }
+
+    /// A file over the size cap is not searched. When it names the touched
+    /// symbol, the blast radius says so: its count may miss those calls.
+    #[test]
+    fn a_blast_names_a_big_file_it_did_not_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("lib.rs");
+        std::fs::write(&lib, "pub fn target(x: u32) -> u32 {\n    x\n}\n").unwrap();
+        std::fs::write(dir.path().join("c.rs"), "fn caller() {\n    target(1);\n}\n").unwrap();
+        let limit = usize::try_from(tilth_core::source::MAX_FILE_SIZE).unwrap();
+        let pad = "// padding line to push the file over the size limit\n".repeat(limit / 50 + 1);
+        std::fs::write(dir.path().join("big.rs"), format!("{pad}fn b() {{ target(2); }}\n")).unwrap();
+        let bloom = tilth_core::index::bloom::BloomFilterCache::new();
+        let scope = dir.path().canonicalize().unwrap();
+        let out = blast_radius(&lib, &[make_edit(1, 1)], &scope, &bloom).expect("blast radius");
+        assert!(out.contains("target: 1 caller\n"), "{out}");
+        assert!(out.contains("not searched: big.rs"), "{out}");
     }
 
     /// Calls inside the edited file are no part of its blast radius, so

@@ -828,6 +828,8 @@ fn compute_blast(overlays: &[FileOverlay], scope: &Path) -> Vec<String> {
     let Ok(walk) = per_file else {
         return Vec::new();
     };
+    // A file skipped for size may hold callers the counts miss.
+    let skipped = crate::search::skipped_files_note(&walk.skipped_large, scope);
     // Sorted by name so the lines come out in the same order every run.
     let at_least = if walk.reached_bound { "at least " } else { "" };
     let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
@@ -857,6 +859,10 @@ fn compute_blast(overlays: &[FileOverlay], scope: &Path) -> Vec<String> {
                 if count == 1 { "" } else { "s" }
             )
         })
+        .chain(
+            (!skipped.is_empty())
+                .then(|| format!("blast: {}", skipped.trim_start_matches("\n\n> "))),
+        )
         .collect()
 }
 
@@ -2247,6 +2253,23 @@ diff --git a/src/main.rs b/src/main.rs
         assert!(out.contains("[-]      A::run"), "{out}");
         assert!(out.contains("[+]      B::run"), "{out}");
         assert!(out.contains("[↦]      helper"), "{out}");
+    }
+
+    /// A file over the size cap is not searched for callers; when it names
+    /// a changed symbol, the blast says so.
+    #[test]
+    fn diff_blast_names_a_big_file_it_did_not_search() {
+        let limit = usize::try_from(tilth_core::source::MAX_FILE_SIZE).unwrap();
+        let pad = "// padding line to push the file over the size limit\n".repeat(limit / 50 + 1);
+        let big = format!("{pad}fn b() {{\n    hello();\n}}\n");
+        let dir = repo_with(&[
+            ("src/main.rs", "fn hello() {\n    1;\n}\n"),
+            ("src/big.rs", &big),
+        ]);
+        write_files(dir.path(), &[("src/main.rs", "fn hello(n: u8) {\n    1;\n}\n")]);
+        let out = diff(&DiffSource::GitUncommitted, Some(dir.path()), None, None, true, 0, None)
+            .unwrap();
+        assert!(out.contains("⚠ blast: 1 file over 500 KB contains the query and was not searched: src/big.rs"), "{out}");
     }
 
     /// Blast counts the callers under the caller's root, not under the whole

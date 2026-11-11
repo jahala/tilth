@@ -311,7 +311,7 @@ fn choose_names(names: Vec<String>, importers: &[Importer]) -> (Vec<String>, Vec
         .map(|name| {
             let imported_by = importers
                 .iter()
-                .filter(|i| mentions(&i.statements, &name))
+                .filter(|i| mentions(i.statements.as_bytes(), &name))
                 .count();
             (imported_by, name)
         })
@@ -351,7 +351,7 @@ fn with_reexport_importers(
         }
         out.push(importer);
     }
-    let names_one = |text: &str| names.iter().any(|n| mentions(text, n));
+    let names_one = |text: &str| names.iter().any(|n| mentions(text.as_bytes(), n));
     while !barrels.is_empty() {
         let found = importers_of(&barrels, scope, &names_one, true)?;
         barrels = Vec::new();
@@ -574,8 +574,8 @@ fn module_stems(path: &Path) -> Vec<String> {
 }
 
 /// `content` holds `name` as a whole identifier.
-fn mentions(content: &str, name: &str) -> bool {
-    let bytes = content.as_bytes();
+pub(crate) fn mentions(content: &[u8], name: &str) -> bool {
+    let bytes = content;
     let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
     memchr::memmem::find_iter(bytes, name.as_bytes()).any(|at| {
         let before = at.checked_sub(1).map(|i| bytes[i]);
