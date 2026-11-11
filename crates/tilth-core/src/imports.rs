@@ -16,6 +16,11 @@ use crate::types::{FileType, Lang};
 /// imports are external.
 #[must_use]
 pub fn resolve_related_files(file_path: &Path, cache: &crate::cache::OutlineCache) -> Vec<PathBuf> {
+    // The path alone says whether a file is code, so a log or data file of
+    // any size is never read just to find it names no imports.
+    if !matches!(crate::lang::detect_file_type(file_path), FileType::Code(_)) {
+        return Vec::new();
+    }
     if let Some(parsed) = cache.get_or_parse(file_path) {
         let imports = imports_in_tree(parsed.tree.root_node(), &parsed.content, parsed.lang);
         return resolve_imports(file_path, parsed.lang, &imports);
@@ -831,6 +836,24 @@ fn resolve_bash(dir: &Path, source: &str) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use std::fs;
+
+    /// A non-code file names no imports, and it is never read to find that
+    /// out. A pipe with no writer blocks whoever opens it, so a call that
+    /// returns proves the file was never opened.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_code_file_is_never_read_for_its_imports() {
+        use crate::test_readers::{make_pipe, unless_blocked_on};
+        let dir = tempfile::tempdir().unwrap();
+        let pipe = dir.path().join("server.log");
+        make_pipe(&pipe);
+        let cache = crate::cache::OutlineCache::new();
+        let related = unless_blocked_on(&pipe, || resolve_related_files(&pipe, &cache));
+        assert_eq!(
+            related.expect("a non-code file was opened to look for imports"),
+            Vec::<PathBuf>::new()
+        );
+    }
 
     #[test]
     fn every_tree_read_language_has_a_compiled_statement_query() {

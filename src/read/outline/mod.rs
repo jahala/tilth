@@ -9,7 +9,17 @@ use std::path::Path;
 
 use tilth_core::types::FileType;
 
+use crate::read::ends::{Ends, Shape};
+
 const OUTLINE_CAP: usize = 100; // max outline lines for huge files
+
+fn max_lines(capped: bool) -> usize {
+    if capped {
+        OUTLINE_CAP
+    } else {
+        usize::MAX
+    }
+}
 
 /// Generate a smart view based on file type.
 pub fn generate(
@@ -19,7 +29,7 @@ pub fn generate(
     buf: &[u8],
     capped: bool,
 ) -> String {
-    let max_lines = if capped { OUTLINE_CAP } else { usize::MAX };
+    let max_lines = max_lines(capped);
 
     // Test files get special treatment regardless of language
     if tilth_core::types::is_test_file(path) {
@@ -41,6 +51,47 @@ pub fn generate(
     with_omission_note(outline, max_lines)
 }
 
+/// A view that shows only a text's first and last lines and its line count,
+/// so a file can stream into it without being held in memory.
+#[derive(Clone, Copy)]
+pub(crate) enum EndsView {
+    Log,
+    Tabular,
+    Other,
+}
+
+impl EndsView {
+    /// The view [`generate`] gives `file_type`, when it is one of these.
+    pub(crate) fn of(file_type: FileType) -> Option<Self> {
+        match file_type {
+            FileType::Log => Some(Self::Log),
+            FileType::Tabular => Some(Self::Tabular),
+            FileType::Other => Some(Self::Other),
+            FileType::Code(_) | FileType::Markdown | FileType::StructuredData => None,
+        }
+    }
+
+    /// How many lines the view shows from each end.
+    pub(crate) fn shape(self) -> Shape {
+        match self {
+            Self::Log => fallback::LOG,
+            Self::Tabular => tabular::TABULAR,
+            Self::Other => fallback::OTHER,
+        }
+    }
+
+    /// What [`generate`] returns for a text whose [`shape`](Self::shape)
+    /// ends are `ends`. They must leave lines out: a text with no more lines
+    /// than the view shows is its own view, which only `generate` has.
+    pub(crate) fn generate(self, ends: &Ends, capped: bool) -> String {
+        let outline = match self {
+            Self::Log | Self::Other => fallback::join(ends),
+            Self::Tabular => tabular::render(ends),
+        };
+        with_omission_note(outline, max_lines(capped))
+    }
+}
+
 /// The outline of a code file with names alone, no signatures or docs,
 /// for a budget the full outline does not fit. `None` for any other file,
 /// and for a test file, whose outline is its test structure.
@@ -51,7 +102,7 @@ pub fn names_only(path: &Path, file_type: FileType, content: &str, capped: bool)
     if tilth_core::types::is_test_file(path) {
         return None;
     }
-    let max_lines = if capped { OUTLINE_CAP } else { usize::MAX };
+    let max_lines = max_lines(capped);
     let outline = code::outline_with(content, lang, max_lines, code::Detail::Names);
     Some(with_omission_note(outline, max_lines))
 }

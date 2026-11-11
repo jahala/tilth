@@ -12,8 +12,6 @@ pub enum TilthError {
     },
     #[error("{} [permission denied]", path.display())]
     PermissionDenied { path: PathBuf },
-    #[error("{} is not a regular file: tilth reads files, not pipes, sockets or devices", path.display())]
-    NotRegularFile { path: PathBuf },
     #[error("{} already exists — pass `overwrite: true` to replace it", path.display())]
     AlreadyExists { path: PathBuf },
     #[error("invalid query \"{query}\": {reason}")]
@@ -36,7 +34,6 @@ impl TilthError {
         match self {
             Self::NotFound { .. }
             | Self::IoError { .. }
-            | Self::NotRegularFile { .. }
             | Self::AlreadyExists { .. }
             | Self::ConcurrentModification { .. } => 2,
             Self::InvalidQuery { .. } | Self::ParseError { .. } => 3,

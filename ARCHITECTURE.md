@@ -125,6 +125,8 @@ src/
 │   ├── mod.rs           read_file decision tree, multi-section reader
 │   │                    (`read_ranges`), heading resolver, suggestion
 │   │                    fallback
+│   ├── ends.rs          A text's first and last lines and line count,
+│   │                    from memory or a stream
 │   └── outline/
 │       ├── mod.rs       Dispatch by FileType
 │       ├── code.rs      Tree-sitter outline for code
@@ -598,7 +600,9 @@ gateway. The decision tree, in order:
    step), with a `suggest_similar` fallback (Levenshtein on directory
    siblings).
 2. **Directory** → `list_directory` (sorted entries, file types).
-3. **Empty file** → header with `ViewMode::Empty`.
+3. **Empty file, or not a regular file** → header with
+   `ViewMode::Empty`. A pipe, socket or device has no fixed contents and
+   is never opened, since opening a pipe that has no writer blocks.
 4. **`section: Some(...)` or `sections: [...]`** → `read_ranges`.
    Each range is either a line range (`"45-89"`) or a heading address
    (`"## Architecture"`, resolved by `resolve_heading`'s walk over
@@ -608,41 +612,42 @@ gateway. The decision tree, in order:
    shape-identical (no delimiter); multiple ranges share one `[section]`
    header followed by per-block `─── lines X-Y ───` delimiters and are
    emitted in user-supplied order — overlap is honored verbatim, no
-   coalescing. Line ranges stream through `LineSelector`, which slices
-   the requested lines out of each chunk, drops every other line as it
-   passes and stops at the last requested line, so their cost does not
-   grow with the file. Only a heading needs the whole text, and a heading
-   section of a file over `READ_WHOLE_MAX` is refused with a pointer to
-   line ranges.
-5. **Not a regular file** → refused by `open_regular` before it opens
-   anything: a pipe, socket or device has no fixed contents, and opening
-   a pipe with no writer blocks forever.
-6. **The head decides first** — `detection::read_head` reads the first
-   `HEAD_WINDOW` bytes, and `is_binary`, the generated markers and the
-   minified sample all look only there. A binary file emits just a
-   header. A generated file (by name, such as `Cargo.lock`, or by a
-   content marker such as `@generated` or `DO NOT EDIT`) or a minified
-   one (`.min.<ext>`, or for files over 100 KB a newline-density
-   heuristic) emits a header whose line count is streamed, so none of
-   these is ever held in memory.
-7. **Over `READ_WHOLE_MAX` (32 MiB)** → the head-and-tail view: the
-   first and last lines from 16 KiB at each end, and the streamed line
-   count. Below the limit the file is read whole, sized from the open
-   handle.
-8. **Full mode + oversized** — guard for `--full` on huge files. Caps
+   coalescing. Returns the verbatim slice regardless of file size.
+   Line ranges stream through `LineSelector`, which copies the requested
+   lines out of each chunk, only counts the others and stops at the last
+   requested line. A heading needs the whole text to find its lines.
+5. **The head decides first** — `detection::read_head` reads the first
+   `HEAD_WINDOW` bytes, and `is_binary` (null bytes in the first 512),
+   the generated markers (`@generated`, `DO NOT EDIT`, …, or a name such
+   as `Cargo.lock`) and the minified check (`.min.<ext>`, or for files
+   over 100 KB a newline-density heuristic) all look only there. A binary
+   file emits just a header; a generated or minified one emits a header
+   whose line count is streamed.
+6. **Log, CSV or unknown type, outlined** — past the token threshold, or
+   over the cap with `--full`, these views show only a file's first and
+   last lines and its line count (`outline::EndsView`). The file streams
+   into `ends::EndsCollector`, so only the lines shown are held. A file
+   with no more lines than the view shows, or whose outline OGATE
+   rejects, goes on to step 7, which reads it whole.
+7. **Full mode + oversized** — guard for `--full` on huge files. Caps
    at `TILTH_FULL_SIZE_CAP` (default in `full_read_size_cap()`); above
    the cap, returns the outline with a banner explaining how to
-   override. The override cannot lift a file past `READ_WHOLE_MAX`,
-   which step 7 settles first.
-9. **Below the token threshold or `--full`** → return full content
+   override. From this step on the file is read whole, up to the length
+   its open handle reported.
+8. **Below the token threshold or `--full`** → return full content
    (with `format::hashlines` if `edit_mode`, plain `number_lines`
    otherwise). Without `--full`, a full view over the caller's budget
    goes on to the outline instead.
-10. **Otherwise** → `outline::generate` per `FileType`, cached in
-    `OutlineCache::get_or_compute`. An outline over the budget is cut
-    by `outline::fit`: a code outline drops its signatures and docs
-    first (`outline::names_only`), so every symbol stays listed, then
-    whole entries from the end, and a closing line says which.
+9. **Otherwise** → `outline::generate` per `FileType`, cached in
+   `OutlineCache::get_or_compute`. OGATE returns the full view instead
+   when the outline saves too little. An outline over the budget is cut
+   by `outline::fit`: a code outline drops its signatures and docs
+   first (`outline::names_only`), so every symbol stays listed, then
+   whole entries from the end, and a closing line says which.
+
+Every read opens the file through `open_file`. On Unix it opens with
+`O_NONBLOCK` and checks the handle's own metadata, so a pipe swapped in
+after the path was checked is still never read.
 
 The `outline/` submodule dispatches on `FileType`:
 
@@ -654,10 +659,12 @@ The `outline/` submodule dispatches on `FileType`:
   indented code blocks).
 - `structured.rs` — JSON/YAML/TOML "keys" view (top-level keys + their
   shapes).
-- `tabular.rs` — CSV/TSV header + first/last few rows.
+- `tabular.rs` — CSV/TSV header + first/last few rows, rendered from
+  the text's `Ends`.
 - `test_file.rs` — describe/it grouping for test files, rendered over
   `tilth_core::test_entries`.
-- `fallback.rs` — last-resort head/tail when nothing else applies.
+- `fallback.rs` — last-resort head/tail and the log view, rendered from
+  the text's `Ends`.
 
 Two helpers feed the MCP layer:
 

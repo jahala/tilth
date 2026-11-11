@@ -73,7 +73,8 @@ home = "0.5"
 # Terminal size detection (TIOCGWINSZ ioctl, falls back to env vars)
 terminal_size = "0.4"
 
-# O_NOFOLLOW open flag for tilth_write's overwrite path (refuse symlink follow)
+# Open flags: O_NOFOLLOW for tilth_write's overwrite path (refuse symlink follow),
+# O_NONBLOCK for reads (a pipe with no writer must not block the open)
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

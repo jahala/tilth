@@ -181,10 +181,9 @@ pub(in crate::mcp) fn tool_read(
 // re-parses every call. Wiring a structured cache is a separate change. The param
 // is still used by the non-code fallback (read_file), so it keeps its real name.
 fn read_signature_file(path: &Path, cache: &OutlineCache) -> Result<String, TilthError> {
-    // A file too large to read whole gets the normal read, which shows its
-    // two ends.
-    let Some((content, byte_len)) = crate::read::read_whole_text(path)? else {
-        return crate::read::read_file(path, None, false, cache, false, None);
+    // A pipe, socket or device has no fixed contents and shows as empty.
+    let Some((content, byte_len)) = crate::read::read_text(path)? else {
+        return Ok(crate::read::empty_view(path));
     };
     let line_count = u32::try_from(content.lines().count()).unwrap_or(u32::MAX);
 
@@ -232,10 +231,9 @@ fn render_signature_entries(entries: &[OutlineEntry], lines: &[&str], out: &mut 
 // call. Wiring a structured cache is a separate change. The param is still used by
 // the non-code fallback (read_file), so it keeps its real name.
 fn read_stripped_file(path: &Path, cache: &OutlineCache) -> Result<String, TilthError> {
-    // A file too large to read whole gets the normal read, which shows its
-    // two ends.
-    let Some((raw, byte_len)) = crate::read::read_whole_text(path)? else {
-        return crate::read::read_file(path, None, false, cache, false, None);
+    // A pipe, socket or device has no fixed contents and shows as empty.
+    let Some((raw, byte_len)) = crate::read::read_text(path)? else {
+        return Ok(crate::read::empty_view(path));
     };
     // A non-editable view, so it reads like search does: without the mark.
     let content = tilth_core::source::strip_bom(&raw);
@@ -270,49 +268,33 @@ fn read_stripped_file(path: &Path, cache: &OutlineCache) -> Result<String, Tilth
 mod tests {
     use super::*;
 
-    /// The signature and stripped views read a file whole. A file over the
-    /// read-whole limit gets the normal head-and-tail view from both instead,
-    /// and a pipe is refused by both rather than blocking.
+    /// A pipe, socket or device shows as empty in the signature and stripped
+    /// views too. Both used to open the path with a blocking read, which
+    /// hung on a pipe that has no writer.
+    #[cfg(unix)]
     #[test]
-    fn signature_and_stripped_views_never_read_an_over_limit_file_whole() {
-        use std::io::Write as _;
+    fn signature_and_stripped_views_show_a_pipe_as_empty() {
+        use tilth_core::test_readers::{make_pipe, unless_blocked_on};
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("huge.rs");
-        let line = "fn filler_function_with_a_long_name() { let value = 1; }\n";
-        {
-            let mut out = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
-            for _ in 0..(40 * 1024 * 1024 / line.len()) {
-                out.write_all(line.as_bytes()).unwrap();
-            }
-        }
-        let cache = OutlineCache::new();
-        for view in [
-            read_signature_file(&path, &cache).unwrap(),
-            read_stripped_file(&path, &cache).unwrap(),
-        ] {
-            assert!(
-                view.contains("[head+tail]"),
-                "{}",
-                &view[..view.len().min(200)]
-            );
-        }
-
-        #[cfg(unix)]
-        {
-            let pipe = dir.path().join("pipe");
-            let made = std::process::Command::new("mkfifo")
-                .arg(&pipe)
-                .status()
-                .unwrap();
-            assert!(made.success(), "mkfifo failed");
-            for err in [
-                read_signature_file(&pipe, &cache).unwrap_err(),
-                read_stripped_file(&pipe, &cache).unwrap_err(),
-            ] {
-                assert!(matches!(err, TilthError::NotRegularFile { .. }), "{err}");
+        let pipe = dir.path().join("pipe.rs");
+        make_pipe(&pipe);
+        let null = std::path::Path::new("/dev/null");
+        for path in [pipe.as_path(), null] {
+            let views = unless_blocked_on(&pipe, || {
+                let cache = OutlineCache::new();
+                [
+                    read_signature_file(path, &cache),
+                    read_stripped_file(path, &cache),
+                ]
+                .map(Result::unwrap)
+            })
+            .expect("a view blocked on the pipe");
+            for view in views {
+                assert_eq!(view, crate::read::empty_view(path));
             }
         }
     }
+
     use crate::mcp::tools::tool_definitions;
 
     #[test]
