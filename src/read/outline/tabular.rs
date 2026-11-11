@@ -6,7 +6,7 @@ pub(crate) const TABULAR: Shape = Shape { head: 6, tail: 3 };
 /// The CSV/TSV outline of a text's [`TABULAR`] ends: column headers, row
 /// count, the first 5 rows and the last 3. A text with more rows than the
 /// outline shows marks the gap and counts the rows left out.
-pub(crate) fn render(ends: &Ends) -> String {
+pub(crate) fn render(ends: &Ends<'_>) -> String {
     let head = ends.head();
     let head: Vec<&str> = head.lines().collect();
     let Some((columns, rows)) = head.split_first() else {

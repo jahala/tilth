@@ -11,7 +11,7 @@ pub(crate) const LOG: Shape = Shape { head: 10, tail: 5 };
 /// The whole text when the ends are all of it, and otherwise the first
 /// lines, a line naming the total and how many are left out, then the last
 /// lines.
-pub(crate) fn excerpt(ends: &Ends) -> String {
+pub(crate) fn excerpt(ends: &Ends<'_>) -> String {
     let (head, tail) = (ends.head(), ends.tail());
     if ends.shows_all() {
         return format!("{head}{tail}");

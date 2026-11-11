@@ -1,11 +1,12 @@
 //! A text's first and last lines and its line count: all that the log, CSV
-//! and unknown-type views show. [`EndsCollector`] takes the text in pieces
-//! of any size, so the same code serves a text in memory (one piece) and a
-//! file streamed from disk, which is then never held in memory.
+//! and unknown-type views show. [`Ends::of_text`] slices them out of a text
+//! in memory. [`EndsCollector`] takes a text in pieces of any size, so a
+//! file streamed from disk is never held in memory. Both split by the same
+//! [`Shape::split`], and a test holds them to the same ends.
 
 use std::borrow::Cow;
 
-use super::LineCounter;
+use super::{count_lines, LineCounter};
 
 /// How many lines a view shows from each end of a text.
 #[derive(Clone, Copy)]
@@ -14,25 +15,48 @@ pub(crate) struct Shape {
     pub(crate) tail: usize,
 }
 
+impl Shape {
+    /// How many lines of a text of `total` lines go in the head, and how
+    /// many after them in the tail.
+    fn split(self, total: usize) -> (usize, usize) {
+        let head = total.min(self.head);
+        (head, self.tail.min(total - head))
+    }
+}
+
 /// A text's first and last lines, split the way `str::lines` splits it, and
 /// its line count. The two ends never overlap: `tail` holds only lines after
 /// `head`. They keep the text's bytes as they are; invalid UTF-8 is replaced
-/// only when they are read as text.
-pub(crate) struct Ends {
+/// only when they are read as text. The ends of a text in memory borrow
+/// it; the ends of a streamed text own the bytes they keep.
+pub(crate) struct Ends<'a> {
     shape: Shape,
     /// The first `shape.head` lines, or all of them, line breaks included.
-    head: Vec<u8>,
+    head: Cow<'a, [u8]>,
     /// Up to `shape.tail` lines after `head`, through the end of the text.
-    tail: Vec<u8>,
+    tail: Cow<'a, [u8]>,
     total: usize,
 }
 
-impl Ends {
-    /// The ends of `text`, held in memory.
-    pub(crate) fn of_text(text: &str, shape: Shape) -> Self {
-        let mut collector = EndsCollector::new(shape);
-        collector.feed(text.as_bytes());
-        collector.finish()
+impl<'a> Ends<'a> {
+    /// The ends of `text`, held in memory: slices of it, never a copy.
+    pub(crate) fn of_text(text: &'a str, shape: Shape) -> Self {
+        let text = text.as_bytes();
+        let total = count_lines(text) as usize;
+        let (_, tail) = shape.split(total);
+        let head_end = match shape.head.checked_sub(1) {
+            Some(last) => memchr::memchr_iter(b'\n', text)
+                .nth(last)
+                .map_or(text.len(), |at| at + 1),
+            None => 0,
+        };
+        let (head, rest) = text.split_at(head_end);
+        Ends {
+            shape,
+            head: Cow::Borrowed(head),
+            tail: Cow::Borrowed(&rest[start_of_last_lines(rest, tail)..]),
+            total,
+        }
     }
 
     /// The first lines as text, line breaks included. The ends are cut at
@@ -66,7 +90,7 @@ impl Ends {
         if !self.shows_all() {
             return Err(self);
         }
-        let mut text = self.head;
+        let mut text = self.head.into_owned();
         text.extend_from_slice(&self.tail);
         Ok(text)
     }
@@ -162,16 +186,15 @@ impl EndsCollector {
         }
     }
 
-    pub(crate) fn finish(self) -> Ends {
+    pub(crate) fn finish(self) -> Ends<'static> {
         let total = self.counter.lines() as usize;
-        let head = total.min(self.shape.head);
-        let tail = self.shape.tail.min(total - head);
+        let (_, tail) = self.shape.split(total);
         let mut window = self.window;
         window.drain(..start_of_last_lines(&window, tail));
         Ends {
             shape: self.shape,
-            head: self.head,
-            tail: window,
+            head: Cow::Owned(self.head),
+            tail: Cow::Owned(window),
             total,
         }
     }
@@ -233,7 +256,7 @@ mod tests {
         texts
     }
 
-    fn collect(text: &[u8], shape: Shape, piece: usize) -> Ends {
+    fn collect(text: &[u8], shape: Shape, piece: usize) -> Ends<'static> {
         let mut collector = EndsCollector::new(shape);
         for chunk in text.chunks(piece.max(1)) {
             collector.feed(chunk);
@@ -328,6 +351,31 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    /// The ends of a text in memory are slices of it, never a copy, and
+    /// they are the ends the collector finds when the text streams in.
+    #[test]
+    fn the_ends_of_a_text_in_memory_borrow_it() {
+        let shapes = [
+            Shape { head: 10, tail: 5 },
+            Shape { head: 1, tail: 1 },
+            Shape { head: 0, tail: 2 },
+            Shape { head: 2, tail: 0 },
+        ];
+        for text in corpus() {
+            let text = String::from_utf8_lossy(&text);
+            for shape in shapes {
+                let ends = Ends::of_text(&text, shape);
+                let streamed = collect(text.as_bytes(), shape, 3);
+                let at = format!("{text:?}, shape {}+{}", shape.head, shape.tail);
+                assert!(matches!(ends.head, Cow::Borrowed(_)), "{at}");
+                assert!(matches!(ends.tail, Cow::Borrowed(_)), "{at}");
+                assert_eq!(ends.head(), streamed.head(), "{at}");
+                assert_eq!(ends.tail(), streamed.tail(), "{at}");
+                assert_eq!(ends.total(), streamed.total(), "{at}");
             }
         }
     }

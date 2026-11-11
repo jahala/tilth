@@ -93,7 +93,7 @@ impl EndsView {
 
     /// What [`generate`] returns for a text whose [`shape`](Self::shape)
     /// ends are `ends`.
-    pub(crate) fn generate(self, ends: &Ends, capped: bool) -> String {
+    pub(crate) fn generate(self, ends: &Ends<'_>, capped: bool) -> String {
         with_omission_note(self.render(ends), max_lines(capped))
     }
 
@@ -102,7 +102,7 @@ impl EndsView {
         self.render(&Ends::of_text(text, self.shape()))
     }
 
-    fn render(self, ends: &Ends) -> String {
+    fn render(self, ends: &Ends<'_>) -> String {
         match self {
             Self::Log | Self::Other => fallback::excerpt(ends),
             Self::Tabular => tabular::render(ends),
