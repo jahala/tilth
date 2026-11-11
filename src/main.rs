@@ -179,7 +179,9 @@ fn main() {
 
     // Shell completions
     if let Some(shell) = cli.completions {
-        clap_complete::generate(shell, &mut Cli::command(), "tilth", &mut io::stdout());
+        let mut script = Vec::new();
+        clap_complete::generate(shell, &mut Cli::command(), "tilth", &mut script);
+        write_stdout(&String::from_utf8_lossy(&script));
         return;
     }
 
@@ -199,7 +201,7 @@ fn main() {
                     eprintln!("No project fingerprint could be generated.");
                     process::exit(1);
                 }
-                println!("{output}");
+                write_stdout(&output);
             }
             Command::Grok {
                 target,
@@ -436,10 +438,9 @@ fn emit_result(
                     "query": query,
                     "output": output,
                 });
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&json)
-                        .expect("serde_json::Value is always serializable")
+                write_stdout(
+                    &serde_json::to_string_pretty(&json)
+                        .expect("serde_json::Value is always serializable"),
                 );
             } else {
                 emit_output(&output, is_tty);
@@ -472,15 +473,34 @@ fn emit_output(output: &str, is_tty: bool) {
         }
     }
 
-    // Conventional CLI output ends with a newline so the next shell prompt
-    // starts on its own line. Most internal formatters terminate with `\n`,
-    // but the search-result footer (e.g. `(~507 tokens)`) and a few other
-    // paths do not — guard at the sink rather than auditing every formatter.
-    print!("{output}");
-    if !output.ends_with('\n') {
-        println!();
+    write_stdout(output);
+}
+
+/// Write a whole response to stdout, the one sink every CLI path prints
+/// through. A reader that went away early (`tilth big.rs --full | head -1`)
+/// ends the run quietly with exit 0, as Unix tools do. `print!` panicked
+/// there instead and aborted with exit 134. Any other write failure, such
+/// as a full disk, is reported and exits 1.
+fn write_stdout(output: &str) {
+    if let Err(e) = write_output(&mut io::stdout().lock(), output) {
+        if e.kind() == io::ErrorKind::BrokenPipe {
+            process::exit(0);
+        }
+        let _ = writeln!(io::stderr(), "output error: {e}");
+        process::exit(1);
     }
-    let _ = io::stdout().flush();
+}
+
+/// Conventional CLI output ends with a newline so the next shell prompt
+/// starts on its own line. Most internal formatters terminate with `\n`,
+/// but the search-result footer (e.g. `(~507 tokens)`) and a few other
+/// paths do not — guard at the sink rather than auditing every formatter.
+fn write_output(writer: &mut impl Write, output: &str) -> io::Result<()> {
+    writer.write_all(output.as_bytes())?;
+    if !output.ends_with('\n') {
+        writer.write_all(b"\n")?;
+    }
+    writer.flush()
 }
 
 fn terminal_height() -> usize {
@@ -586,6 +606,51 @@ mod tests {
         // handling, but cli.full stays false. compute_expand must return 0.
         let cli_full = false; // user did NOT pass --full
         assert_eq!(compute_expand(None, cli_full), 0);
+    }
+
+    /// A sink that fails after `room` bytes, or on flush.
+    struct FullSink {
+        room: usize,
+        fail_flush: bool,
+    }
+
+    impl Write for FullSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.room == 0 {
+                return Err(io::ErrorKind::StorageFull.into());
+            }
+            let n = buf.len().min(self.room);
+            self.room -= n;
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if self.fail_flush {
+                return Err(io::ErrorKind::StorageFull.into());
+            }
+            Ok(())
+        }
+    }
+
+    /// A failure in the body, the trailing newline or the flush reaches the
+    /// caller, so `write_stdout` can report it instead of exiting 0 on a
+    /// truncated response.
+    #[test]
+    fn write_output_returns_every_write_failure() {
+        for (room, fail_flush) in [(0, false), (2, false), (4, false), (usize::MAX, true)] {
+            let mut sink = FullSink { room, fail_flush };
+            let err = write_output(&mut sink, "body").unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::StorageFull, "room {room}");
+        }
+    }
+
+    #[test]
+    fn write_output_ends_with_exactly_one_newline() {
+        for output in ["body", "body\n"] {
+            let mut bytes = Vec::new();
+            write_output(&mut bytes, output).unwrap();
+            assert_eq!(bytes, b"body\n");
+        }
     }
 
     /// #195: `--scope <file>` gets the same refusal as the MCP tools. It used
