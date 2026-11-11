@@ -97,7 +97,7 @@ fn search_capped(
             let file_size = match std::fs::metadata(path) {
                 Ok(meta) => {
                     if meta.len() > tilth_core::source::MAX_FILE_SIZE {
-                        if super::oversized_holds(path, |b| super::has_match(matcher, b)) {
+                        if super::oversized_holds(path, matcher) {
                             super::record(skipped_large, path);
                         }
                         return ignore::WalkState::Continue;

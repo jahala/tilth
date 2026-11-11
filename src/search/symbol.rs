@@ -297,7 +297,7 @@ fn matches_in_file(path: &Path, wanted: Wanted, matchers: Matchers) -> Scan {
     let file_size = match std::fs::metadata(path) {
         Ok(meta) => {
             if meta.len() > tilth_core::source::MAX_FILE_SIZE {
-                if super::oversized_holds(path, |b| super::has_match(matchers.name, b)) {
+                if super::oversized_holds(path, matchers.name) {
                     return Scan::TooLarge;
                 }
                 return none();

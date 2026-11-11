@@ -92,18 +92,30 @@ fn parse_pattern(query: &str) -> (&str, bool) {
 }
 
 /// Does a file over the size limit contain what the search looks for? The
-/// walkers skip such a file without parsing it, and this one plain read is
-/// what lets the result name it instead of leaving it out in silence.
-pub(crate) fn oversized_holds(path: &Path, found: impl Fn(&[u8]) -> bool) -> bool {
-    std::fs::read(path).is_ok_and(|bytes| found(&bytes))
+/// walkers skip such a file without parsing it, and this check is what lets
+/// the result name it instead of leaving it out in silence. It streams the
+/// file, so a multi-gigabyte file costs a fixed buffer, and a binary one
+/// stops at its first NUL byte.
+pub(crate) fn oversized_holds(path: &Path, matcher: &grep_regex::RegexMatcher) -> bool {
+    std::fs::File::open(path).is_ok_and(|file| stream_holds(file, matcher))
 }
 
-/// Does `matcher` match anywhere in `bytes`? Stops at the first hit.
-pub(crate) fn has_match(matcher: &grep_regex::RegexMatcher, bytes: &[u8]) -> bool {
+/// The longest line the size check holds in memory. A file with a longer
+/// line (a minified bundle) is not checked past it.
+const MAX_CHECKED_LINE: usize = 1 << 20;
+
+/// Does `matcher` match in `reader`? Reads it as a stream in a fixed
+/// buffer and stops at the first match, at the first NUL byte (a binary
+/// file, which search never reads) or at a line over `MAX_CHECKED_LINE`.
+fn stream_holds(reader: impl std::io::Read, matcher: &grep_regex::RegexMatcher) -> bool {
     let mut hit = false;
-    let _ = grep_searcher::Searcher::new().search_slice(
+    let mut searcher = grep_searcher::SearcherBuilder::new()
+        .binary_detection(grep_searcher::BinaryDetection::quit(b'\0'))
+        .heap_limit(Some(MAX_CHECKED_LINE))
+        .build();
+    let _ = searcher.search_reader(
         matcher,
-        bytes,
+        reader,
         grep_searcher::sinks::Lossy(|_, _| {
             hit = true;
             Ok(false)
@@ -2681,6 +2693,43 @@ mod tests {
         }
         let quiet = search_symbol("unrelated", tmp.path(), &cache, None, false).unwrap();
         assert!(!quiet.contains("not searched"), "{quiet}");
+    }
+
+    /// A big binary file (a database, an archive) was read whole on every
+    /// search to look for the query in it, and was named when its bytes
+    /// happened to spell it. Search never reads binary files, so the note
+    /// must not name one either.
+    #[test]
+    fn a_big_binary_file_is_not_named_as_holding_the_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        let limit = usize::try_from(tilth_core::source::MAX_FILE_SIZE).unwrap();
+        let mut bytes = b"SQLite format 3\0".to_vec();
+        bytes.resize(limit + 1, 0);
+        bytes.extend_from_slice(b"\nneedle_target_fn\n");
+        std::fs::write(tmp.path().join("data.db"), bytes).unwrap();
+        let cache = OutlineCache::new();
+        for out in [
+            search_symbol("needle_target_fn", tmp.path(), &cache, None, false).unwrap(),
+            search_content("needle_target_fn", tmp.path(), &cache, None, false).unwrap(),
+        ] {
+            assert!(!out.contains("not searched"), "{out}");
+        }
+    }
+
+    /// The check reads a file as a stream and stops at the first hit, at the
+    /// first NUL byte, or at a line too long to hold. These readers never
+    /// end, so a check that read the whole file would never return.
+    #[test]
+    fn the_size_check_stops_early_on_endless_input() {
+        use std::io::Read as _;
+        let matcher = grep_regex::RegexMatcher::new(r"\bneedle\b").unwrap();
+        let hit = std::io::Cursor::new(b"first line\nneedle here\n".to_vec())
+            .chain(std::io::repeat(b'\n'));
+        assert!(stream_holds(hit, &matcher));
+        let binary = std::io::Cursor::new(b"header\0".to_vec()).chain(std::io::repeat(b'a'));
+        assert!(!stream_holds(binary, &matcher));
+        let one_line = std::io::repeat(b'a');
+        assert!(!stream_holds(one_line, &matcher));
     }
 
     /// The caller walk skipped big files with no word, so callers, grok and
