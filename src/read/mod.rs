@@ -278,9 +278,9 @@ pub fn read_file(
         return list_directory(path);
     }
 
-    // An empty file prints its header only. So does a pipe, socket or
-    // device, which has no fixed contents, and it is never opened: opening a
-    // pipe that has no writer blocks.
+    // An empty file prints its header only, before its section or its
+    // permissions are looked at. So does a pipe, socket or device, which
+    // has no fixed contents.
     if !meta.is_file() || meta.len() == 0 {
         return Ok(empty_view(path));
     }
@@ -293,12 +293,9 @@ pub fn read_file(
     // From here on, everything describes the file this handle reads: its
     // size, its emptiness and the mtime its outline is cached under, even if
     // a rename replaced the path after the metadata call above.
-    let Some(mut file) = open_file(path)? else {
+    let Some(mut file) = open_file(path)?.filter(|file| !file.is_empty()) else {
         return Ok(empty_view(path));
     };
-    if file.is_empty() {
-        return Ok(empty_view(path));
-    }
     let byte_len = file.len();
     let mtime = file
         .metadata()
@@ -775,8 +772,9 @@ pub fn read_ranges_with_budget(
 }
 
 /// The formatted blocks of a section read, with the bytes and lines they
-/// hold, or `None` for an empty file, whatever its ranges, and for a pipe,
-/// socket or device, which has no fixed contents: both show as empty.
+/// hold, or `None` for an empty file and for a pipe, socket or device,
+/// which has no fixed contents: both show as empty, whatever their
+/// well-formed ranges.
 fn collect_blocks(
     path: &Path,
     ranges: &[&str],
@@ -788,12 +786,14 @@ fn collect_blocks(
             reason: "at least one range is required".into(),
         });
     }
-    let Some(mut file) = open_file(path)? else {
+    let Some(mut file) = open_file(path)?.filter(|file| !file.is_empty()) else {
+        // Nothing to select from, so every range shows as empty, but a
+        // malformed one fails here as it does on any file.
+        for range in ranges.iter().filter(|range| !range.starts_with('#')) {
+            line_range(range)?;
+        }
         return Ok(None);
     };
-    if file.is_empty() {
-        return Ok(None);
-    }
 
     // A heading anchor needs the text to find its lines. Line ranges do not,
     // so without one the file streams and is never held in memory.
@@ -1824,18 +1824,17 @@ mod tests {
     }
 
     /// A section read of an empty file shows it as empty, whatever its
-    /// ranges, as a single `section` of it always did.
+    /// well-formed ranges, as a single `section` of it always did.
     #[test]
     fn a_section_read_of_an_empty_file_shows_it_as_empty() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("empty.md");
         std::fs::write(&path, "").unwrap();
-        let shapes: [&[&str]; 5] = [
+        let shapes: [&[&str]; 4] = [
             &["1-2"],
             &["1-2", "4-5"],
             &["## Heading"],
             &["## Heading", "3-4"],
-            &["x-y", "1-1"],
         ];
         for ranges in shapes {
             assert_eq!(
@@ -1849,9 +1848,48 @@ mod tests {
                 "{ranges:?}"
             );
         }
+        // A single `section` of an empty file shows it as empty before
+        // looking at the range, malformed or not.
         let cache = OutlineCache::new();
-        let single = read_file(&path, Some("1-2"), false, &cache, false, None).unwrap();
-        assert_eq!(single, empty_view(&path));
+        for range in ["1-2", "x-y"] {
+            let single = read_file(&path, Some(range), false, &cache, false, None).unwrap();
+            assert_eq!(single, empty_view(&path), "{range}");
+        }
+    }
+
+    /// A malformed line range fails a section read of an empty file, of a
+    /// pipe and of a device, as it fails one of any other file: the first
+    /// malformed range, with the forms the query accepts.
+    #[cfg(unix)]
+    #[test]
+    fn a_malformed_range_fails_even_where_there_is_nothing_to_select() {
+        use tilth_core::test_readers::{make_pipe, unless_blocked_on};
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("empty.md");
+        std::fs::write(&empty, "").unwrap();
+        let pipe = dir.path().join("pipe");
+        make_pipe(&pipe);
+        let expected = "invalid query \"abc\": expected format: \"start-end\" \
+                        (e.g. \"45-89\") or heading (e.g. \"## Architecture\")";
+        let shapes: [&[&str]; 4] = [
+            &["abc"],
+            &["abc", "0-5"],
+            &["1-2", "abc"],
+            &["## Heading", "abc", "5-4"],
+        ];
+        for path in [empty.as_path(), pipe.as_path(), Path::new("/dev/null")] {
+            for ranges in shapes {
+                let errors = unless_blocked_on(&pipe, || {
+                    [
+                        read_ranges(path, ranges, false),
+                        read_ranges_with_budget(path, ranges, false, 100),
+                    ]
+                    .map(|read| read.unwrap_err().to_string())
+                })
+                .expect("a read blocked on the pipe");
+                assert_eq!(errors, [expected, expected], "{path:?} {ranges:?}");
+            }
+        }
     }
 
     /// A pipe, socket or device has no fixed contents. It shows as empty, as
