@@ -132,6 +132,15 @@ mod tests {
     fn a_read_during_an_overwrite_sees_one_whole_version() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+        /// Marks the writer gone when it ends, a panic included, so the
+        /// reader never waits on a writer that will not come.
+        struct Gone<'a>(&'a AtomicBool);
+        impl Drop for Gone<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("f.rs");
         let first = "fn alpha() {}\n".repeat(200);
@@ -140,9 +149,11 @@ mod tests {
         let cache = tilth_core::cache::OutlineCache::new();
         let replaced = AtomicUsize::new(0);
         let reader_done = AtomicBool::new(false);
+        let writer_gone = AtomicBool::new(false);
 
         std::thread::scope(|s| {
             s.spawn(|| {
+                let _gone = Gone(&writer_gone);
                 while !reader_done.load(Ordering::SeqCst) {
                     let next = if replaced.load(Ordering::SeqCst).is_multiple_of(2) {
                         &second
@@ -154,6 +165,11 @@ mod tests {
                 }
             });
             while replaced.load(Ordering::SeqCst) == 0 {
+                if writer_gone.load(Ordering::SeqCst) {
+                    // The writer ended before its first replace; joining the
+                    // scope reports its panic.
+                    return;
+                }
                 std::thread::yield_now();
             }
             for _ in 0..200 {

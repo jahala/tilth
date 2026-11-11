@@ -80,9 +80,9 @@ pub(in crate::mcp) fn tool_read(
             let path = super::resolve_read_path(&PathBuf::from(path_str), root)?;
             session.record_read(&path);
             let read = if force_signature {
-                read_signature_file(&path, cache).map(|(body, _)| body)
+                read_signature_file(&path, cache)
             } else if force_stripped {
-                read_stripped_file(&path, cache).map(|(body, _, _)| body)
+                read_stripped_file(&path, cache)
             } else {
                 crate::read::read_file(&path, None, force_full, cache, edit_mode, budget)
             };
@@ -147,13 +147,9 @@ pub(in crate::mcp) fn tool_read(
     session.record_read(&path);
 
     let mut output = if section.is_none() && force_signature {
-        read_signature_file(&path, cache)
-            .map(|(body, _)| body)
-            .map_err(|e| e.to_string())?
+        read_signature_file(&path, cache).map_err(|e| e.to_string())?
     } else if section.is_none() && force_stripped {
-        read_stripped_file(&path, cache)
-            .map(|(body, _, _)| body)
-            .map_err(|e| e.to_string())?
+        read_stripped_file(&path, cache).map_err(|e| e.to_string())?
     } else {
         crate::read::read_file(&path, section, force_full, cache, edit_mode, budget)
             .map_err(|e| e.to_string())?
@@ -184,35 +180,22 @@ pub(in crate::mcp) fn tool_read(
 // formatted outline strings, not Vec<OutlineEntry>, so get_outline_entries below
 // re-parses every call. Wiring a structured cache is a separate change. The param
 // is still used by the non-code fallback (read_file), so it keeps its real name.
-fn read_signature_file(path: &Path, cache: &OutlineCache) -> Result<(String, u32), TilthError> {
-    let content = std::fs::read_to_string(path).map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => TilthError::NotFound {
-            path: path.to_path_buf(),
-            suggestion: None,
-        },
-        std::io::ErrorKind::PermissionDenied => TilthError::PermissionDenied {
-            path: path.to_path_buf(),
-        },
-        _ => TilthError::IoError {
-            path: path.to_path_buf(),
-            source: e,
-        },
-    })?;
-    let meta = std::fs::metadata(path).map_err(|e| TilthError::IoError {
-        path: path.to_path_buf(),
-        source: e,
-    })?;
+fn read_signature_file(path: &Path, cache: &OutlineCache) -> Result<String, TilthError> {
+    // A file too large to read whole gets the normal read, which shows its
+    // two ends.
+    let Some((content, byte_len)) = crate::read::read_whole_text(path)? else {
+        return crate::read::read_file(path, None, false, cache, false, None);
+    };
     let line_count = u32::try_from(content.lines().count()).unwrap_or(u32::MAX);
 
     let FileType::Code(lang) = tilth_core::lang::detect_file_type_with_content(path, &content)
     else {
-        let body = crate::read::read_file(path, None, false, cache, false, None)?;
-        return Ok((body, line_count));
+        return crate::read::read_file(path, None, false, cache, false, None);
     };
 
     // Build the signature header only on the code path — the non-code fallback
     // above returns the normal read and never uses it.
-    let header = crate::format::file_header(path, meta.len(), line_count, ViewMode::Signature);
+    let header = crate::format::file_header(path, byte_len, line_count, ViewMode::Signature);
     // Parse without the byte-order mark, so a line-1 import is still one,
     // but print the file's own lines: their hash anchors must match what
     // `tilth_write` reads from disk. Removing the mark keeps line numbers.
@@ -223,7 +206,7 @@ fn read_signature_file(path: &Path, cache: &OutlineCache) -> Result<(String, u32
     if body.is_empty() {
         body = crate::format::hashlines(&content, 1);
     }
-    Ok((format!("{header}\n\n{}", body.trim_end()), line_count))
+    Ok(format!("{header}\n\n{}", body.trim_end()))
 }
 
 fn render_signature_entries(entries: &[OutlineEntry], lines: &[&str], out: &mut String) {
@@ -248,33 +231,21 @@ fn render_signature_entries(entries: &[OutlineEntry], lines: &[&str], out: &mut 
 // formatted outline strings, not Vec<OutlineEntry>, so strip_noise re-parses every
 // call. Wiring a structured cache is a separate change. The param is still used by
 // the non-code fallback (read_file), so it keeps its real name.
-fn read_stripped_file(path: &Path, cache: &OutlineCache) -> Result<(String, u32, u32), TilthError> {
+fn read_stripped_file(path: &Path, cache: &OutlineCache) -> Result<String, TilthError> {
+    // A file too large to read whole gets the normal read, which shows its
+    // two ends.
+    let Some((raw, byte_len)) = crate::read::read_whole_text(path)? else {
+        return crate::read::read_file(path, None, false, cache, false, None);
+    };
     // A non-editable view, so it reads like search does: without the mark.
-    let content = tilth_core::source::read_source(path).map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => TilthError::NotFound {
-            path: path.to_path_buf(),
-            suggestion: None,
-        },
-        std::io::ErrorKind::PermissionDenied => TilthError::PermissionDenied {
-            path: path.to_path_buf(),
-        },
-        _ => TilthError::IoError {
-            path: path.to_path_buf(),
-            source: e,
-        },
-    })?;
-    let meta = std::fs::metadata(path).map_err(|e| TilthError::IoError {
-        path: path.to_path_buf(),
-        source: e,
-    })?;
+    let content = tilth_core::source::strip_bom(&raw);
     let total_lines = u32::try_from(content.lines().count()).unwrap_or(u32::MAX);
 
     if !matches!(detect_file_type(path), FileType::Code(_)) {
-        let body = crate::read::read_file(path, None, false, cache, false, None)?;
-        return Ok((body, total_lines, 0));
+        return crate::read::read_file(path, None, false, cache, false, None);
     }
 
-    let skip_lines = crate::search::strip::strip_noise(&content, path, Some((1, total_lines)));
+    let skip_lines = crate::search::strip::strip_noise(content, path, Some((1, total_lines)));
     let width = total_lines.max(1).to_string().len();
     let mut body = String::with_capacity(content.len());
     let mut kept: u32 = 0;
@@ -288,20 +259,60 @@ fn read_stripped_file(path: &Path, cache: &OutlineCache) -> Result<(String, u32,
     }
 
     let stripped = total_lines.saturating_sub(kept);
-    let header = crate::format::file_header(path, meta.len(), total_lines, ViewMode::Stripped);
+    let header = crate::format::file_header(path, byte_len, total_lines, ViewMode::Stripped);
     let note = format!(
         "// stripped {stripped} of {total_lines} lines (plain comments, debug logs, blank collapse) — non-editable view"
     );
-    Ok((
-        format!("{header}\n{note}\n\n{}", body.trim_end()),
-        total_lines,
-        stripped,
-    ))
+    Ok(format!("{header}\n{note}\n\n{}", body.trim_end()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The signature and stripped views read a file whole. A file over the
+    /// read-whole limit gets the normal head-and-tail view from both instead,
+    /// and a pipe is refused by both rather than blocking.
+    #[test]
+    fn signature_and_stripped_views_never_read_an_over_limit_file_whole() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.rs");
+        let line = "fn filler_function_with_a_long_name() { let value = 1; }\n";
+        {
+            let mut out = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+            for _ in 0..(40 * 1024 * 1024 / line.len()) {
+                out.write_all(line.as_bytes()).unwrap();
+            }
+        }
+        let cache = OutlineCache::new();
+        for view in [
+            read_signature_file(&path, &cache).unwrap(),
+            read_stripped_file(&path, &cache).unwrap(),
+        ] {
+            assert!(
+                view.contains("[head+tail]"),
+                "{}",
+                &view[..view.len().min(200)]
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            let pipe = dir.path().join("pipe");
+            let made = std::process::Command::new("mkfifo")
+                .arg(&pipe)
+                .status()
+                .unwrap();
+            assert!(made.success(), "mkfifo failed");
+            for err in [
+                read_signature_file(&pipe, &cache).unwrap_err(),
+                read_stripped_file(&pipe, &cache).unwrap_err(),
+            ] {
+                assert!(matches!(err, TilthError::NotRegularFile { .. }), "{err}");
+            }
+        }
+    }
     use crate::mcp::tools::tool_definitions;
 
     #[test]

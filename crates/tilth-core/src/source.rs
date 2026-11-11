@@ -170,19 +170,7 @@ mod tests {
 
     #[test]
     fn stream_contains_finds_a_needle_split_across_reads() {
-        // A reader that returns one byte per read puts every possible split
-        // of the needle across two reads.
-        struct OneByte<'a>(&'a [u8]);
-        impl Read for OneByte<'_> {
-            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-                let Some((&first, rest)) = self.0.split_first() else {
-                    return Ok(0);
-                };
-                out[0] = first;
-                self.0 = rest;
-                Ok(1)
-            }
-        }
+        use crate::test_readers::OneByte;
         assert!(stream_contains(OneByte(b"xx needle yy"), b"needle").unwrap());
         assert!(!stream_contains(OneByte(b"xx needl e yy"), b"needle").unwrap());
 
@@ -198,18 +186,8 @@ mod tests {
     fn stream_contains_stops_at_the_first_match() {
         // Reading past the match would hit the error, so a true answer
         // proves the scan stopped there.
-        struct ThenFail(bool);
-        impl Read for ThenFail {
-            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-                if self.0 {
-                    return Err(io::Error::other("read past the match"));
-                }
-                self.0 = true;
-                out[..6].copy_from_slice(b"needle");
-                Ok(6)
-            }
-        }
-        assert!(stream_contains(ThenFail(false), b"needle").unwrap());
+        let reader = crate::test_readers::ThenFail::new(b"needle");
+        assert!(stream_contains(reader, b"needle").unwrap());
     }
 
     #[test]

@@ -593,9 +593,10 @@ division.
 `read::read_file(path, section, full, cache, edit_mode)` is the
 gateway. The decision tree, in order:
 
-1. `metadata` errors → typed `TilthError::NotFound` /
-   `PermissionDenied` / `IoError` with a `suggest_similar` fallback
-   (Levenshtein on directory siblings).
+1. `metadata` and open errors → typed `TilthError::NotFound` /
+   `PermissionDenied` / `IoError` (`path_error`, one mapping for every
+   step), with a `suggest_similar` fallback (Levenshtein on directory
+   siblings).
 2. **Directory** → `list_directory` (sorted entries, file types).
 3. **Empty file** → header with `ViewMode::Empty`.
 4. **`section: Some(...)` or `sections: [...]`** → `read_ranges`.
@@ -607,20 +608,32 @@ gateway. The decision tree, in order:
    shape-identical (no delimiter); multiple ranges share one `[section]`
    header followed by per-block `─── lines X-Y ───` delimiters and are
    emitted in user-supplied order — overlap is honored verbatim, no
-   coalescing. Returns the verbatim slice regardless of file size.
-5. **Binary check, then read** — `is_binary` looks for null bytes in
-   the first 512 bytes via `memchr`, and only those bytes are read
-   first. Binary files emit just a header; any other file is then read
-   whole.
-6. **Generated** — by name (`Cargo.lock`, `package-lock.json`, etc.) or
-   content marker (`@generated`, `DO NOT EDIT`, `auto-generated`,
-   etc.).
-7. **Minified** — `.min.<ext>` convention or, for files >100KB, a
-   newline-density heuristic.
+   coalescing. Line ranges stream through `LineSelector`, which slices
+   the requested lines out of each chunk, drops every other line as it
+   passes and stops at the last requested line, so their cost does not
+   grow with the file. Only a heading needs the whole text, and a heading
+   section of a file over `READ_WHOLE_MAX` is refused with a pointer to
+   line ranges.
+5. **Not a regular file** → refused by `open_regular` before it opens
+   anything: a pipe, socket or device has no fixed contents, and opening
+   a pipe with no writer blocks forever.
+6. **The head decides first** — `detection::read_head` reads the first
+   `HEAD_WINDOW` bytes, and `is_binary`, the generated markers and the
+   minified sample all look only there. A binary file emits just a
+   header. A generated file (by name, such as `Cargo.lock`, or by a
+   content marker such as `@generated` or `DO NOT EDIT`) or a minified
+   one (`.min.<ext>`, or for files over 100 KB a newline-density
+   heuristic) emits a header whose line count is streamed, so none of
+   these is ever held in memory.
+7. **Over `READ_WHOLE_MAX` (32 MiB)** → the head-and-tail view: the
+   first and last lines from 16 KiB at each end, and the streamed line
+   count. Below the limit the file is read whole, sized from the open
+   handle.
 8. **Full mode + oversized** — guard for `--full` on huge files. Caps
    at `TILTH_FULL_SIZE_CAP` (default in `full_read_size_cap()`); above
    the cap, returns the outline with a banner explaining how to
-   override.
+   override. The override cannot lift a file past `READ_WHOLE_MAX`,
+   which step 7 settles first.
 9. **Below the token threshold or `--full`** → return full content
    (with `format::hashlines` if `edit_mode`, plain `number_lines`
    otherwise). Without `--full`, a full view over the caller's budget
