@@ -220,18 +220,29 @@ fn has_regex_metachar(s: &str) -> bool {
 /// - `.*` or `.?` with name characters on both sides (`Searcher.*Builder`).
 ///   `Cargo.*`, `*.test.*`, `.*rc` and `foo.*.bak` are file globs, because
 ///   there the dot starts an extension or a dotfile;
-/// - a `+` or `{n}` / `{n,m}` quantifier after `.`, `]` or `)`;
+/// - a `+` after `.`, `]` or `)`;
+/// - a `{n}` or `{n,m}` repeat count after `]` or `)`, or after `.` unless
+///   it is two numbers closing the query or a path component: `*.{1,8}` is
+///   a glob for the extensions 1 and 8, while `a.{2,4}b` and `x.{3}` are
+///   regexes;
 /// - a backslash escape (`\w`, `\(`, `\.`), except on Windows, where a
-///   backslash separates path components.
+///   backslash separates path components. Escaping a glob character
+///   (`\[`, `\*`) is a glob escape too, so it counts only when the query
+///   has no glob character left unescaped: `app/\[slug\]/*.tsx` is a glob,
+///   `\[TODO\]` a regex.
 ///
 /// Parentheses alone do not count: `app/(auth)/*.tsx` is a route-group glob.
 fn is_regex_shaped(query: &str) -> bool {
     let b = query.as_bytes();
     let name_char = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let glob_char = |c: u8| matches!(c, b'*' | b'?' | b'[' | b']' | b'{' | b'}');
     if b.contains(&b'|') || b.first() == Some(&b'^') || b.last() == Some(&b'$') {
         return true;
     }
-    for i in 0..b.len() {
+    let mut glob_escape = false;
+    let mut unescaped_glob = false;
+    let mut i = 0;
+    while i < b.len() {
         let prev = i.checked_sub(1).map(|j| b[j]);
         let next = b.get(i + 1).copied();
         match b[i] {
@@ -242,28 +253,55 @@ fn is_regex_shaped(query: &str) -> bool {
                 return true;
             }
             b'+' if matches!(prev, Some(b'.' | b']' | b')')) => return true,
-            b'{' if matches!(prev, Some(b'.' | b']' | b')')) && is_repeat_count(&b[i + 1..]) => {
+            b'{' if matches!(prev, Some(b']' | b')')) && repeat_count(&b[i + 1..]).is_some() => {
                 return true;
+            }
+            b'{' if prev == Some(b'.') => {
+                if let Some(count) = repeat_count(&b[i + 1..]) {
+                    let after = b.get(i + 1 + count.len).copied();
+                    let alternation = count.two_numbers && matches!(after, None | Some(b'/'));
+                    if !alternation {
+                        return true;
+                    }
+                }
+            }
+            b'\\' if !cfg!(windows) && next.is_some_and(glob_char) => {
+                glob_escape = true;
+                i += 2;
+                continue;
             }
             b'\\' if !cfg!(windows) && next.is_some_and(|c| c.is_ascii_graphic()) => return true,
             _ => {}
         }
+        unescaped_glob |= glob_char(b[i]);
+        i += 1;
     }
-    false
+    glob_escape && !unescaped_glob
 }
 
-/// `rest` starts right after a `{`: is it `n}` or `n,m}`, a regex repeat count?
-fn is_repeat_count(rest: &[u8]) -> bool {
-    let Some(close) = rest.iter().position(|&c| c == b'}') else {
-        return false;
-    };
+/// A regex repeat count right after a `{`: `n}`, `n,}` or `n,m}`.
+struct RepeatCount {
+    /// Bytes from after the `{` to after the `}`.
+    len: usize,
+    /// `n,m}`, which a glob reads as two alternatives.
+    two_numbers: bool,
+}
+
+/// `rest` starts right after a `{`: is it a regex repeat count?
+fn repeat_count(rest: &[u8]) -> Option<RepeatCount> {
+    let close = rest.iter().position(|&c| c == b'}')?;
     let mut parts = rest[..close].split(|&c| c == b',');
     let min = parts.next().unwrap_or_default();
-    let max = parts.next().unwrap_or_default();
-    !min.is_empty()
-        && min.iter().all(u8::is_ascii_digit)
-        && max.iter().all(u8::is_ascii_digit)
-        && parts.next().is_none()
+    let max = parts.next();
+    let digits = |p: &[u8]| p.iter().all(u8::is_ascii_digit);
+    let valid = !min.is_empty()
+        && digits(min)
+        && max.is_none_or(digits)
+        && parts.next().is_none();
+    valid.then(|| RepeatCount {
+        len: close + 1,
+        two_numbers: max.is_some_and(|m| !m.is_empty()),
+    })
 }
 
 /// An identifier, or a `::` path of identifiers (`B::run`). Every segment
@@ -388,6 +426,11 @@ mod tests {
             "log\\.[a-z]*",
             "fn.+main*",
             "[0-9]{3}*",
+            "a.{2,4}b",
+            "x.{3}",
+            "x.{2,}",
+            #[cfg(not(windows))]
+            "\\[TODO\\]",
         ] {
             assert!(
                 matches!(classify(query, &scope), QueryType::Regex(ref p) if p == query),
@@ -422,6 +465,10 @@ mod tests {
             "app/(auth)/*.tsx",
             "include/c++/*",
             "TODO.*",
+            "man/*.{1,8}",
+            "*.{1,2}",
+            #[cfg(not(windows))]
+            "app/\\[slug\\]/*.tsx",
         ] {
             assert!(
                 matches!(classify(query, &scope), QueryType::Glob(_)),
