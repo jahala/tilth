@@ -222,10 +222,15 @@ pub fn read_file(
 
     // OGATE: if the outline is not meaningfully smaller than the full file,
     // return the full file — same token cost with less information is strictly
-    // worse and forces the caller to do a second read.
+    // worse and forces the caller to do a second read. Only when the full view
+    // fits the budget, though: cut to fit, it would show the first lines and
+    // hide everything after them, where the outline below names them all.
     let outline_tokens = estimate_tokens(outline.len() as u64);
     if outline_tokens >= tokens * OUTLINE_MIN_COMPRESSION / 100 {
-        return Ok(full_view());
+        let view = full_view();
+        if fits(&view) {
+            return Ok(view);
+        }
     }
 
     let mode = match file_type {
@@ -1175,6 +1180,44 @@ mod tests {
 
     // OGATE: "never-worse outline gate" — if the outline barely compresses
     // (outline_tokens >= 80% of full-file tokens), return full content instead.
+    #[test]
+    fn ogate_flat_file_over_the_budget_gets_its_outline_cut_to_fit() {
+        use std::fmt::Write as _;
+        // The same flat file as the OGATE test below, read under a budget its
+        // full view cannot fit. Falling back to the full view and cutting it
+        // there showed the first few functions and hid the rest. The outline
+        // path keeps every name it can and says what it left out.
+        let mut src = String::new();
+        for i in 0..2000 {
+            writeln!(src, "pub fn flat_{i}() {{}}").unwrap();
+        }
+        let path = write_temp("tilth_ogate_flat_budget.rs", &src);
+
+        let cache = OutlineCache::new();
+        let budget = 3_000;
+        let result = read_file(&path, None, false, &cache, false, Some(budget)).unwrap();
+
+        assert!(
+            !result.contains("[full]"),
+            "an over-budget flat file must not fall back to a cut full view: {}",
+            result.lines().next().unwrap_or("")
+        );
+        assert!(
+            result.contains("[outline]") && result.contains("of 2000 entries shown"),
+            "the outline must say how many of the functions it names: {result}"
+        );
+        assert!(
+            result.contains("fn flat_100"),
+            "the outline must name far more than the first few functions"
+        );
+        assert!(
+            estimate_tokens(result.len() as u64) <= budget,
+            "output must fit the budget"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn ogate_flat_file_returns_full_when_outline_barely_compresses() {
         use std::fmt::Write as _;
