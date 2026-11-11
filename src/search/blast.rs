@@ -84,33 +84,59 @@ pub(crate) fn blast_radius(
 
     // Calls from the edited file itself are not part of its blast radius.
     let canonical = path.canonicalize().ok()?;
-    let files: Vec<FileCallers> = find_callers_batch(&symbol_names, scope, bloom, None, |sites| {
-        let mut file = FileCallers::default();
-        for (symbol, m) in sites {
-            if m.path == canonical {
-                continue;
+    let walk = find_callers_batch(
+        &symbol_names,
+        scope,
+        bloom,
+        None,
+        Some(BLAST_STOP_AFTER),
+        |sites| {
+            let mut file = FileCallers::default();
+            for (symbol, m) in sites {
+                if m.path == canonical {
+                    continue;
+                }
+                if is_test_file(&m.path) {
+                    file.test_path.get_or_insert_with(|| m.path.clone());
+                    file.tests += 1;
+                    continue;
+                }
+                let entry = file.by_symbol.entry(symbol).or_default();
+                entry.total += 1;
+                if entry.first.len() < PROD_CALLERS_LISTED {
+                    entry.first.push((m.path, m.line, m.calling_function));
+                }
             }
-            if is_test_file(&m.path) {
-                file.test_path.get_or_insert_with(|| m.path.clone());
-                file.tests += 1;
-                continue;
-            }
-            let entry = file.by_symbol.entry(symbol).or_default();
-            entry.total += 1;
-            if entry.first.len() < PROD_CALLERS_LISTED {
-                entry.first.push((m.path, m.line, m.calling_function));
-            }
-        }
-        file
-    })
-    .ok()?
-    .per_file;
+            file
+        },
+    )
+    .ok()?;
+    let files = walk.per_file;
 
     if files.iter().all(|f| f.by_symbol.is_empty() && f.tests == 0) {
         return None;
     }
 
-    Some(format_blast_radius(&touched, &files, scope))
+    Some(format_blast_radius(
+        &touched,
+        &files,
+        walk.reached_bound,
+        scope,
+    ))
+}
+
+/// Call sites after which a blast walk stops. Blast runs on every write
+/// that touches a definition, so it must stay fast on a huge tree; past
+/// this many sites its counts are labelled lower bounds.
+pub(crate) const BLAST_STOP_AFTER: usize = 50;
+
+/// `n` as a count, prefixed "at least" when the walk stopped early.
+fn lower_bound(n: usize, partial: bool) -> String {
+    if partial {
+        format!("at least {n}")
+    } else {
+        n.to_string()
+    }
 }
 
 /// Production callers listed per symbol before the rest are counted.
@@ -136,8 +162,14 @@ struct SymbolCallers {
 }
 
 /// `files` come in path order, so a symbol's listed callers are its first
-/// by (path, line).
-fn format_blast_radius(touched: &[TouchedSymbol], files: &[FileCallers], scope: &Path) -> String {
+/// by (path, line). `partial` says the walk stopped at `BLAST_STOP_AFTER`,
+/// so every count is a lower bound.
+fn format_blast_radius(
+    touched: &[TouchedSymbol],
+    files: &[FileCallers],
+    partial: bool,
+    scope: &Path,
+) -> String {
     let mut out = String::from("\n── blast radius ──\n");
     let rel = |p: &Path| p.strip_prefix(scope).unwrap_or(p).display().to_string();
 
@@ -156,7 +188,7 @@ fn format_blast_radius(touched: &[TouchedSymbol], files: &[FileCallers], scope: 
             out,
             "{}: {} caller{}",
             ts.name,
-            total,
+            lower_bound(total, partial),
             if total == 1 { "" } else { "s" }
         );
 
@@ -170,7 +202,8 @@ fn format_blast_radius(touched: &[TouchedSymbol], files: &[FileCallers], scope: 
         }
 
         if total > PROD_CALLERS_LISTED {
-            let _ = writeln!(out, "  ... and {} more", total - PROD_CALLERS_LISTED);
+            let more = lower_bound(total - PROD_CALLERS_LISTED, partial);
+            let _ = writeln!(out, "  ... and {more} more");
         }
     }
 
@@ -193,9 +226,12 @@ fn format_blast_radius(touched: &[TouchedSymbol], files: &[FileCallers], scope: 
         if unlisted > 0 {
             let _ = write!(
                 summary,
-                ", and {unlisted} more file{}",
+                ", and {} more file{}",
+                lower_bound(unlisted, partial),
                 if unlisted == 1 { "" } else { "s" }
             );
+        } else if partial {
+            summary.push_str(", and possibly more files");
         }
 
         let _ = writeln!(out, "tests: {summary}");
@@ -320,5 +356,54 @@ mod tests {
         let edits = vec![make_edit(10, 10)];
         let result = touched_symbols(&edits, &[]);
         assert!(result.is_empty());
+    }
+
+    /// A tree with `target` defined in `lib.rs`, `files` production files
+    /// that call it three times each, and one test file that calls it
+    /// three times. Returns the blast radius of an edit to `target`'s
+    /// signature.
+    fn blast_of_tree(files: usize) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("lib.rs");
+        std::fs::write(&lib, "pub fn target(x: u32) -> u32 {\n    x\n}\n").unwrap();
+        let calls = "fn caller() {\n    target(1);\n    target(2);\n    target(3);\n}\n";
+        for i in 0..files {
+            std::fs::write(dir.path().join(format!("c{i:02}.rs")), calls).unwrap();
+        }
+        std::fs::create_dir(dir.path().join("__tests__")).unwrap();
+        std::fs::write(dir.path().join("__tests__/t.rs"), calls).unwrap();
+
+        let bloom = tilth_core::index::bloom::BloomFilterCache::new();
+        let scope = dir.path().canonicalize().unwrap();
+        blast_radius(&lib, &[make_edit(1, 1)], &scope, &bloom).expect("blast radius")
+    }
+
+    #[test]
+    fn a_blast_under_the_bound_gives_exact_counts() {
+        // 4 × 3 = 12 production calls and 3 test calls, under the bound.
+        let out = blast_of_tree(4);
+        assert!(out.contains("target: 12 callers\n"), "{out}");
+        assert!(out.contains("tests: __tests__/t.rs (3)\n"), "{out}");
+        assert!(!out.contains("at least"), "{out}");
+        assert!(!out.contains("possibly"), "{out}");
+    }
+
+    #[test]
+    fn a_blast_that_hits_the_bound_says_its_counts_are_lower_bounds() {
+        // 40 × 3 = 120 production calls, well past the bound. A write stops
+        // the walk there to stay fast, so the count must not read as exact.
+        let out = blast_of_tree(40);
+        let line = out
+            .lines()
+            .find(|l| l.starts_with("target: "))
+            .unwrap_or_else(|| panic!("no target line in {out}"));
+        let n: usize = line
+            .strip_prefix("target: at least ")
+            .and_then(|rest| rest.strip_suffix(" callers"))
+            .unwrap_or_else(|| panic!("count not labelled a lower bound: {line}"))
+            .parse()
+            .unwrap();
+        assert!((PROD_CALLERS_LISTED..=120).contains(&n), "{out}");
+        assert!(out.contains("  ... and at least "), "{out}");
     }
 }

@@ -170,7 +170,7 @@ pub fn analyze_deps(
         let symbols_set: HashSet<String> = all_names.iter().cloned().collect();
         // One `Dependent` per file that calls the target's symbols. Calls from
         // within the target file itself are self-references, not dependents.
-        let found = find_callers_batch(&symbols_set, scope, bloom, None, |sites| {
+        let found = find_callers_batch(&symbols_set, scope, bloom, None, None, |sites| {
             let dep_path = sites.first().map(|(_, m)| m.path.clone())?;
             if dep_path == *path {
                 return None;

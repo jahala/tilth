@@ -1571,11 +1571,19 @@ mod tests {
         let single: std::collections::HashSet<String> =
             std::iter::once("walker".to_string()).collect();
         let rs_callers =
-            tilth_core::find_callers_batch(&single, &scope, &bloom, Some("*.rs"), |sites| sites)
-                .expect("callers failed");
-        let toml_callers =
-            tilth_core::find_callers_batch(&single, &scope, &bloom, Some("*.toml"), |sites| sites)
-                .expect("callers toml failed");
+            tilth_core::find_callers_batch(&single, &scope, &bloom, Some("*.rs"), None, |sites| {
+                sites
+            })
+            .expect("callers failed");
+        let toml_callers = tilth_core::find_callers_batch(
+            &single,
+            &scope,
+            &bloom,
+            Some("*.toml"),
+            None,
+            |sites| sites,
+        )
+        .expect("callers toml failed");
         let rs_callers: Vec<_> = rs_callers.per_file.into_iter().flatten().collect();
         let toml_callers: Vec<_> = toml_callers.per_file.into_iter().flatten().collect();
 

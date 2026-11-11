@@ -4,13 +4,14 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use streaming_iterator::StreamingIterator;
 
 use crate::error::TilthError;
-use crate::lang::{detect_file_type, detect_file_type_with_content};
 use crate::lang::outline::outline_language;
+use crate::lang::{detect_file_type, detect_file_type_with_content};
 use crate::types::FileType;
 
 /// A single caller match — a call site of a target symbol.
@@ -38,10 +39,14 @@ pub struct CallerMatch {
 pub struct CallerWalk<T> {
     pub per_file: Vec<T>,
     pub skipped_large: Vec<PathBuf>,
+    /// The walk found at least `stop_after` call sites. It may have stopped
+    /// before visiting every file, so counts drawn from `per_file` are lower
+    /// bounds. Always false without `stop_after`.
+    pub reached_bound: bool,
 }
 
 /// Find every call site of any symbol in `targets` under `scope`, in one
-/// parallel walk that always runs to the end.
+/// parallel walk that runs to the end unless `stop_after` is set.
 ///
 /// `per_file` receives one file's call sites as (`target_name`, match)
 /// pairs in line order, and reduces them to what the caller keeps. It runs
@@ -51,6 +56,11 @@ pub struct CallerWalk<T> {
 /// the sites it will show; that is what bounds memory on a large tree.
 /// Code files over `MAX_FILE_SIZE` are not parsed; the ones whose text holds
 /// a target are listed in `skipped_large`, so a caller can say so.
+///
+/// `stop_after` is for callers that must stay fast on any tree and can say
+/// their count is a lower bound: the walk stops once it has found that many
+/// call sites, and `reached_bound` tells the caller so. Which files it
+/// reached first then depends on thread timing.
 // The std hasher is part of the signature dependents pin; a generic hasher
 // would change it for every caller.
 #[allow(clippy::implicit_hasher)]
@@ -59,6 +69,7 @@ pub fn find_callers_batch<T, F>(
     scope: &Path,
     bloom: &crate::index::bloom::BloomFilterCache,
     glob: Option<&str>,
+    stop_after: Option<usize>,
     per_file: F,
 ) -> Result<CallerWalk<T>, TilthError>
 where
@@ -67,15 +78,22 @@ where
 {
     let found: Mutex<Vec<(PathBuf, T)>> = Mutex::new(Vec::new());
     let skipped_large: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+    let sites_found = AtomicUsize::new(0);
+    let reached = |n: usize| stop_after.is_some_and(|bound| n >= bound);
 
     let walker = super::walk::walker(scope, glob)?;
 
     walker.run(|| {
         let found = &found;
         let skipped_large = &skipped_large;
+        let sites_found = &sites_found;
         let per_file = &per_file;
 
         Box::new(move |entry| {
+            if reached(sites_found.load(Ordering::Relaxed)) {
+                return ignore::WalkState::Quit;
+            }
+
             let Ok(entry) = entry else {
                 return ignore::WalkState::Continue;
             };
@@ -129,6 +147,7 @@ where
             if !file_callers.is_empty() {
                 // Stable, so two calls on one line keep the query's order.
                 file_callers.sort_by_key(|(_, m)| m.line);
+                sites_found.fetch_add(file_callers.len(), Ordering::Relaxed);
                 let kept = per_file(file_callers);
                 found
                     .lock()
@@ -151,6 +170,7 @@ where
     Ok(CallerWalk {
         per_file: found.into_iter().map(|(_, kept)| kept).collect(),
         skipped_large,
+        reached_bound: reached(sites_found.into_inner()),
     })
 }
 
@@ -325,7 +345,7 @@ mod tests {
 
         let bloom = crate::index::bloom::BloomFilterCache::new();
         let targets: HashSet<String> = std::iter::once("helper_after".to_string()).collect();
-        let found = find_callers_batch(&targets, dir.path(), &bloom, None, |sites| {
+        let found = find_callers_batch(&targets, dir.path(), &bloom, None, None, |sites| {
             sites
                 .into_iter()
                 .map(|(_, m)| m.calling_function)
@@ -339,5 +359,28 @@ mod tests {
             .map(String::as_str)
             .collect();
         assert_eq!(callers, ["comment_caller", "docstring_caller"]);
+    }
+
+    /// `reached_bound` is set exactly when the walk found `stop_after` sites,
+    /// so a caller labels a count a lower bound only when it may be one.
+    #[test]
+    fn reached_bound_says_whether_the_walk_found_stop_after_sites() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "fn a() {\n    go();\n    go();\n}\n",
+        )
+        .unwrap();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let targets: HashSet<String> = std::iter::once("go".to_string()).collect();
+        let walk = |stop_after| {
+            find_callers_batch(&targets, dir.path(), &bloom, None, stop_after, |s| s.len()).unwrap()
+        };
+
+        let unbounded = walk(None);
+        assert_eq!(unbounded.per_file, [2]);
+        assert!(!unbounded.reached_bound);
+        assert!(!walk(Some(3)).reached_bound, "2 sites under a bound of 3");
+        assert!(walk(Some(2)).reached_bound, "2 sites reach a bound of 2");
     }
 }

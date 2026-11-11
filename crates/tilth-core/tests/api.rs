@@ -316,7 +316,7 @@ fn callers_across_two_files_name_the_calling_function_and_line() {
     let bloom = BloomFilterCache::new();
     let targets: HashSet<String> = ["greet".to_string()].into_iter().collect();
     let found: Vec<(String, CallerMatch)> =
-        find_callers_batch(&targets, dir.path(), &bloom, None, |sites| sites)
+        find_callers_batch(&targets, dir.path(), &bloom, None, None, |sites| sites)
             .unwrap()
             .per_file
             .into_iter()

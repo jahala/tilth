@@ -50,7 +50,7 @@ fn collect_sites(
     keep: usize,
 ) -> Result<(HashMap<String, TargetSites>, Vec<PathBuf>), TilthError> {
     let merged: Mutex<HashMap<String, TargetSites>> = Mutex::new(HashMap::new());
-    let walk = find_callers_batch(targets, scope, bloom, glob, |sites| {
+    let walk = find_callers_batch(targets, scope, bloom, glob, None, |sites| {
         let mut by_target: HashMap<String, TargetSites> = HashMap::new();
         for (target, m) in sites {
             let entry = by_target.entry(target).or_default();
@@ -290,7 +290,7 @@ fn write_second_hop_impact(
             .then_with(|| a.line.cmp(&b.line))
     };
     let first: Mutex<(usize, Vec<(String, CallerMatch)>)> = Mutex::new((0, Vec::new()));
-    let walked = find_callers_batch(all_caller_names, scope, bloom, glob, |sites| {
+    let walked = find_callers_batch(all_caller_names, scope, bloom, glob, None, |sites| {
         let mut seen: HashSet<String> = HashSet::new();
         let mut file_first: Vec<(String, CallerMatch)> = Vec::new();
         for (via, m) in sites {

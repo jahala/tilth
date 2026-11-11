@@ -493,7 +493,7 @@ pub fn grok(
             .then_with(|| a.1.line.cmp(&b.1.line))
     };
     let split: std::sync::Mutex<CallerSplit> = std::sync::Mutex::new(CallerSplit::default());
-    let walk = find_callers_batch(&symbols, scope, bloom, None, |sites| {
+    let walk = find_callers_batch(&symbols, scope, bloom, None, None, |sites| {
         let mut file = CallerSplit::default();
         for (_, m) in sites {
             if is_recursive_call_site(&m, &canonical_target, &target) {

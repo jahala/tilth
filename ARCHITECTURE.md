@@ -515,7 +515,8 @@ machinery:
   (`tilth-core`) is the single tree-sitter walk that resolves call sites for any number of target
   symbols (1 to N) — `search_callers_expanded` calls it with a
   one-element set, the deps / blast / 2nd-hop paths call it with the
-  full set. The walk always runs to the end. It hands each file's call
+  full set. The walk runs to the end unless the caller passes a
+  `stop_after` bound; only the two blast paths do (see Blast). It hands each file's call
   sites, in line order, to a function the caller passes, and returns
   that function's results in path order. Each caller counts there and
   keeps only what it shows, merged into a running top N under a total
@@ -548,8 +549,11 @@ machinery:
   too. The external-dep stdlib
   heuristic (`is_stdlib`) is per-language; module-path validation
   (`is_valid_module_path`) avoids treating relative paths as packages.
-- **Blast** (`blast.rs`) — symbol-level blast radius for diff
-  workflows; called by `tilth_diff --blast`.
+- **Blast** (`blast.rs`) — symbol-level blast radius, printed after
+  every edit-mode write that touches a definition and counted by
+  `tilth_diff --blast`. A write must stay fast on any tree, so both
+  walks stop at `BLAST_STOP_AFTER` (50) call sites, and a count that
+  reached the bound reads "at least N".
 
 ### Glob (`glob.rs`)
 
