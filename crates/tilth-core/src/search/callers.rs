@@ -271,7 +271,7 @@ fn owners_in_tree(
 }
 
 /// Is `path` a code file the walk would parse, over the size cap, whose text
-/// holds one of `targets`?
+/// names one of `targets` as a whole word? `renew` is no call of `new`.
 fn oversized_code_holding(path: &Path, targets: &HashSet<String>) -> bool {
     let too_big = std::fs::metadata(path).is_ok_and(|m| m.len() > crate::source::MAX_FILE_SIZE);
     if !too_big {
@@ -283,11 +283,7 @@ fn oversized_code_holding(path: &Path, targets: &HashSet<String>) -> bool {
     if outline_language(lang).is_none() {
         return false;
     }
-    std::fs::read(path).is_ok_and(|bytes| {
-        targets
-            .iter()
-            .any(|t| memchr::memmem::find(&bytes, t.as_bytes()).is_some())
-    })
+    std::fs::read(path).is_ok_and(|bytes| targets.iter().any(|t| super::deps::mentions(&bytes, t)))
 }
 
 /// Tree-sitter call site detection for a set of target symbols, from one
@@ -618,6 +614,35 @@ mod tests {
 
         let cpp = "struct B { int run(); };\nint B::run() { return go(); }\n";
         assert_eq!(caller_labels("b.cpp", cpp, "go"), labels(&[(2, "B.run")]));
+    }
+
+    /// A file skipped for size is listed only when it names a target as a
+    /// whole word: `renew` holds the text `new`, but no call of `new`.
+    #[test]
+    fn a_big_file_is_listed_only_when_it_names_a_target_as_a_word() {
+        let dir = tempfile::tempdir().unwrap();
+        let limit = usize::try_from(crate::source::MAX_FILE_SIZE).unwrap();
+        let pad = "// padding line to push the file over the size limit\n".repeat(limit / 50 + 1);
+        std::fs::write(
+            dir.path().join("word.rs"),
+            format!("{pad}fn a() {{ new(); }}\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("part.rs"),
+            format!("{pad}fn b() {{ renew(); }}\n"),
+        )
+        .unwrap();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let targets: HashSet<String> = std::iter::once("new".to_string()).collect();
+        let walk =
+            find_callers_batch(&targets, dir.path(), &bloom, None, None, |s| s.len()).unwrap();
+        let names: Vec<_> = walk
+            .skipped_large
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, ["word.rs"]);
     }
 
     /// `reached_bound` is set exactly when the walk found `stop_after` sites,

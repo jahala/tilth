@@ -33,7 +33,7 @@ pub struct DepsResult {
     /// first, then non-tests before tests, then by path.
     pub used_by: Vec<Dependent>,
     /// Code files skipped for size although they name one of the target's
-    /// symbols, so they may be dependents nobody checked.
+    /// symbols or its module, so they may be dependents nobody checked.
     pub skipped_large: Vec<PathBuf>,
     pub exported_count: usize,
     /// The names left out of the call-site search, because the file has
@@ -66,7 +66,8 @@ pub struct Dependent {
     pub via: Option<PathBuf>,
 }
 
-/// Analyse the dependency graph for `path` within `scope`.
+/// Analyse the dependency graph for `path` within `scope`. The paths in the
+/// result are canonical.
 ///
 /// Phase 1: Extract exported symbols from the outline.
 /// Phase 2: Forward dependencies — what this file uses.
@@ -76,9 +77,16 @@ pub fn analyze_deps(
     scope: &Path,
     bloom: &crate::index::bloom::BloomFilterCache,
 ) -> Result<DepsResult, TilthError> {
-    // Canonicalize for reliable path comparison (callers return absolute paths).
+    // Canonicalize both, so the walk names files the way import resolution
+    // and the target do: through a symlinked scope (any path under `/tmp`
+    // on macOS) they would never compare equal. Every path returned is
+    // canonical.
     let path = &path.canonicalize().map_err(|e| TilthError::IoError {
         path: path.to_path_buf(),
+        source: e,
+    })?;
+    let scope = &scope.canonicalize().map_err(|e| TilthError::IoError {
+        path: scope.to_path_buf(),
         source: e,
     })?;
 
@@ -133,7 +141,14 @@ pub fn analyze_deps(
     // The files that import this one. What their import statements name
     // is what other files use, so past the cap those names are searched
     // first.
-    let direct = importers_of(std::slice::from_ref(path), scope, &|_| true, false)?;
+    let mut skipped_importers = Vec::new();
+    let direct = importers_of(
+        std::slice::from_ref(path),
+        scope,
+        &|_| true,
+        false,
+        &mut skipped_importers,
+    )?;
     let (searched, unsearched) = choose_names(all_names, &direct);
 
     // ── Phase 2: Forward dependencies ────────────────────────────────────────
@@ -158,8 +173,11 @@ pub fn analyze_deps(
     let imports = extract_imports(&content, lang);
     let mut external_set: HashSet<String> = HashSet::new();
     for import in &imports {
-        if let Some(import_path) = resolve_import(path, lang, import) {
-            local_by_file.entry(import_path).or_default();
+        let local = resolve_import(path, lang, import);
+        if !local.is_empty() {
+            for import_path in local {
+                local_by_file.entry(import_path).or_default();
+            }
         } else if is_external(&import.source, lang)
             && !is_stdlib(&import.source, lang)
             && is_valid_module_path(&import.source)
@@ -229,7 +247,14 @@ pub fn analyze_deps(
     // does not depend on the target.
     let mut every_name = searched;
     every_name.extend(unsearched.iter().cloned());
-    for importer in with_reexport_importers(path, direct, scope, &every_name)? {
+    let importers =
+        with_reexport_importers(path, direct, scope, &every_name, &mut skipped_importers)?;
+    // A big file that names the target's module was not read for imports.
+    let mut skipped_large = skipped_large;
+    skipped_large.extend(skipped_importers);
+    skipped_large.sort();
+    skipped_large.dedup();
+    for importer in importers {
         let dependent = found_by_path
             .entry(importer.path.clone())
             .or_insert_with(|| Dependent {
@@ -300,7 +325,7 @@ fn choose_names(names: Vec<String>, importers: &[Importer]) -> (Vec<String>, Vec
         .map(|name| {
             let imported_by = importers
                 .iter()
-                .filter(|i| mentions(&i.statements, &name))
+                .filter(|i| mentions(i.statements.as_bytes(), &name))
                 .count();
             (imported_by, name)
         })
@@ -323,6 +348,7 @@ fn with_reexport_importers(
     direct: Vec<Importer>,
     scope: &Path,
     names: &[String],
+    skipped_large: &mut Vec<PathBuf>,
 ) -> Result<Vec<Importer>, TilthError> {
     let mut seen: HashSet<PathBuf> = HashSet::from([target.to_path_buf()]);
     let mut out = Vec::new();
@@ -340,9 +366,9 @@ fn with_reexport_importers(
         }
         out.push(importer);
     }
-    let names_one = |text: &str| names.iter().any(|n| mentions(text, n));
+    let names_one = |text: &str| names.iter().any(|n| mentions(text.as_bytes(), n));
     while !barrels.is_empty() {
-        let found = importers_of(&barrels, scope, &names_one, true)?;
+        let found = importers_of(&barrels, scope, &names_one, true, skipped_large)?;
         barrels = Vec::new();
         for importer in found {
             let canonical = importer
@@ -366,19 +392,23 @@ fn with_reexport_importers(
 /// path. A file is parsed only when its text names a target's module and
 /// passes `keep`, so the walk parses few files. With `through`, the
 /// targets are re-exporting files, and each importer records the one it
-/// imports as its `via`.
+/// imports as its `via`. Files over the size cap whose text holds a
+/// target's `module_name` as a word are added to `skipped_large`.
 fn importers_of(
     targets: &[PathBuf],
     scope: &Path,
     keep: &(dyn Fn(&str) -> bool + Sync),
     through: bool,
+    skipped_large: &mut Vec<PathBuf>,
 ) -> Result<Vec<Importer>, TilthError> {
     let stems: Vec<String> = targets.iter().flat_map(|t| module_stems(t)).collect();
     let names: HashSet<&std::ffi::OsStr> = targets.iter().filter_map(|t| t.file_name()).collect();
     let found: Mutex<Vec<Importer>> = Mutex::new(Vec::new());
+    let too_large: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
     let walker = super::walk::walker(scope, None)?;
     walker.run(|| {
         let found = &found;
+        let too_large = &too_large;
         let stems = &stems;
         let names = &names;
         Box::new(move |entry| {
@@ -389,11 +419,16 @@ fn importers_of(
                 return ignore::WalkState::Continue;
             }
             let file = entry.path();
-            if let Some(importer) = imports_one_of(file, targets, stems, names, keep, through) {
-                found
+            match imports_one_of(file, targets, stems, names, keep, through) {
+                ImportScan::Importer(importer) => found
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .push(importer);
+                    .push(importer),
+                ImportScan::TooLarge => too_large
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(file.to_path_buf()),
+                ImportScan::No => {}
             }
             ignore::WalkState::Continue
         })
@@ -402,7 +437,20 @@ fn importers_of(
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     found.sort_by(|a, b| a.path.cmp(&b.path));
+    skipped_large.extend(
+        too_large
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
     Ok(found)
+}
+
+/// What one file of an importer walk is.
+enum ImportScan {
+    Importer(Importer),
+    /// Over the size cap, with a target's module named in its text.
+    TooLarge,
+    No,
 }
 
 /// `file` as an `Importer` of one of `targets`, if its imports name one.
@@ -413,11 +461,8 @@ fn imports_one_of(
     names: &HashSet<&std::ffi::OsStr>,
     keep: &(dyn Fn(&str) -> bool + Sync),
     through: bool,
-) -> Option<Importer> {
-    if std::fs::metadata(file).ok()?.len() > crate::source::MAX_FILE_SIZE {
-        return None;
-    }
-    if !matches!(
+) -> ImportScan {
+    let importable = matches!(
         crate::lang::detect_file_type(file),
         FileType::Code(
             Lang::Rust
@@ -429,15 +474,56 @@ fn imports_one_of(
                 | Lang::Cpp
                 | Lang::Bash
         )
-    ) {
-        return None;
+    );
+    if !importable {
+        return ImportScan::No;
     }
+    let Ok(meta) = std::fs::metadata(file) else {
+        return ImportScan::No;
+    };
+    if meta.len() > crate::source::MAX_FILE_SIZE {
+        let names_a_module = std::fs::read(file).is_ok_and(|bytes| {
+            targets
+                .iter()
+                .filter_map(|target| module_name(target))
+                .any(|name| mentions(&bytes, name))
+        });
+        return if names_a_module {
+            ImportScan::TooLarge
+        } else {
+            ImportScan::No
+        };
+    }
+    match importer_from(file, targets, stems, names, keep, through) {
+        Some(importer) => ImportScan::Importer(importer),
+        None => ImportScan::No,
+    }
+}
+
+/// `file`, under the size cap, as an `Importer` of one of `targets`.
+fn importer_from(
+    file: &Path,
+    targets: &[PathBuf],
+    stems: &[String],
+    names: &HashSet<&std::ffi::OsStr>,
+    keep: &(dyn Fn(&str) -> bool + Sync),
+    through: bool,
+) -> Option<Importer> {
     let content = crate::source::read_source(file).ok()?;
     if !stems
         .iter()
         .any(|s| memchr::memmem::find(content.as_bytes(), s.as_bytes()).is_some())
-        || !keep(&content)
     {
+        return None;
+    }
+    // A file that names none of what `keep` wants can still pass it all on
+    // with a star statement (`export * from`), which spells no name. Any
+    // `*` would not do as a pre-filter: most Python files hold `*args`.
+    let mentions_wanted = keep(&content);
+    let may_star = ["import *", "export *"]
+        .iter()
+        .any(|star| memchr::memmem::find(content.as_bytes(), star.as_bytes()).is_some());
+    if !mentions_wanted && !may_star {
         return None;
     }
     let FileType::Code(lang) = detect_file_type_with_content(file, &content) else {
@@ -446,26 +532,31 @@ fn imports_one_of(
     let mut lines = Vec::new();
     let mut statements = String::new();
     let mut via = None;
-    let mut reexports = is_reexporting_file(file);
+    let barrel_file = is_reexporting_file(file);
+    let mut reexports = barrel_file;
     let own_path = file.canonicalize().ok()?;
     for import in extract_imports(&content, lang) {
-        let Some(resolved) = resolve_import(file, lang, &import) else {
+        let target = resolve_import(file, lang, &import)
+            .into_iter()
+            .filter(|r| r.file_name().is_some_and(|n| names.contains(n)))
+            .map(|r| r.canonicalize().unwrap_or(r))
+            .find(|r| targets.contains(r) && *r != own_path);
+        let Some(resolved) = target else {
             continue;
         };
-        if !resolved.file_name().is_some_and(|n| names.contains(n)) {
-            continue;
-        }
-        let resolved = resolved.canonicalize().unwrap_or(resolved);
-        if !targets.contains(&resolved) || resolved == own_path {
-            continue;
-        }
         let statement = content
             .lines()
             .skip(import.start_line as usize - 1)
             .take((import.end_line - import.start_line) as usize + 1)
             .collect::<Vec<_>>()
             .join("\n");
-        if !keep(&statement) {
+        // A star statement takes every name without spelling one. Passing
+        // them on (`export *`, or a star import in a package's entry file)
+        // carries the target to the file's own importers; taking them
+        // (`import * as ns`) uses the target when the file names it.
+        let star = star_statement(&statement, lang);
+        let passes_on = star.is_some_and(|reexport| reexport || barrel_file);
+        if !(keep(&statement) || passes_on || (star.is_some() && mentions_wanted)) {
             continue;
         }
         lines.push(import.start_line);
@@ -495,6 +586,33 @@ fn imports_one_of(
     })
 }
 
+/// Whether `statement` takes every name a module exports: `Some(true)` for
+/// a JavaScript or TypeScript `export * from`, which passes them on, and
+/// `Some(false)` for `import * as ns from` or Python's `from m import *`.
+fn star_statement(statement: &str, lang: Lang) -> Option<bool> {
+    let text = statement.trim_start();
+    match lang {
+        Lang::TypeScript | Lang::Tsx | Lang::JavaScript => {
+            let rest = |keyword: &str| {
+                text.strip_prefix(keyword)
+                    .is_some_and(|r| r.trim_start().starts_with('*'))
+            };
+            if rest("export") {
+                Some(true)
+            } else if rest("import") {
+                Some(false)
+            } else {
+                None
+            }
+        }
+        Lang::Python => text
+            .split_once(" import ")
+            .is_some_and(|(_, names)| names.trim() == "*")
+            .then_some(false),
+        _ => None,
+    }
+}
+
 /// A file whose role is to re-export its package: `index.ts`, `__init__.py`.
 fn is_reexporting_file(file: &Path) -> bool {
     let name = file.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -505,29 +623,38 @@ fn is_reexporting_file(file: &Path) -> bool {
         )
 }
 
-/// The words an import of `path` contains one of: its file stem, and for
-/// a package's entry file (`index.ts`, `__init__.py`, `mod.rs`) its
-/// directory's name, which is how most imports name a package.
+/// The words an import of `path` contains one of: its module's name, and
+/// its file stem, by which a file beside a package's entry file can import
+/// it (`./index`).
 fn module_stems(path: &Path) -> Vec<String> {
-    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-        return Vec::new();
-    };
-    let mut stems = vec![stem.to_string()];
-    if matches!(stem, "index" | "__init__" | "mod") {
-        if let Some(dir) = path
-            .parent()
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str())
-        {
-            stems.push(dir.to_string());
-        }
-    }
+    let stem = path.file_stem().and_then(|s| s.to_str());
+    let mut stems: Vec<String> = module_name(path)
+        .into_iter()
+        .chain(stem)
+        .map(str::to_string)
+        .collect();
+    stems.dedup();
     stems
 }
 
+/// The name an import gives `path`'s module: its file stem, or for a
+/// package's entry file (`mod.rs`, `index.ts`, `__init__.py`) its
+/// directory's name. The entry's own stem names no one package, and
+/// nearly every big file holds it as a word, as in `mod tests`.
+fn module_name(path: &Path) -> Option<&str> {
+    let is_package_entry =
+        is_reexporting_file(path) || path.file_name().is_some_and(|n| n == "mod.rs");
+    let name = if is_package_entry {
+        path.parent()?.file_name()
+    } else {
+        path.file_stem()
+    };
+    name?.to_str()
+}
+
 /// `content` holds `name` as a whole identifier.
-fn mentions(content: &str, name: &str) -> bool {
-    let bytes = content.as_bytes();
+pub(crate) fn mentions(content: &[u8], name: &str) -> bool {
+    let bytes = content;
     let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
     memchr::memmem::find_iter(bytes, name.as_bytes()).any(|at| {
         let before = at.checked_sub(1).map(|i| bytes[i]);
@@ -718,6 +845,7 @@ mod tests {
     fn dependents_of(root: &Path, rel: &str) -> Vec<(String, Vec<String>, Option<String>)> {
         let bloom = crate::index::bloom::BloomFilterCache::new();
         let result = analyze_deps(&root.join(rel), root, &bloom).unwrap();
+        let root = &root.canonicalize().unwrap();
         result
             .used_by
             .into_iter()
@@ -827,6 +955,41 @@ mod tests {
         );
     }
 
+    /// A scope reached through a symlink (on macOS, any path under `/tmp`)
+    /// names its files by the link, while the target is canonical. The
+    /// target's own calls must still not make it its own dependent, and a
+    /// dependent's `via` must sit under the scope like its path.
+    #[cfg(unix)]
+    #[test]
+    fn a_scope_through_a_symlink_gives_the_same_dependents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().canonicalize().unwrap().join("real");
+        write(&real, "src/service.ts", "export function serve() { return 1; }\nexport function twice() { return serve() + serve(); }\n");
+        write(&real, "src/index.ts", "export * from \"./service\";\n");
+        write(
+            &real,
+            "c.ts",
+            "import { serve } from \"./src\";\nexport const s = serve;\n",
+        );
+        write(
+            &real,
+            "d.ts",
+            "import { serve } from \"./src/service\";\nexport const t = 1;\n",
+        );
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let found = dependents_of(&link, "src/service.ts");
+        assert_eq!(found, dependents_of(&real, "src/service.ts"));
+        assert_eq!(
+            found,
+            [
+                ("src/index.ts".to_string(), vec![], None),
+                ("c.ts".to_string(), vec![], Some("src/index.ts".to_string())),
+                ("d.ts".to_string(), vec![], None),
+            ]
+        );
+    }
+
     /// A TS barrel passes its module on: a file that imports a name from
     /// the barrel depends on the module that defines it.
     #[test]
@@ -873,6 +1036,129 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    /// `export * from` passes every name on, however many barrels deep, and
+    /// a namespace import takes them all. Neither statement names `serve`,
+    /// so a filter on names broke the chain at the second barrel and lost
+    /// the namespace importer. A namespace importer that never uses the
+    /// name still does not depend on the target.
+    #[test]
+    fn star_re_exports_chain_and_namespace_imports_are_dependents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        write(
+            &root,
+            "src/core/service.ts",
+            "export function serve() { return 1; }\n",
+        );
+        write(&root, "src/core/index.ts", "export * from \"./service\";\n");
+        write(&root, "src/index.ts", "export * from \"./core\";\n");
+        write(
+            &root,
+            "app.ts",
+            "import { serve } from \"./src\";\nexport const a = serve;\n",
+        );
+        write(
+            &root,
+            "ns.ts",
+            "import * as core from \"./src/core\";\nexport const n = core.serve;\n",
+        );
+        write(
+            &root,
+            "unused.ts",
+            "import * as core from \"./src/core\";\nexport const u = core.other;\n",
+        );
+        let found = dependents_of(&root, "src/core/service.ts");
+        assert_eq!(
+            found,
+            [
+                ("src/core/index.ts".to_string(), vec![], None),
+                (
+                    "app.ts".to_string(),
+                    vec![],
+                    Some("src/index.ts".to_string())
+                ),
+                (
+                    "ns.ts".to_string(),
+                    vec![],
+                    Some("src/core/index.ts".to_string())
+                ),
+                (
+                    "src/index.ts".to_string(),
+                    vec![],
+                    Some("src/core/index.ts".to_string())
+                ),
+            ]
+        );
+    }
+
+    /// A file over the size cap is not read for its imports. When it names
+    /// the target's module, the result lists it as skipped, as the call
+    /// search does for a file that names one of the target's names.
+    #[test]
+    fn a_big_importer_is_listed_as_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        write(&root, "service.py", "def serve():\n    return 1\n");
+        let limit = usize::try_from(crate::source::MAX_FILE_SIZE).unwrap();
+        let pad = "# padding line to push the file over the size limit\n".repeat(limit / 50 + 1);
+        write(&root, "big.py", &format!("import service\n{pad}"));
+        write(&root, "other_big.py", &pad);
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let result = analyze_deps(&root.join("service.py"), &root, &bloom).unwrap();
+        assert_eq!(result.skipped_large, [root.join("big.py")]);
+    }
+
+    /// A package's entry file is named in imports by its directory. The
+    /// entry stem itself (`mod`, `index`, `__init__`) is a word nearly every
+    /// big file holds, as in `mod tests {}`, so it made every big file a
+    /// skipped importer.
+    #[test]
+    fn a_big_file_is_listed_only_when_it_names_the_package() {
+        let limit = usize::try_from(crate::source::MAX_FILE_SIZE).unwrap();
+        let pad = |line: &str| format!("{line}\n").repeat(limit / line.len() + 1);
+        let cases = [
+            (
+                "src/foo/mod.rs",
+                "pub fn target() {}\n",
+                "big.rs",
+                "mod tests {}",
+                "mod foo;",
+            ),
+            (
+                "lib/index.js",
+                "export function target() {}\n",
+                "big.js",
+                "// index",
+                "import * as lib from './lib';",
+            ),
+            (
+                "pkg/__init__.py",
+                "def target():\n    pass\n",
+                "big.py",
+                "# __init__",
+                "import pkg",
+            ),
+        ];
+        for (entry, source, big, entry_word, import) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().canonicalize().unwrap();
+            write(&root, entry, source);
+            write(&root, big, &pad(entry_word));
+            write(
+                &root,
+                &format!("named_{big}"),
+                &format!("{import}\n{}", pad(entry_word)),
+            );
+            let bloom = crate::index::bloom::BloomFilterCache::new();
+            let result = analyze_deps(&root.join(entry), &root, &bloom).unwrap();
+            assert_eq!(
+                result.skipped_large,
+                [root.join(format!("named_{big}"))],
+                "{entry}"
+            );
+        }
     }
 
     /// Past the cap, the names other files import are searched first, and
