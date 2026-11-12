@@ -139,6 +139,10 @@ fn only_the_runner_starts_git() {
 #[test]
 fn a_missing_git_is_named_in_the_diff_error() {
     let repo = tempfile::tempdir().expect("create tempdir");
+    // The file pair exists, so the diff gets as far as git.
+    for name in ["a.rs", "b.rs"] {
+        std::fs::write(repo.path().join(name), "").expect("write file");
+    }
     let no_git = tempfile::tempdir().expect("create tempdir");
     let not_found = std::io::Error::from_raw_os_error(2);
     for (args, command) in [

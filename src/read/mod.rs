@@ -93,9 +93,9 @@ fn stream(
 }
 
 /// The error a read reports for an I/O failure on `path`, so a read fails
-/// the same way whichever step hit the error. A missing path names a
-/// similar one.
-fn path_error(path: &Path, source: io::Error) -> TilthError {
+/// the same way whichever step hit the error, as does a file that a diff
+/// compares. A missing path names a similar one.
+pub(crate) fn path_error(path: &Path, source: io::Error) -> TilthError {
     TilthError::from_io(path, source, || suggest_similar(path))
 }
 
