@@ -16,6 +16,7 @@ use std::fmt;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 /// Settings pinned on every command. User config can otherwise quote
@@ -28,7 +29,7 @@ const PINNED: [&str; 4] = [
     "diff.suppressBlankEmpty=false",
 ];
 
-/// How often a command with a time limit checks whether git has exited.
+/// How often a command with a deadline checks whether git has exited.
 const POLL: Duration = Duration::from_millis(5);
 
 /// One git command, built up and then run.
@@ -41,7 +42,7 @@ pub(crate) struct Git<'a> {
     revisions: Vec<&'a str>,
     paths: Vec<&'a Path>,
     also_success: Option<i32>,
-    limit: Option<Duration>,
+    deadline: Option<Instant>,
 }
 
 impl<'a> Git<'a> {
@@ -54,7 +55,7 @@ impl<'a> Git<'a> {
             revisions: Vec::new(),
             paths: Vec::new(),
             also_success: None,
-            limit: None,
+            deadline: None,
         }
     }
 
@@ -85,10 +86,10 @@ impl<'a> Git<'a> {
     }
 
     /// Stop git and fail with [`GitError::TimedOut`] if it has not exited
-    /// within `limit`. Its output is read once it exits, so a command that
-    /// prints more than the pipe holds waits until the limit (#356).
-    pub(crate) fn time_limit(mut self, limit: Duration) -> Self {
-        self.limit = Some(limit);
+    /// by `deadline`. Several commands can share one deadline, so together
+    /// they take no longer than it allows.
+    pub(crate) fn deadline(mut self, deadline: Instant) -> Self {
+        self.deadline = Some(deadline);
         self
     }
 
@@ -97,11 +98,11 @@ impl<'a> Git<'a> {
         let command = self.command;
         let io = |source| GitError::Io { command, source };
         let child = self.to_command().spawn().map_err(io)?;
-        let output = match self.limit {
+        let output = match self.deadline {
             None => child.wait_with_output().map_err(io)?,
-            Some(limit) => wait_within(child, limit)
+            Some(deadline) => wait_until(child, deadline)
                 .map_err(io)?
-                .ok_or(GitError::TimedOut { command, limit })?,
+                .ok_or(GitError::TimedOut { command })?,
         };
         if !(output.status.success() || output.status.code() == self.also_success) {
             return Err(GitError::Failed {
@@ -137,34 +138,73 @@ impl<'a> Git<'a> {
     }
 }
 
-/// Wait for `child` until `limit` has passed, then read what it printed.
-/// `None` when it was still running and has been stopped.
-fn wait_within(mut child: Child, limit: Duration) -> io::Result<Option<Output>> {
-    let deadline = Instant::now() + limit;
+/// Wait for `child` until `deadline`, and return what it printed. `None`
+/// when it was still running and has been stopped.
+///
+/// Its output is read while it runs. A pipe holds only 64 KiB, and git waits
+/// on a full pipe, so a git that printed more would otherwise never exit
+/// before the deadline (#356).
+fn wait_until(mut child: Child, deadline: Instant) -> io::Result<Option<Output>> {
+    let readers = child
+        .stdout
+        .take()
+        .map(drain)
+        .transpose()
+        .and_then(|stdout| {
+            let stderr = child.stderr.take().map(drain).transpose()?;
+            Ok((stdout, stderr))
+        });
+    let (stdout, stderr) = match readers {
+        Ok(readers) => readers,
+        Err(e) => {
+            stop(&mut child);
+            return Err(e);
+        }
+    };
     loop {
         if let Some(status) = child.try_wait()? {
-            let mut output = Output {
+            return Ok(Some(Output {
                 status,
-                stdout: Vec::new(),
-                stderr: Vec::new(),
-            };
-            if let Some(mut stdout) = child.stdout.take() {
-                stdout.read_to_end(&mut output.stdout)?;
-            }
-            if let Some(mut stderr) = child.stderr.take() {
-                stderr.read_to_end(&mut output.stderr)?;
-            }
-            return Ok(Some(output));
+                stdout: drained(stdout)?,
+                stderr: drained(stderr)?,
+            }));
         }
         if Instant::now() >= deadline {
-            // Kill fails only if git exited in the meantime, and the wait
-            // then just reaps it, so neither result changes the outcome.
-            let _ = child.kill();
-            let _ = child.wait();
+            // The readers are not joined: each ends when its pipe closes,
+            // and a process git started may hold a pipe open past the
+            // deadline.
+            stop(&mut child);
             return Ok(None);
         }
-        std::thread::sleep(POLL);
+        thread::sleep(POLL);
     }
+}
+
+/// Kill `child` and reap it. Kill fails only if it exited in the meantime,
+/// and the wait then just reaps it, so neither result changes the outcome.
+fn stop(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// A thread that reads `pipe` to its end.
+fn drain(mut pipe: impl Read + Send + 'static) -> io::Result<JoinHandle<io::Result<Vec<u8>>>> {
+    thread::Builder::new().spawn(move || {
+        let mut bytes = Vec::new();
+        pipe.read_to_end(&mut bytes).map(|_| bytes)
+    })
+}
+
+/// What a [`drain`] thread read, once its pipe has closed.
+fn drained(reader: Option<JoinHandle<io::Result<Vec<u8>>>>) -> io::Result<Vec<u8>> {
+    reader.map_or_else(
+        || Ok(Vec::new()),
+        |reader| {
+            reader
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        },
+    )
 }
 
 /// The top of the work tree `dir` is in. Git prints every diff path
@@ -214,11 +254,8 @@ pub(crate) enum GitError {
         command: &'static str,
         stderr: String,
     },
-    /// Git had not exited within its time limit and was stopped.
-    TimedOut {
-        command: &'static str,
-        limit: Duration,
-    },
+    /// Git had not exited by its deadline and was stopped.
+    TimedOut { command: &'static str },
 }
 
 impl fmt::Display for GitError {
@@ -227,11 +264,7 @@ impl fmt::Display for GitError {
             Self::Io { command, source } => write!(f, "failed to run git {command}: {source}"),
             Self::NotARepository { stderr } => write!(f, "git rev-parse failed: {stderr}"),
             Self::Failed { command, stderr } => write!(f, "git {command} failed: {stderr}"),
-            Self::TimedOut { command, limit } => write!(
-                f,
-                "git {command} did not finish within {} ms",
-                limit.as_millis()
-            ),
+            Self::TimedOut { command } => write!(f, "git {command} did not finish in time"),
         }
     }
 }
@@ -250,7 +283,7 @@ impl std::error::Error for GitError {
     clippy::disallowed_methods,
     reason = "by design: tests read the files they check directly"
 )]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// tilth only reads a repository, so git must never take the index lock
@@ -279,15 +312,22 @@ mod tests {
         String::from_utf8_lossy(&out.stderr).trim().to_string()
     }
 
-    /// An empty repository.
-    fn repo() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().expect("create tempdir");
+    /// What `git <args>` prints in `dir`, trimmed. Fixtures are built with
+    /// git itself, outside the runner, so the runner is not testing itself.
+    pub(crate) fn git(dir: &Path, args: &[&str]) -> String {
         let out = Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(dir.path())
+            .args(args)
+            .current_dir(dir)
             .output()
-            .expect("run git init");
-        assert!(out.status.success(), "git init");
+            .expect("run git");
+        assert!(out.status.success(), "git {args:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// An empty repository.
+    pub(crate) fn repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        git(dir.path(), &["init", "-q"]);
         dir
     }
 
@@ -381,31 +421,51 @@ mod tests {
         assert!(differ().success_on(1).run().is_ok());
     }
 
-    /// Git cannot exit before a limit of zero passes, so it is stopped.
+    /// Git cannot exit before a deadline that has already passed, so it is
+    /// stopped.
     #[test]
-    fn a_command_past_its_limit_is_stopped() {
+    fn a_command_past_its_deadline_is_stopped() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let err = Git::new(dir.path(), "version")
-            .time_limit(Duration::ZERO)
+            .deadline(Instant::now())
             .run()
             .unwrap_err();
         assert!(
-            matches!(err, GitError::TimedOut { command: "version", limit } if limit.is_zero()),
+            matches!(err, GitError::TimedOut { command: "version" }),
             "{err:?}"
         );
-        assert_eq!(err.to_string(), "git version did not finish within 0 ms");
+        assert_eq!(err.to_string(), "git version did not finish in time");
     }
 
-    /// Within its limit, a command gives the same result as without one.
+    /// Before its deadline, a command gives the same result as without one.
     #[test]
-    fn a_command_within_its_limit_returns_its_output() {
+    fn a_command_within_its_deadline_returns_its_output() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let bounded = Git::new(dir.path(), "version")
-            .time_limit(Duration::from_secs(60))
+            .deadline(Instant::now() + Duration::from_secs(60))
             .run()
             .unwrap();
         let unbounded = Git::new(dir.path(), "version").run().unwrap();
         assert!(bounded.starts_with("git version "), "{bounded}");
         assert_eq!(bounded, unbounded);
+    }
+
+    /// Output larger than a pipe holds is read while git runs, so git can
+    /// finish writing it and exit (#356).
+    #[test]
+    fn output_longer_than_a_pipe_arrives_before_the_deadline() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        std::fs::write(&a, "").unwrap();
+        std::fs::write(&b, "line\n".repeat(32 * 1024)).unwrap();
+        let patch = Git::new(dir.path(), "diff")
+            .args(&["--no-index"])
+            .path(&a)
+            .path(&b)
+            .success_on(1)
+            .deadline(Instant::now() + Duration::from_secs(60))
+            .run()
+            .unwrap();
+        assert!(patch.len() > 128 * 1024, "{} bytes", patch.len());
     }
 }
