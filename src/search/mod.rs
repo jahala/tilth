@@ -296,7 +296,7 @@ pub fn search_symbol(
 ) -> Result<String, TilthError> {
     let result = symbol::search(query, walk, None, full)?;
     let bloom = tilth_core::index::bloom::BloomFilterCache::new();
-    format_search_result(&result, cache, None, &bloom, 0, None)
+    format_search_result(&result, walk, cache, None, &bloom, 0, None)
 }
 
 #[expect(
@@ -315,7 +315,7 @@ pub fn search_symbol_expanded(
     budget: Option<u64>,
 ) -> Result<String, TilthError> {
     let result = symbol::search(query, walk, context, full)?;
-    format_search_result(&result, cache, Some(session), bloom, expand, budget)
+    format_search_result(&result, walk, cache, Some(session), bloom, expand, budget)
 }
 
 #[expect(
@@ -411,7 +411,7 @@ pub fn search_content(
     let (pattern, is_regex) = parse_pattern(query);
     let result = content::search(pattern, walk, is_regex, None, full)?;
     let bloom = tilth_core::index::bloom::BloomFilterCache::new();
-    format_search_result(&result, cache, None, &bloom, 0, None)
+    format_search_result(&result, walk, cache, None, &bloom, 0, None)
 }
 
 pub fn search_regex(
@@ -422,7 +422,7 @@ pub fn search_regex(
 ) -> Result<String, TilthError> {
     let result = content::search(pattern, walk, true, None, full)?;
     let bloom = tilth_core::index::bloom::BloomFilterCache::new();
-    format_search_result(&result, cache, None, &bloom, 0, None)
+    format_search_result(&result, walk, cache, None, &bloom, 0, None)
 }
 
 #[expect(
@@ -442,7 +442,7 @@ pub fn search_content_expanded(
     let (pattern, is_regex) = parse_pattern(query);
     let result = content::search(pattern, walk, is_regex, context, full)?;
     let bloom = tilth_core::index::bloom::BloomFilterCache::new();
-    format_search_result(&result, cache, Some(session), &bloom, expand, budget)
+    format_search_result(&result, walk, cache, Some(session), &bloom, expand, budget)
 }
 
 /// Expanded regex search — takes raw pattern, no slash wrapping needed.
@@ -462,7 +462,7 @@ pub fn search_regex_expanded(
 ) -> Result<String, TilthError> {
     let result = content::search(pattern, walk, true, context, full)?;
     let bloom = tilth_core::index::bloom::BloomFilterCache::new();
-    format_search_result(&result, cache, Some(session), &bloom, expand, budget)
+    format_search_result(&result, walk, cache, Some(session), &bloom, expand, budget)
 }
 
 /// Raw symbol search — returns structured result for programmatic inspection.
@@ -494,12 +494,14 @@ pub fn search_regex_raw(
 }
 
 /// Format a raw search result (symbol or content — both use the same pipeline).
+/// `walk` is the walk that found it.
 pub fn format_raw_result(
     result: &SearchResult,
+    walk: Walk<'_>,
     cache: &OutlineCache,
 ) -> Result<String, TilthError> {
     let bloom = tilth_core::index::bloom::BloomFilterCache::new();
-    format_search_result(result, cache, None, &bloom, 0, None)
+    format_search_result(result, walk, cache, None, &bloom, 0, None)
 }
 
 pub fn search_glob(pattern: &str, scope: &Path, walk: WalkConfig) -> Result<String, TilthError> {
@@ -1115,16 +1117,15 @@ pub(crate) fn format_token_count(tokens: u64) -> String {
 }
 
 /// Fallback: lightweight directory walk to find a basename-matching file
-/// when it didn't survive ranking/truncation in the match set.
-fn find_basename_fallback(scope: &Path, query_lower: &str) -> Option<PathBuf> {
+/// when it didn't survive ranking/truncation in the match set. It visits the
+/// files the search's own walk visits, down to six levels below the scope.
+fn find_basename_fallback(walk: Walk<'_>, query_lower: &str) -> Option<PathBuf> {
     let mut candidate: Option<PathBuf> = None;
     let mut best_priority: u8 = 0;
 
-    let walker = ignore::WalkBuilder::new(scope)
-        .follow_links(true)
-        .same_file_system(true) // Stop at mount boundaries (NFS, external volumes).
-        .hidden(true)
-        .git_ignore(true)
+    // The search already ran this walk, so its glob is valid.
+    let walker = tilth_core::search::walk::walk_builder(walk)
+        .ok()?
         .max_depth(Some(6))
         .build();
 
@@ -1158,7 +1159,7 @@ fn find_basename_fallback(scope: &Path, query_lower: &str) -> Option<PathBuf> {
 fn basename_file_outline(
     query: &str,
     matches: &[Match],
-    scope: &Path,
+    walk: Walk<'_>,
     cache: &OutlineCache,
 ) -> Option<String> {
     let query_lower = query.to_ascii_lowercase();
@@ -1170,7 +1171,7 @@ fn basename_file_outline(
 
     // Find the best candidate among existing matches whose basename matches the query
     let matched_path = find_basename_candidate(matches, &query_lower)
-        .or_else(|| find_basename_fallback(scope, &query_lower))?;
+        .or_else(|| find_basename_fallback(walk, &query_lower))?;
 
     // Read file and generate outline
     let content = tilth_core::source::read_source(&matched_path).ok()?;
@@ -1193,7 +1194,7 @@ fn basename_file_outline(
         return None;
     }
 
-    let rel_path = rel(&matched_path, scope);
+    let rel_path = rel(&matched_path, walk.scope);
     let line_count = content.lines().count();
     Some(format!(
         "## File overview: {rel_path} ({line_count} {})\n{outline}",
@@ -1208,6 +1209,7 @@ fn basename_file_outline(
 )]
 fn format_search_result(
     result: &SearchResult,
+    walk: Walk<'_>,
     cache: &OutlineCache,
     session: Option<&Session>,
     bloom: &tilth_core::index::bloom::BloomFilterCache,
@@ -1230,9 +1232,7 @@ fn format_search_result(
 
     // File-level retrieval: when a file basename matches the query exactly,
     // prepend a compact outline so the agent gets file-level context first.
-    if let Some(file_outline) =
-        basename_file_outline(&result.query, &result.matches, &result.scope, cache)
-    {
+    if let Some(file_outline) = basename_file_outline(&result.query, &result.matches, walk, cache) {
         let _ = write!(out, "\n\n{file_outline}");
     }
 
@@ -3402,6 +3402,64 @@ mod tests {
                 out.ends_with(&format!("Available extensions in scope: {shown}{tail}")),
                 "{out}"
             );
+        }
+    }
+
+    /// The "File overview" a search adds for a file named after the query
+    /// came from a walk of its own, which saw files the search walk hides:
+    /// `SKIP_DIRS`, `.tilthignore`, and gitignore whichever way the call set
+    /// it (#347). It must visit what the search walk visits.
+    #[test]
+    fn basename_overview_visits_only_what_the_search_walk_visits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        for dir in ["node_modules/pkg", "tilthignored", "gitignored", "src"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        std::fs::write(root.join(".tilthignore"), "tilthignored/\n").unwrap();
+        std::fs::write(root.join(".gitignore"), "gitignored/\n").unwrap();
+        // Each file is named after its query and holds no match for it, so
+        // only the fallback walk can find it.
+        for file in [
+            "node_modules/pkg/skipped.rs",
+            "tilthignored/tilthhidden.rs",
+            "gitignored/githidden.rs",
+            "src/visible.rs",
+        ] {
+            std::fs::write(root.join(file), "fn other() {}\n").unwrap();
+        }
+
+        let gitignore = |respect_gitignore| WalkConfig {
+            respect_gitignore,
+            ..WalkConfig::default()
+        };
+        let cases = [
+            ("visible", None, gitignore(false), Some("src/visible.rs")),
+            ("skipped", None, gitignore(false), None),
+            ("tilthhidden", None, gitignore(false), None),
+            ("githidden", None, gitignore(true), None),
+            (
+                "githidden",
+                None,
+                gitignore(false),
+                Some("gitignored/githidden.rs"),
+            ),
+            ("visible", Some("*.py"), gitignore(false), None),
+        ];
+        let cache = OutlineCache::new();
+        for (query, glob, config, want) in cases {
+            let walk = Walk {
+                scope: root,
+                glob,
+                config,
+            };
+            let out = search_symbol(query, walk, &cache, false).unwrap();
+            let shown = out
+                .lines()
+                .find_map(|line| line.strip_prefix("## File overview: "))
+                .and_then(|rest| rest.split(" (").next());
+            assert_eq!(shown, want, "{query:?} with {walk:?}: {out}");
         }
     }
 }

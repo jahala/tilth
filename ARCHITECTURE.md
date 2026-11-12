@@ -407,7 +407,11 @@ tree-sitter `Query` objects live in `callee_query.rs`.
 `walker(walk)` builds an `ignore::WalkParallel` with tilth's opinionated
 defaults from a `Walk`: the scope, an optional glob, and the run's
 `WalkConfig`. `base_walk_builder(scope, config)` builds the same walker,
-without the glob, for the sequential map and list walks:
+without the glob, for the sequential map and list walks. `walk_builder(walk)`
+is the glob-narrowed builder `walker` runs; a search's basename "File
+overview" fallback walks it in order, six levels deep. `clippy.toml` forbids
+`ignore::WalkBuilder::new` and `ignore::Walk::new` outside `walk.rs`, so
+every walk visits files by the same policy:
 
 - **Always-skipped directories** (`SKIP_DIRS`): build artifacts,
   dependency caches, VCS internals — `.git`, `node_modules`, `target`,
