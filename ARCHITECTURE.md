@@ -1104,7 +1104,9 @@ A handful of small files cut across every subsystem.
   `&'static str`, so only text tilth wrote can be one, and a caller's
   revision or path goes after `--end-of-options` or `--` (#277). Every
   command pins `core.quotePath` and `diff.suppressBlankEmpty` and reads
-  no stdin. `time_limit` stops a command that runs too long. A failure
+  no stdin. `deadline` stops a command still running at a given
+  instant, and reads its output while it runs, so output larger than a
+  pipe cannot hold git up (#356). A failure
   is a `GitError` (`Io`, `NotARepository`, `Failed`, `TimedOut`) whose
   text is git's own words after the command that failed; nothing parses
   git's stderr, because git translates it. `tests/git_runner.rs` fails
@@ -1126,8 +1128,9 @@ user-facing.
 - **`overview.rs`** — `fingerprint(root)` walks files (depth 2),
   detects primary language, parses the project manifest (`Cargo.toml`,
   `package.json`, `go.mod`, `pyproject.toml`), reads `git` context
-  (branch and uncommitted file count, each git command limited to
-  200 ms), and emits a few
+  (branch and uncommitted file count from one `git status`, with one
+  200 ms deadline for the whole line, which is left out when git does
+  not answer by then), and emits a few
   hot-file lines. Wrapped in `catch_unwind` and a 250ms wall-clock
   budget; warn-on-overrun via stderr. Output is the project summary
   that the MCP `initialize` response prepends to `SERVER_INSTRUCTIONS`.
