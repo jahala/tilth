@@ -625,7 +625,10 @@ fn git_context(root: &Path, deadline: Instant) -> Option<String> {
     let dirty_str = if changes == 0 {
         "clean".to_string()
     } else {
-        format!("{changes} uncommitted files")
+        format!(
+            "{changes} uncommitted {}",
+            crate::format::noun(changes, "file", "files")
+        )
     };
 
     Some(format!("branch {branch}, {dirty_str}"))
@@ -1071,7 +1074,7 @@ mod tests {
         let repo = crate::git::tests::repo();
         fs::write(repo.path().join("new.txt"), "").unwrap();
         let line = git_context(repo.path(), far_off()).expect("a git line");
-        assert!(line.ends_with(", 1 uncommitted files"), "{line}");
+        assert!(line.ends_with(", 1 uncommitted file"), "{line}");
         assert_eq!(git_context(repo.path(), Instant::now()), None);
     }
 
