@@ -1,5 +1,16 @@
 //! Reading source files for parsing and search.
 //!
+//! A file's bytes become text by one rule, [`into_text`]: a NUL byte in
+//! the first [`BINARY_WINDOW`] bytes makes a file binary, and any other
+//! file is text, each byte sequence that is not UTF-8 read as U+FFFD.
+//! Search, symbols, outlines and reads all follow it, so a Latin-1 file is
+//! searched, parsed and shown alike, and a binary one is skipped alike.
+//! Only the hash-anchored writes read strictly, through [`read_to_string`]:
+//! they write lines back, and must never turn a byte into U+FFFD. The
+//! structural diff reads strictly too, until #312 rebuilds it.
+//!
+//! [`BINARY_WINDOW`]: crate::lang::detection::BINARY_WINDOW
+//!
 //! A UTF-8 byte-order mark (U+FEFF, bytes `EF BB BF`) is an encoding marker,
 //! not text. Left in place it sits in front of line 1, so `str::trim_start`
 //! keeps it (U+FEFF is not white space), a line-1 `#include` or `import`
@@ -47,20 +58,45 @@ pub fn strip_bom_bytes(bytes: &[u8]) -> &[u8] {
     bytes.strip_prefix(BOM.as_bytes()).unwrap_or(bytes)
 }
 
-/// Read a UTF-8 file for parsing or search, without its byte-order mark.
-/// It reads as [`read_to_string`] does, so a pipe, socket or device reads
-/// as empty.
+/// The text of a file's `bytes`, or `None` when they are binary: the one
+/// rule by which tilth reads a file as text. Bytes with a NUL in their
+/// first [`BINARY_WINDOW`] bytes are binary, as [`is_binary`] says. Any
+/// other bytes are text, and each sequence in them that is not UTF-8 reads
+/// as U+FFFD, as [`String::from_utf8_lossy`] reads it, so a stray byte
+/// costs its own character and nothing else. Text that is UTF-8 becomes
+/// the `String` without a copy.
+///
+/// [`BINARY_WINDOW`]: crate::lang::detection::BINARY_WINDOW
+/// [`is_binary`]: crate::lang::detection::is_binary
+#[must_use]
+pub fn into_text(bytes: Vec<u8>) -> Option<String> {
+    if crate::lang::detection::is_binary(&bytes) {
+        return None;
+    }
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "by design: the home of the text rule, keeping UTF-8 without a copy"
+    )]
+    let text = String::from_utf8(bytes);
+    Some(text.unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
+}
+
+/// The text of the file at `path` for parsing or search, by the rule of
+/// [`into_text`] and without its byte-order mark, or `None` for a binary
+/// file. It reads as [`read`] does, so a pipe, socket or device reads as
+/// empty text.
 ///
 /// # Errors
 ///
-/// Returns the open's or the read's I/O error, and an
-/// [`io::ErrorKind::InvalidData`] error for text that is not UTF-8.
-pub fn read_source(path: &Path) -> io::Result<String> {
-    let mut text = read_to_string(path)?;
+/// Returns the open's or the read's I/O error.
+pub fn read_source(path: &Path) -> io::Result<Option<String>> {
+    let Some(mut text) = into_text(read(path)?) else {
+        return Ok(None);
+    };
     if text.starts_with(BOM) {
         text.drain(..BOM.len());
     }
-    Ok(text)
+    Ok(Some(text))
 }
 
 /// The bytes of the file at `path`, as [`std::fs::read`] gives them, but
@@ -75,15 +111,27 @@ pub fn read(path: &Path) -> io::Result<Vec<u8>> {
     OpenFile::open(path)?.map_or_else(|| Ok(Vec::new()), |mut file| file.read_all())
 }
 
-/// The text of the file at `path`, as [`std::fs::read_to_string`] gives
-/// it, but opened through [`OpenFile`], as [`read`] is.
+/// The text of the file at `path` when all of it is UTF-8, as
+/// [`std::fs::read_to_string`] gives it, but opened through [`OpenFile`],
+/// as [`read`] is. This strict read is for the hash-anchored writes alone,
+/// which write a file's lines back; everything else reads text by the rule
+/// of [`into_text`].
 ///
 /// # Errors
 ///
 /// Returns the open's or the read's I/O error, and an
 /// [`io::ErrorKind::InvalidData`] error for text that is not UTF-8.
 pub fn read_to_string(path: &Path) -> io::Result<String> {
-    OpenFile::open(path)?.map_or_else(|| Ok(String::new()), |mut file| file.read_to_string())
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "by design: the one strict decode, for the writes that must keep every byte"
+    )]
+    String::from_utf8(read(path)?).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "stream did not contain valid UTF-8",
+        )
+    })
 }
 
 /// A file open for reading, with its handle's metadata. Every read of it
@@ -160,18 +208,6 @@ impl OpenFile {
         let mut bytes = Vec::with_capacity(self.capacity());
         self.reader()?.read_to_end(&mut bytes)?;
         Ok(bytes)
-    }
-
-    /// All of the file as text, up to its length at open.
-    ///
-    /// # Errors
-    ///
-    /// Returns the read's I/O error, and an [`io::ErrorKind::InvalidData`]
-    /// error for text that is not UTF-8.
-    pub fn read_to_string(&mut self) -> io::Result<String> {
-        let mut text = String::with_capacity(self.capacity());
-        self.reader()?.read_to_string(&mut text)?;
-        Ok(text)
     }
 
     fn capacity(&self) -> usize {
@@ -529,7 +565,35 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a.rs");
         std::fs::write(&path, "\u{feff}use a;\n").unwrap();
-        assert_eq!(read_source(&path).unwrap(), "use a;\n");
+        assert_eq!(read_source(&path).unwrap().as_deref(), Some("use a;\n"));
+    }
+
+    /// A NUL byte in the first 512 bytes makes bytes binary; any other
+    /// bytes are text, each sequence that is not UTF-8 read as U+FFFD.
+    #[test]
+    fn bytes_are_binary_or_lossy_text() {
+        assert_eq!(
+            into_text(b"caf\xc3\xa9\n".to_vec()).as_deref(),
+            Some("caf\u{e9}\n")
+        );
+        assert_eq!(
+            into_text(b"caf\xe9 \xe2\x82 ok\n".to_vec()).as_deref(),
+            Some("caf\u{fffd} \u{fffd} ok\n")
+        );
+        assert_eq!(into_text(b"text\0".to_vec()), None);
+        let late = format!("{}\0", "x".repeat(512));
+        assert_eq!(into_text(late.clone().into_bytes()), Some(late));
+        assert_eq!(into_text(Vec::new()).as_deref(), Some(""));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.c");
+        std::fs::write(&path, b"\xef\xbb\xbfint caf\xe9;\n").unwrap();
+        assert_eq!(
+            read_source(&path).unwrap().as_deref(),
+            Some("int caf\u{fffd};\n")
+        );
+        std::fs::write(&path, b"int a;\0\n").unwrap();
+        assert_eq!(read_source(&path).unwrap(), None);
     }
 
     /// A regular file's handle blocks as a usual one does: the open's
@@ -550,6 +614,10 @@ mod tests {
     /// pipe that has no writer.
     #[cfg(unix)]
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "by design: the strict read is one of the reads this checks"
+    )]
     fn a_pipe_or_device_reads_as_empty() {
         use crate::test_readers::{make_pipe, unless_blocked_on};
         let dir = tempfile::tempdir().unwrap();
@@ -565,7 +633,10 @@ mod tests {
                 )
             })
             .expect("a read blocked on the pipe");
-            assert_eq!(reads, (true, Vec::new(), String::new(), String::new()));
+            assert_eq!(
+                reads,
+                (true, Vec::new(), String::new(), Some(String::new()))
+            );
         }
     }
 
@@ -583,7 +654,6 @@ mod tests {
             .unwrap();
         appender.write_all(b"second\n").unwrap();
         assert_eq!(file.read_all().unwrap(), b"first\n");
-        assert_eq!(file.read_to_string().unwrap(), "first\n");
     }
 
     #[test]

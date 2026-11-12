@@ -28,7 +28,7 @@ pub fn resolve_related_files(file_path: &Path, cache: &crate::cache::OutlineCach
     }
     // The cache holds no tree for this file (no grammar, or over its size
     // cap): read it and parse here.
-    let Ok(content) = crate::source::read_source(file_path) else {
+    let Ok(Some(content)) = crate::source::read_source(file_path) else {
         return Vec::new();
     };
     resolve_related_files_with_content(file_path, &content)

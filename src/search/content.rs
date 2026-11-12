@@ -116,11 +116,15 @@ fn search_capped(
             let Ok(bytes) = tilth_core::source::read(path) else {
                 return ignore::WalkState::Continue;
             };
-            let bytes = tilth_core::source::strip_bom_bytes(&bytes);
+            // A binary file has no matches, by the rule every read uses.
+            let Some(text) = tilth_core::source::into_text(bytes) else {
+                return ignore::WalkState::Continue;
+            };
+            let text = tilth_core::source::strip_bom(&text);
 
             // Catch unmarked minified bundles between 100 KB and the size cap.
             if file_size >= tilth_core::lang::detection::MINIFIED_CHECK_THRESHOLD
-                && tilth_core::lang::detection::is_minified_by_content(bytes)
+                && tilth_core::lang::detection::is_minified_by_content(text.as_bytes())
             {
                 return ignore::WalkState::Continue;
             }
@@ -130,11 +134,11 @@ fn search_capped(
             let mut file_matches = Vec::new();
             let mut searcher = Searcher::new();
 
-            // The UTF8 sink ends this file's search at its first matched line
-            // that is not UTF-8, and the error is dropped here: #308.
+            // The sink fails only on a line that is not UTF-8, and the text
+            // holds none, so the search cannot fail.
             let _ = searcher.search_slice(
                 matcher,
-                bytes,
+                text.as_bytes(),
                 UTF8(|line_num, line| {
                     file_matches.push(Match {
                         path: path.to_path_buf(),
@@ -328,6 +332,66 @@ mod completeness_tests {
         assert_eq!(
             one_per_file.total_found, 12,
             "and the count must still be exact"
+        );
+    }
+
+    /// The matched lines of `pattern` under `dir`, as `(file, line, text)`.
+    fn hits(dir: &Path, pattern: &str) -> Vec<(String, u32, String)> {
+        let result = search(
+            pattern,
+            Walk::new(dir, WalkConfig::default()),
+            false,
+            None,
+            false,
+        )
+        .unwrap();
+        let mut hits: Vec<_> = result
+            .matches
+            .iter()
+            .map(|m| {
+                let name = m.path.file_name().unwrap().to_string_lossy().into_owned();
+                (name, m.line, m.text.clone())
+            })
+            .collect();
+        hits.sort();
+        assert_eq!(result.total_found, hits.len());
+        hits
+    }
+
+    /// A byte that is not UTF-8 reads as U+FFFD and costs nothing else: a
+    /// matched line that holds one does not end the file's search.
+    #[test]
+    fn a_matched_line_that_is_not_utf8_does_not_end_the_search() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("notes.txt"),
+            b"find me caf\xe9\nfind me two\nfind me three\n",
+        )
+        .unwrap();
+        let line = |n: u32, text: &str| ("notes.txt".to_string(), n, text.to_string());
+        assert_eq!(
+            hits(d.path(), "find me"),
+            [
+                line(1, "find me caf\u{fffd}"),
+                line(2, "find me two"),
+                line(3, "find me three"),
+            ]
+        );
+    }
+
+    /// A file is binary when a NUL byte falls in its first 512 bytes, the
+    /// rule a read uses, and a binary file has no matches. A NUL further
+    /// on is a stray byte in a text file.
+    #[test]
+    fn a_binary_file_has_no_matches() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("blob.bin"), b"find me\0\nfind me again\n").unwrap();
+        let mut late = vec![b'x'; 600];
+        late.extend_from_slice(b"\nfind me\0\n");
+        std::fs::write(d.path().join("late.txt"), &late).unwrap();
+        assert_eq!(
+            hits(d.path(), "find me"),
+            [("late.txt".to_string(), 2, "find me\0".to_string())]
         );
     }
 }
