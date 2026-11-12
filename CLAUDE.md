@@ -13,14 +13,14 @@ crates/tilth-core/src/
     mod.rs             Shared language infrastructure: detect_file_type(), package_root().
     spec.rs            Per-language spec table (grammar, definition kinds, callee/sibling queries, stdlib rule, lexer flags).
     outline.rs         Tree-sitter outline extraction: outline_language(), walk_top_level(), get_outline_entries().
-    treesitter.rs      Shared AST constants: DEFINITION_KINDS, extract_definition_name(), definition_weight().
+    treesitter.rs      Shared AST constants: DEFINITION_KINDS, extract_definition_name(), definition_weight(). compiled_query(): the one compiled-Query cache.
     detection.rs       Generated file detection (lockfiles, .min.js) and binary detection.
     <lang>.rs          One spec per language. c.rs, cpp.rs and go.rs also hold test fixtures, shared with the binary's tests through the `test-fixtures` feature.
   search/
     walk.rs            The shared directory walker: Walk (scope, glob, WalkConfig), WalkConfig (threads, gitignore), SKIP_DIRS, .tilthignore, glob overrides.
     callers.rs         Structural call-site detection (tree-sitter + memchr pre-filter): find_callers_batch(), CallerMatch.
     callees.rs         Callee extraction and resolution for expanded definitions.
-    callee_query.rs    Per-language tree-sitter call-expression queries + compiled-Query cache, shared by callers.rs and callees.rs.
+    callee_query.rs    Per-language tree-sitter call-expression queries, shared by callers.rs and callees.rs.
     scope.rs           Enclosing-scope lookup: nearest definition at a line, qualified by containing type/module.
     deps.rs            File-level dependency analysis: analyze_deps() → DepsResult.
     bloom_walk.rs      Shared file-prefilter for relational queries (callers/callees/deps): size gate + bloom-filter pre-check before a full parse.

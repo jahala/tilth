@@ -1,14 +1,13 @@
 //! Imports as data, one per module a statement names, and their resolution
 //! to local file paths (the MCP layer's related-file hint, deps, callees).
 
-use std::collections::hash_map::Entry;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
 
 use streaming_iterator::StreamingIterator;
 
 use crate::lang::detect_file_type_with_content;
+use crate::lang::outline::outline_language;
+use crate::lang::treesitter::compiled_query;
 use crate::types::{FileType, Lang};
 
 /// The local files a code file's imports resolve to, read through `cache`'s
@@ -142,7 +141,7 @@ pub fn extract_imports(content: &str, lang: Lang) -> Vec<Import> {
     if !reads_statements_from_tree(lang) {
         return line_imports(content, lang);
     }
-    let Some(language) = crate::lang::outline::outline_language(lang) else {
+    let Some(language) = outline_language(lang) else {
         return Vec::new();
     };
     let mut parser = tree_sitter::Parser::new();
@@ -208,9 +207,6 @@ pub fn imports_in_tree(root: tree_sitter::Node, content: &str, lang: Lang) -> Ve
 /// and drops the Elixir calls that are not imports. Each language compiles
 /// only when a file of it is read, since compiling costs a few milliseconds.
 fn statement_query(lang: Lang) -> Option<&'static tree_sitter::Query> {
-    static COMPILED: LazyLock<Mutex<HashMap<Lang, &'static tree_sitter::Query>>> =
-        LazyLock::new(|| Mutex::new(HashMap::new()));
-
     let pattern = match lang {
         Lang::Go | Lang::Scala | Lang::Java | Lang::Swift => "(import_declaration) @statement",
         Lang::Rust => "(use_declaration) @statement",
@@ -226,20 +222,7 @@ fn statement_query(lang: Lang) -> Option<&'static tree_sitter::Query> {
         Lang::CSharp => "(using_directive) @statement",
         _ => return None,
     };
-    let mut compiled = COMPILED
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match compiled.entry(lang) {
-        Entry::Occupied(e) => Some(*e.get()),
-        Entry::Vacant(e) => {
-            let language = crate::lang::outline::outline_language(lang)?;
-            // One query per language at most, so leaking it to get a
-            // `'static` borrow is bounded, and matching then runs without
-            // the lock.
-            let query = Box::leak(Box::new(tree_sitter::Query::new(&language, pattern).ok()?));
-            Some(*e.insert(query))
-        }
-    }
+    compiled_query(&outline_language(lang)?, pattern)
 }
 
 /// Languages whose import statements are read from the syntax tree: one

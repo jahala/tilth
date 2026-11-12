@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use streaming_iterator::StreamingIterator;
 
 use crate::lang::outline::{get_outline_entries, outline_language};
+use crate::lang::treesitter::compiled_query;
 use crate::types::{Lang, OutlineEntry};
 
 /// A resolved callee: a function/method called from within an expanded definition.
@@ -61,48 +62,44 @@ pub fn extract_callee_names(
 
     let callee_filter = crate::lang::spec::spec(lang).callee_filter;
 
-    let Some(names) = super::callee_query::with_callee_query(&ts_lang, query_str, |query| {
-        let Some(callee_idx) = query.capture_index_for_name("callee") else {
-            return Vec::new();
-        };
-
-        let mut cursor = tree_sitter::QueryCursor::new();
-        let mut matches = cursor.matches(query, tree.root_node(), content_bytes);
-        let mut names: Vec<String> = Vec::new();
-
-        while let Some(m) = matches.next() {
-            for cap in m.captures() {
-                if cap.index != callee_idx {
-                    continue;
-                }
-
-                // 1-indexed line number of the capture
-                let line = cap.node.start_position().row as u32 + 1;
-
-                // Filter by def_range if provided
-                if let Some((start, end)) = def_range {
-                    if line < start || line > end {
-                        continue;
-                    }
-                }
-
-                // Some patterns match more than a call (see `callee_filter`).
-                if callee_filter.is_some_and(|keep| !keep(&cap.node)) {
-                    continue;
-                }
-
-                if let Ok(text) = cap.node.utf8_text(content_bytes) {
-                    names.push(text.to_string());
-                }
-            }
-        }
-
-        names
-    }) else {
+    let Some(query) = compiled_query(&ts_lang, query_str) else {
+        return Vec::new();
+    };
+    let Some(callee_idx) = query.capture_index_for_name("callee") else {
         return Vec::new();
     };
 
-    let mut names = names;
+    let mut cursor = tree_sitter::QueryCursor::new();
+    let mut matches = cursor.matches(query, tree.root_node(), content_bytes);
+    let mut names: Vec<String> = Vec::new();
+
+    while let Some(m) = matches.next() {
+        for cap in m.captures() {
+            if cap.index != callee_idx {
+                continue;
+            }
+
+            // 1-indexed line number of the capture
+            let line = cap.node.start_position().row as u32 + 1;
+
+            // Filter by def_range if provided
+            if let Some((start, end)) = def_range {
+                if line < start || line > end {
+                    continue;
+                }
+            }
+
+            // Some patterns match more than a call (see `callee_filter`).
+            if callee_filter.is_some_and(|keep| !keep(&cap.node)) {
+                continue;
+            }
+
+            if let Ok(text) = cap.node.utf8_text(content_bytes) {
+                names.push(text.to_string());
+            }
+        }
+    }
+
     names.sort();
     names.dedup();
 

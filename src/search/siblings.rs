@@ -1,7 +1,7 @@
 use streaming_iterator::StreamingIterator;
 
 use tilth_core::lang::outline::outline_language;
-use tilth_core::lang::treesitter::with_query;
+use tilth_core::lang::treesitter::compiled_query;
 use tilth_core::types::{Lang, OutlineEntry, OutlineKind};
 
 /// A sibling field or method resolved from the same parent struct/class/impl.
@@ -34,9 +34,8 @@ pub fn extract_sibling_references(content: &str, lang: Lang, def_range: (u32, u3
         return Vec::new();
     };
 
-    // For Go, resolve the receiver name before entering the query cache lock to
-    // avoid re-entrancy on `QUERY_CACHE` (the receiver extractor also uses it).
-    // The extractor is supplied per-language via `spec(lang).extract_receiver`
+    // For Go, the receiver name filters the `@recv` captures below. The
+    // extractor is supplied per-language via `spec(lang).extract_receiver`
     // (only Go has one).
     let go_receiver = tilth_core::lang::spec::spec(lang)
         .extract_receiver
@@ -54,86 +53,84 @@ pub fn extract_sibling_references(content: &str, lang: Lang, def_range: (u32, u3
     let bytes = content.as_bytes();
     let (start, end) = def_range;
 
-    let Some(names) = with_query(&ts_lang, query_str, |query| {
-        let Some(ref_idx) = query.capture_index_for_name("ref") else {
-            return Vec::new();
-        };
+    let Some(query) = compiled_query(&ts_lang, query_str) else {
+        return Vec::new();
+    };
+    let Some(ref_idx) = query.capture_index_for_name("ref") else {
+        return Vec::new();
+    };
 
-        // For Python, we also need @obj to filter `self.x` vs `other.x`.
-        // For Scala, we also need @obj to filter `this.x` vs `other.x`.
-        let obj_idx = query.capture_index_for_name("obj");
-        // For Go, we need @recv to filter receiver-only accesses.
-        let recv_idx = query.capture_index_for_name("recv");
+    // For Python, we also need @obj to filter `self.x` vs `other.x`.
+    // For Scala, we also need @obj to filter `this.x` vs `other.x`.
+    let obj_idx = query.capture_index_for_name("obj");
+    // For Go, we need @recv to filter receiver-only accesses.
+    let recv_idx = query.capture_index_for_name("recv");
 
-        let mut cursor = tree_sitter::QueryCursor::new();
-        let mut matches = cursor.matches(query, tree.root_node(), bytes);
-        let mut names: Vec<String> = Vec::new();
+    let mut cursor = tree_sitter::QueryCursor::new();
+    let mut matches = cursor.matches(query, tree.root_node(), bytes);
+    let mut names: Vec<String> = Vec::new();
 
-        while let Some(m) = matches.next() {
-            // For Python: verify @obj == "self"
-            if lang == Lang::Python {
-                if let Some(oi) = obj_idx {
-                    let obj_ok = m.captures().iter().any(|c| {
-                        c.index == oi && c.node.utf8_text(bytes).is_ok_and(|t| t == "self")
-                    });
-                    if !obj_ok {
-                        continue;
-                    }
-                }
-            }
-
-            // For Scala: verify @obj == "this"
-            if lang == Lang::Scala {
-                if let Some(oi) = obj_idx {
-                    let obj_ok = m.captures().iter().any(|c| {
-                        c.index == oi && c.node.utf8_text(bytes).is_ok_and(|t| t == "this")
-                    });
-                    if !obj_ok {
-                        continue;
-                    }
-                }
-            }
-
-            // For Go: verify @recv matches the receiver parameter name
-            if lang == Lang::Go {
-                if let (Some(ri), Some(ref recv_name)) = (recv_idx, &go_receiver) {
-                    let recv_ok = m.captures().iter().any(|c| {
-                        c.index == ri
-                            && c.node
-                                .utf8_text(bytes)
-                                .is_ok_and(|t| t == recv_name.as_str())
-                    });
-                    if !recv_ok {
-                        continue;
-                    }
-                } else if lang == Lang::Go {
-                    // No receiver found — can't determine self references
+    while let Some(m) = matches.next() {
+        // For Python: verify @obj == "self"
+        if lang == Lang::Python {
+            if let Some(oi) = obj_idx {
+                let obj_ok = m
+                    .captures()
+                    .iter()
+                    .any(|c| c.index == oi && c.node.utf8_text(bytes).is_ok_and(|t| t == "self"));
+                if !obj_ok {
                     continue;
-                }
-            }
-
-            for cap in m.captures() {
-                if cap.index != ref_idx {
-                    continue;
-                }
-
-                let line = cap.node.start_position().row as u32 + 1;
-                if line < start || line > end {
-                    continue;
-                }
-
-                if let Ok(text) = cap.node.utf8_text(bytes) {
-                    names.push(text.to_string());
                 }
             }
         }
 
-        names
-    }) else {
-        return Vec::new();
-    };
+        // For Scala: verify @obj == "this"
+        if lang == Lang::Scala {
+            if let Some(oi) = obj_idx {
+                let obj_ok = m
+                    .captures()
+                    .iter()
+                    .any(|c| c.index == oi && c.node.utf8_text(bytes).is_ok_and(|t| t == "this"));
+                if !obj_ok {
+                    continue;
+                }
+            }
+        }
 
-    let mut names = names;
+        // For Go: verify @recv matches the receiver parameter name
+        if lang == Lang::Go {
+            if let (Some(ri), Some(ref recv_name)) = (recv_idx, &go_receiver) {
+                let recv_ok = m.captures().iter().any(|c| {
+                    c.index == ri
+                        && c.node
+                            .utf8_text(bytes)
+                            .is_ok_and(|t| t == recv_name.as_str())
+                });
+                if !recv_ok {
+                    continue;
+                }
+            } else if lang == Lang::Go {
+                // No receiver found — can't determine self references
+                continue;
+            }
+        }
+
+        for cap in m.captures() {
+            if cap.index != ref_idx {
+                continue;
+            }
+
+            let line = cap.node.start_position().row as u32 + 1;
+            if line < start || line > end {
+                continue;
+            }
+
+            if let Ok(text) = cap.node.utf8_text(bytes) {
+                names.push(text.to_string());
+            }
+        }
+    }
+
     names.sort();
     names.dedup();
     names
