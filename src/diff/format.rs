@@ -571,7 +571,6 @@ mod tests {
             added: 0,
             removed: 0,
             conflicts: Vec::new(),
-            new_content: None,
             is_generated: false,
             is_binary: false,
         }

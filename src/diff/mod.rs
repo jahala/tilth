@@ -165,7 +165,6 @@ pub struct FileOverlay {
     pub added: usize,
     pub removed: usize,
     pub conflicts: Vec<Conflict>,
-    pub new_content: Option<String>,
     /// A lockfile or other generated file, summarized by its line counts.
     pub is_generated: bool,
     pub is_binary: bool,

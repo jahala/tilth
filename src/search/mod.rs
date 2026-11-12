@@ -29,6 +29,12 @@ use tilth_core::types::FileType;
 use crate::format::rel;
 
 const EXPAND_FULL_FILE_THRESHOLD: u64 = 800;
+/// How many callees the `-- calls --` footer under an expanded definition
+/// lists before it counts the rest.
+const CALLS_SHOWN: usize = 8;
+/// How many sibling members the `-- siblings --` footer lists before it
+/// counts the rest.
+const SIBLINGS_SHOWN: usize = 6;
 
 #[derive(Debug)]
 struct Expansion {
@@ -217,21 +223,14 @@ pub(crate) fn owner_candidates(
     } else {
         "."
     };
-    let mut listed: Vec<String> = others
-        .iter()
-        .take(SHOWN)
-        .map(|o| {
-            let place = format!("{}:{}", rel(&o.path, scope), o.line);
-            o.owner.as_ref().map_or_else(
-                || format!("{name} ({place})"),
-                |owner| format!("{owner}{sep}{name} ({place})"),
-            )
-        })
-        .collect();
-    if others.len() > SHOWN {
-        listed.push(format!("and {} more", others.len() - SHOWN));
-    }
-    listed.join(", ")
+    let listed = others.iter().map(|o| {
+        let place = format!("{}:{}", rel(&o.path, scope), o.line);
+        o.owner.as_ref().map_or_else(
+            || format!("{name} ({place})"),
+            |owner| format!("{owner}{sep}{name} ({place})"),
+        )
+    });
+    format::capped_list(listed, SHOWN)
 }
 
 /// The sentence that names the files a walk skipped for size although they
@@ -243,18 +242,14 @@ pub(crate) fn skipped_files_note(skipped: &[PathBuf], held: &str, scope: &Path) 
     if skipped.is_empty() {
         return None;
     }
-    let mut files: Vec<String> = skipped.iter().take(SHOWN).map(|p| rel(p, scope)).collect();
-    if skipped.len() > SHOWN {
-        files.push(format!("and {} more", skipped.len() - SHOWN));
-    }
+    let files = format::capped_list(skipped.iter().map(|p| rel(p, scope)), SHOWN);
     let (count, contains, was) = match skipped.len() {
         1 => ("1 file".to_string(), "contains", "was"),
         n => (format!("{n} files"), "contain", "were"),
     };
     Some(format!(
-        "{count} over {} {contains} {held} and {was} not searched: {}",
+        "{count} over {} {contains} {held} and {was} not searched: {files}",
         tilth_core::source::max_file_size_label(),
-        files.join(", ")
     ))
 }
 
@@ -959,9 +954,10 @@ fn format_single_match(
                                 if let Some(ref name) = m.def_name {
                                     nodes.retain(|n| n.callee.name != *name);
                                 }
-                                if nodes.len() > 8 {
+                                let total = nodes.len();
+                                if total > CALLS_SHOWN {
                                     nodes.sort_by_key(|n| i32::from(n.callee.file == m.path));
-                                    nodes.truncate(8);
+                                    nodes.truncate(CALLS_SHOWN);
                                 }
 
                                 if !nodes.is_empty() {
@@ -993,6 +989,9 @@ fn format_single_match(
                                             }
                                         }
                                     }
+                                    if let Some(more) = format::and_more(total, CALLS_SHOWN) {
+                                        let _ = write!(out, "\n  ... {more}");
+                                    }
                                 }
                             }
 
@@ -1016,7 +1015,7 @@ fn format_single_match(
                                             siblings::resolve_siblings(&filtered, &parent.children);
                                         if !resolved.is_empty() {
                                             out.push_str("\n\n-- siblings --");
-                                            for s in &resolved {
+                                            for s in resolved.iter().take(SIBLINGS_SHOWN) {
                                                 let _ = write!(
                                                     out,
                                                     "\n  {}  {}:{}-{}  {}",
@@ -1026,6 +1025,11 @@ fn format_single_match(
                                                     s.end_line,
                                                     s.signature,
                                                 );
+                                            }
+                                            if let Some(more) =
+                                                format::and_more(resolved.len(), SIBLINGS_SHOWN)
+                                            {
+                                                let _ = write!(out, "\n  ... {more}");
                                             }
                                         }
                                     }
@@ -1758,10 +1762,11 @@ fn format_glob_result(result: &glob::GlobResult, scope: &Path) -> Result<String,
     }
 
     if result.files.is_empty() && !result.available_extensions.is_empty() {
+        const SHOWN: usize = 10;
         let _ = write!(
             out,
             "\n\nNo matches. Available extensions in scope: {}",
-            result.available_extensions.join(", ")
+            format::capped_list(result.available_extensions.iter(), SHOWN)
         );
     }
 
@@ -3245,5 +3250,104 @@ mod tests {
         .unwrap();
         assert!(out.contains("not searched: big.rs"), "{out}");
         assert!(out.contains("contains `run` or `start` and was"), "{out}");
+    }
+
+    /// The footer block under `heading` in `out`, up to the next blank line.
+    fn footer_block<'a>(out: &'a str, heading: &str) -> &'a str {
+        let start = out
+            .find(heading)
+            .unwrap_or_else(|| panic!("no {heading} block: {out}"));
+        let block = &out[start..];
+        block.find("\n\n").map_or(block, |end| &block[..end])
+    }
+
+    /// An expanded `target` whose body calls `free` free functions and
+    /// `methods` methods of its own type through `self`.
+    fn expand_target(free: usize, methods: usize) -> String {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut src = String::new();
+        for i in 0..free {
+            let _ = writeln!(src, "fn f{i}() {{}}");
+        }
+        src.push_str("struct S;\nimpl S {\n");
+        for i in 0..methods {
+            let _ = writeln!(src, "    fn m{i}(&self) {{}}");
+        }
+        src.push_str("    fn target(&self) {\n");
+        for i in 0..free {
+            let _ = writeln!(src, "        f{i}();");
+        }
+        for i in 0..methods {
+            let _ = writeln!(src, "        self.m{i}();");
+        }
+        src.push_str("    }\n}\n");
+        std::fs::write(tmp.path().join("lib.rs"), src).unwrap();
+        let bloom = tilth_core::index::bloom::BloomFilterCache::new();
+        search_symbol_expanded(
+            "target",
+            tmp.path(),
+            &OutlineCache::new(),
+            &Session::new(),
+            &bloom,
+            1,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap()
+    }
+
+    /// The `-- calls --` footer stopped at eight callees and said nothing
+    /// of the rest (#330).
+    #[test]
+    fn the_calls_footer_counts_the_callees_it_leaves_out() {
+        let out = expand_target(CALLS_SHOWN + 1, 0);
+        let calls = footer_block(&out, "-- calls --");
+        assert_eq!(calls.lines().count(), 1 + CALLS_SHOWN + 1, "{calls}");
+        assert!(calls.ends_with("\n  ... and 1 more"), "{calls}");
+
+        let out = expand_target(CALLS_SHOWN, 0);
+        let calls = footer_block(&out, "-- calls --");
+        assert_eq!(calls.lines().count(), 1 + CALLS_SHOWN, "{calls}");
+        assert!(!calls.contains("more"), "{calls}");
+    }
+
+    /// The `-- siblings --` footer stopped at six and said nothing of the
+    /// rest (#330).
+    #[test]
+    fn the_siblings_footer_counts_the_siblings_it_leaves_out() {
+        let out = expand_target(0, SIBLINGS_SHOWN + 1);
+        let siblings = footer_block(&out, "-- siblings --");
+        assert_eq!(
+            siblings.lines().count(),
+            1 + SIBLINGS_SHOWN + 1,
+            "{siblings}"
+        );
+        assert!(siblings.ends_with("\n  ... and 1 more"), "{siblings}");
+
+        let out = expand_target(0, SIBLINGS_SHOWN);
+        let siblings = footer_block(&out, "-- siblings --");
+        assert_eq!(siblings.lines().count(), 1 + SIBLINGS_SHOWN, "{siblings}");
+        assert!(!siblings.contains("more"), "{siblings}");
+    }
+
+    /// A glob that matched nothing named the first ten extensions in scope
+    /// and said nothing of the rest (#330).
+    #[test]
+    fn a_glob_with_no_match_counts_the_extensions_it_leaves_out() {
+        let names = |n: usize| (0..n).map(|i| format!("e{i:02}")).collect::<Vec<_>>();
+        for (count, tail) in [(11, ", and 1 more"), (10, "")] {
+            let tmp = tempfile::tempdir().unwrap();
+            for ext in names(count) {
+                std::fs::write(tmp.path().join(format!("a.{ext}")), "x\n").unwrap();
+            }
+            let out = search_glob("*.nomatch", tmp.path()).unwrap();
+            let shown = names(10).join(", ");
+            assert!(
+                out.ends_with(&format!("Available extensions in scope: {shown}{tail}")),
+                "{out}"
+            );
+        }
     }
 }

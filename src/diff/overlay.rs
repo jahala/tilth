@@ -36,7 +36,6 @@ pub(crate) fn compute_overlay(
         added,
         removed,
         conflicts: Vec::new(),
-        new_content: None,
         is_generated: file_diff.is_generated,
         is_binary: file_diff.is_binary,
     };
@@ -52,11 +51,7 @@ pub(crate) fn compute_overlay(
         Err(_) => Vec::new(),
         Ok((old, new)) => {
             let old_path = file_diff.old_path.as_deref().unwrap_or(&file_diff.path);
-            let changes = symbol_changes(old_path, &file_diff.path, &old, &new);
-            if file_diff.status != FileStatus::Deleted {
-                overlay.new_content = Some(new);
-            }
-            changes
+            symbol_changes(old_path, &file_diff.path, &old, &new)
         }
     };
     // A whole added or deleted file lists its declarations, not its imports.

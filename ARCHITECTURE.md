@@ -796,20 +796,27 @@ deliberately scoped — only `OutlineCache`, `Session`, and
 
 ### `OutlineCache` (`tilth-core` `cache.rs`)
 
-Two `DashMap` tables, both keyed by `(PathBuf, SystemTime)`:
+Two `DashMap` tables, both keyed by path, each value carrying the
+file's `mtime`:
 
 - `entries`: rendered outline strings (`Arc<str>`).
 - `parsed`: parsed tree-sitter trees (`Arc<ParsedFile>`,
   carrying `Arc<String>` content, `tree_sitter::Tree`, and `Lang`).
 
 Entries are computed lazily via `get_or_compute` and `get_or_parse`.
-Both use the entry-API to avoid TOCTOU races. There is no eviction —
-`mtime` change on the keyed file means the old entry is never hit
-again, and idle entries simply sit there. For long-running MCP
-processes this is an O(touched files) cache; the trade-off is that a
-file repeatedly modified will accumulate stale entries until the
-process exits. In practice the working set of active files is small
-enough that this hasn't been a concern.
+Both use the entry-API to avoid TOCTOU races. A changed `mtime`
+replaces the file's entry in place.
+
+Reads fill the cache with the files they outline, and `tilth_search`
+with every file whose matches it shows (the enclosing scope and the
+outline context of each match). Callers, grok, deps and diff do not
+use it. A parsed tree takes about 30 times its source in memory, so a
+235 KB Rust file holds 7 MB. The entries stay within a memory budget,
+`CACHE_BUDGET_BYTES` (128 MiB), counted from each outline's length and
+each tree's node count. When an entry takes the cache over it, the
+cache drops every entry and starts again, the way `BloomFilterCache`
+does; a dropped file is parsed again on its next use. The doc comments
+on the two constants give the measurements behind them.
 
 The ceiling on `get_or_parse` (`tilth_core::source::MAX_FILE_SIZE`,
 500 KB) keeps tree-sitter parses from blowing up memory on generated
@@ -1034,7 +1041,9 @@ A handful of small files cut across every subsystem.
   `number_lines(content, start)` and `hashlines(content, start)` are
   the line-numbering / hash-anchored variants. `noun(n, one, many)`
   picks the noun after every count in tilth's output, so a count of
-  one reads `1 line`.
+  one reads `1 line`. `and_more(total, limit)` ends a list cut to its
+  first `limit` with `and N more`, and `capped_list` sets a comma list
+  that way, as in `a, b, and 3 more`.
 - **`budget.rs`** — `apply(output, budget)` truncates a finished
   output string to a token budget. Used by every entry point and tool.
 - **`error.rs`** (`tilth-core`) — `TilthError` enum (`NotFound`, `PermissionDenied`,
@@ -1133,11 +1142,3 @@ tracking.
   loop would fix this but is an invasive rewrite. Bounding the
   walker (max files visited per call) is the lower-cost option and
   would also prevent the underlying problem.
-
-- **No `OutlineCache` eviction.** Long-running MCP processes
-  accumulate cache entries indefinitely (one per `(path, mtime)`
-  pair touched). For practical workloads the working set stays
-  small enough that this hasn't surfaced, but a session that visits
-  thousands of distinct files would grow the cache without bound.
-  An LRU layer or an mtime-staleness sweeper at request boundaries
-  would be a small, targeted fix.
