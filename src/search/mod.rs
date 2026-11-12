@@ -3292,6 +3292,7 @@ mod tests {
             1,
             None,
             None,
+            WalkConfig::default(),
             false,
             None,
         )
@@ -3342,7 +3343,7 @@ mod tests {
             for ext in names(count) {
                 std::fs::write(tmp.path().join(format!("a.{ext}")), "x\n").unwrap();
             }
-            let out = search_glob("*.nomatch", tmp.path()).unwrap();
+            let out = search_glob("*.nomatch", tmp.path(), WalkConfig::default()).unwrap();
             let shown = names(10).join(", ");
             assert!(
                 out.ends_with(&format!("Available extensions in scope: {shown}{tail}")),

@@ -278,7 +278,7 @@ mod tests {
                 "patterns": ["*.nomatch"],
                 "scope": project.path().to_str().unwrap(),
             });
-            let out = tool_list(&args).expect("tool_list should succeed");
+            let out = tool_list(&args, WalkConfig::default()).expect("tool_list should succeed");
             let shown = names(10).join(", ");
             assert!(
                 out.ends_with(&format!("no matches; found extensions: {shown}{tail}\n")),
