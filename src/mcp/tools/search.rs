@@ -94,7 +94,7 @@ pub(in crate::mcp) fn tool_search(
             session.record_search(query);
             let result = crate::search::content::search(query, walk, true, context, full)
                 .map_err(|e| e.to_string())?;
-            crate::search::format_raw_result(&result, cache)
+            crate::search::format_raw_result(&result, walk, cache)
         }
         "callers" => {
             let targets: Vec<&str> = query
