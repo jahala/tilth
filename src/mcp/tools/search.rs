@@ -631,6 +631,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn repeated_symbol_is_deduped_only_if_the_earlier_section_kept_its_body() {
+        use std::fmt::Write as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut source = String::from("pub fn big_target() {\n");
+        for i in 0..400 {
+            let _ = writeln!(source, "    let marker_{i} = {i} + 1;");
+        }
+        source.push_str("}\n");
+        std::fs::write(tmp.path().join("big.rs"), source).unwrap();
+
+        let search = |budget: u64| {
+            run_search(&serde_json::json!({
+                "query": "big_target,big_target",
+                "scope": tmp.path(),
+                "expand": 2,
+                "budget": budget,
+            }))
+        };
+
+        let tight = search(240);
+        assert_eq!(tight.matches("# Search:").count(), 2, "{tight}");
+        assert!(tight.contains("expansion omitted to fit budget"), "{tight}");
+        assert!(!tight.contains("let marker_0 ="), "{tight}");
+        assert!(!tight.contains("[shown earlier]"), "{tight}");
+
+        let roomy = search(3000);
+        assert_eq!(roomy.matches("let marker_0 =").count(), 1, "{roomy}");
+        assert_eq!(roomy.matches("[shown earlier]").count(), 1, "{roomy}");
+    }
+
     fn run_search(args: &Value) -> String {
         let cache = OutlineCache::new();
         let session = Session::new();
