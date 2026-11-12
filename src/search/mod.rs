@@ -32,6 +32,9 @@ const EXPAND_FULL_FILE_THRESHOLD: u64 = 800;
 /// How many callees the `-- calls --` footer under an expanded definition
 /// lists before it counts the rest.
 const CALLS_SHOWN: usize = 8;
+/// How many second-hop `->` callees the `-- calls --` footer lists across
+/// all its callees before each one counts the rest.
+const CHILDREN_SHOWN: usize = 15;
 /// How many sibling members the `-- siblings --` footer lists before it
 /// counts the rest.
 const SIBLINGS_SHOWN: usize = 6;
@@ -923,24 +926,30 @@ fn format_single_match(
                                 m.def_range,
                             );
                             if !callee_names.is_empty() {
-                                let mut nodes =
-                                    tilth_core::search::callees::resolve_callees_transitive(
-                                        &callee_names,
-                                        &m.path,
-                                        &content,
-                                        bloom,
-                                        2,
-                                        15,
-                                    );
-
-                                if let Some(ref name) = m.def_name {
-                                    nodes.retain(|n| n.callee.name != *name);
-                                }
-                                let total = nodes.len();
+                                let first_hop = tilth_core::search::callees::resolve_callees(
+                                    &callee_names,
+                                    &m.path,
+                                    &content,
+                                    bloom,
+                                );
+                                let mut shown: Vec<_> = first_hop
+                                    .iter()
+                                    .filter(|c| m.def_name.as_ref() != Some(&c.name))
+                                    .cloned()
+                                    .collect();
+                                let total = shown.len();
                                 if total > CALLS_SHOWN {
-                                    nodes.sort_by_key(|n| i32::from(n.callee.file == m.path));
-                                    nodes.truncate(CALLS_SHOWN);
+                                    shown.sort_by_key(|c| i32::from(c.file == m.path));
+                                    shown.truncate(CALLS_SHOWN);
                                 }
+                                // The second hop only under the callees shown,
+                                // so a hidden one spends none of the budget.
+                                let nodes = tilth_core::search::callees::resolve_second_hops(
+                                    shown,
+                                    &first_hop,
+                                    bloom,
+                                    CHILDREN_SHOWN,
+                                );
 
                                 if !nodes.is_empty() {
                                     out.push_str("\n\n-- calls --");
@@ -969,6 +978,11 @@ fn format_single_match(
                                             if let Some(ref sig) = child.signature {
                                                 let _ = write!(out, "  {sig}");
                                             }
+                                        }
+                                        if let Some(more) =
+                                            format::and_more(n.children_found, n.children.len())
+                                        {
+                                            let _ = write!(out, "\n    ... {more}");
                                         }
                                     }
                                     if let Some(more) = format::and_more(total, CALLS_SHOWN) {
@@ -3246,6 +3260,111 @@ mod tests {
         let calls = footer_block(&out, "-- calls --");
         assert_eq!(calls.lines().count(), 1 + CALLS_SHOWN, "{calls}");
         assert!(!calls.contains("more"), "{calls}");
+    }
+
+    /// An expanded `target` that calls one function per entry of `hubs`,
+    /// each of which calls as many leaf functions as its entry says.
+    fn expand_hubs(hubs: &[usize]) -> String {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut src = String::new();
+        for (h, &leaves) in hubs.iter().enumerate() {
+            let _ = writeln!(src, "fn hub{h}() {{");
+            for l in 0..leaves {
+                let _ = writeln!(src, "    leaf{h}_{l}();");
+            }
+            src.push_str("}\n");
+            for l in 0..leaves {
+                let _ = writeln!(src, "fn leaf{h}_{l}() {{}}");
+            }
+        }
+        src.push_str("fn target() {\n");
+        for h in 0..hubs.len() {
+            let _ = writeln!(src, "    hub{h}();");
+        }
+        src.push_str("}\n");
+        std::fs::write(tmp.path().join("lib.rs"), src).unwrap();
+        let bloom = tilth_core::index::bloom::BloomFilterCache::new();
+        search_symbol_expanded(
+            "target",
+            Walk::new(tmp.path(), WalkConfig::default()),
+            &OutlineCache::new(),
+            &Session::new(),
+            &bloom,
+            1,
+            None,
+            false,
+            None,
+        )
+        .unwrap()
+    }
+
+    /// The second-hop `->` lines share one budget, and a callee it cut
+    /// lost its calls without a word (#343).
+    #[test]
+    fn the_calls_footer_counts_the_second_hop_calls_it_leaves_out() {
+        let out = expand_hubs(&[CHILDREN_SHOWN + 1]);
+        let calls = footer_block(&out, "-- calls --");
+        assert_eq!(calls.lines().count(), 2 + CHILDREN_SHOWN + 1, "{calls}");
+        assert!(calls.ends_with("\n    ... and 1 more"), "{calls}");
+
+        let out = expand_hubs(&[CHILDREN_SHOWN]);
+        let calls = footer_block(&out, "-- calls --");
+        assert_eq!(calls.lines().count(), 2 + CHILDREN_SHOWN, "{calls}");
+        assert!(!calls.contains("more"), "{calls}");
+
+        // The budget runs out at the first hub, and the second still counts
+        // the calls it no longer shows.
+        let out = expand_hubs(&[CHILDREN_SHOWN, 2]);
+        let calls = footer_block(&out, "-- calls --");
+        assert!(
+            calls.ends_with("\n  hub1  lib.rs:33-36  fn hub1()\n    ... and 2 more"),
+            "{calls}"
+        );
+    }
+
+    /// A callee the footer hides spent the second-hop budget, so the
+    /// callees it shows had none left (#343). Here `target` calls a local
+    /// `hub` with a full budget's worth of calls and `CALLS_SHOWN` imported
+    /// functions, which the footer lists first and so leaves `hub` out.
+    #[test]
+    fn the_second_hop_budget_goes_to_the_callees_the_footer_shows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut b = String::new();
+        for i in 0..CALLS_SHOWN {
+            let _ = writeln!(b, "def f{i}():\n    g{i}()\n\ndef g{i}():\n    pass\n");
+        }
+        std::fs::write(tmp.path().join("b.py"), b).unwrap();
+        let imported: Vec<String> = (0..CALLS_SHOWN).map(|i| format!("f{i}")).collect();
+        let mut a = format!("from b import {}\n\ndef hub():\n", imported.join(", "));
+        for l in 0..CHILDREN_SHOWN {
+            let _ = writeln!(a, "    leaf{l}()");
+        }
+        for l in 0..CHILDREN_SHOWN {
+            let _ = writeln!(a, "\ndef leaf{l}():\n    pass");
+        }
+        a.push_str("\ndef target():\n    hub()\n");
+        for f in &imported {
+            let _ = writeln!(a, "    {f}()");
+        }
+        std::fs::write(tmp.path().join("a.py"), a).unwrap();
+        let bloom = tilth_core::index::bloom::BloomFilterCache::new();
+        let out = search_symbol_expanded(
+            "target",
+            Walk::new(tmp.path(), WalkConfig::default()),
+            &OutlineCache::new(),
+            &Session::new(),
+            &bloom,
+            1,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        let calls = footer_block(&out, "-- calls --");
+        for i in 0..CALLS_SHOWN {
+            assert!(calls.contains(&format!("\n    -> g{i}  b.py:")), "{calls}");
+        }
+        assert!(calls.ends_with("\n  ... and 1 more"), "{calls}");
     }
 
     /// The `-- siblings --` footer stopped at six and said nothing of the

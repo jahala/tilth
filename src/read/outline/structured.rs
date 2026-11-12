@@ -1,6 +1,10 @@
 use std::path::Path;
 
-use crate::format::noun;
+use crate::format::{capped_list, noun};
+
+/// How many keys of an object two levels down the JSON outline names before
+/// it counts the rest.
+const KEYS_SHOWN: usize = 5;
 
 /// Depth-limited outline for JSON, YAML, TOML.
 pub fn outline(path: &Path, content: &str, max_lines: usize) -> String {
@@ -54,15 +58,9 @@ fn walk_json(
                 match val {
                     serde_json::Value::Object(inner) => {
                         if depth + 1 >= max_depth {
-                            let keys: Vec<&String> = inner.keys().take(5).collect();
-                            let key_list = keys
-                                .iter()
-                                .map(|k| k.as_str())
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            let suffix = if inner.len() > 5 { ", ..." } else { "" };
+                            let key_list = capped_list(inner.keys(), KEYS_SHOWN);
                             lines.push(format!(
-                                "{full_key}: {{{}}} [{key_list}{suffix}]",
+                                "{full_key}: {{{}}} [{key_list}]",
                                 key_count(inner.len())
                             ));
                         } else {
@@ -313,6 +311,28 @@ features = [\"a\", \"b\", \"c\", \"d\"]
         assert!(
             out.contains("features: [4 items]"),
             "array should render as item count, got:\n{out}"
+        );
+    }
+
+    /// The JSON outline line of an object nested one level down that holds
+    /// `n` keys.
+    fn nested_object_line(n: usize) -> String {
+        let keys: Vec<String> = (0..n).map(|i| format!("\"k{i}\": {i}")).collect();
+        let content = format!("{{\"a\": {{\"b\": {{{}}}}}}}", keys.join(", "));
+        json_outline(&content, 100)
+    }
+
+    /// A nested object's key list ended with `, ...` when it was cut, which
+    /// says something is missing but not how much (#343).
+    #[test]
+    fn a_cut_json_key_list_counts_the_keys_it_leaves_out() {
+        assert_eq!(
+            nested_object_line(KEYS_SHOWN + 1),
+            "a.b: {6 keys} [k0, k1, k2, k3, k4, and 1 more]"
+        );
+        assert_eq!(
+            nested_object_line(KEYS_SHOWN),
+            "a.b: {5 keys} [k0, k1, k2, k3, k4]"
         );
     }
 
