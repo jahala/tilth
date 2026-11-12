@@ -20,8 +20,12 @@ pub struct ResolvedCallee {
 #[derive(Debug)]
 pub struct ResolvedCalleeNode {
     pub callee: ResolvedCallee,
-    /// 2nd-hop callees resolved from within this callee's body.
+    /// 2nd-hop callees resolved from within this callee's body, as many as
+    /// the shared budget had left.
     pub children: Vec<ResolvedCallee>,
+    /// How many 2nd-hop callees this callee has. More than `children.len()`
+    /// when the budget cut some.
+    pub children_found: usize,
 }
 
 /// Extract names of functions/methods called within a given line range.
@@ -311,8 +315,10 @@ fn resolve_same_package(
 /// callee at depth < `depth_limit`, reads the callee's file, extracts nested
 /// callee names from the definition range, and resolves them as children.
 ///
-/// `budget` caps the total number of 2nd-hop (child) callees across all parents.
-/// Cycle detection prevents infinite loops via `(file, start_line)` tracking.
+/// `budget` caps the total number of 2nd-hop (child) callees kept across all
+/// parents. Every parent still resolves its own, so each node counts what the
+/// budget cut. Cycle detection prevents infinite loops via `(file, start_line)`
+/// tracking.
 #[must_use]
 pub fn resolve_callees_transitive(
     initial_names: &[String],
@@ -331,6 +337,7 @@ pub fn resolve_callees_transitive(
             .map(|c| ResolvedCalleeNode {
                 callee: c,
                 children: Vec::new(),
+                children_found: 0,
             })
             .collect();
     }
@@ -347,26 +354,27 @@ pub fn resolve_callees_transitive(
     let mut result = Vec::with_capacity(first_hop.len());
 
     for parent in first_hop {
-        let children = if budget_remaining > 0 {
-            resolve_second_hop(&parent, bloom, &mut visited, &mut budget_remaining)
-        } else {
-            Vec::new()
-        };
+        let mut children = resolve_second_hop(&parent, bloom, &visited);
+        let children_found = children.len();
+        children.truncate(budget_remaining);
+        budget_remaining -= children.len();
+        visited.extend(children.iter().map(|c| (c.file.clone(), c.start_line)));
         result.push(ResolvedCalleeNode {
             callee: parent,
             children,
+            children_found,
         });
     }
 
     result
 }
 
-/// Resolve 2nd-hop callees for a single parent callee.
+/// Resolve 2nd-hop callees for a single parent callee, leaving out the
+/// parent itself and every callee already `visited`.
 fn resolve_second_hop(
     parent: &ResolvedCallee,
     bloom: &crate::index::bloom::BloomFilterCache,
-    visited: &mut HashSet<(PathBuf, u32)>,
-    budget: &mut usize,
+    visited: &HashSet<(PathBuf, u32)>,
 ) -> Vec<ResolvedCallee> {
     let Ok(content) = crate::source::read_source(&parent.file) else {
         return Vec::new();
@@ -398,17 +406,6 @@ fn resolve_second_hop(
         }
         true
     });
-
-    // Apply budget cap
-    if resolved.len() > *budget {
-        resolved.truncate(*budget);
-    }
-
-    // Mark children as visited and decrement budget
-    for c in &resolved {
-        visited.insert((c.file.clone(), c.start_line));
-    }
-    *budget = budget.saturating_sub(resolved.len());
 
     resolved
 }

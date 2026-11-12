@@ -31,6 +31,9 @@ const EXPAND_FULL_FILE_THRESHOLD: u64 = 800;
 /// How many callees the `-- calls --` footer under an expanded definition
 /// lists before it counts the rest.
 const CALLS_SHOWN: usize = 8;
+/// How many second-hop `->` callees the `-- calls --` footer lists across
+/// all its callees before each one counts the rest.
+const CHILDREN_SHOWN: usize = 15;
 /// How many sibling members the `-- siblings --` footer lists before it
 /// counts the rest.
 const SIBLINGS_SHOWN: usize = 6;
@@ -937,7 +940,7 @@ fn format_single_match(
                                         &content,
                                         bloom,
                                         2,
-                                        15,
+                                        CHILDREN_SHOWN,
                                     );
 
                                 if let Some(ref name) = m.def_name {
@@ -976,6 +979,11 @@ fn format_single_match(
                                             if let Some(ref sig) = child.signature {
                                                 let _ = write!(out, "  {sig}");
                                             }
+                                        }
+                                        if let Some(more) =
+                                            format::and_more(n.children_found, n.children.len())
+                                        {
+                                            let _ = write!(out, "\n    ... {more}");
                                         }
                                     }
                                     if let Some(more) = format::and_more(total, CALLS_SHOWN) {
@@ -3104,6 +3112,67 @@ mod tests {
         let calls = footer_block(&out, "-- calls --");
         assert_eq!(calls.lines().count(), 1 + CALLS_SHOWN, "{calls}");
         assert!(!calls.contains("more"), "{calls}");
+    }
+
+    /// An expanded `target` that calls one function per entry of `hubs`,
+    /// each of which calls as many leaf functions as its entry says.
+    fn expand_hubs(hubs: &[usize]) -> String {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut src = String::new();
+        for (h, &leaves) in hubs.iter().enumerate() {
+            let _ = writeln!(src, "fn hub{h}() {{");
+            for l in 0..leaves {
+                let _ = writeln!(src, "    leaf{h}_{l}();");
+            }
+            src.push_str("}\n");
+            for l in 0..leaves {
+                let _ = writeln!(src, "fn leaf{h}_{l}() {{}}");
+            }
+        }
+        src.push_str("fn target() {\n");
+        for h in 0..hubs.len() {
+            let _ = writeln!(src, "    hub{h}();");
+        }
+        src.push_str("}\n");
+        std::fs::write(tmp.path().join("lib.rs"), src).unwrap();
+        let bloom = tilth_core::index::bloom::BloomFilterCache::new();
+        search_symbol_expanded(
+            "target",
+            tmp.path(),
+            &OutlineCache::new(),
+            &Session::new(),
+            &bloom,
+            1,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap()
+    }
+
+    /// The second-hop `->` lines share one budget, and a callee it cut
+    /// lost its calls without a word (#343).
+    #[test]
+    fn the_calls_footer_counts_the_second_hop_calls_it_leaves_out() {
+        let out = expand_hubs(&[CHILDREN_SHOWN + 1]);
+        let calls = footer_block(&out, "-- calls --");
+        assert_eq!(calls.lines().count(), 2 + CHILDREN_SHOWN + 1, "{calls}");
+        assert!(calls.ends_with("\n    ... and 1 more"), "{calls}");
+
+        let out = expand_hubs(&[CHILDREN_SHOWN]);
+        let calls = footer_block(&out, "-- calls --");
+        assert_eq!(calls.lines().count(), 2 + CHILDREN_SHOWN, "{calls}");
+        assert!(!calls.contains("more"), "{calls}");
+
+        // The budget runs out at the first hub, and the second still counts
+        // the calls it no longer shows.
+        let out = expand_hubs(&[CHILDREN_SHOWN, 2]);
+        let calls = footer_block(&out, "-- calls --");
+        assert!(
+            calls.ends_with("\n  hub1  lib.rs:33-36  fn hub1()\n    ... and 2 more"),
+            "{calls}"
+        );
     }
 
     /// The `-- siblings --` footer stopped at six and said nothing of the

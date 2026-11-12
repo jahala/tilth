@@ -10,10 +10,17 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
-use crate::format::noun;
+use crate::format::{self, noun};
 use tilth_core::lang::detect_file_type;
 use tilth_core::search::walk::SKIP_DIRS;
 use tilth_core::types::{FileType, Lang};
+
+/// How many directories the `dirs:` line lists before it counts the rest.
+const DIRS_SHOWN: usize = 10;
+/// How many dependencies the `deps:` line lists before it counts the rest.
+const DEPS_SHOWN: usize = 10;
+/// How many hot files the `hot` line lists before it counts the rest.
+const HOT_SHOWN: usize = 5;
 
 /// Compute a project fingerprint for MCP initialization.
 /// Must be fast (<250ms) — runs synchronously in the initialize handler.
@@ -141,10 +148,9 @@ fn fingerprint_inner(root: &Path) -> String {
             // Check if ANY path component is a non-source dir
             !lower.split('/').any(|part| non_source.contains(&part))
         });
-        // Most files first, ties by name, then the top 10. The names come out
-        // of a hash map in a random order, so the name decides every tie.
+        // Most files first, ties by name. The names come out of a hash map
+        // in a random order, so the name decides every tie.
         mods.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        mods.truncate(10);
         mods.into_iter().map(|(name, _)| name).collect()
     };
 
@@ -156,12 +162,15 @@ fn fingerprint_inner(root: &Path) -> String {
         noun(dir_count, "directory", "directories")
     ));
 
-    // Directories (cap at 10, sorted by file count descending)
+    // Directories, most files first
     if !modules.is_empty() {
-        let mut dirs = modules;
-        dirs.truncate(10);
-        let display: Vec<String> = dirs.iter().map(|m| format!("{m}/")).collect();
-        lines.push(format!("  dirs: {}", display.join(" ")));
+        let mut dirs: Vec<String> = modules
+            .iter()
+            .take(DIRS_SHOWN)
+            .map(|m| format!("{m}/"))
+            .collect();
+        dirs.extend(format::and_more(modules.len(), DIRS_SHOWN));
+        lines.push(format!("  dirs: {}", dirs.join(" ")));
     }
 
     // Manifest — name, version, deps
@@ -169,7 +178,7 @@ fn fingerprint_inner(root: &Path) -> String {
         if let Some(info) = parse_manifest(root, &manifest) {
             // Deps line
             if !info.deps.is_empty() {
-                let dep_str = info.deps.join(", ");
+                let dep_str = format::capped_list(info.deps.iter(), DEPS_SHOWN);
                 lines.push(format!("  deps: {dep_str}"));
             }
 
@@ -459,7 +468,6 @@ fn parse_cargo_toml(root: &Path) -> Option<ManifestInfo> {
         .map(|d| d.into_iter().map(|(k, _)| k).collect())
         .unwrap_or_default();
     deps.sort();
-    deps.truncate(10);
     Some(ManifestInfo {
         name,
         version,
@@ -482,7 +490,6 @@ fn parse_package_json(root: &Path) -> Option<ManifestInfo> {
         .map(|d| d.into_iter().map(|(k, _)| k).collect())
         .unwrap_or_default();
     deps.sort();
-    deps.truncate(10);
     Some(ManifestInfo {
         name: parsed.name,
         version: parsed.version,
@@ -522,7 +529,6 @@ fn parse_go_mod(root: &Path) -> Option<ManifestInfo> {
     }
 
     deps.sort();
-    deps.truncate(10);
 
     Some(ManifestInfo {
         name,
@@ -559,7 +565,6 @@ fn parse_pyproject_toml(root: &Path) -> Option<ManifestInfo> {
         })
         .collect();
     deps.sort();
-    deps.truncate(10);
     Some(ManifestInfo {
         name: project.name,
         version: project.version,
@@ -752,78 +757,65 @@ fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opti
         }
     }
 
-    if path_counts.is_empty() {
-        return None;
-    }
-
-    // Sort by import count descending, take top 5
-    let mut sorted: Vec<(std::path::PathBuf, usize)> = path_counts.into_iter().collect();
-    sorted.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    sorted.truncate(5);
-
-    if sorted[0].1 < 2 {
-        return None;
-    }
-
-    // For each hot file, find the most commonly imported symbol by scanning
-    // import sources that reference this file's module name.
-    let parts: Vec<String> = sorted
-        .iter()
+    // A file is hot when two or more files import it. Most importers first,
+    // ties by path.
+    let mut sorted: Vec<(std::path::PathBuf, usize)> = path_counts
+        .into_iter()
         .filter(|(_, count)| *count >= 2)
-        .map(|(path, count)| {
-            let rel = path.strip_prefix(root).unwrap_or(path);
-            let rel_str = rel.display().to_string();
+        .collect();
+    if sorted.is_empty() {
+        return None;
+    }
+    sorted.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
 
-            // Derive the module name from the file path
-            // src/types.rs → "types", src/lang/mod.rs → "lang", src/error.rs → "error"
-            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-            let module_name = if stem == "mod" || stem == "index" || stem == "__init__" {
-                path.parent()
-                    .and_then(|p| p.file_name())
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(stem)
-            } else {
-                stem
-            };
+    // For each hot file shown, find the most commonly imported symbol by
+    // scanning import sources that reference this file's module name.
+    let parts = sorted.iter().map(|(path, count)| {
+        let rel = path.strip_prefix(root).unwrap_or(path);
+        let rel_str = rel.display().to_string();
 
-            // Count symbols imported from this module across all import sources
-            let mut symbol_counts: HashMap<String, usize> = HashMap::new();
-            for source in &all_import_sources {
-                // Match imports that reference this module
-                // e.g., for module "types": "tilth_core::types::OutlineEntry" matches
-                let segments: Vec<&str> = source.split("::").collect();
-                if let Some(mod_pos) = segments.iter().position(|s| *s == module_name) {
-                    // Everything after the module name is a symbol path
-                    for &sym in segments.iter().skip(mod_pos + 1) {
-                        if !sym.is_empty()
-                            && !sym.contains('*')
-                            && !sym.contains('{')
-                            && sym != "self"
-                        {
-                            *symbol_counts.entry(sym.to_string()).or_insert(0) += 1;
-                        }
+        // Derive the module name from the file path
+        // src/types.rs → "types", src/lang/mod.rs → "lang", src/error.rs → "error"
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let module_name = if stem == "mod" || stem == "index" || stem == "__init__" {
+            path.parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or(stem)
+        } else {
+            stem
+        };
+
+        // Count symbols imported from this module across all import sources
+        let mut symbol_counts: HashMap<String, usize> = HashMap::new();
+        for source in &all_import_sources {
+            // Match imports that reference this module
+            // e.g., for module "types": "tilth_core::types::OutlineEntry" matches
+            let segments: Vec<&str> = source.split("::").collect();
+            if let Some(mod_pos) = segments.iter().position(|s| *s == module_name) {
+                // Everything after the module name is a symbol path
+                for &sym in segments.iter().skip(mod_pos + 1) {
+                    if !sym.is_empty() && !sym.contains('*') && !sym.contains('{') && sym != "self"
+                    {
+                        *symbol_counts.entry(sym.to_string()).or_insert(0) += 1;
                     }
                 }
             }
+        }
 
-            // Pick the most frequently imported symbol (break ties alphabetically for determinism)
-            let top_sym = symbol_counts
-                .into_iter()
-                .max_by(|(a_sym, a_c), (b_sym, b_c)| a_c.cmp(b_c).then(b_sym.cmp(a_sym)))
-                .map(|(sym, _)| sym);
+        // Pick the most frequently imported symbol (break ties alphabetically for determinism)
+        let top_sym = symbol_counts
+            .into_iter()
+            .max_by(|(a_sym, a_c), (b_sym, b_c)| a_c.cmp(b_c).then(b_sym.cmp(a_sym)))
+            .map(|(sym, _)| sym);
 
-            top_sym.map_or_else(
-                || format!("{rel_str} ×{count}"),
-                |sym| format!("{rel_str}({sym}) ×{count}"),
-            )
-        })
-        .collect();
+        top_sym.map_or_else(
+            || format!("{rel_str} ×{count}"),
+            |sym| format!("{rel_str}({sym}) ×{count}"),
+        )
+    });
 
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join(", "))
-    }
+    Some(format::capped_list(parts, HOT_SHOWN))
 }
 
 // ---------------------------------------------------------------------------
@@ -903,6 +895,103 @@ mod tests {
         for _ in 0..10 {
             assert_eq!(fingerprint(tmp.path()), expected);
         }
+    }
+
+    /// A tree of `n` directories that each hold two Python files.
+    fn tree_of_dirs(n: usize) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..n {
+            let dir = tmp.path().join(format!("d{i:02}"));
+            fs::create_dir_all(&dir).unwrap();
+            for file in ["a.py", "b.py"] {
+                fs::write(dir.join(file), "x = 1\n").unwrap();
+            }
+        }
+        tmp
+    }
+
+    /// The summary listed ten directories and counted only those ten in its
+    /// header, so a tree with more read as if it had ten (#343).
+    #[test]
+    fn the_startup_summary_counts_the_dirs_it_leaves_out() {
+        let tmp = tree_of_dirs(DIRS_SHOWN + 1);
+        let expected = "[tilth] Python project — 22 source files, 11 directories\n  \
+             dirs: d00/ d01/ d02/ d03/ d04/ d05/ d06/ d07/ d08/ d09/ and 1 more";
+        assert_eq!(fingerprint(tmp.path()), expected);
+
+        let tmp = tree_of_dirs(DIRS_SHOWN);
+        let expected = "[tilth] Python project — 20 source files, 10 directories\n  \
+             dirs: d00/ d01/ d02/ d03/ d04/ d05/ d06/ d07/ d08/ d09/";
+        assert_eq!(fingerprint(tmp.path()), expected);
+    }
+
+    /// The `deps:` line of a manifest with `n` dependencies.
+    fn deps_line(n: usize) -> String {
+        let tmp = tempfile::tempdir().unwrap();
+        let deps: Vec<String> = (0..n).map(|i| format!("\"dep{i:02}\": \"1\"")).collect();
+        fs::write(
+            tmp.path().join("package.json"),
+            format!("{{\"dependencies\": {{{}}}}}", deps.join(", ")),
+        )
+        .unwrap();
+        let summary = fingerprint(tmp.path());
+        summary
+            .lines()
+            .find(|line| line.starts_with("  deps: "))
+            .unwrap_or_else(|| panic!("no deps line: {summary}"))
+            .to_string()
+    }
+
+    /// The summary listed ten dependencies and said nothing of the rest
+    /// (#343).
+    #[test]
+    fn the_startup_summary_counts_the_deps_it_leaves_out() {
+        assert_eq!(
+            deps_line(DEPS_SHOWN + 1),
+            "  deps: dep00, dep01, dep02, dep03, dep04, dep05, dep06, dep07, dep08, dep09, \
+             and 1 more"
+        );
+        assert_eq!(
+            deps_line(DEPS_SHOWN),
+            "  deps: dep00, dep01, dep02, dep03, dep04, dep05, dep06, dep07, dep08, dep09"
+        );
+    }
+
+    /// The hot files of a Rust tree where two files import each of `n`
+    /// modules.
+    fn hot_of(n: usize) -> Option<String> {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        let modules: Vec<String> = (0..n).map(|i| format!("h{i}")).collect();
+        for module in &modules {
+            fs::write(src.join(format!("{module}.rs")), "").unwrap();
+        }
+        for user in ["a.rs", "b.rs"] {
+            fs::write(
+                src.join(user),
+                format!("use crate::{{{}}};\n", modules.join(", ")),
+            )
+            .unwrap();
+        }
+        let walk = walk_files(tmp.path());
+        hot_files(tmp.path(), &walk, Some(Lang::Rust))
+    }
+
+    /// The summary listed five hot files and said nothing of the rest
+    /// (#343).
+    #[test]
+    fn the_startup_summary_counts_the_hot_files_it_leaves_out() {
+        assert_eq!(
+            hot_of(HOT_SHOWN + 1).as_deref(),
+            Some(
+                "src/h0.rs ×2, src/h1.rs ×2, src/h2.rs ×2, src/h3.rs ×2, src/h4.rs ×2, and 1 more"
+            )
+        );
+        assert_eq!(
+            hot_of(HOT_SHOWN).as_deref(),
+            Some("src/h0.rs ×2, src/h1.rs ×2, src/h2.rs ×2, src/h3.rs ×2, src/h4.rs ×2")
+        );
     }
 
     /// Editors on Windows save `package.json` with a byte-order mark, and
