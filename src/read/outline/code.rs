@@ -1,3 +1,4 @@
+use crate::format;
 use tilth_core::imports::{imports_in_tree, Import};
 use tilth_core::lang::outline::{extract_import_source, outline_language, walk_top_level};
 use tilth_core::types::{Lang, OutlineEntry, OutlineKind};
@@ -135,8 +136,12 @@ fn format_entries(
     out.join("\n")
 }
 
+/// The modules an import summary names before it says how many more there are.
+const SOURCES_SHOWN: usize = 5;
+
 /// Format a collapsed import summary grouped by source with counts.
-/// Spec format: `imports: react(4), express(2), @/lib(3)`
+/// Spec format: `imports: react(4), express(2), @/lib(3)`, cut to the first
+/// [`SOURCES_SHOWN`] sources by [`format::capped_list`].
 ///
 /// Each module a statement names counts once, so a Go block or a Rust group
 /// lists its members. A statement with no module in `imports` (PHP, C# and
@@ -161,7 +166,6 @@ fn format_imports(
             named.push(extract_import_source(&statement.name, Some(lang)));
         }
     }
-    let count = named.len();
 
     // Count occurrences of each source, in first-seen order
     let mut sources: Vec<String> = Vec::new();
@@ -175,23 +179,12 @@ fn format_imports(
     }
 
     // Format as "source(count)" or just "source" if count is 1
-    let mut parts: Vec<String> = Vec::new();
-    for src in sources.iter().take(5) {
-        let c = seen[src];
-        if c > 1 {
-            parts.push(format!("{src}({c})"));
-        } else {
-            parts.push(src.clone());
-        }
-    }
-
-    let suffix = if count > 5 {
-        format!(", ... ({count} total)")
-    } else {
-        String::new()
-    };
-    let condensed = parts.join(", ");
-    format!("[{start}-]   imports: {condensed}{suffix}")
+    let parts = sources.iter().map(|src| match seen[src] {
+        1 => src.clone(),
+        c => format!("{src}({c})"),
+    });
+    let condensed = format::capped_list(parts, SOURCES_SHOWN);
+    format!("[{start}-]   imports: {condensed}")
 }
 
 /// Format a single outline entry with optional indentation.
@@ -360,6 +353,37 @@ type UserId = String
         assert!(
             rendered.contains("[1-]   imports: os, collections, .local, __future__\n"),
             "{rendered}"
+        );
+    }
+
+    /// The summary cuts on modules and ends a cut list with what it left
+    /// out. It cut on statements and counted them, so six imports from three
+    /// modules showed all three and still ended `, ... (6 total)`.
+    #[test]
+    fn import_summary_marks_only_a_cut_list_of_modules() {
+        let summary = |imports: &[&str]| {
+            let python = format!("{}\n\ndef g():\n    pass\n", imports.join("\n"));
+            let rendered = outline(&python, Lang::Python, 1000);
+            rendered.lines().next().unwrap_or_default().to_string()
+        };
+
+        let three_modules = [
+            "from x import a",
+            "from x import b",
+            "from y import c",
+            "from y import d",
+            "from z import e",
+            "from z import f",
+        ];
+        assert_eq!(summary(&three_modules), "[1-]   imports: x(2), y(2), z(2)");
+
+        let at_cap = ["import a", "import b", "import c", "import d", "import e"];
+        assert_eq!(summary(&at_cap), "[1-]   imports: a, b, c, d, e");
+
+        let one_over = [&at_cap[..], &["import f"]].concat();
+        assert_eq!(
+            summary(&one_over),
+            "[1-]   imports: a, b, c, d, e, and 1 more"
         );
     }
 
