@@ -5,12 +5,12 @@ use std::collections::HashMap;
 use std::fmt::Write;
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
 use crate::format::{self, noun};
+use crate::git::Git;
 use tilth_core::lang::detect_file_type;
 use tilth_core::search::walk::SKIP_DIRS;
 use tilth_core::types::{FileType, Lang};
@@ -584,60 +584,28 @@ fn parse_pyproject_toml(root: &Path) -> Option<ManifestInfo> {
 // Git context
 // ---------------------------------------------------------------------------
 
-/// Run a git command with a 200ms timeout. Returns None if it fails or times out.
-/// Best-effort: every git failure (spawn error, non-zero exit, timeout, I/O error)
-/// is intentionally swallowed into None — git context is a cosmetic fingerprint
-/// and must never break the primary read/search path.
-fn git_output(root: &Path, args: &[&str]) -> Option<String> {
-    let mut child = Command::new("git")
-        .args(args)
-        .current_dir(root)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
+/// How long each git command of the `git:` line may take.
+const GIT_LIMIT: Duration = Duration::from_millis(200);
 
-    let deadline = Instant::now() + Duration::from_millis(200);
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    return None;
-                }
-                let out = child.stdout.take()?;
-                #[expect(
-                    clippy::disallowed_methods,
-                    reason = "by design: a child process's output, not a file"
-                )]
-                let s = std::io::read_to_string(out).ok()?;
-                let trimmed = s.trim().to_string();
-                return if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed)
-                };
-            }
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    // Best effort, like the rest of this function: kill fails
-                    // only if git exited in the meantime, and the wait then
-                    // just reaps it.
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return None;
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            Err(_) => return None,
-        }
-    }
+/// What `git <command> <args>` printed, trimmed, or `None` if it printed
+/// nothing, failed or ran past [`GIT_LIMIT`]. Every failure is swallowed:
+/// git context is a cosmetic fingerprint and must never break the primary
+/// read/search path.
+fn git_output(root: &Path, command: &'static str, args: &[&'static str]) -> Option<String> {
+    let out = Git::new(root, command)
+        .args(args)
+        .time_limit(GIT_LIMIT)
+        .run()
+        .ok()?;
+    let trimmed = out.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 fn git_context(root: &Path) -> Option<String> {
-    let branch = git_output(root, &["branch", "--show-current"])
-        .or_else(|| git_output(root, &["rev-parse", "--short", "HEAD"]))?;
+    let branch = git_output(root, "branch", &["--show-current"])
+        .or_else(|| git_output(root, "rev-parse", &["--short", "HEAD"]))?;
 
-    let dirty_count = git_output(root, &["status", "--porcelain"]).map_or(0, |s| s.lines().count());
+    let dirty_count = git_output(root, "status", &["--porcelain"]).map_or(0, |s| s.lines().count());
 
     let dirty_str = if dirty_count == 0 {
         "clean".to_string()

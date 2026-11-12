@@ -99,6 +99,7 @@ src/
 ├── types.rs         Binary types: QueryType, ViewMode, Match,
 │                    SearchResult, FacetTotals
 ├── format.rs        Output headers, line numbering, hashlines
+├── git.rs           The one git runner: Git, GitError
 ├── budget.rs        Token cap (truncate output to a token budget)
 ├── session.rs       Per-MCP-process counters: reads, searches, top
 │                    queries, hot dirs, expanded-set dedup
@@ -935,9 +936,9 @@ single tool each.
    (the call's `root`, the server's root, or the CLI's working directory)
    is in, unless the scope lies outside it. Then the scope names
    its own, so a scope in another worktree diffs that worktree.
-2. **`run_git_diff`** shells out to `git diff` with the right args
-   (or reads the patch file). Before the first commit, `HEAD` is the
-   empty tree.
+2. **`run_git_diff`** runs `git diff` with the right args through the
+   git runner (or reads the patch file). Before the first commit, `HEAD`
+   is the empty tree.
 3. **`resolve_sides`** decides where each side reads file content from
    (`Side`: a revision, the index, the working tree, a file). It is the
    one place that knows what a range means: `a..b` compares `a` with `b`,
@@ -1093,6 +1094,16 @@ A handful of small files cut across every subsystem.
   that way, as in `a, b, and 3 more`.
 - **`budget.rs`** — `apply(output, budget)` truncates a finished
   output string to a token budget. Used by every entry point and tool.
+- **`git.rs`** — the one way tilth runs git, used by the diff and the
+  overview. `Git::new(dir, command)` builds a command: options are
+  `&'static str`, so only text tilth wrote can be one, and a caller's
+  revision or path goes after `--end-of-options` or `--` (#277). Every
+  command pins `core.quotePath` and `diff.suppressBlankEmpty` and reads
+  no stdin. `time_limit` stops a command that runs too long. A failure
+  is a `GitError` (`Io`, `NotARepository`, `Failed`, `TimedOut`) whose
+  text is git's own words after the command that failed; nothing parses
+  git's stderr, because git translates it. `tests/git_runner.rs` fails
+  on a `Command::new("git")` anywhere else outside test code.
 - **`error.rs`** (`tilth-core`) — `TilthError` enum (`NotFound`, `PermissionDenied`,
   `InvalidQuery`, `IoError`, `ParseError`) with `Display` impls that
   format human-readable messages and include suggestions where
@@ -1110,7 +1121,8 @@ user-facing.
 - **`overview.rs`** — `fingerprint(root)` walks files (depth 2),
   detects primary language, parses the project manifest (`Cargo.toml`,
   `package.json`, `go.mod`, `pyproject.toml`), reads `git` context
-  (`branch`, `uncommitted`, `recent commits`), and emits a few
+  (branch and uncommitted file count, each git command limited to
+  200 ms), and emits a few
   hot-file lines. Wrapped in `catch_unwind` and a 250ms wall-clock
   budget; warn-on-overrun via stderr. Output is the project summary
   that the MCP `initialize` response prepends to `SERVER_INSTRUCTIONS`.

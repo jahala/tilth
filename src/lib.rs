@@ -8,6 +8,7 @@ pub mod diff;
 pub(crate) mod edit;
 pub(crate) mod edit_parse_check;
 pub(crate) mod format;
+pub(crate) mod git;
 pub mod install;
 pub mod map;
 pub mod mcp;

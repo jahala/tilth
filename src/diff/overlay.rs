@@ -10,6 +10,7 @@ use super::{
     ChangeType, Conflict, DiffLine, DiffLineKind, FileDiff, FileOverlay, FileStatus, Hunk,
     MatchConfidence, Side, Sides, SymbolChange,
 };
+use crate::git::{Git, GitError};
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -328,8 +329,8 @@ fn file_contents(
 fn read_side(side: &Side, path: &Path, repo: &Path) -> Result<String, String> {
     let path_str = path.to_string_lossy();
     match side {
-        Side::Rev(rev) => git_show(&format!("{rev}:{path_str}"), repo),
-        Side::Index => git_show(&format!(":{path_str}"), repo),
+        Side::Rev(rev) => git_show(&format!("{rev}:{path_str}"), repo).map_err(|e| e.to_string()),
+        Side::Index => git_show(&format!(":{path_str}"), repo).map_err(|e| e.to_string()),
         Side::WorkingTree => {
             // Git emits paths relative to the repository top.
             let disk = repo.join(path);
@@ -342,23 +343,9 @@ fn read_side(side: &Side, path: &Path, repo: &Path) -> Result<String, String> {
     }
 }
 
-pub(super) fn git_show(spec: &str, repo: &Path) -> Result<String, String> {
-    let output = super::git_command(repo)
-        .args([
-            "-c",
-            "core.quotePath=false",
-            "show",
-            "--end-of-options",
-            spec,
-        ])
-        .output()
-        .map_err(|e| format!("git show failed: {e}"))?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(format!("git show {spec}: {}", stderr.trim()))
-    }
+/// The content `spec` (`<rev>:<path>`, or `:<path>` for the index) names.
+pub(super) fn git_show(spec: &str, repo: &Path) -> Result<String, GitError> {
+    Git::new(repo, "show").revision(spec).run()
 }
 
 // ---------------------------------------------------------------------------
