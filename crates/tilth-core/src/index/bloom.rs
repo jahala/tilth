@@ -7,10 +7,11 @@
 //! Identifier extraction uses a simple byte-level state machine -- no
 //! tree-sitter needed -- making it fast enough to run on every uncached file.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{PoisonError, RwLock};
 use std::time::SystemTime;
 
-use dashmap::DashMap;
 use fastbloom::BloomFilter;
 
 use crate::lang::detect_file_type;
@@ -20,10 +21,38 @@ use crate::types::{FileType, Lang};
 // BloomFilterCache
 // ---------------------------------------------------------------------------
 
+/// The most memory the cached filters may hold, by [`entry_bytes`]. A callers
+/// walk over the cargo registry source (1,420 crates, 1.9 GB, 67,762 files
+/// cached) fills 77 MB, so a repeated walk over a tree that size finds every
+/// filter still cached, with room for a tree 1.7 times larger. Half this
+/// budget would not hold it, and a repeated walk over it would rebuild most of
+/// its filters.
+const CACHE_BUDGET_BYTES: usize = 128 * 1024 * 1024;
+
 /// Thread-safe cache of per-file Bloom filters, keyed by path and validated
 /// by mtime. Stale entries are automatically rebuilt on access.
+///
+/// The filters stay within a memory budget. When a new filter would take
+/// them over it, the cache drops them all and starts again: a dropped file
+/// is checked again from its content, as on its first visit. A walk over a
+/// tree that fits the budget never meets it; a walk over a larger one
+/// rebuilds filters as it would with no cache.
 pub struct BloomFilterCache {
-    filters: DashMap<PathBuf, (BloomFilter, SystemTime)>,
+    filters: RwLock<Filters>,
+    budget: usize,
+}
+
+/// The cached filters and the bytes they hold, kept together under one lock
+/// so the count is exact.
+#[derive(Default)]
+struct Filters {
+    entries: HashMap<PathBuf, Entry>,
+    bytes: usize,
+}
+
+struct Entry {
+    filter: BloomFilter,
+    mtime: SystemTime,
 }
 
 impl Default for BloomFilterCache {
@@ -36,8 +65,13 @@ impl BloomFilterCache {
     /// Create an empty cache.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_budget(CACHE_BUDGET_BYTES)
+    }
+
+    fn with_budget(budget: usize) -> Self {
         Self {
-            filters: DashMap::new(),
+            filters: RwLock::default(),
+            budget,
         }
     }
 
@@ -51,19 +85,53 @@ impl BloomFilterCache {
     #[must_use]
     pub fn contains(&self, path: &Path, mtime: SystemTime, content: &str, symbol: &str) -> bool {
         // Fast path: check existing cached entry
-        if let Some(entry) = self.filters.get(path) {
-            let (ref filter, cached_mtime) = *entry;
-            if cached_mtime == mtime {
-                return filter.contains(symbol);
-            }
+        if let Some(entry) = self
+            .filters
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entries
+            .get(path)
+            .filter(|entry| entry.mtime == mtime)
+        {
+            return entry.filter.contains(symbol);
         }
 
         // Cache miss or stale: build and cache a new filter
         let filter = build_filter(content, code_lang(path));
         let result = filter.contains(symbol);
-        self.filters.insert(path.to_path_buf(), (filter, mtime));
+        self.filters
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(path.to_path_buf(), Entry { filter, mtime }, self.budget);
         result
     }
+}
+
+impl Filters {
+    /// Cache `entry` for `path` in place of any older one, keeping the
+    /// filters within `budget`. A filter larger than the whole budget is not
+    /// cached.
+    fn insert(&mut self, path: PathBuf, entry: Entry, budget: usize) {
+        if let Some(stale) = self.entries.remove(&path) {
+            self.bytes -= entry_bytes(&path, &stale.filter);
+        }
+        let cost = entry_bytes(&path, &entry.filter);
+        if cost > budget {
+            return;
+        }
+        if self.bytes + cost > budget {
+            self.entries.clear();
+            self.bytes = 0;
+        }
+        self.bytes += cost;
+        self.entries.insert(path, entry);
+    }
+}
+
+/// The memory one cached filter holds: its bits, its path, and its slot in
+/// the table. The table's spare slots are not counted.
+fn entry_bytes(path: &Path, filter: &BloomFilter) -> usize {
+    std::mem::size_of::<(PathBuf, Entry)>() + path.as_os_str().len() + filter.num_bits() / 8
 }
 
 /// The source language of `path`, or `None` when it is not a known code file.
@@ -359,6 +427,77 @@ fn is_ident_continue(b: u8) -> bool {
 mod tests {
     use super::*;
 
+    impl BloomFilterCache {
+        /// How many filters the cache holds, and the bytes they take.
+        ///
+        /// The bytes are summed from the filters themselves, and must match the
+        /// count the cache keeps.
+        fn held(&self) -> (usize, usize) {
+            let filters = self.filters.read().unwrap_or_else(PoisonError::into_inner);
+            let bytes = filters
+                .entries
+                .iter()
+                .map(|(path, entry)| entry_bytes(path, &entry.filter))
+                .sum();
+            assert_eq!(filters.bytes, bytes, "the cache miscounts its bytes");
+            (filters.entries.len(), bytes)
+        }
+
+        fn holds(&self, path: &Path) -> bool {
+            self.filters
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entries
+                .contains_key(path)
+        }
+    }
+
+    /// The path, content and one defined symbol of the `i`th file of a tree.
+    fn nth_file(i: usize) -> (PathBuf, String, String) {
+        let symbol = format!("present_{i}");
+        let content = format!("fn {symbol}() {{}}\n");
+        (PathBuf::from(format!("/tree/file_{i}.rs")), content, symbol)
+    }
+
+    /// A cache with room for about `files` filters like those of [`nth_file`].
+    fn cache_with_room_for(files: usize) -> BloomFilterCache {
+        let (path, content, _) = nth_file(0);
+        let one = entry_bytes(&path, &build_filter(&content, Some(Lang::Rust)));
+        BloomFilterCache::with_budget(one * files)
+    }
+
+    #[test]
+    fn cache_stays_within_its_budget() {
+        let cache = cache_with_room_for(10);
+        for i in 0..100 {
+            let (path, content, symbol) = nth_file(i);
+            assert!(cache.contains(&path, SystemTime::UNIX_EPOCH, &content, &symbol));
+            let (_, bytes) = cache.held();
+            assert!(
+                bytes <= cache.budget,
+                "after {} files the cache holds {bytes} bytes, over its budget of {}",
+                i + 1,
+                cache.budget
+            );
+        }
+        let (filters, _) = cache.held();
+        assert!(filters <= 10, "the cache holds {filters} filters");
+    }
+
+    #[test]
+    fn evicted_file_is_checked_again_from_its_content() {
+        let cache = cache_with_room_for(10);
+        let mtime = SystemTime::UNIX_EPOCH;
+        for i in 0..100 {
+            let (path, content, symbol) = nth_file(i);
+            assert!(cache.contains(&path, mtime, &content, &symbol));
+        }
+        let (first, content, symbol) = nth_file(0);
+        assert!(!cache.holds(&first), "the first file was not evicted");
+        assert!(cache.contains(&first, mtime, &content, &symbol));
+        assert!(!cache.contains(&first, mtime, &content, "present_1"));
+    }
+
     #[test]
     fn test_basic_membership() {
         let mut bf = BloomFilter::with_false_pos(0.01).expected_items(100);
@@ -542,6 +681,8 @@ mod tests {
         // Different mtime: should rebuild from new content
         assert!(cache.contains(path, mtime_new, new_content, "new_function"));
         assert!(!cache.contains(path, mtime_new, new_content, "old_function"));
+        let (filters, _) = cache.held();
+        assert_eq!(filters, 1, "the stale filter was kept");
     }
 
     #[test]

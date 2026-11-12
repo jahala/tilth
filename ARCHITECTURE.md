@@ -837,6 +837,13 @@ This is actively used in the relational-query paths (it's why
 `tilth_search kind:callers` doesn't take O(N files) tree-sitter parses
 on every query).
 
+The filters stay within a memory budget, `CACHE_BUDGET_BYTES`, sized
+to hold a callers walk over the cargo registry source (its doc gives the
+numbers). When a new filter would take the cache over its budget, it
+drops every filter and starts again; a dropped file is checked again
+from its content. One lock holds the filters and their byte count
+together, so the count is exact.
+
 ## Diff and edit subsystems
 
 These two are separate from the search/read pipeline but share the same
