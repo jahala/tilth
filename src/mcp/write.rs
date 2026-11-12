@@ -177,7 +177,14 @@ mod tests {
                 std::thread::yield_now();
             }
             for _ in 0..200 {
-                let read = crate::read::read_file(&p, None, true, &cache, false, None);
+                let read = crate::read::read_file(
+                    &p,
+                    None,
+                    Some(crate::config::Config::default().full_size_cap),
+                    &cache,
+                    false,
+                    None,
+                );
                 let out = match read {
                     Ok(out) => out,
                     Err(e) => {

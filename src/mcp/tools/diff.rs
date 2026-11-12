@@ -1,10 +1,11 @@
 use serde_json::Value;
+use tilth_core::search::walk::WalkConfig;
 
 use crate::diff::DiffSource;
 
 use super::anchor_path;
 
-pub(in crate::mcp) fn tool_diff(args: &Value) -> Result<String, String> {
+pub(in crate::mcp) fn tool_diff(args: &Value, walk: WalkConfig) -> Result<String, String> {
     let source = args.get("source").and_then(|v| v.as_str());
     let scope = args.get("scope").and_then(|v| v.as_str());
     let a = args.get("a").and_then(|v| v.as_str());
@@ -52,7 +53,15 @@ pub(in crate::mcp) fn tool_diff(args: &Value) -> Result<String, String> {
         }
         _ => {}
     }
-    crate::diff::diff(&diff_source, root, scope, search, blast, expand, budget)
+    crate::diff::diff(
+        &diff_source,
+        root,
+        scope,
+        search,
+        blast.then_some(walk),
+        expand,
+        budget,
+    )
 }
 
 #[cfg(test)]
@@ -104,7 +113,7 @@ mod tests {
         let _lock = crate::diff::CWD_LOCK.lock().unwrap();
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(cwd).unwrap();
-        let result = tool_diff(args);
+        let result = tool_diff(args, WalkConfig::default());
         std::env::set_current_dir(&prev).unwrap();
         result
     }
@@ -154,7 +163,7 @@ mod tests {
         // against the server cwd — the wrong-checkout hazard. The standard
         // refusal (anchor_path) applies, naming the arg and the escape hatch.
         let args = serde_json::json!({ "a": "rel/a.rs", "b": "rel/b.rs" });
-        let err = tool_diff(&args).unwrap_err();
+        let err = tool_diff(&args, WalkConfig::default()).unwrap_err();
         assert!(
             err.contains("relative a") && err.contains("root"),
             "refusal must name the arg and the root escape hatch: {err}"
@@ -167,7 +176,7 @@ mod tests {
         // hazard `root` exists to remove — so it is refused, never silently
         // ignored or defaulted.
         let args = serde_json::json!({ "source": "uncommitted", "root": "some/checkout" });
-        let err = tool_diff(&args).unwrap_err();
+        let err = tool_diff(&args, WalkConfig::default()).unwrap_err();
         assert!(
             err.contains("root") && err.contains("absolute"),
             "refusal must direct the caller to an absolute root: {err}"
@@ -190,7 +199,8 @@ mod tests {
                 key: format!("--output={}", victim.display()),
                 "root": repo.path().to_str().unwrap(),
             });
-            let err = tool_diff(&args).expect_err("an option-shaped value must be refused");
+            let err = tool_diff(&args, WalkConfig::default())
+                .expect_err("an option-shaped value must be refused");
             assert!(
                 err.contains(key) && err.contains("must not start with '-'"),
                 "refusal must name the argument and the rule: {err}"
@@ -212,7 +222,7 @@ mod tests {
             "source": "uncommitted",
             "root": "/nonexistent/checkout/zzz",
         });
-        let err = tool_diff(&args).unwrap_err();
+        let err = tool_diff(&args, WalkConfig::default()).unwrap_err();
         assert!(
             err.contains("/nonexistent/checkout/zzz") && err.contains("not a valid directory"),
             "refusal must name the bad root: {err}"

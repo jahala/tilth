@@ -17,7 +17,7 @@ crates/tilth-core/src/
     detection.rs       Generated file detection (lockfiles, .min.js) and binary detection.
     <lang>.rs          One spec per language. c.rs, cpp.rs and go.rs also hold test fixtures, shared with the binary's tests through the `test-fixtures` feature.
   search/
-    walk.rs            The shared directory walker: SKIP_DIRS, .tilthignore, the gitignore switch, glob overrides.
+    walk.rs            The shared directory walker: Walk (scope, glob, WalkConfig), WalkConfig (threads, gitignore), SKIP_DIRS, .tilthignore, glob overrides.
     callers.rs         Structural call-site detection (tree-sitter + memchr pre-filter): find_callers_batch(), CallerMatch.
     callees.rs         Callee extraction and resolution for expanded definitions.
     callee_query.rs    Per-language tree-sitter call-expression queries + compiled-Query cache, shared by callers.rs and callees.rs.
@@ -32,8 +32,9 @@ crates/tilth-core/src/
   types.rs             Shared types: Lang, FileType, OutlineEntry, OutlineKind.
   error.rs             TilthError, with exit codes.
 src/
-  main.rs              CLI entry (clap). Dispatches to MCP, map, or single-query mode.
+  main.rs              CLI entry (clap). Builds the one Config, then dispatches to MCP, map, or single-query mode.
   lib.rs               Public API: classify query → read/search/glob → formatted output.
+  config.rs            Config, built once from the environment and the flags and passed down. env_var() is the one read of the environment.
   mcp/
     mod.rs             MCP server (JSON-RPC on stdio). Embeds SERVER_INSTRUCTIONS + EDIT_MODE_EXTRA via include_str! from prompts/.
     write.rs           tilth_write overwrite/append primitives — create-only guard, O_NOFOLLOW symlink refusal, atomic parent-dir creation.
@@ -118,7 +119,7 @@ python3 scripts/check/output_parity.py --base OLD --new NEW --repos <fixture rep
 
 The toolchain is pinned in `rust-toolchain.toml`, and CI and the release build install it from there. Clippy's lints change between releases, so bumping it is a deliberate PR that re-runs clippy. The file lists no components, so release builds skip clippy and rustfmt; the CI check job and a local checkout add them with `rustup component add clippy rustfmt`.
 
-Lints live in `[workspace.lints]` in the root `Cargo.toml` (pedantic, a nursery subset, and restrictions on unwrap, expect, print and unsafe). `clippy.toml` exempts `#[test]` functions and `#[cfg(test)]` modules from the unwrap, expect, print and dbg lints, and nothing else: a helper function in `tests/*.rs` needs its own `#[expect]`. An exception is an `#[expect(lint, reason = "...")]` on the item or statement it excuses, never an `allow`: `allow_attributes` fails the build. A temporary exception's reason names its tracking issue, as in `reason = "split by responsibility in #315"`. A permanent one starts with `by design: `. `tests/expect_reasons.rs` fails on any other reason. Results go to stdout through `write_stdout` (CLI) or the MCP transport's writer, and diagnostics through `diag::emit`; `clippy.toml` forbids `std::io::stdout` and `std::io::stderr` everywhere else.
+Lints live in `[workspace.lints]` in the root `Cargo.toml` (pedantic, a nursery subset, and restrictions on unwrap, expect, print and unsafe). `clippy.toml` exempts `#[test]` functions and `#[cfg(test)]` modules from the unwrap, expect, print and dbg lints, and nothing else: a helper function in `tests/*.rs` needs its own `#[expect]`. An exception is an `#[expect(lint, reason = "...")]` on the item or statement it excuses, never an `allow`: `allow_attributes` fails the build. A temporary exception's reason names its tracking issue, as in `reason = "split by responsibility in #315"`. A permanent one starts with `by design: `. `tests/expect_reasons.rs` fails on any other reason. Results go to stdout through `write_stdout` (CLI) or the MCP transport's writer, and diagnostics through `diag::emit`; `clippy.toml` forbids `std::io::stdout` and `std::io::stderr` everywhere else. The environment is read only through `config::env_var` and never written; `clippy.toml` forbids `std::env::var`, `var_os`, `vars`, `vars_os`, `set_var` and `remove_var`.
 
 CI runs `fmt --all --check`, `clippy --workspace --all-targets -D warnings`, `cargo test --workspace` and the tilth-core publish dry-run on every push/PR.
 

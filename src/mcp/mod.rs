@@ -5,9 +5,10 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::config::Config;
 use crate::diag;
 use crate::session::Session;
-use crate::timeout::{self, spawn_with_timeout, SpawnFailure, ThreadTracker};
+use crate::timeout::{spawn_with_timeout, SpawnFailure, ThreadTracker};
 use tilth_core::cache::OutlineCache;
 use tilth_core::index::bloom::BloomFilterCache;
 
@@ -27,16 +28,18 @@ struct Services {
     session: Arc<Session>,
     bloom: Arc<BloomFilterCache>,
     tracker: Arc<ThreadTracker>,
+    config: Config,
     edit_mode: bool,
 }
 
 impl Services {
-    fn new(edit_mode: bool) -> Self {
+    fn new(config: Config, edit_mode: bool) -> Self {
         Self {
             cache: Arc::new(OutlineCache::new()),
             session: Arc::new(Session::new()),
             bloom: Arc::new(BloomFilterCache::new()),
             tracker: Arc::new(ThreadTracker::new()),
+            config,
             edit_mode,
         }
     }
@@ -57,6 +60,10 @@ impl Services {
         &self.tracker
     }
 
+    fn config(&self) -> &Config {
+        &self.config
+    }
+
     fn edit_mode(&self) -> bool {
         self.edit_mode
     }
@@ -70,20 +77,20 @@ impl Services {
 const SERVER_INSTRUCTIONS: &str = include_str!("../../prompts/mcp-base.md");
 const EDIT_MODE_EXTRA: &str = include_str!("../../prompts/mcp-edit.md");
 
-/// MCP server over stdio. When `edit_mode` is true, exposes `tilth_write` and
-/// switches `tilth_read` to hashline output format. Read-only deployments
-/// (no `--edit`) omit `tilth_write` and its large schema entirely, so they pay
-/// no edit-protocol context tax.
+/// MCP server over stdio, run with `config`. When `edit_mode` is true,
+/// exposes `tilth_write` and switches `tilth_read` to hashline output format.
+/// Read-only deployments (no `--edit`) omit `tilth_write` and its large
+/// schema entirely, so they pay no edit-protocol context tax.
 ///
 /// `scope` overrides the default search root. When provided, tilth chdir's to it
 /// at startup so all tools, git commands, and searches use the correct project root.
 /// This fixes MCP hosts that launch tilth with cwd=/ (e.g., Codex).
-pub fn run(edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
+pub fn run(config: Config, edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
     let scope_is_explicit = scope.is_some();
 
     enter_project_root(scope)?;
 
-    let services = Services::new(edit_mode);
+    let services = Services::new(config, edit_mode);
     let stdin = io::stdin();
     #[expect(
         clippy::disallowed_methods,
@@ -294,9 +301,7 @@ fn handle_request(req: &JsonRpcRequest, services: &Services) -> JsonRpcResponse 
     let edit_mode = services.edit_mode();
     match req.method.as_str() {
         "initialize" => {
-            let overview = if std::env::var("TILTH_NO_OVERVIEW").is_ok() {
-                String::new()
-            } else {
+            let overview = if services.config().overview {
                 match std::env::current_dir() {
                     Ok(cwd) => crate::overview::fingerprint(&cwd),
                     Err(e) => {
@@ -307,6 +312,8 @@ fn handle_request(req: &JsonRpcRequest, services: &Services) -> JsonRpcResponse 
                         String::new()
                     }
                 }
+            } else {
+                String::new()
             };
             let instructions = if edit_mode {
                 if overview.is_empty() {
@@ -370,26 +377,37 @@ fn handle_request(req: &JsonRpcRequest, services: &Services) -> JsonRpcResponse 
 /// Execute a tool by name with the given arguments. Returns formatted output or error string.
 /// No classifier involved — the caller specifies the tool explicitly.
 fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String, String> {
-    let gitignore = match args.get("gitignore") {
-        None => None,
-        Some(value) => Some(value.as_bool().ok_or("gitignore must be a boolean")?),
-    };
-    tilth_core::search::walk::with_gitignore_override(gitignore, || {
-        let edit_mode = services.edit_mode();
-        match tool {
-            "tilth_read" => tool_read(args, services.cache(), services.session(), edit_mode),
-            "tilth_search" => {
-                tool_search(args, services.cache(), services.session(), services.bloom())
-            }
-            "tilth_list" => tool_list(args),
-            "tilth_deps" => tool_deps(args, services.bloom()),
-            "tilth_grok" => tool_grok(args, services.bloom(), services.session()),
-            "tilth_diff" => tool_diff(args),
-            "tilth_session" => tool_session(args, services.session()),
-            "tilth_write" if edit_mode => tool_write(args, services.session(), services.bloom()),
-            _ => Err(format!("unknown tool: {tool}")),
-        }
-    })
+    // A call's `gitignore` argument overrides the server's setting for that
+    // call alone.
+    let mut config = *services.config();
+    if let Some(value) = args.get("gitignore") {
+        config.walk.respect_gitignore = value.as_bool().ok_or("gitignore must be a boolean")?;
+    }
+    let edit_mode = services.edit_mode();
+    let walk = config.walk;
+    match tool {
+        "tilth_read" => tool_read(
+            args,
+            services.cache(),
+            services.session(),
+            edit_mode,
+            &config,
+        ),
+        "tilth_search" => tool_search(
+            args,
+            services.cache(),
+            services.session(),
+            services.bloom(),
+            walk,
+        ),
+        "tilth_list" => tool_list(args, walk),
+        "tilth_deps" => tool_deps(args, services.bloom(), walk),
+        "tilth_grok" => tool_grok(args, services.bloom(), services.session(), &config),
+        "tilth_diff" => tool_diff(args, walk),
+        "tilth_session" => tool_session(args, services.session()),
+        "tilth_write" if edit_mode => tool_write(args, services.session(), services.bloom(), walk),
+        _ => Err(format!("unknown tool: {tool}")),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -408,7 +426,7 @@ fn handle_tool_call(req: &JsonRpcRequest, services: &Services) -> JsonRpcRespons
                 .into(),
         )
     } else {
-        run_tool_with_timeout(services, tool_name, args, timeout::request_timeout())
+        run_tool_with_timeout(services, tool_name, args, services.config().request_timeout)
     };
 
     build_tool_response(req.id.clone(), result)
@@ -678,6 +696,46 @@ mod tests {
         ));
     }
 
+    // -- dispatch_tool: per-call gitignore ------------------------------------
+
+    /// A call's `gitignore` argument decides for that call alone; without
+    /// one, the server's setting decides.
+    #[test]
+    fn a_calls_gitignore_argument_wins_over_the_server_setting() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("ignored")).unwrap();
+        std::fs::write(tmp.path().join(".gitignore"), "ignored/\n").unwrap();
+        std::fs::write(tmp.path().join("ignored/hidden.rs"), "fn needle() {}\n").unwrap();
+        let scope = tmp.path().to_str().unwrap();
+        let calls = [
+            (
+                "tilth_list",
+                serde_json::json!({ "scope": scope, "patterns": ["*.rs"] }),
+            ),
+            (
+                "tilth_search",
+                serde_json::json!({ "scope": scope, "query": "needle" }),
+            ),
+        ];
+        for (tool, args) in calls {
+            let hidden_found = |server: bool, call: Option<bool>| {
+                let mut config = Config::default();
+                config.walk.respect_gitignore = server;
+                let mut args = args.clone();
+                if let Some(call) = call {
+                    args["gitignore"] = call.into();
+                }
+                dispatch_tool(tool, &args, &Services::new(config, false))
+                    .unwrap()
+                    .contains("hidden.rs")
+            };
+            assert!(hidden_found(false, None), "{tool}");
+            assert!(!hidden_found(true, None), "{tool}");
+            assert!(hidden_found(true, Some(false)), "{tool}");
+            assert!(!hidden_found(false, Some(true)), "{tool}");
+        }
+    }
+
     // -- dispatch_tool: removed tools ----------------------------------------
 
     /// The token-accounting tool was removed outright, with no alias: a call by
@@ -689,7 +747,7 @@ mod tests {
     #[test]
     fn tilth_files_is_not_dispatched() {
         let args = serde_json::json!({ "patterns": ["*.rs"] });
-        let services = Services::new(false);
+        let services = Services::new(Config::default(), false);
         let err = dispatch_tool("tilth_files", &args, &services)
             .expect_err("tilth_files must not dispatch");
         assert!(
@@ -702,7 +760,7 @@ mod tests {
     fn tilth_savings_is_not_dispatched() {
         let args = serde_json::json!({});
         for edit_mode in [false, true] {
-            let services = Services::new(edit_mode);
+            let services = Services::new(Config::default(), edit_mode);
             let err = dispatch_tool("tilth_savings", &args, &services)
                 .expect_err("tilth_savings must not dispatch");
             assert!(

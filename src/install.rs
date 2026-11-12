@@ -551,6 +551,14 @@ fn home_dir() -> Result<PathBuf, String> {
     home::home_dir().ok_or_else(|| "home directory not found ($HOME / $USERPROFILE)".into())
 }
 
+/// The Windows roaming application-data folder, `%APPDATA%`.
+#[cfg(target_os = "windows")]
+fn appdata_dir() -> Result<PathBuf, String> {
+    crate::config::env_var("APPDATA")
+        .map(PathBuf::from)
+        .ok_or_else(|| "APPDATA not set".into())
+}
+
 /// Merge a tilth server entry into a JSON config under the given servers key.
 /// Extracted for testability — used by `write_json_config` and unit tests.
 fn upsert_json_server(config: &mut Value, servers_key: &str, entry: Value) -> Result<(), String> {
@@ -580,8 +588,7 @@ fn vscode_global_storage_base() -> Result<PathBuf, String> {
 
     #[cfg(target_os = "windows")]
     {
-        let appdata = std::env::var("APPDATA").map_err(|_| "APPDATA not set")?;
-        Ok(PathBuf::from(appdata).join("Code/User/globalStorage"))
+        Ok(appdata_dir()?.join("Code/User/globalStorage"))
     }
 
     #[cfg(target_os = "linux")]
@@ -605,8 +612,7 @@ fn claude_desktop_path() -> Result<PathBuf, String> {
 
     #[cfg(target_os = "windows")]
     {
-        let appdata = std::env::var("APPDATA").map_err(|_| "APPDATA not set")?;
-        Ok(PathBuf::from(appdata).join("Claude/claude_desktop_config.json"))
+        Ok(appdata_dir()?.join("Claude/claude_desktop_config.json"))
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]

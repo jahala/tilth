@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+use crate::config::Config;
 use crate::format::noun;
 use crate::session::Session;
 use crate::types::ViewMode;
@@ -20,6 +21,7 @@ pub(in crate::mcp) fn tool_read(
     cache: &OutlineCache,
     session: &Session,
     edit_mode: bool,
+    config: &Config,
 ) -> Result<String, String> {
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
     // The budget every read is fitted to. With no `budget` argument it is
@@ -48,6 +50,7 @@ pub(in crate::mcp) fn tool_read(
     // before falling back to force_full, so `full:true` + `mode:signature` yields a
     // signature view, not a full dump. Pinned by tool_read_signature_beats_full_flag.
     let force_full = full_flag || mode_str == "full";
+    let full_cap = force_full.then_some(config.full_size_cap);
     let force_signature = mode_str == "signature";
     let force_stripped = mode_str == "stripped";
 
@@ -60,14 +63,10 @@ pub(in crate::mcp) fn tool_read(
             ));
         }
 
-        // Aggregate deadline for batch reads: 60s default, override with TILTH_BATCH_TIMEOUT
-        // Note: deadline is checked between files, so a single massive file could still
-        // exceed it. The per-request timeout (handle_tool_call) catches that case.
-        let batch_timeout = std::env::var("TILTH_BATCH_TIMEOUT")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(60);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(batch_timeout);
+        // The deadline is checked between files, so a single massive file can
+        // still exceed it. The per-request timeout (handle_tool_call) catches
+        // that case.
+        let deadline = std::time::Instant::now() + config.batch_timeout;
 
         // Every file is read at its own size first. Only when the batch is
         // over the budget do the biggest files shrink, each to a fair share
@@ -98,7 +97,7 @@ pub(in crate::mcp) fn tool_read(
                 let read = crate::read::read_file(
                     &path,
                     None,
-                    force_full,
+                    full_cap,
                     cache,
                     edit_mode,
                     Some(read_budget),
@@ -122,7 +121,7 @@ pub(in crate::mcp) fn tool_read(
                     if let Ok(view) = crate::read::read_file(
                         &path,
                         None,
-                        force_full,
+                        full_cap,
                         cache,
                         edit_mode,
                         // One token of the share is the separator's.
@@ -202,7 +201,7 @@ pub(in crate::mcp) fn tool_read(
         crate::read::read_file(
             &path,
             section,
-            force_full,
+            full_cap,
             cache,
             edit_mode,
             Some(file_budget),
@@ -374,7 +373,7 @@ mod tests {
         }
         std::fs::write(&log, &text).unwrap();
         let cache = OutlineCache::new();
-        let default = crate::read::read_file(&log, None, false, &cache, false, None).unwrap();
+        let default = crate::read::read_file(&log, None, None, &cache, false, None).unwrap();
         assert!(default.contains("[outline]"), "{default}");
         assert_eq!(read_signature_file(&log, &cache).unwrap(), default);
         assert_eq!(read_stripped_file(&log, &cache).unwrap(), default);
@@ -412,7 +411,8 @@ mod tests {
         let cache = OutlineCache::new();
         let session = Session::new();
 
-        let out = tool_read(&args, &cache, &session, false).expect("signature read");
+        let out =
+            tool_read(&args, &cache, &session, false, &Config::default()).expect("signature read");
 
         assert!(
             out.contains("[signature]"),
@@ -440,8 +440,14 @@ mod tests {
             "path": path.to_str().unwrap(),
             "mode": "signature",
         });
-        let out =
-            tool_read(&args, &OutlineCache::new(), &Session::new(), false).expect("signature read");
+        let out = tool_read(
+            &args,
+            &OutlineCache::new(),
+            &Session::new(),
+            false,
+            &Config::default(),
+        )
+        .expect("signature read");
         assert_eq!(
             out.lines().filter(|l| l.starts_with("1:")).count(),
             1,
@@ -465,7 +471,8 @@ mod tests {
         let cache = OutlineCache::new();
         let session = Session::new();
 
-        let out = tool_read(&args, &cache, &session, true).expect("stripped read");
+        let out =
+            tool_read(&args, &cache, &session, true, &Config::default()).expect("stripped read");
 
         assert!(out.contains("[stripped]"), "stripped header missing: {out}");
         assert!(out.contains("/// keep docs"), "doc comment missing: {out}");
@@ -493,7 +500,8 @@ mod tests {
         let cache = OutlineCache::new();
         let session = Session::new();
 
-        let err = tool_read(&args, &cache, &session, false).expect_err("unknown mode must error");
+        let err = tool_read(&args, &cache, &session, false, &Config::default())
+            .expect_err("unknown mode must error");
         assert!(
             err.starts_with("unknown read mode: outline"),
             "error must name the bad mode: {err}"
@@ -516,7 +524,8 @@ mod tests {
         let cache = OutlineCache::new();
         let session = Session::new();
 
-        let out = tool_read(&args, &cache, &session, false).expect("signature read on text");
+        let out = tool_read(&args, &cache, &session, false, &Config::default())
+            .expect("signature read on text");
 
         // Non-code falls back to the normal read: no signature header, full content.
         assert!(
@@ -539,7 +548,8 @@ mod tests {
         let cache = OutlineCache::new();
         let session = Session::new();
 
-        let out = tool_read(&args, &cache, &session, false).expect("stripped read on text");
+        let out = tool_read(&args, &cache, &session, false, &Config::default())
+            .expect("stripped read on text");
 
         assert!(
             !out.contains("[stripped]"),
@@ -577,6 +587,7 @@ mod tests {
             &cache,
             &session,
             false,
+            &Config::default(),
         )
         .expect("full:true read");
         let via_mode = tool_read(
@@ -584,6 +595,7 @@ mod tests {
             &cache,
             &session,
             false,
+            &Config::default(),
         )
         .expect("mode:full read");
         let via_auto = tool_read(
@@ -591,6 +603,7 @@ mod tests {
             &cache,
             &session,
             false,
+            &Config::default(),
         )
         .expect("auto read");
 
@@ -628,7 +641,8 @@ mod tests {
         let cache = OutlineCache::new();
         let session = Session::new();
 
-        let out = tool_read(&args, &cache, &session, false).expect("signature+full read");
+        let out = tool_read(&args, &cache, &session, false, &Config::default())
+            .expect("signature+full read");
 
         assert!(
             out.contains("[signature]"),
@@ -655,8 +669,8 @@ mod tests {
         let cache = OutlineCache::new();
         let session = Session::new();
 
-        let err =
-            tool_read(&args, &cache, &session, false).expect_err("signature + section must error");
+        let err = tool_read(&args, &cache, &session, false, &Config::default())
+            .expect_err("signature + section must error");
         assert!(
             err.contains("signature") && err.contains("section"),
             "error must name the conflict: {err}"
@@ -697,7 +711,7 @@ mod tests {
             "mode": "full",
             "root": root.to_str().unwrap()
         });
-        let result = tool_read(&args, &cache, &session, false).unwrap();
+        let result = tool_read(&args, &cache, &session, false, &Config::default()).unwrap();
         assert!(
             result.contains("fn hello()"),
             "expected file content via root-anchored path, got: {result}"
@@ -720,7 +734,7 @@ mod tests {
             "mode": "full",
             "root": unrelated_root.path().to_str().unwrap()
         });
-        let result = tool_read(&args, &cache, &session, false).unwrap();
+        let result = tool_read(&args, &cache, &session, false, &Config::default()).unwrap();
         assert!(
             result.contains("fn abs()"),
             "absolute path must resolve independently of root, got: {result}"
@@ -741,7 +755,7 @@ mod tests {
             "paths": [abs_file.to_str().unwrap()],
             "mode": "full"
         });
-        let result = tool_read(&args, &cache, &session, false).unwrap();
+        let result = tool_read(&args, &cache, &session, false, &Config::default()).unwrap();
         assert!(
             result.contains("fn check()"),
             "no-root regression: absolute path must be readable without root, got: {result}"
@@ -756,7 +770,7 @@ mod tests {
         let cache = OutlineCache::new();
         let session = Session::new();
         let args = serde_json::json!({ "paths": ["src/foo.rs"], "mode": "full" });
-        let err = tool_read(&args, &cache, &session, false).unwrap_err();
+        let err = tool_read(&args, &cache, &session, false, &Config::default()).unwrap_err();
         assert!(
             err.contains("src/foo.rs") && err.contains("root"),
             "relative path without root must refuse with an actionable message: {err}"
@@ -793,7 +807,14 @@ mod tests {
     }
 
     fn read_args(args: &Value) -> String {
-        tool_read(args, &OutlineCache::new(), &Session::new(), false).unwrap()
+        tool_read(
+            args,
+            &OutlineCache::new(),
+            &Session::new(),
+            false,
+            &Config::default(),
+        )
+        .unwrap()
     }
 
     /// With no `budget`, the read skipped the outline fit: the full view
