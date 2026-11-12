@@ -10,6 +10,7 @@ use std::sync::Mutex;
 use crate::format::noun;
 use tilth_core::index::bloom::BloomFilterCache;
 use tilth_core::search::callers::{find_callers_and_owners, find_callers_batch, CallerMatch};
+use tilth_core::search::walk::WalkConfig;
 use tilth_core::TilthError;
 
 const MAX_MATCHES: usize = 10;
@@ -47,11 +48,12 @@ fn collect_sites(
     scope: &Path,
     bloom: &BloomFilterCache,
     glob: Option<&str>,
+    walk: WalkConfig,
     context: Option<&Path>,
     keep: usize,
 ) -> Result<(HashMap<String, TargetSites>, Vec<PathBuf>), TilthError> {
     let merged: Mutex<HashMap<String, TargetSites>> = Mutex::new(HashMap::new());
-    let walk = find_callers_batch(targets, scope, bloom, glob, None, |sites| {
+    let walked = find_callers_batch(targets, scope, bloom, glob, walk, None, |sites| {
         let mut by_target: HashMap<String, TargetSites> = HashMap::new();
         for (target, m) in sites {
             let entry = by_target.entry(target).or_default();
@@ -78,7 +80,7 @@ fn collect_sites(
     let merged = merged
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    Ok((merged, walk.skipped_large))
+    Ok((merged, walked.skipped_large))
 }
 
 /// Scan `scope` for the literal `target` byte sequence. Used by the
@@ -86,8 +88,8 @@ fn collect_sites(
 /// doesn't exist" from "real symbol with no direct callers" (indirect
 /// dispatch, dead code, framework registration, …) when the caller walk
 /// returned zero matches.
-fn target_seen_in_scope(target: &str, scope: &Path, glob: Option<&str>) -> bool {
-    let Ok(walker) = tilth_core::search::walk::walker(scope, glob) else {
+fn target_seen_in_scope(target: &str, scope: &Path, glob: Option<&str>, walk: WalkConfig) -> bool {
+    let Ok(walker) = tilth_core::search::walk::walker(scope, glob, walk) else {
         return false;
     };
     let needle = target.as_bytes();
@@ -131,6 +133,10 @@ fn target_seen_in_scope(target: &str, scope: &Path, glob: Option<&str>) -> bool 
 }
 
 /// Format and rank caller search results with optional expand.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "per-call options become one Request in #307"
+)]
 pub fn search_callers_expanded(
     target: &str,
     scope: &Path,
@@ -138,13 +144,14 @@ pub fn search_callers_expanded(
     expand: usize,
     context: Option<&Path>,
     glob: Option<&str>,
+    walk: WalkConfig,
     full: bool,
 ) -> Result<String, TilthError> {
     let max_matches = if full { FULL_MAX_MATCHES } else { MAX_MATCHES };
     let name = called_name(target);
     let single: HashSet<String> = std::iter::once(name.to_string()).collect();
     let (mut by_target, skipped_large) =
-        collect_sites(&single, scope, bloom, glob, context, max_matches)?;
+        collect_sites(&single, scope, bloom, glob, walk, context, max_matches)?;
     let sites = by_target.remove(name).unwrap_or_default();
     let held = crate::search::names_phrase([name]);
     let skipped_note = crate::search::skipped_files_note(&skipped_large, &held, scope)
@@ -152,7 +159,7 @@ pub fn search_callers_expanded(
         .unwrap_or_default();
 
     if sites.total == 0 {
-        let target_seen = target_seen_in_scope(name, scope, glob);
+        let target_seen = target_seen_in_scope(name, scope, glob, walk);
         let mut message = no_callers_message(target, scope, target_seen, glob);
         message.push_str(&skipped_note);
         return Ok(message);
@@ -167,6 +174,7 @@ pub fn search_callers_expanded(
         scope,
         bloom,
         glob,
+        walk,
     );
 
     output.push_str(&skipped_note);
@@ -319,6 +327,7 @@ fn write_second_hop_impact(
     scope: &Path,
     bloom: &BloomFilterCache,
     glob: Option<&str>,
+    walk: WalkConfig,
 ) {
     if all_caller_names.is_empty() || all_caller_names.len() > IMPACT_FANOUT_THRESHOLD {
         return;
@@ -352,6 +361,7 @@ fn write_second_hop_impact(
         scope,
         bloom,
         glob,
+        walk,
         |sites, owners| {
             let mut file = Hop2File {
                 path: sites
@@ -493,6 +503,10 @@ fn write_second_hop_impact(
 /// call for that target would produce (PR #138 review: HIGH — 2nd-hop parity;
 /// MED — header shape parity). The walk runs to the end and counts each
 /// target on its own, so a hit-rich target cannot starve a rarer one.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "per-call options become one Request in #307"
+)]
 pub fn search_callers_multi_expanded(
     targets: &[&str],
     scope: &Path,
@@ -500,6 +514,7 @@ pub fn search_callers_multi_expanded(
     expand: usize,
     context: Option<&Path>,
     glob: Option<&str>,
+    walk: WalkConfig,
     full: bool,
 ) -> Result<String, TilthError> {
     let max_matches = if full { FULL_MAX_MATCHES } else { MAX_MATCHES };
@@ -525,7 +540,7 @@ pub fn search_callers_multi_expanded(
     }
     let target_set: HashSet<String> = names.iter().map(|n| (*n).to_string()).collect();
     let (by_target, skipped_large) =
-        collect_sites(&target_set, scope, bloom, glob, context, max_matches)?;
+        collect_sites(&target_set, scope, bloom, glob, walk, context, max_matches)?;
 
     // Render in the caller-supplied target order so output is deterministic.
     // Two targets can share a name (`A.run,B.run`), so each reads its sites.
@@ -536,7 +551,7 @@ pub fn search_callers_multi_expanded(
         let sites = by_target.get(name).unwrap_or(&none);
 
         if sites.total == 0 {
-            let target_seen = target_seen_in_scope(name, scope, glob);
+            let target_seen = target_seen_in_scope(name, scope, glob, walk);
             output.push_str(&no_callers_message(target, scope, target_seen, glob));
             output.push_str("\n\n");
             continue;
@@ -550,6 +565,7 @@ pub fn search_callers_multi_expanded(
             scope,
             bloom,
             glob,
+            walk,
         );
         output.push('\n');
     }
@@ -658,18 +674,46 @@ mod tests {
             }
             std::fs::write(dir.path().join(format!("f{f:02}.rs")), body).unwrap();
         }
-        let first =
-            search_callers_expanded("hot", dir.path(), &bloom, 0, None, None, false).unwrap();
+        let first = search_callers_expanded(
+            "hot",
+            dir.path(),
+            &bloom,
+            0,
+            None,
+            None,
+            WalkConfig::default(),
+            false,
+        )
+        .unwrap();
         assert!(
             first.contains("— 10 of 625 call sites"),
             "header must give the exact total:\n{first}"
         );
         for _ in 0..4 {
-            let again =
-                search_callers_expanded("hot", dir.path(), &bloom, 0, None, None, false).unwrap();
+            let again = search_callers_expanded(
+                "hot",
+                dir.path(),
+                &bloom,
+                0,
+                None,
+                None,
+                WalkConfig::default(),
+                false,
+            )
+            .unwrap();
             assert_eq!(again, first, "same output every run");
         }
-        let full = search_callers_expanded("hot", dir.path(), &bloom, 0, None, None, true).unwrap();
+        let full = search_callers_expanded(
+            "hot",
+            dir.path(),
+            &bloom,
+            0,
+            None,
+            None,
+            WalkConfig::default(),
+            true,
+        )
+        .unwrap();
         assert!(full.contains("— 100 of 625 call sites"), "{full}");
     }
 
@@ -684,8 +728,17 @@ mod tests {
             let _ = writeln!(body, "fn c{i}() {{ target_fn(); }}");
         }
         std::fs::write(dir.path().join("lib.rs"), body).unwrap();
-        let out =
-            search_callers_expanded("target_fn", dir.path(), &bloom, 0, None, None, false).unwrap();
+        let out = search_callers_expanded(
+            "target_fn",
+            dir.path(),
+            &bloom,
+            0,
+            None,
+            None,
+            WalkConfig::default(),
+            false,
+        )
+        .unwrap();
         assert!(out.contains("— 10 of 12 call sites"), "{out}");
         assert!(out.contains("... and 2 more call sites."), "{out}");
         assert_eq!(out.matches("\n## ").count(), 10);
@@ -755,8 +808,17 @@ mod tests {
         )
         .unwrap();
 
-        let result =
-            search_callers_expanded("alpha", dir.path(), &bloom, 0, None, None, false).unwrap();
+        let result = search_callers_expanded(
+            "alpha",
+            dir.path(),
+            &bloom,
+            0,
+            None,
+            None,
+            WalkConfig::default(),
+            false,
+        )
+        .unwrap();
 
         assert!(
             result.contains("[caller: macro_arg_caller]"),
@@ -796,8 +858,17 @@ mod tests {
         )
         .unwrap();
 
-        let result =
-            search_callers_expanded("target", dir.path(), &bloom, 0, None, None, false).unwrap();
+        let result = search_callers_expanded(
+            "target",
+            dir.path(),
+            &bloom,
+            0,
+            None,
+            None,
+            WalkConfig::default(),
+            false,
+        )
+        .unwrap();
 
         assert!(
             result.contains("-> return target("),
@@ -841,8 +912,17 @@ mod tests {
         )
         .unwrap();
 
-        let result =
-            search_callers_expanded("target_fn", dir.path(), &bloom, 0, None, None, false).unwrap();
+        let result = search_callers_expanded(
+            "target_fn",
+            dir.path(),
+            &bloom,
+            0,
+            None,
+            None,
+            WalkConfig::default(),
+            false,
+        )
+        .unwrap();
 
         let footer_line = result
             .lines()
@@ -884,8 +964,17 @@ mod tests {
         )
         .unwrap();
 
-        let result =
-            search_callers_expanded("target", dir.path(), &bloom, 0, None, None, false).unwrap();
+        let result = search_callers_expanded(
+            "target",
+            dir.path(),
+            &bloom,
+            0,
+            None,
+            None,
+            WalkConfig::default(),
+            false,
+        )
+        .unwrap();
 
         assert!(result.contains("[caller: Service.run]"), "{result}");
         assert!(result.contains("[caller: outer]"), "{result}");
@@ -921,8 +1010,17 @@ mod tests {
         )
         .unwrap();
 
-        let result =
-            search_callers_expanded("target", dir.path(), &bloom, 0, None, None, false).unwrap();
+        let result = search_callers_expanded(
+            "target",
+            dir.path(),
+            &bloom,
+            0,
+            None,
+            None,
+            WalkConfig::default(),
+            false,
+        )
+        .unwrap();
 
         assert!(result.contains("[caller: Route.__init__]"), "{result}");
         let impact = result
@@ -956,12 +1054,30 @@ mod tests {
              func (e *Engine) ServeHTTP() {\n\te.handle()\n}\n",
         )
         .unwrap();
-        let bare =
-            search_callers_expanded("handle", dir.path(), &bloom, 0, None, None, false).unwrap();
+        let bare = search_callers_expanded(
+            "handle",
+            dir.path(),
+            &bloom,
+            0,
+            None,
+            None,
+            WalkConfig::default(),
+            false,
+        )
+        .unwrap();
         assert!(bare.contains("[caller: Engine.ServeHTTP]"), "{bare}");
         for target in ["Engine.handle", "Engine::handle"] {
-            let out =
-                search_callers_expanded(target, dir.path(), &bloom, 0, None, None, false).unwrap();
+            let out = search_callers_expanded(
+                target,
+                dir.path(),
+                &bloom,
+                0,
+                None,
+                None,
+                WalkConfig::default(),
+                false,
+            )
+            .unwrap();
             assert!(out.contains(&format!("# Callers of \"{target}\"")), "{out}");
             assert!(out.contains("— 1 call site"), "{out}");
             assert!(
@@ -977,6 +1093,7 @@ mod tests {
             0,
             None,
             None,
+            WalkConfig::default(),
             false,
         )
         .unwrap();
@@ -1004,8 +1121,17 @@ mod tests {
              def lookup(d):\n    return d.get(\"k\")\n",
         )
         .unwrap();
-        let out =
-            search_callers_expanded("fetch", dir.path(), &bloom, 0, None, None, false).unwrap();
+        let out = search_callers_expanded(
+            "fetch",
+            dir.path(),
+            &bloom,
+            0,
+            None,
+            None,
+            WalkConfig::default(),
+            false,
+        )
+        .unwrap();
         assert!(out.contains("[caller: Cache.get]"), "{out}");
         assert!(out.contains("lookup"), "{out}");
         assert!(
@@ -1019,8 +1145,17 @@ mod tests {
             "def leaf():\n    return 1\n\n\ndef mid():\n    return leaf()\n\n\ndef top():\n    return mid()\n",
         )
         .unwrap();
-        let out =
-            search_callers_expanded("leaf", dir.path(), &bloom, 0, None, None, false).unwrap();
+        let out = search_callers_expanded(
+            "leaf",
+            dir.path(),
+            &bloom,
+            0,
+            None,
+            None,
+            WalkConfig::default(),
+            false,
+        )
+        .unwrap();
         assert!(
             out.contains("2 functions affected across 2 hops.\n"),
             "{out}"

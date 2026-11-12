@@ -9,6 +9,7 @@ use std::process::{Command, Stdio};
 
 use rayon::prelude::*;
 
+use tilth_core::search::walk::WalkConfig;
 use tilth_core::types::OutlineKind;
 
 #[derive(Debug)]
@@ -490,6 +491,9 @@ fn build_overlays(raw: &str, sides: &Sides, repo: Option<&Path>) -> Vec<FileOver
 /// process cwd (CLI, or an MCP call with no `root` arg). A `scope` outside
 /// that repository diffs the repository it lies in.
 ///
+/// `blast` warns about the callers of each symbol whose signature changed,
+/// found by a walk that `blast` configures; `None` skips the warnings.
+///
 /// `expand` adds the patch lines of the first `expand` changed symbols below
 /// an overview. A file scope already shows every symbol's lines, and a log
 /// lists symbols only, so neither takes it.
@@ -498,7 +502,7 @@ pub fn diff(
     repo: Option<&Path>,
     scope: Option<&str>,
     search: Option<&str>,
-    blast: bool,
+    blast: Option<WalkConfig>,
     expand: usize,
     budget: Option<u64>,
 ) -> Result<String, String> {
@@ -576,11 +580,11 @@ pub fn diff(
     }
     let overlays = files;
 
-    if blast {
+    if let Some(walk) = blast {
         // Callers are counted under the caller's root, which may sit below
         // the repository top that git commands run in, or under the
         // scope's repository when the scope lies outside the root's.
-        let mut blast_warnings = compute_blast(&overlays, &callers_root);
+        let mut blast_warnings = compute_blast(&overlays, &callers_root, walk);
         warnings.append(&mut blast_warnings);
     }
 
@@ -873,7 +877,7 @@ fn keep_search_matches(overlay: &mut FileOverlay, term: &str) -> bool {
 
 /// Find callers of signature-changed symbols under `scope` and return
 /// warnings. `scope` is the caller's root, or the cwd without one.
-fn compute_blast(overlays: &[FileOverlay], scope: &Path) -> Vec<String> {
+fn compute_blast(overlays: &[FileOverlay], scope: &Path, walk: WalkConfig) -> Vec<String> {
     let sig_changed: HashSet<String> = overlays
         .iter()
         .flat_map(|o| o.symbol_changes.iter())
@@ -894,6 +898,7 @@ fn compute_blast(overlays: &[FileOverlay], scope: &Path) -> Vec<String> {
         scope,
         &bloom,
         None,
+        walk,
         Some(crate::search::blast::BLAST_STOP_AFTER),
         |sites| {
             let mut counts: std::collections::HashMap<String, usize> =
@@ -904,22 +909,26 @@ fn compute_blast(overlays: &[FileOverlay], scope: &Path) -> Vec<String> {
             counts
         },
     );
-    let Ok(walk) = per_file else {
+    let Ok(walked) = per_file else {
         return Vec::new();
     };
     // A file skipped for size may hold callers the counts miss.
     let held = crate::search::names_phrase(sig_changed.iter().map(String::as_str));
-    let skipped = crate::search::skipped_files_note(&walk.skipped_large, &held, scope);
+    let skipped = crate::search::skipped_files_note(&walked.skipped_large, &held, scope);
     // Sorted by name so the lines come out in the same order every run.
-    let at_least = if walk.reached_bound { "at least " } else { "" };
+    let at_least = if walked.reached_bound {
+        "at least "
+    } else {
+        ""
+    };
     let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
-    for file in walk.per_file {
+    for file in walked.per_file {
         for (target, n) in file {
             *counts.entry(target).or_default() += n;
         }
     }
     // A walk that stopped may never have reached a symbol's callers.
-    if walk.reached_bound {
+    if walked.reached_bound {
         for name in sig_changed {
             counts.entry(name).or_default();
         }
@@ -1158,7 +1167,15 @@ mod tests {
         let _lock = CWD_LOCK.lock().unwrap();
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(dir).unwrap();
-        let result = diff(source, None, scope, search, blast, 0, budget);
+        let result = diff(
+            source,
+            None,
+            scope,
+            search,
+            blast.then_some(WalkConfig::default()),
+            0,
+            budget,
+        );
         std::env::set_current_dir(&prev).unwrap();
         result
     }
@@ -1300,7 +1317,7 @@ mod tests {
             Some(dir.path()),
             None,
             None,
-            true,
+            Some(WalkConfig::default()),
             0,
             None,
         )
@@ -1626,7 +1643,7 @@ diff --git a/src/main.rs b/src/main.rs
             Some(dir.path()),
             None,
             None,
-            false,
+            None,
             0,
             None,
         )
@@ -1647,7 +1664,7 @@ diff --git a/src/main.rs b/src/main.rs
             Some(dir.path()),
             None,
             None,
-            false,
+            None,
             0,
             None,
         )
@@ -1665,7 +1682,7 @@ diff --git a/src/main.rs b/src/main.rs
             Some(dir.path()),
             None,
             None,
-            false,
+            None,
             0,
             None,
         )
@@ -1707,7 +1724,7 @@ diff --git a/src/main.rs b/src/main.rs
             fs::write(&file_a, a).unwrap();
             fs::write(&file_b, b).unwrap();
             let source = DiffSource::Files(file_a, file_b);
-            diff(&source, Some(dir.path()), None, None, false, 0, None).unwrap()
+            diff(&source, Some(dir.path()), None, None, None, 0, None).unwrap()
         };
 
         let added = pair("fn a() {}\n", "fn a() {}\nfn b() {}\n");
@@ -1972,7 +1989,7 @@ diff --git a/src/main.rs b/src/main.rs
     }
 
     fn diff_at(root: &Path, source: &DiffSource, scope: Option<&str>) -> Result<String, String> {
-        diff(source, Some(root), scope, None, false, 0, None)
+        diff(source, Some(root), scope, None, None, 0, None)
     }
 
     fn last_commit() -> DiffSource {
@@ -2030,7 +2047,7 @@ diff --git a/src/main.rs b/src/main.rs
                 None,
                 Some("nested"),
                 None,
-                false,
+                None,
                 0,
                 None,
             );
@@ -2487,7 +2504,7 @@ diff --git a/src/main.rs b/src/main.rs
             Some(dir.path()),
             None,
             Some("UNIQUE_MARKER"),
-            false,
+            None,
             0,
             None,
         )
@@ -2578,7 +2595,7 @@ diff --git a/src/main.rs b/src/main.rs
             Some(dir.path()),
             None,
             None,
-            true,
+            Some(WalkConfig::default()),
             0,
             None,
         )
@@ -2638,7 +2655,7 @@ diff --git a/src/main.rs b/src/main.rs
             Some(dir.path()),
             None,
             None,
-            true,
+            Some(WalkConfig::default()),
             0,
             None,
         )
@@ -2670,7 +2687,7 @@ diff --git a/src/main.rs b/src/main.rs
             Some(&dir.path().join("app")),
             None,
             None,
-            true,
+            Some(WalkConfig::default()),
             0,
             None,
         )
@@ -2769,7 +2786,7 @@ diff --git a/src/main.rs b/src/main.rs
                 Some(dir.path()),
                 None,
                 None,
-                false,
+                None,
                 expand,
                 None,
             )
@@ -2810,7 +2827,7 @@ diff --git a/src/main.rs b/src/main.rs
             Some(dir.path()),
             None,
             None,
-            false,
+            None,
             2,
             None,
         )

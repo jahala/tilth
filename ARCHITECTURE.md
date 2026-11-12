@@ -55,8 +55,8 @@ crates/tilth-core/src/
 │                    one size limit every parse and search walk shares
 │
 ├── search/          Cross-file queries
-│   ├── walk.rs          Walker and ignore policy (SKIP_DIRS, .tilthignore,
-│   │                    gitignore switch, glob overrides)
+│   ├── walk.rs          Walker and ignore policy (WalkConfig, SKIP_DIRS,
+│   │                    .tilthignore, gitignore switch, glob overrides)
 │   ├── callers.rs       find_callers_batch: call sites of N symbols in one walk
 │   ├── callees.rs       Resolve function calls inside a definition
 │   ├── callee_query.rs  Cached tree-sitter `Query` objects for callee
@@ -88,6 +88,9 @@ src/
 ├── lib.rs           Public API + dispatch (run / run_full / run_expanded /
 │                    run_callers / run_deps)
 ├── main.rs          CLI binary (clap parser → lib calls or mcp::run)
+├── config.rs        Config: built once from the environment and the
+│                    flags, then passed down; env_var, the one read of
+│                    the environment
 ├── mcp.rs           MCP server: JSON-RPC stdio loop, tool dispatch,
 │                    per-request timeout / abandoned-thread tracking
 ├── classify.rs      Query string → QueryType (8-rule precedence ladder)
@@ -153,6 +156,25 @@ Both surfaces produce the same string outputs from the same internals.
 The CLI is a thin shell around `lib.rs`; the MCP server is a thicker
 shell with its own concurrency model.
 
+### Configuration (`src/config.rs`)
+
+`main` builds one `Config` before it dispatches, from the environment
+(`Config::from_env`) and the flags that override it
+(`--respect-gitignore`, `--no-overview`). It passes the `Config`, or the
+one field a function needs, down as a parameter; the MCP server keeps it
+in `Services`. The field docs on `Config` list each `TILTH_*` variable and
+what it does. A value that does not parse falls back to its default.
+
+`config::env_var` is the only read of the process environment, and
+nothing writes it. `clippy.toml` forbids `std::env::var`, `var_os`,
+`vars`, `vars_os`, `set_var` and `remove_var` everywhere else. Besides
+the `Config`, `env_var` reads the CLI's `PAGER` and `LINES` and the
+installer's `APPDATA` on Windows. Those locate things on the host, as
+`HOME` does, so they stay at their one use.
+
+The walk settings are `tilth_core::WalkConfig` (threads, gitignore), which
+every walk takes as an argument, so library users set them the same way.
+
 ### CLI (`src/main.rs`)
 
 A clap `derive`-style parser (`Cli` struct) accepts a free-form `query`
@@ -214,8 +236,8 @@ methods worth describing in detail:
   `include_str!("../../prompts/mcp-base.md")` and rewritten on `fd3de77`
   as a pre-flight gate naming the exact Bash commands and host tools to
   avoid, with concrete `<bad>→<good>` rewrites. When
-  `TILTH_NO_OVERVIEW` is unset, `overview::fingerprint(cwd)` is
-  prepended — a project summary built in <250ms (a stderr warning fires
+  `Config::overview` is on (no `TILTH_NO_OVERVIEW`, no `--no-overview`),
+  `overview::fingerprint(cwd)` is prepended — a project summary built in <250ms (a stderr warning fires
   if it overruns).
 - `tools/list` — returns the tool schemas. `tools/call` is the workhorse
   and goes through `handle_tool_call`.
@@ -230,7 +252,7 @@ showed that agents overused structural maps.
 
 Concurrency: each `tools/call` spawns a worker thread, communicates via
 `mpsc::channel`, and waits with `recv_timeout`. The default per-tool
-timeout is 90s (`TILTH_TIMEOUT` env override). On timeout, the response
+timeout is `Config::request_timeout`, 90s unless `TILTH_TIMEOUT` sets it. On timeout, the response
 goes back immediately with an `isError: true` payload; the worker thread
 is **abandoned** (not joined, not killed) — this is the safest option in
 Rust since cancelling a thread mid-tree-sitter-parse is unsound. A
@@ -379,31 +401,30 @@ tree-sitter `Query` objects live in `callee_query.rs`.
 
 ### Walker and ignore policy (`tilth-core` `search/walk.rs`)
 
-`walker(scope, glob)` builds an `ignore::WalkParallel` with tilth's
-opinionated defaults:
+`walker(scope, glob, walk)` builds an `ignore::WalkParallel` with tilth's
+opinionated defaults, and `base_walk_builder(scope, walk)` the same
+walker for the sequential map and list walks. `walk` is the run's
+`WalkConfig`:
 
 - **Always-skipped directories** (`SKIP_DIRS`): build artifacts,
   dependency caches, VCS internals — `.git`, `node_modules`, `target`,
   `dist`, `build`, `__pycache__`, `vendor`, `.next`, `.venv`,
   `.mypy_cache`, etc. ~30 entries.
-- **`.gitignore`, global gitignore, `.git/info/exclude`, and custom
-  `.ignore` files are all deliberately never consulted**
-  (`git_ignore(false)`, `git_global(false)`, `git_exclude(false)`,
-  `ignore(false)`). This is not an oversight: grep-style queries need
-  to see gitignored-but-locally-relevant files (docs/, configs,
-  generated code, per-engineer agent state) that a `.gitignore` would
-  hide from a normal directory listing. A per-project `.tilthignore`
-  override was proposed and **rejected 2026-07-03** — it would
-  special-case one tool's walker instead of fixing the underlying
-  need (which is `SKIP_DIRS`-style unconditional exclusion, already
-  covered above).
+- **`.tilthignore`** files are always honored, at the scope and above it.
+- **`.gitignore`, global gitignore, `.git/info/exclude` and `.ignore`
+  files are off by default**, because grep-style queries need to see
+  gitignored but locally relevant files (docs, configs, generated code,
+  per-engineer agent state). `WalkConfig::respect_gitignore` turns them
+  on (`TILTH_RESPECT_GITIGNORE` or `--respect-gitignore`), and an MCP
+  call's `gitignore` argument overrides it for that call.
 - **Symlinks are followed** (`follow_links(true)`). This is the
   upstream `feat: follow symlinks in all file walkers (#46)` change
   and creates a known duplicate-match problem when a path is reachable
   via multiple symlink chains — see [Open
   threads](#open-architectural-threads).
-- **Threads**: `TILTH_THREADS` env or `available_parallelism / 2`
-  clamped to `[2, 6]`.
+- **Threads**: `WalkConfig::threads`, from `TILTH_THREADS`, or by
+  default `available_parallelism / 2` clamped to `[2, 6]`. `0` lets the
+  walker choose. The rayon pool gets the same count.
 
 The glob filter, when present, is applied via `OverrideBuilder` —
 gitignore-style with whitelist, negation (`!`), and brace expansion.
@@ -662,7 +683,8 @@ gateway. The decision tree, in order:
    file whose outline OGATE rejects goes on to step 7 too, which reads
    it whole.
 7. **Full mode + oversized.** This guards `--full` on huge files. Caps
-   at `TILTH_FULL_SIZE_CAP` (default in `full_read_size_cap()`); above
+   at `Config::full_size_cap` (`TILTH_FULL_SIZE_CAP`, 2 MB by default),
+   which reaches `read_file` as its `full_cap` argument; above
    the cap, returns the outline with a banner explaining how to
    override. From this step on the file is read whole, up to the length
    its open handle reported.
@@ -991,8 +1013,8 @@ strategic guidance every host gets at `initialize`. It lives in
 agents kept reaching for those despite earlier "DO NOT use
 Grep/Read/Glob" rules. Edit mode appends an `EDIT_MODE_EXTRA` block
 from `prompts/mcp-edit.md` with the `tilth_write` instructions.
-`overview::fingerprint(cwd)` is prepended unless `TILTH_NO_OVERVIEW`
-is set — a brief summary of language counts, manifests, hot files,
+`overview::fingerprint(cwd)` is prepended unless `Config::overview` is
+off — a brief summary of language counts, manifests, hot files,
 and git context.
 
 `AGENTS.md` at the repo root is the user-facing copy of these

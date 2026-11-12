@@ -6,6 +6,7 @@ use serde_json::Value;
 use crate::session::Session;
 use tilth_core::cache::OutlineCache;
 use tilth_core::index::bloom::BloomFilterCache;
+use tilth_core::search::walk::WalkConfig;
 
 use super::{apply_budget, resolve_scope};
 
@@ -15,6 +16,7 @@ pub(in crate::mcp) fn tool_search(
     cache: &OutlineCache,
     session: &Session,
     bloom: &Arc<BloomFilterCache>,
+    walk: WalkConfig,
 ) -> Result<String, String> {
     let query = args
         .get("query")
@@ -59,8 +61,8 @@ pub(in crate::mcp) fn tool_search(
                 1 => {
                     session.record_search(queries[0]);
                     crate::search::search_symbol_expanded(
-                        queries[0], &scope, cache, session, bloom, expand, context, glob, full,
-                        budget,
+                        queries[0], &scope, cache, session, bloom, expand, context, glob, walk,
+                        full, budget,
                     )
                 }
                 2..=5 => {
@@ -68,7 +70,7 @@ pub(in crate::mcp) fn tool_search(
                         session.record_search(q);
                     }
                     crate::search::search_multi_symbol_expanded(
-                        &queries, &scope, cache, session, bloom, expand, context, glob, full,
+                        &queries, &scope, cache, session, bloom, expand, context, glob, walk, full,
                         budget,
                     )
                 }
@@ -83,13 +85,14 @@ pub(in crate::mcp) fn tool_search(
         "content" => {
             session.record_search(query);
             crate::search::search_content_expanded(
-                query, &scope, cache, session, expand, context, glob, full, budget,
+                query, &scope, cache, session, expand, context, glob, walk, full, budget,
             )
         }
         "regex" => {
             session.record_search(query);
-            let result = crate::search::content::search(query, &scope, true, context, glob, full)
-                .map_err(|e| e.to_string())?;
+            let result =
+                crate::search::content::search(query, &scope, true, context, glob, walk, full)
+                    .map_err(|e| e.to_string())?;
             crate::search::format_raw_result(&result, cache)
         }
         "callers" => {
@@ -103,7 +106,7 @@ pub(in crate::mcp) fn tool_search(
                 1 => {
                     session.record_search(targets[0]);
                     crate::search::callers::search_callers_expanded(
-                        targets[0], &scope, bloom, expand, context, glob, full,
+                        targets[0], &scope, bloom, expand, context, glob, walk, full,
                     )
                 }
                 2..=5 => {
@@ -111,7 +114,7 @@ pub(in crate::mcp) fn tool_search(
                         session.record_search(t);
                     }
                     crate::search::callers::search_callers_multi_expanded(
-                        &targets, &scope, bloom, expand, context, glob, full,
+                        &targets, &scope, bloom, expand, context, glob, walk, full,
                     )
                 }
                 _ => {
@@ -166,7 +169,7 @@ mod tests {
             "scope": tmp.path().to_str().unwrap(),
         });
 
-        let out = tool_search(&args, &cache, &session, &bloom).unwrap();
+        let out = tool_search(&args, &cache, &session, &bloom, WalkConfig::default()).unwrap();
 
         // Both targets must be reported with a real call site, not a single
         // literal "alpha,beta" lookup that finds nothing. Header uses the
@@ -214,7 +217,7 @@ mod tests {
             "scope": tmp.path().to_str().unwrap(),
         });
 
-        let out = tool_search(&args, &cache, &session, &bloom).unwrap();
+        let out = tool_search(&args, &cache, &session, &bloom, WalkConfig::default()).unwrap();
 
         assert!(
             out.contains("uses_alpha"),
@@ -258,7 +261,14 @@ mod tests {
             "kind": "callers",
             "scope": tmp.path().to_str().unwrap(),
         });
-        let single_out = tool_search(&single_args, &cache, &session, &bloom).unwrap();
+        let single_out = tool_search(
+            &single_args,
+            &cache,
+            &session,
+            &bloom,
+            WalkConfig::default(),
+        )
+        .unwrap();
         assert!(
             single_out.contains("impact (2nd hop)"),
             "single-target baseline should show 2nd-hop impact: {single_out}"
@@ -272,7 +282,8 @@ mod tests {
             "kind": "callers",
             "scope": tmp.path().to_str().unwrap(),
         });
-        let multi_out = tool_search(&multi_args, &cache, &session, &bloom).unwrap();
+        let multi_out =
+            tool_search(&multi_args, &cache, &session, &bloom, WalkConfig::default()).unwrap();
         assert!(
             multi_out.contains("impact (2nd hop)"),
             "multi-target alpha bucket dropped the 2nd-hop impact section: {multi_out}"
@@ -310,14 +321,22 @@ mod tests {
             "kind": "callers",
             "scope": tmp.path().to_str().unwrap(),
         });
-        let single_out = tool_search(&single_args, &cache, &session, &bloom).unwrap();
+        let single_out = tool_search(
+            &single_args,
+            &cache,
+            &session,
+            &bloom,
+            WalkConfig::default(),
+        )
+        .unwrap();
 
         let multi_args = serde_json::json!({
             "query": "alpha,beta",
             "kind": "callers",
             "scope": tmp.path().to_str().unwrap(),
         });
-        let multi_out = tool_search(&multi_args, &cache, &session, &bloom).unwrap();
+        let multi_out =
+            tool_search(&multi_args, &cache, &session, &bloom, WalkConfig::default()).unwrap();
 
         // Top-level bucket header: same "# Callers of ... — N call site(s)" shape.
         assert!(
@@ -382,7 +401,7 @@ mod tests {
             "scope": tmp.path().to_str().unwrap(),
         });
 
-        let out = tool_search(&args, &cache, &session, &bloom).unwrap();
+        let out = tool_search(&args, &cache, &session, &bloom, WalkConfig::default()).unwrap();
 
         assert!(
             out.contains("uses_beta"),
@@ -414,7 +433,7 @@ mod tests {
         let session = Session::new();
         let bloom = Arc::new(BloomFilterCache::new());
         let args = serde_json::json!({ "query": "anything_unlikely_to_match_zzz" });
-        let result = tool_search(&args, &cache, &session, &bloom);
+        let result = tool_search(&args, &cache, &session, &bloom, WalkConfig::default());
         assert!(
             result.is_ok(),
             "bare search must default to cwd, not refuse: {result:?}"
@@ -430,7 +449,7 @@ mod tests {
         let session = Session::new();
         let bloom = Arc::new(BloomFilterCache::new());
         let args = serde_json::json!({ "query": "anything", "scope": "some/relative/dir" });
-        let err = tool_search(&args, &cache, &session, &bloom).unwrap_err();
+        let err = tool_search(&args, &cache, &session, &bloom, WalkConfig::default()).unwrap_err();
         assert!(
             err.contains("relative scope") && err.contains("root"),
             "explicit relative scope without root must refuse: {err}"
@@ -462,7 +481,7 @@ mod tests {
             "scope": "src/x.py",
             "root": tmp.path().to_str().unwrap(),
         });
-        let err = tool_search(&args, &cache, &session, &bloom)
+        let err = tool_search(&args, &cache, &session, &bloom, WalkConfig::default())
             .expect_err("a file scope must be refused, not widened to root");
         assert!(
             err.contains("scope \"src/x.py\" is a file"),
@@ -485,7 +504,7 @@ mod tests {
         let session = Session::new();
         let bloom = Arc::new(BloomFilterCache::new());
         let args = serde_json::json!({ "query": "needle", "scope": file.to_str().unwrap() });
-        let err = tool_search(&args, &cache, &session, &bloom).unwrap_err();
+        let err = tool_search(&args, &cache, &session, &bloom, WalkConfig::default()).unwrap_err();
         let dir = tmp.path().join("src");
         assert!(
             err.contains("is a file")
@@ -611,7 +630,7 @@ mod tests {
         let bloom = Arc::new(BloomFilterCache::new());
         let search = |query: &str, budget: u64| {
             let args = serde_json::json!({ "query": query, "scope": scope, "budget": budget });
-            tool_search(&args, &cache, &session, &bloom).unwrap()
+            tool_search(&args, &cache, &session, &bloom, WalkConfig::default()).unwrap()
         };
 
         let tight = search(tight_query, tight_budget);
@@ -667,7 +686,7 @@ mod tests {
         let cache = OutlineCache::new();
         let session = Session::new();
         let bloom = Arc::new(BloomFilterCache::new());
-        tool_search(args, &cache, &session, &bloom).unwrap()
+        tool_search(args, &cache, &session, &bloom, WalkConfig::default()).unwrap()
     }
 
     /// `full` must reach both symbol dispatches. The handler hard-coded

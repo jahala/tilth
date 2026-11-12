@@ -13,6 +13,7 @@ use crate::lang::detect_file_type_with_content;
 use crate::lang::outline::get_outline_entries;
 use crate::search::callees::{extract_callee_names, resolve_callees};
 use crate::search::callers::find_callers_batch;
+use crate::search::walk::WalkConfig;
 use crate::source::mentions;
 use crate::types::{is_test_file, FileType, Lang, OutlineKind};
 
@@ -67,8 +68,8 @@ pub struct Dependent {
     pub via: Option<PathBuf>,
 }
 
-/// Analyse the dependency graph for `path` within `scope`. The paths in the
-/// result are canonical.
+/// Analyse the dependency graph for `path` within `scope`, walking it as
+/// `walk` says. The paths in the result are canonical.
 ///
 /// Phase 1: Extract exported symbols from the outline.
 /// Phase 2: Forward dependencies — what this file uses.
@@ -78,6 +79,7 @@ pub fn analyze_deps(
     path: &Path,
     scope: &Path,
     bloom: &crate::index::bloom::BloomFilterCache,
+    walk: WalkConfig,
 ) -> Result<DepsResult, TilthError> {
     // Canonicalize both, so the walk names files the way import resolution
     // and the target do: through a symlinked scope (any path under `/tmp`
@@ -147,6 +149,7 @@ pub fn analyze_deps(
     let direct = importers_of(
         std::slice::from_ref(path),
         scope,
+        walk,
         &|_| true,
         false,
         &mut skipped_importers,
@@ -214,7 +217,7 @@ pub fn analyze_deps(
         let symbols_set: HashSet<String> = searched.iter().cloned().collect();
         // One `Dependent` per file that calls the target's symbols. Calls from
         // within the target file itself are self-references, not dependents.
-        let found = find_callers_batch(&symbols_set, scope, bloom, None, None, |sites| {
+        let found = find_callers_batch(&symbols_set, scope, bloom, None, walk, None, |sites| {
             let dep_path = sites.first().map(|(_, m)| m.path.clone())?;
             if dep_path == *path {
                 return None;
@@ -249,8 +252,14 @@ pub fn analyze_deps(
     // does not depend on the target.
     let mut every_name = searched;
     every_name.extend(unsearched.iter().cloned());
-    let importers =
-        with_reexport_importers(path, direct, scope, &every_name, &mut skipped_importers)?;
+    let importers = with_reexport_importers(
+        path,
+        direct,
+        scope,
+        walk,
+        &every_name,
+        &mut skipped_importers,
+    )?;
     // A big file that names the target's module was not read for imports.
     let mut skipped_large = skipped_large;
     skipped_large.extend(skipped_importers);
@@ -349,6 +358,7 @@ fn with_reexport_importers(
     target: &Path,
     direct: Vec<Importer>,
     scope: &Path,
+    walk: WalkConfig,
     names: &[String],
     skipped_large: &mut Vec<PathBuf>,
 ) -> Result<Vec<Importer>, TilthError> {
@@ -370,7 +380,7 @@ fn with_reexport_importers(
     }
     let names_one = |text: &str| names.iter().any(|n| mentions(text.as_bytes(), n));
     while !barrels.is_empty() {
-        let found = importers_of(&barrels, scope, &names_one, true, skipped_large)?;
+        let found = importers_of(&barrels, scope, walk, &names_one, true, skipped_large)?;
         barrels = Vec::new();
         for importer in found {
             let canonical = importer
@@ -399,6 +409,7 @@ fn with_reexport_importers(
 fn importers_of(
     targets: &[PathBuf],
     scope: &Path,
+    walk: WalkConfig,
     keep: &(dyn Fn(&str) -> bool + Sync),
     through: bool,
     skipped_large: &mut Vec<PathBuf>,
@@ -407,7 +418,7 @@ fn importers_of(
     let names: HashSet<&std::ffi::OsStr> = targets.iter().filter_map(|t| t.file_name()).collect();
     let found: Mutex<Vec<Importer>> = Mutex::new(Vec::new());
     let too_large: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
-    let walker = super::walk::walker(scope, None)?;
+    let walker = super::walk::walker(scope, None, walk)?;
     walker.run(|| {
         let found = &found;
         let too_large = &too_large;
@@ -721,7 +732,7 @@ mod tests {
         let path = tmp.path().join(file);
         fs::write(&path, content).unwrap();
         let bloom = crate::index::bloom::BloomFilterCache::new();
-        analyze_deps(&path, tmp.path(), &bloom)
+        analyze_deps(&path, tmp.path(), &bloom, WalkConfig::default())
             .unwrap()
             .uses_external
     }
@@ -740,7 +751,7 @@ mod tests {
         )
         .unwrap();
         let bloom = crate::index::bloom::BloomFilterCache::new();
-        let deps = analyze_deps(&a, tmp.path(), &bloom).unwrap();
+        let deps = analyze_deps(&a, tmp.path(), &bloom, WalkConfig::default()).unwrap();
         let mut local: Vec<String> = deps
             .uses_local
             .iter()
@@ -752,7 +763,9 @@ mod tests {
         let py = tmp.path().join("m.py");
         fs::write(&py, "\u{feff}import requests\nimport numpy\n").unwrap();
         assert_eq!(
-            analyze_deps(&py, tmp.path(), &bloom).unwrap().uses_external,
+            analyze_deps(&py, tmp.path(), &bloom, WalkConfig::default())
+                .unwrap()
+                .uses_external,
             ["numpy", "requests"]
         );
     }
@@ -828,7 +841,7 @@ mod tests {
 
     fn dependents_of(root: &Path, rel: &str) -> Vec<(String, Vec<String>, Option<String>)> {
         let bloom = crate::index::bloom::BloomFilterCache::new();
-        let result = analyze_deps(&root.join(rel), root, &bloom).unwrap();
+        let result = analyze_deps(&root.join(rel), root, &bloom, WalkConfig::default()).unwrap();
         let root = &root.canonicalize().unwrap();
         result
             .used_by
@@ -881,7 +894,8 @@ mod tests {
             "export { y } from \"./y\";\nimport { z } from \"./z\";\n",
         );
         let bloom = crate::index::bloom::BloomFilterCache::new();
-        let result = analyze_deps(&root.join("index.ts"), &root, &bloom).unwrap();
+        let result =
+            analyze_deps(&root.join("index.ts"), &root, &bloom, WalkConfig::default()).unwrap();
         let local: Vec<&Path> = result.uses_local.iter().map(|d| d.path.as_path()).collect();
         assert_eq!(local, [root.join("y.ts"), root.join("z.ts")]);
     }
@@ -1090,7 +1104,13 @@ mod tests {
         write(&root, "big.py", &format!("import service\n{pad}"));
         write(&root, "other_big.py", &pad);
         let bloom = crate::index::bloom::BloomFilterCache::new();
-        let result = analyze_deps(&root.join("service.py"), &root, &bloom).unwrap();
+        let result = analyze_deps(
+            &root.join("service.py"),
+            &root,
+            &bloom,
+            WalkConfig::default(),
+        )
+        .unwrap();
         assert_eq!(result.skipped_large, [root.join("big.py")]);
     }
 
@@ -1136,7 +1156,8 @@ mod tests {
                 &format!("{import}\n{}", pad(entry_word)),
             );
             let bloom = crate::index::bloom::BloomFilterCache::new();
-            let result = analyze_deps(&root.join(entry), &root, &bloom).unwrap();
+            let result =
+                analyze_deps(&root.join(entry), &root, &bloom, WalkConfig::default()).unwrap();
             assert_eq!(
                 result.skipped_large,
                 [root.join(format!("named_{big}"))],
@@ -1166,7 +1187,8 @@ mod tests {
             "from lib import run\n\ndef main():\n    run()\n",
         );
         let bloom = crate::index::bloom::BloomFilterCache::new();
-        let result = analyze_deps(&root.join("lib.py"), &root, &bloom).unwrap();
+        let result =
+            analyze_deps(&root.join("lib.py"), &root, &bloom, WalkConfig::default()).unwrap();
         assert_eq!(result.exported_count, MAX_EXPORTED_SYMBOLS + 5);
         assert_eq!(result.unsearched.len(), 5, "{:?}", result.unsearched);
         assert!(!result.unsearched.contains(&"run".to_string()));
@@ -1274,7 +1296,13 @@ mod tests {
             .unwrap();
         }
         let bloom = crate::index::bloom::BloomFilterCache::new();
-        let result = analyze_deps(&dir.path().join("target.ts"), dir.path(), &bloom).unwrap();
+        let result = analyze_deps(
+            &dir.path().join("target.ts"),
+            dir.path(),
+            &bloom,
+            WalkConfig::default(),
+        )
+        .unwrap();
         assert_eq!(result.uses_local.len(), 12, "{:?}", result.uses_local);
         assert_eq!(result.used_by.len(), 60);
         assert!(result.used_by[0].path.ends_with("user00.ts"));

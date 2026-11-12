@@ -5,6 +5,7 @@ use globset::Glob;
 
 use crate::types::estimate_tokens;
 use tilth_core::error::TilthError;
+use tilth_core::search::walk::WalkConfig;
 
 const MAX_FILES: usize = 20;
 
@@ -22,7 +23,7 @@ pub struct GlobResult {
 
 /// Glob search using `ignore::WalkBuilder` (parallel via `super::walker`,
 /// with the same `.tilthignore` and opt-in gitignore policy).
-pub fn search(pattern: &str, scope: &Path) -> Result<GlobResult, TilthError> {
+pub fn search(pattern: &str, scope: &Path, walk: WalkConfig) -> Result<GlobResult, TilthError> {
     let glob = Glob::new(pattern).map_err(|e| TilthError::InvalidQuery {
         query: pattern.to_string(),
         reason: e.to_string(),
@@ -32,7 +33,7 @@ pub fn search(pattern: &str, scope: &Path) -> Result<GlobResult, TilthError> {
     let matched: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
     let extensions: std::sync::Mutex<HashSet<String>> = std::sync::Mutex::new(HashSet::new());
 
-    let walker = tilth_core::search::walk::walker(scope, None)?;
+    let walker = tilth_core::search::walk::walker(scope, None, walk)?;
 
     walker.run(|| {
         let matcher = &matcher;
@@ -190,13 +191,13 @@ mod tests {
             std::fs::write(tmp.path().join(format!("f{i:03}.rs")), "fn main() {}").unwrap();
         }
 
-        let first: Vec<PathBuf> = search("*.rs", tmp.path())
+        let first: Vec<PathBuf> = search("*.rs", tmp.path(), WalkConfig::default())
             .unwrap()
             .files
             .into_iter()
             .map(|f| f.path)
             .collect();
-        let second: Vec<PathBuf> = search("*.rs", tmp.path())
+        let second: Vec<PathBuf> = search("*.rs", tmp.path(), WalkConfig::default())
             .unwrap()
             .files
             .into_iter()
@@ -221,7 +222,7 @@ mod tests {
         for i in 0..(MAX_FILES + 5) {
             std::fs::write(tmp.path().join(format!("g{i:03}.rs")), "fn main() {}").unwrap();
         }
-        let result = search("*.rs", tmp.path()).unwrap();
+        let result = search("*.rs", tmp.path(), WalkConfig::default()).unwrap();
         assert_eq!(result.files.len(), MAX_FILES, "file list stays capped");
         assert_eq!(
             result.total_found,

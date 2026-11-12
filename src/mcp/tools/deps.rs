@@ -4,12 +4,14 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use tilth_core::index::bloom::BloomFilterCache;
+use tilth_core::search::walk::WalkConfig;
 
 use super::resolve_scope;
 
 pub(in crate::mcp) fn tool_deps(
     args: &Value,
     bloom: &Arc<BloomFilterCache>,
+    walk: WalkConfig,
 ) -> Result<String, String> {
     let path_str = args
         .get("path")
@@ -26,7 +28,8 @@ pub(in crate::mcp) fn tool_deps(
         .and_then(serde_json::Value::as_u64)
         .map(|b| b as usize);
 
-    let deps_result = tilth_core::analyze_deps(&path, &scope, bloom).map_err(|e| e.to_string())?;
+    let deps_result =
+        tilth_core::analyze_deps(&path, &scope, bloom, walk).map_err(|e| e.to_string())?;
     let mut output = scope_warning.unwrap_or_default();
     output.push_str(&crate::search::deps::format_deps(
         &deps_result,
@@ -52,7 +55,7 @@ mod tests {
         // frozen server cwd before this spec. The `?` on the path resolution must
         // propagate the refusal, naming the path and the root escape hatch.
         let args = serde_json::json!({ "path": "src/foo.rs" });
-        let err = tool_deps(&args, &bloom()).unwrap_err();
+        let err = tool_deps(&args, &bloom(), WalkConfig::default()).unwrap_err();
         assert!(
             err.contains("src/foo.rs") && err.contains("root"),
             "relative deps path without root must refuse: {err}"
@@ -71,7 +74,7 @@ mod tests {
         let abs = tmp.path().join("foo.rs");
         std::fs::write(&abs, "fn foo() {}\n").unwrap();
         let args = serde_json::json!({ "path": abs.to_str().unwrap() });
-        let out = tool_deps(&args, &bloom())
+        let out = tool_deps(&args, &bloom(), WalkConfig::default())
             .expect("absolute path + omitted scope must default to cwd, not refuse");
         assert!(
             !out.contains("cannot be resolved"),
@@ -91,7 +94,7 @@ mod tests {
             "path": abs.to_str().unwrap(),
             "scope": "some/relative/dir",
         });
-        let err = tool_deps(&args, &bloom()).unwrap_err();
+        let err = tool_deps(&args, &bloom(), WalkConfig::default()).unwrap_err();
         assert!(
             err.contains("relative scope") && err.contains("root"),
             "explicit relative scope without root must refuse: {err}"
@@ -110,7 +113,7 @@ mod tests {
             "scope": "src/foo.rs",
             "root": tmp.path().to_str().unwrap(),
         });
-        let err = tool_deps(&args, &bloom())
+        let err = tool_deps(&args, &bloom(), WalkConfig::default())
             .expect_err("a file scope must be refused, not widened to root");
         assert!(
             err.contains("scope \"src/foo.rs\" is a file")

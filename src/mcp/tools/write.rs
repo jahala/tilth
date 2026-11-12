@@ -19,6 +19,7 @@ use serde_json::Value;
 use crate::format::noun;
 use crate::session::Session;
 use tilth_core::index::bloom::BloomFilterCache;
+use tilth_core::search::walk::WalkConfig;
 
 /// Parse one `files[]` entry into a hash-mode edit task. Parse errors are
 /// deferred onto the task so a malformed entry surfaces as a per-file failure
@@ -251,6 +252,7 @@ pub(in crate::mcp) fn tool_write(
     args: &Value,
     session: &Session,
     bloom: &Arc<BloomFilterCache>,
+    walk: WalkConfig,
 ) -> Result<String, String> {
     let files_val = args
         .get("files")
@@ -528,7 +530,7 @@ pub(in crate::mcp) fn tool_write(
                 session.record_read(path);
             }
         }
-        match crate::edit::apply_batch(hash_tasks, bloom, show_diff) {
+        match crate::edit::apply_batch(hash_tasks, bloom, walk, show_diff) {
             Ok(batch) => {
                 output.push_str(&batch.output);
                 // Cross-worktree warning for the hash-mode relative paths whose
@@ -617,7 +619,13 @@ mod tests {
             "scope": dir.path().to_str().unwrap(),
             "files": [{"path": p.to_str().unwrap(), "mode": "overwrite", "content": "fn main(){}\n"}],
         });
-        let out = tool_write(&args, &Session::new(), &fresh_bloom()).unwrap();
+        let out = tool_write(
+            &args,
+            &Session::new(),
+            &fresh_bloom(),
+            WalkConfig::default(),
+        )
+        .unwrap();
         assert!(out.contains("created"), "expected 'created' verb: {out}");
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "fn main(){}\n");
     }
@@ -631,7 +639,13 @@ mod tests {
             "scope": dir.path().to_str().unwrap(),
             "files": [{"path": p.to_str().unwrap(), "mode": "overwrite", "content": "new"}],
         });
-        let out = tool_write(&args, &Session::new(), &fresh_bloom()).unwrap();
+        let out = tool_write(
+            &args,
+            &Session::new(),
+            &fresh_bloom(),
+            WalkConfig::default(),
+        )
+        .unwrap();
         assert!(
             out.contains("already exists") && out.contains("overwrite: true"),
             "expected create-only guard message: {out}"
@@ -652,7 +666,13 @@ mod tests {
             "scope": dir.path().to_str().unwrap(),
             "files": [{"path": p.to_str().unwrap(), "mode": "overwrite", "content": "replaced", "overwrite": true}],
         });
-        let out = tool_write(&args, &Session::new(), &fresh_bloom()).unwrap();
+        let out = tool_write(
+            &args,
+            &Session::new(),
+            &fresh_bloom(),
+            WalkConfig::default(),
+        )
+        .unwrap();
         assert!(
             out.contains("overwrote"),
             "expected 'overwrote' verb: {out}"
@@ -668,7 +688,13 @@ mod tests {
             "scope": dir.path().to_str().unwrap(),
             "files": [{"path": p.to_str().unwrap(), "mode": "append", "content": "line1\n"}],
         });
-        let out = tool_write(&args, &Session::new(), &fresh_bloom()).unwrap();
+        let out = tool_write(
+            &args,
+            &Session::new(),
+            &fresh_bloom(),
+            WalkConfig::default(),
+        )
+        .unwrap();
         assert!(out.contains("append"), "expected 'append' summary: {out}");
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "line1\n");
     }
@@ -685,8 +711,13 @@ mod tests {
                 {"path": ps, "mode": "overwrite", "content": "b"},
             ],
         });
-        let err = tool_write(&args, &Session::new(), &fresh_bloom())
-            .expect_err("duplicate paths must be rejected");
+        let err = tool_write(
+            &args,
+            &Session::new(),
+            &fresh_bloom(),
+            WalkConfig::default(),
+        )
+        .expect_err("duplicate paths must be rejected");
         assert!(err.contains("duplicate file path"), "unexpected err: {err}");
         // Nothing written: the batch is refused before any file op.
         assert!(!p.exists(), "no file should be created on a rejected batch");
@@ -700,7 +731,13 @@ mod tests {
             "scope": dir.path().to_str().unwrap(),
             "files": [{"path": p.to_str().unwrap(), "mode": "bogus", "content": "x"}],
         });
-        let out = tool_write(&args, &Session::new(), &fresh_bloom()).unwrap();
+        let out = tool_write(
+            &args,
+            &Session::new(),
+            &fresh_bloom(),
+            WalkConfig::default(),
+        )
+        .unwrap();
         assert!(
             out.contains("unknown mode"),
             "expected unknown-mode error: {out}"
@@ -722,7 +759,13 @@ mod tests {
         });
         // hash task fails (file absent) but the overwrite succeeds, so the
         // call returns Ok with both sections rather than hard-failing.
-        let out = tool_write(&args, &Session::new(), &fresh_bloom()).unwrap();
+        let out = tool_write(
+            &args,
+            &Session::new(),
+            &fresh_bloom(),
+            WalkConfig::default(),
+        )
+        .unwrap();
         assert!(
             out.contains("created"),
             "direct write should report success: {out}"
@@ -743,7 +786,13 @@ mod tests {
             "scope": dir.path().to_str().unwrap(),
             "files": [{"path": p.to_str().unwrap(), "mode": "overwrite", "content": "x"}],
         });
-        let out = tool_write(&args, &Session::new(), &fresh_bloom()).unwrap();
+        let out = tool_write(
+            &args,
+            &Session::new(),
+            &fresh_bloom(),
+            WalkConfig::default(),
+        )
+        .unwrap();
         assert!(
             out.contains("outside scope"),
             "expected scope refusal: {out}"
@@ -765,7 +814,13 @@ mod tests {
             "files": [{"path": p.to_str().unwrap(), "mode": "hash",
                        "edits": [{"start": "1:000", "content": "hacked"}]}],
         });
-        let out = tool_write(&args, &Session::new(), &fresh_bloom()).unwrap();
+        let out = tool_write(
+            &args,
+            &Session::new(),
+            &fresh_bloom(),
+            WalkConfig::default(),
+        )
+        .unwrap();
         assert!(
             out.contains("outside scope"),
             "hash mode must honor the scope guard: {out}"
@@ -787,7 +842,13 @@ mod tests {
         let args = serde_json::json!({
             "files": [{"path": p.to_str().unwrap(), "mode": "overwrite", "content": "probe\n"}],
         });
-        let out = tool_write(&args, &Session::new(), &fresh_bloom()).unwrap();
+        let out = tool_write(
+            &args,
+            &Session::new(),
+            &fresh_bloom(),
+            WalkConfig::default(),
+        )
+        .unwrap();
         assert!(
             out.contains("refusing write outside scope")
                 && out.contains("pass root: <dir containing this path>"),
@@ -800,7 +861,13 @@ mod tests {
             "root": outside.path().to_str().unwrap(),
             "files": [{"path": p.to_str().unwrap(), "mode": "overwrite", "content": "probe\n"}],
         });
-        tool_write(&args, &Session::new(), &fresh_bloom()).unwrap();
+        tool_write(
+            &args,
+            &Session::new(),
+            &fresh_bloom(),
+            WalkConfig::default(),
+        )
+        .unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "probe\n");
     }
 
@@ -815,7 +882,13 @@ mod tests {
             "scope": dir.path().to_str().unwrap(),
             "files": [{"path": p.to_str().unwrap(), "mode": "overwrite", "content": "x"}],
         });
-        let out = tool_write(&args, &Session::new(), &fresh_bloom()).unwrap();
+        let out = tool_write(
+            &args,
+            &Session::new(),
+            &fresh_bloom(),
+            WalkConfig::default(),
+        )
+        .unwrap();
         assert!(
             out.contains("pass a scope that contains this path"),
             "refusal under an explicit scope must say to widen it: {out}"
@@ -831,7 +904,13 @@ mod tests {
             "scope": dir.path().to_str().unwrap(),
             "files": [{"path": p.to_str().unwrap(), "mode": "append", "content": "d\n"}],
         });
-        let out = tool_write(&args, &Session::new(), &fresh_bloom()).unwrap();
+        let out = tool_write(
+            &args,
+            &Session::new(),
+            &fresh_bloom(),
+            WalkConfig::default(),
+        )
+        .unwrap();
         // 3 pre-existing lines → the appended line is numbered 4, and only it is
         // echoed. Anchors come from before+content, not a post-write re-read.
         assert!(
@@ -861,7 +940,13 @@ mod tests {
             }],
             "scope": root_path.to_str().unwrap(),
         });
-        let out = tool_write(&args, &Session::new(), &fresh_bloom()).expect("create succeeds");
+        let out = tool_write(
+            &args,
+            &Session::new(),
+            &fresh_bloom(),
+            WalkConfig::default(),
+        )
+        .expect("create succeeds");
         let expected = root_path.join("relative/file.txt");
         assert!(
             expected.exists(),
@@ -892,7 +977,13 @@ mod tests {
             }],
             "scope": target_dir.path().to_str().unwrap(),
         });
-        let out = tool_write(&args, &Session::new(), &fresh_bloom()).expect("create succeeds");
+        let out = tool_write(
+            &args,
+            &Session::new(),
+            &fresh_bloom(),
+            WalkConfig::default(),
+        )
+        .expect("create succeeds");
         assert!(
             target.exists(),
             "absolute path file must exist at its own location: {}",
@@ -925,7 +1016,13 @@ mod tests {
             }],
             "scope": dir.path().to_str().unwrap(),
         });
-        let out = tool_write(&args, &Session::new(), &fresh_bloom()).expect("create succeeds");
+        let out = tool_write(
+            &args,
+            &Session::new(),
+            &fresh_bloom(),
+            WalkConfig::default(),
+        )
+        .expect("create succeeds");
         let abs_path = p.canonicalize().unwrap();
         assert!(
             out.contains(abs_path.to_str().unwrap()),
@@ -944,8 +1041,13 @@ mod tests {
                 "content": "x",
             }],
         });
-        let err = tool_write(&args, &Session::new(), &fresh_bloom())
-            .expect_err("relative root must be rejected");
+        let err = tool_write(
+            &args,
+            &Session::new(),
+            &fresh_bloom(),
+            WalkConfig::default(),
+        )
+        .expect_err("relative root must be rejected");
         assert!(
             err.contains("must be an absolute path"),
             "error must mention absolute path requirement; got: {err}"
@@ -988,8 +1090,13 @@ mod tests {
                 "content": "root-only write\n",
             }],
         });
-        let out = tool_write(&args, &Session::new(), &fresh_bloom())
-            .expect("root-only write (no scope) must succeed into root, not refuse");
+        let out = tool_write(
+            &args,
+            &Session::new(),
+            &fresh_bloom(),
+            WalkConfig::default(),
+        )
+        .expect("root-only write (no scope) must succeed into root, not refuse");
         assert!(
             !out.contains("error: refusing write outside scope"),
             "root-only write must not be refused by the containment guard: {out}"
@@ -1111,7 +1218,13 @@ mod tests {
                 }]
             }]
         });
-        let out = tool_write(&args, &Session::new(), &fresh_bloom()).expect("hash edit succeeds");
+        let out = tool_write(
+            &args,
+            &Session::new(),
+            &fresh_bloom(),
+            WalkConfig::default(),
+        )
+        .expect("hash edit succeeds");
 
         assert!(
             target.exists(),

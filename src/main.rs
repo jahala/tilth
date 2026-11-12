@@ -1,11 +1,13 @@
 #![forbid(unsafe_code)]
 
 use std::io::{self, IsTerminal, Write};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process;
 
 use clap::{CommandFactory, Parser};
 use clap_complete::Shell;
+use tilth::config::{env_var, Config};
 use tilth::{diag, FileScopeHint};
 
 /// tilth — Tree-sitter indexed lookups, smart code reading for AI agents.
@@ -194,10 +196,11 @@ enum Command {
 fn main() {
     let cli = Cli::parse();
 
-    if cli.respect_gitignore {
-        std::env::set_var("TILTH_RESPECT_GITIGNORE", "1");
-    }
-    configure_thread_pools();
+    // A flag overrides its variable.
+    let mut config = Config::from_env(env_var);
+    config.walk.respect_gitignore |= cli.respect_gitignore;
+    config.overview &= !cli.no_overview;
+    configure_thread_pools(config.walk.threads);
 
     // Shell completions
     if let Some(shell) = cli.completions {
@@ -237,7 +240,7 @@ fn main() {
             } => {
                 let scope =
                     cli_scope(&scope, FileScopeHint::Directory).unwrap_or_else(|e| usage_exit(&e));
-                match tilth::run_grok(&target, &scope, full) {
+                match tilth::run_grok(&target, &scope, full, &config) {
                     Ok(output) => emit_output(&output, stdout_is_terminal()),
                     Err(e) => {
                         diag::emit(format_args!("grok error: {e}"));
@@ -279,7 +282,7 @@ fn main() {
                     None, // repo: the CLI already runs in the caller's checkout
                     scope.as_deref(),
                     search.as_deref(),
-                    blast,
+                    blast.then_some(config.walk),
                     expand,
                     budget_opt,
                 ) {
@@ -296,9 +299,6 @@ fn main() {
 
     // MCP mode: JSON-RPC server
     if cli.mcp {
-        if cli.no_overview {
-            std::env::set_var("TILTH_NO_OVERVIEW", "1");
-        }
         // Pass --scope to MCP if it's not the default ".". A scope that is
         // not a directory stops the launch: the server used to ignore it
         // and serve the directory it happened to start in.
@@ -307,7 +307,7 @@ fn main() {
         } else {
             Some(cli_scope(&cli.scope, FileScopeHint::Directory).unwrap_or_else(|e| usage_exit(&e)))
         };
-        if let Err(e) = tilth::mcp::run(cli.edit, mcp_scope.as_deref()) {
+        if let Err(e) = tilth::mcp::run(config, cli.edit, mcp_scope.as_deref()) {
             diag::emit(format_args!("mcp error: {e}"));
             process::exit(1);
         }
@@ -321,7 +321,7 @@ fn main() {
         let cache = tilth_core::cache::OutlineCache::new();
         let scope =
             cli_scope(&cli.scope, FileScopeHint::Directory).unwrap_or_else(|e| usage_exit(&e));
-        let output = tilth::map::generate(&scope, 3, cli.budget, &cache);
+        let output = tilth::map::generate(&scope, 3, cli.budget, &cache, config.walk);
         emit_output(&output, is_tty);
         return;
     }
@@ -369,6 +369,7 @@ fn main() {
             expand,
             cli.budget,
             cli.glob.as_deref(),
+            config.walk,
             cli.full,
         );
         emit_result(result, &query, cli.json, is_tty);
@@ -392,7 +393,7 @@ fn main() {
                 }
             }
         };
-        let result = tilth::run_deps(&path, &scope, cli.budget, cli.full);
+        let result = tilth::run_deps(&path, &scope, cli.budget, cli.full, config.walk);
         emit_result(result, &query, cli.json, is_tty);
         return;
     }
@@ -408,6 +409,7 @@ fn main() {
             cli.glob.as_deref(),
             &cache,
             cli.full,
+            &config,
         )
     } else if full {
         // The last argument must stay `cli.full`, never the `full` above: a
@@ -421,6 +423,7 @@ fn main() {
             cli.glob.as_deref(),
             &cache,
             cli.full,
+            &config,
         )
     } else {
         tilth::run(
@@ -430,6 +433,7 @@ fn main() {
             cli.budget,
             cli.glob.as_deref(),
             &cache,
+            &config,
         )
     };
 
@@ -493,7 +497,7 @@ fn emit_output(output: &str, is_tty: bool) {
     let term_height = terminal_height();
 
     if is_tty && line_count > term_height {
-        let pager = std::env::var("PAGER").unwrap_or_else(|_| "less".into());
+        let pager = env_var("PAGER").unwrap_or_else(|| "less".into());
         if let Ok(mut child) = process::Command::new(&pager)
             .arg("-R")
             .stdin(process::Stdio::piped())
@@ -568,29 +572,17 @@ fn terminal_height() -> usize {
     if let Some((_, terminal_size::Height(h))) = terminal_size::terminal_size() {
         return h as usize;
     }
-    if let Ok(lines) = std::env::var("LINES") {
-        if let Ok(h) = lines.parse::<usize>() {
-            return h;
-        }
-    }
-    24
+    env_var("LINES")
+        .and_then(|lines| lines.parse::<usize>().ok())
+        .unwrap_or(24)
 }
 
-/// Configure rayon global thread pool to limit CPU usage.
-///
-/// Defaults to min(cores / 2, 6). Override with `TILTH_THREADS` env var.
-/// This matters for long-lived MCP sessions where back-to-back searches
-/// can sustain high CPU (see #27).
-fn configure_thread_pools() {
-    let num_threads = std::env::var("TILTH_THREADS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism().map_or(4, |n| (n.get() / 2).clamp(2, 6))
-        });
-
+/// Size the rayon global thread pool to limit CPU use, with the walks'
+/// thread count (`None` lets rayon choose). This matters for long-lived MCP
+/// sessions where back-to-back searches can sustain high CPU (see #27).
+fn configure_thread_pools(threads: Option<NonZeroUsize>) {
     rayon::ThreadPoolBuilder::new()
-        .num_threads(num_threads)
+        .num_threads(threads.map_or(0, NonZeroUsize::get))
         .build_global()
         .ok();
 }

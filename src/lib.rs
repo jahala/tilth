@@ -2,6 +2,7 @@
 
 pub(crate) mod budget;
 pub(crate) mod classify;
+pub mod config;
 pub mod diag;
 pub mod diff;
 pub(crate) mod edit;
@@ -46,7 +47,9 @@ pub mod __fuzz {
 use std::path::{Path, PathBuf};
 
 use classify::classify;
+use config::Config;
 use tilth_core::cache::OutlineCache;
+use tilth_core::search::walk::WalkConfig;
 use tilth_core::TilthError;
 use types::QueryType;
 
@@ -254,6 +257,7 @@ pub fn run(
     budget_tokens: Option<u64>,
     glob: Option<&str>,
     cache: &OutlineCache,
+    config: &Config,
 ) -> Result<String, TilthError> {
     run_inner(
         query,
@@ -265,6 +269,7 @@ pub fn run(
         glob,
         cache,
         false,
+        config,
     )
 }
 
@@ -275,6 +280,10 @@ pub fn run(
 /// path `--full --expand=0` takes, so the cap has to be raised here even
 /// though the only branch that expands anything is the multi-symbol one,
 /// which carries its own floor of one match per symbol.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "per-call options become one Request in #307"
+)]
 pub fn run_full(
     query: &str,
     scope: &Path,
@@ -283,6 +292,7 @@ pub fn run_full(
     glob: Option<&str>,
     cache: &OutlineCache,
     cli_full: bool,
+    config: &Config,
 ) -> Result<String, TilthError> {
     run_inner(
         query,
@@ -294,6 +304,7 @@ pub fn run_full(
         glob,
         cache,
         cli_full,
+        config,
     )
 }
 
@@ -316,6 +327,7 @@ pub fn run_expanded(
     glob: Option<&str>,
     cache: &OutlineCache,
     cli_full: bool,
+    config: &Config,
 ) -> Result<String, TilthError> {
     run_inner(
         query,
@@ -327,6 +339,7 @@ pub fn run_expanded(
         glob,
         cache,
         cli_full,
+        config,
     )
 }
 
@@ -337,12 +350,14 @@ pub fn run_callers(
     expand: usize,
     budget_tokens: Option<u64>,
     glob: Option<&str>,
+    walk: WalkConfig,
     full: bool,
 ) -> Result<String, TilthError> {
     let bloom = tilth_core::BloomFilterCache::new();
     let expand = if expand > 0 { expand } else { 2 };
-    let output =
-        search::callers::search_callers_expanded(target, scope, &bloom, expand, None, glob, full)?;
+    let output = search::callers::search_callers_expanded(
+        target, scope, &bloom, expand, None, glob, walk, full,
+    )?;
     match budget_tokens {
         Some(b) => Ok(budget::apply(&output, b)),
         None => Ok(output),
@@ -355,9 +370,10 @@ pub fn run_deps(
     scope: &Path,
     budget_tokens: Option<u64>,
     full: bool,
+    walk: WalkConfig,
 ) -> Result<String, TilthError> {
     let bloom = tilth_core::BloomFilterCache::new();
-    let result = tilth_core::analyze_deps(path, scope, &bloom)?;
+    let result = tilth_core::analyze_deps(path, scope, &bloom, walk)?;
     let budget_usize = budget_tokens.map(|b| b as usize);
     Ok(search::deps::format_deps(
         &result,
@@ -371,7 +387,12 @@ pub fn run_deps(
 ///
 /// `target_spec` accepts a bare symbol name (`parse_unified_diff`), a path:line
 /// pair (`src/diff/parse.rs:7`), or a `Type::method` reference.
-pub fn run_grok(target_spec: &str, scope: &Path, full: bool) -> Result<String, TilthError> {
+pub fn run_grok(
+    target_spec: &str,
+    scope: &Path,
+    full: bool,
+    config: &Config,
+) -> Result<String, TilthError> {
     let bloom = tilth_core::BloomFilterCache::new();
     let session = session::Session::default();
     let caps = if full {
@@ -379,7 +400,7 @@ pub fn run_grok(target_spec: &str, scope: &Path, full: bool) -> Result<String, T
     } else {
         search::grok::GrokCaps::default()
     };
-    let result = search::grok::grok(target_spec, scope, &bloom, &session, caps)?;
+    let result = search::grok::grok(target_spec, scope, &bloom, &session, caps, config)?;
     Ok(search::grok::format_grok(&result, scope))
 }
 
@@ -397,7 +418,9 @@ fn run_inner(
     glob: Option<&str>,
     cache: &OutlineCache,
     cli_full: bool,
+    config: &Config,
 ) -> Result<String, TilthError> {
+    let walk = config.walk;
     let query_type = classify(query, scope);
 
     let use_expanded =
@@ -437,6 +460,7 @@ fn run_inner(
                 expand,
                 None,
                 glob,
+                walk,
                 cli_full,
                 budget_tokens,
             )?;
@@ -453,7 +477,8 @@ fn run_inner(
     // FilePath and Glob are read operations, not search — handle before expanded dispatch
     let output = match query_type {
         QueryType::FilePath(path) => {
-            let mut out = read::read_file(&path, section, full, cache, false, budget_tokens)?;
+            let full_cap = full.then_some(config.full_size_cap);
+            let mut out = read::read_file(&path, section, full_cap, cache, false, budget_tokens)?;
             if section.is_none() && !full && read::would_outline(&path) {
                 let related = tilth_core::imports::resolve_related_files(&path, cache);
                 out.push_str(&read::related_hint(
@@ -462,7 +487,7 @@ fn run_inner(
             }
             out
         }
-        QueryType::Glob(pattern) => search::search_glob(&pattern, scope)?,
+        QueryType::Glob(pattern) => search::search_glob(&pattern, scope, walk)?,
         _ if use_expanded => {
             let ctx = ExpandedCtx {
                 session: session::Session::new(),
@@ -471,9 +496,9 @@ fn run_inner(
                 full_search: cli_full,
                 budget: budget_tokens,
             };
-            run_query_expanded(&query_type, scope, cache, &ctx, glob)?
+            run_query_expanded(&query_type, scope, cache, &ctx, glob, walk)?
         }
-        _ => run_query_basic(&query_type, scope, cache, glob, cli_full)?,
+        _ => run_query_basic(&query_type, scope, cache, glob, walk, cli_full)?,
     };
 
     // For the expanded-search branch, fit_to_budget already applied
@@ -494,6 +519,7 @@ fn run_query_expanded(
     cache: &OutlineCache,
     ctx: &ExpandedCtx,
     glob: Option<&str>,
+    walk: WalkConfig,
 ) -> Result<String, TilthError> {
     match query_type {
         QueryType::Symbol(name) => search::search_symbol_expanded(
@@ -505,6 +531,7 @@ fn run_query_expanded(
             ctx.expand,
             None,
             glob,
+            walk,
             ctx.full_search,
             ctx.budget,
         ),
@@ -516,6 +543,7 @@ fn run_query_expanded(
             ctx.expand,
             None,
             glob,
+            walk,
             ctx.full_search,
             ctx.budget,
         ),
@@ -532,6 +560,7 @@ fn run_query_expanded(
             ctx.expand,
             None,
             glob,
+            walk,
             ctx.full_search,
             ctx.budget,
         ),
@@ -543,6 +572,7 @@ fn run_query_expanded(
             ctx.expand,
             None,
             glob,
+            walk,
             ctx.full_search,
             ctx.budget,
         ),
@@ -554,6 +584,7 @@ fn run_query_expanded(
             ctx.expand,
             None,
             glob,
+            walk,
             ctx.full_search,
             ctx.budget,
         ),
@@ -575,22 +606,29 @@ fn run_query_basic(
     scope: &Path,
     cache: &OutlineCache,
     glob: Option<&str>,
+    walk: WalkConfig,
     full_search: bool,
 ) -> Result<String, TilthError> {
     match query_type {
-        QueryType::Symbol(name) => search::search_symbol(name, scope, cache, glob, full_search),
+        QueryType::Symbol(name) => {
+            search::search_symbol(name, scope, cache, glob, walk, full_search)
+        }
         QueryType::Concept(text) if text.contains(' ') => {
-            multi_word_concept_search(text, scope, cache, glob, full_search)
+            multi_word_concept_search(text, scope, cache, glob, walk, full_search)
         }
         QueryType::Concept(text) => {
             // Single-word concept: prefer definitions, then content, then any match.
-            single_query_search(text, scope, cache, true, glob, full_search)
+            single_query_search(text, scope, cache, true, glob, walk, full_search)
         }
-        QueryType::Content(text) => search::search_content(text, scope, cache, glob, full_search),
-        QueryType::Regex(pattern) => search::search_regex(pattern, scope, cache, glob, full_search),
+        QueryType::Content(text) => {
+            search::search_content(text, scope, cache, glob, walk, full_search)
+        }
+        QueryType::Regex(pattern) => {
+            search::search_regex(pattern, scope, cache, glob, walk, full_search)
+        }
         QueryType::Fallthrough(text) => {
             // Accept any symbol match immediately (no definitions preference).
-            single_query_search(text, scope, cache, false, glob, full_search)
+            single_query_search(text, scope, cache, false, glob, walk, full_search)
         }
         // FilePath/Glob never reach here
         QueryType::FilePath(_) | QueryType::Glob(_) => {
@@ -610,9 +648,10 @@ fn single_query_search(
     cache: &OutlineCache,
     prefer_definitions: bool,
     glob: Option<&str>,
+    walk: WalkConfig,
     full_search: bool,
 ) -> Result<String, TilthError> {
-    let sym_result = search::search_symbol_raw(text, scope, glob, full_search)?;
+    let sym_result = search::search_symbol_raw(text, scope, glob, walk, full_search)?;
     let accept_sym = if prefer_definitions {
         sym_result.definitions > 0
     } else {
@@ -623,7 +662,7 @@ fn single_query_search(
         return search::format_raw_result(&sym_result, cache);
     }
 
-    let content_result = search::search_content_raw(text, scope, glob, full_search)?;
+    let content_result = search::search_content_raw(text, scope, glob, walk, full_search)?;
     if content_result.total_found > 0 {
         return search::format_raw_result(&content_result, cache);
     }
@@ -667,10 +706,11 @@ fn multi_word_concept_search(
     scope: &Path,
     cache: &OutlineCache,
     glob: Option<&str>,
+    walk: WalkConfig,
     full_search: bool,
 ) -> Result<String, TilthError> {
     // Try exact phrase match first
-    let mut content_result = search::search_content_raw(text, scope, glob, full_search)?;
+    let mut content_result = search::search_content_raw(text, scope, glob, walk, full_search)?;
     content_result.query = text.to_string();
     if content_result.total_found > 0 {
         return search::format_raw_result(&content_result, cache);
@@ -695,7 +735,7 @@ fn multi_word_concept_search(
             .join("|")
     };
 
-    let mut relaxed_result = search::search_regex_raw(&relaxed, scope, glob, full_search)?;
+    let mut relaxed_result = search::search_regex_raw(&relaxed, scope, glob, walk, full_search)?;
     relaxed_result.query = text.to_string();
     if relaxed_result.total_found > 0 {
         return search::format_raw_result(&relaxed_result, cache);
@@ -898,21 +938,25 @@ mod tests {
         let scope = dir.path();
 
         // "widget" is accepted at the symbol stage, so it never falls through.
-        let widget =
-            search::search_symbol_raw("widget", scope, None, false).expect("symbol search");
+        let widget = search::search_symbol_raw("widget", scope, None, WalkConfig::default(), false)
+            .expect("symbol search");
         assert!(widget.definitions > 0, "widget must have definitions");
 
         // "marks" has no definition but does have content hits, so it is the
         // only query that exercises the content stage of the cascade.
-        let marks = search::search_symbol_raw("marks", scope, None, false).expect("symbol search");
+        let marks = search::search_symbol_raw("marks", scope, None, WalkConfig::default(), false)
+            .expect("symbol search");
         assert_eq!(marks.definitions, 0, "marks must have no definition");
-        let marks_text = search::search_content_raw("marks", scope, None, false).expect("content");
+        let marks_text =
+            search::search_content_raw("marks", scope, None, WalkConfig::default(), false)
+                .expect("content");
         assert!(marks_text.total_found > 0, "marks must have content hits");
 
         // "widget 424242" must not appear verbatim, or the multi-word search
         // stops at the exact-phrase stage and never reaches the relaxed regex.
         let phrase =
-            search::search_content_raw("widget 424242", scope, None, false).expect("content");
+            search::search_content_raw("widget 424242", scope, None, WalkConfig::default(), false)
+                .expect("content");
         assert_eq!(phrase.total_found, 0, "the phrase must not match verbatim");
     }
 
@@ -925,8 +969,17 @@ mod tests {
         let dir = fixture();
         let cache = OutlineCache::new();
         for &(query, path) in UNEXPANDED_QUERIES {
-            let out = run_full(query, dir.path(), None, None, Some("*.rs"), &cache, true)
-                .unwrap_or_else(|e| panic!("{path}: {query:?} failed: {e}"));
+            let out = run_full(
+                query,
+                dir.path(),
+                None,
+                None,
+                Some("*.rs"),
+                &cache,
+                true,
+                &Config::default(),
+            )
+            .unwrap_or_else(|e| panic!("{path}: {query:?} failed: {e}"));
             for shown in header_match_counts(&out) {
                 assert!(
                     shown > 10,
@@ -946,8 +999,17 @@ mod tests {
         let dir = fixture();
         let cache = OutlineCache::new();
         for &(query, path) in UNEXPANDED_QUERIES {
-            let out = run_full(query, dir.path(), None, None, Some("*.rs"), &cache, false)
-                .unwrap_or_else(|e| panic!("{path}: {query:?} failed: {e}"));
+            let out = run_full(
+                query,
+                dir.path(),
+                None,
+                None,
+                Some("*.rs"),
+                &cache,
+                false,
+                &Config::default(),
+            )
+            .unwrap_or_else(|e| panic!("{path}: {query:?} failed: {e}"));
             for shown in header_match_counts(&out) {
                 assert!(
                     shown <= 10,
@@ -965,8 +1027,16 @@ mod tests {
         let dir = fixture();
         let cache = OutlineCache::new();
         for query in ["zzqqxx", "zzqq xxyy"] {
-            let out = run(query, dir.path(), None, None, None, &cache)
-                .unwrap_or_else(|e| panic!("{query:?} must not be an error, got: {e}"));
+            let out = run(
+                query,
+                dir.path(),
+                None,
+                None,
+                None,
+                &cache,
+                &Config::default(),
+            )
+            .unwrap_or_else(|e| panic!("{query:?} must not be an error, got: {e}"));
             assert!(
                 out.starts_with(&format!("# Search: \"{query}\" in "))
                     && out.contains("— 0 matches"),
@@ -983,7 +1053,16 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("config"), "x\n").unwrap();
         let cache = OutlineCache::new();
-        let out = run("confg", dir.path(), None, None, None, &cache).expect("no error");
+        let out = run(
+            "confg",
+            dir.path(),
+            None,
+            None,
+            None,
+            &cache,
+            &Config::default(),
+        )
+        .expect("no error");
         assert!(out.contains("— 0 matches"), "{out}");
         assert!(
             out.contains("config"),
@@ -997,8 +1076,16 @@ mod tests {
     fn zero_hit_path_query_still_reports_the_missing_path() {
         let dir = fixture();
         let cache = OutlineCache::new();
-        let err = run("src/nothing_here.rs", dir.path(), None, None, None, &cache)
-            .expect_err("a missing path is an error");
+        let err = run(
+            "src/nothing_here.rs",
+            dir.path(),
+            None,
+            None,
+            None,
+            &cache,
+            &Config::default(),
+        )
+        .expect_err("a missing path is an error");
         assert!(err.to_string().starts_with("not found: "), "{err}");
     }
 
@@ -1023,7 +1110,16 @@ mod tests {
         }
         std::fs::write(scope.join("dense.js"), src).unwrap();
 
-        let out = run("dense.js", &scope, None, None, None, &OutlineCache::new()).unwrap();
+        let out = run(
+            "dense.js",
+            &scope,
+            None,
+            None,
+            None,
+            &OutlineCache::new(),
+            &Config::default(),
+        )
+        .unwrap();
         let shown: Vec<String> = (0..8).map(|i| format!("helper{i:02}.js")).collect();
         assert!(
             out.ends_with(&format!("\n\n> Related: {}, and 4 more", shown.join(", "))),

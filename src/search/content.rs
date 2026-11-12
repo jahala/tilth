@@ -10,6 +10,7 @@ use grep_regex::RegexMatcher;
 use grep_searcher::sinks::UTF8;
 use grep_searcher::Searcher;
 use tilth_core::error::TilthError;
+use tilth_core::search::walk::WalkConfig;
 
 const MAX_MATCHES: usize = 10;
 const FULL_MAX_MATCHES: usize = 100;
@@ -21,6 +22,7 @@ pub fn search(
     is_regex: bool,
     context: Option<&Path>,
     glob: Option<&str>,
+    walk: WalkConfig,
     full: bool,
 ) -> Result<SearchResult, TilthError> {
     let max_matches = if full { FULL_MAX_MATCHES } else { MAX_MATCHES };
@@ -30,6 +32,7 @@ pub fn search(
         is_regex,
         context,
         glob,
+        walk,
         max_matches,
         max_matches,
     )
@@ -42,12 +45,17 @@ pub fn search(
     clippy::too_many_lines,
     reason = "reading goes through one Source in #308"
 )]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "per-call options become one Request in #307"
+)]
 fn search_capped(
     pattern: &str,
     scope: &Path,
     is_regex: bool,
     context: Option<&Path>,
     glob: Option<&str>,
+    walk: WalkConfig,
     max_matches: usize,
     per_file_cap: usize,
 ) -> Result<SearchResult, TilthError> {
@@ -72,7 +80,7 @@ fn search_capped(
     // Relaxed is correct: walker.run() joins all threads before we read the final value.
     let total_found = AtomicUsize::new(0);
 
-    let walker = tilth_core::search::walk::walker(scope, glob)?;
+    let walker = tilth_core::search::walk::walker(scope, glob, walk)?;
     // One clock for the per-file bound and the final sort, so both rank by
     // the same scores.
     let now = std::time::SystemTime::now();
@@ -245,14 +253,32 @@ mod completeness_tests {
     #[test]
     fn content_search_totals_are_complete_and_deterministic() {
         let d = fixture();
-        let r1 = search("needle_alpha", d.path(), false, None, None, false).unwrap();
+        let r1 = search(
+            "needle_alpha",
+            d.path(),
+            false,
+            None,
+            None,
+            WalkConfig::default(),
+            false,
+        )
+        .unwrap();
         assert_eq!(
             r1.total_found, FILES,
             "must count the needle in ALL files, not quit mid-walk"
         );
         let first: Vec<_> = r1.matches.iter().map(|m| (&m.path, m.line)).collect();
         for _ in 0..4 {
-            let r = search("needle_alpha", d.path(), false, None, None, false).unwrap();
+            let r = search(
+                "needle_alpha",
+                d.path(),
+                false,
+                None,
+                None,
+                WalkConfig::default(),
+                false,
+            )
+            .unwrap();
             assert_eq!(
                 r.total_found, r1.total_found,
                 "totals must not vary run-to-run"
@@ -284,8 +310,19 @@ mod completeness_tests {
         let shown = |r: &SearchResult| -> Vec<(u32, String)> {
             r.matches.iter().map(|m| (m.line, m.text.clone())).collect()
         };
-        let run =
-            |cap| search_capped("needle_gamma", d.path(), false, None, None, 10, cap).unwrap();
+        let run = |cap| {
+            search_capped(
+                "needle_gamma",
+                d.path(),
+                false,
+                None,
+                None,
+                WalkConfig::default(),
+                10,
+                cap,
+            )
+            .unwrap()
+        };
 
         let bounded = run(10);
         let unbounded = run(usize::MAX);

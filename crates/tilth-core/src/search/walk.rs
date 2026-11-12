@@ -1,6 +1,7 @@
 //! The shared directory walker: one policy for which files every search,
 //! callers walk and map visits.
 
+use std::num::NonZeroUsize;
 use std::path::Path;
 
 use ignore::WalkBuilder;
@@ -66,22 +67,45 @@ pub fn with_gitignore_override<T>(value: Option<bool>, f: impl FnOnce() -> T) ->
     f()
 }
 
-fn gitignore_from_env() -> Option<bool> {
-    std::env::var("TILTH_RESPECT_GITIGNORE").ok().map(|v| {
-        matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
+/// How walks run. The binary builds it once at startup and passes it to
+/// every walk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WalkConfig {
+    /// Worker threads for a parallel walk. `None` lets the walker choose.
+    pub threads: Option<NonZeroUsize>,
+    /// Whether walks honor `.gitignore`, `.ignore` and Git exclude rules.
+    /// A per-call MCP override, when one is set, wins over it.
+    pub respect_gitignore: bool,
 }
 
-/// Whether walks honor `.gitignore`, `.ignore` and Git exclude rules: the
-/// per-call MCP override when one is set, else `TILTH_RESPECT_GITIGNORE`
-/// (which `--respect-gitignore` sets), else off.
-pub fn respect_gitignore() -> bool {
-    call_gitignore_override()
-        .or_else(gitignore_from_env)
-        .unwrap_or(false)
+impl WalkConfig {
+    /// Half the available cores, kept between 2 and 6, or 4 when the core
+    /// count is unknown.
+    #[must_use]
+    pub fn default_threads() -> NonZeroUsize {
+        const TWO: NonZeroUsize = NonZeroUsize::MIN.saturating_add(1);
+        const FOUR: NonZeroUsize = NonZeroUsize::MIN.saturating_add(3);
+        const SIX: NonZeroUsize = NonZeroUsize::MIN.saturating_add(5);
+        std::thread::available_parallelism().map_or(FOUR, |cores| {
+            NonZeroUsize::new(cores.get() / 2).map_or(TWO, |half| half.clamp(TWO, SIX))
+        })
+    }
+
+    /// Whether this walk honors gitignore-style files: the per-call MCP
+    /// override when one is set, else [`respect_gitignore`](Self::respect_gitignore).
+    fn honors_gitignore(self) -> bool {
+        call_gitignore_override().unwrap_or(self.respect_gitignore)
+    }
+}
+
+impl Default for WalkConfig {
+    /// [`default_threads`](Self::default_threads) workers, gitignore off.
+    fn default() -> Self {
+        Self {
+            threads: Some(Self::default_threads()),
+            respect_gitignore: false,
+        }
+    }
 }
 
 /// Shared walker policy: searches files except known junk directories and
@@ -94,8 +118,8 @@ pub fn respect_gitignore() -> bool {
 /// walker (the `tilth` binary's `map::generate`), which each apply their own final
 /// `.max_depth()`/`.threads()` and `.build()`/`.build_parallel()`.
 #[must_use]
-pub fn base_walk_builder(scope: &Path) -> WalkBuilder {
-    base_walk_builder_with_gitignore(scope, respect_gitignore())
+pub fn base_walk_builder(scope: &Path, walk: WalkConfig) -> WalkBuilder {
+    base_walk_builder_with_gitignore(scope, walk.honors_gitignore())
 }
 
 fn base_walk_builder_with_gitignore(scope: &Path, respect_gitignore: bool) -> WalkBuilder {
@@ -128,17 +152,15 @@ fn include_entry(entry: &ignore::DirEntry) -> bool {
 /// known junk directories. Gitignore-style files are opt-in.
 /// When `glob` is Some, applies a file-pattern filter (whitelist or negation).
 /// With gitignore enabled, the glob cannot override ignore rules.
-pub fn walker(scope: &Path, glob: Option<&str>) -> Result<ignore::WalkParallel, TilthError> {
-    let threads = std::env::var("TILTH_THREADS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism().map_or(4, |n| (n.get() / 2).clamp(2, 6))
-        });
-
-    let respect_gitignore = respect_gitignore();
+pub fn walker(
+    scope: &Path,
+    glob: Option<&str>,
+    walk: WalkConfig,
+) -> Result<ignore::WalkParallel, TilthError> {
+    let respect_gitignore = walk.honors_gitignore();
     let mut builder = base_walk_builder_with_gitignore(scope, respect_gitignore);
-    builder.threads(threads);
+    // The walker reads 0 as "choose for me".
+    builder.threads(walk.threads.map_or(0, NonZeroUsize::get));
 
     if let Some(pattern) = glob {
         if !pattern.is_empty() {
@@ -182,7 +204,7 @@ mod tests {
 
     /// Collect all file paths from a walker into a sorted Vec.
     fn walk_paths(scope: &Path, glob: Option<&str>) -> Vec<PathBuf> {
-        let w = walker(scope, glob).expect("walker failed");
+        let w = walker(scope, glob, WalkConfig::default()).expect("walker failed");
         collect_walk_paths(w)
     }
 
@@ -380,7 +402,7 @@ mod tests {
     #[test]
     fn walker_invalid_glob_returns_error() {
         let scope = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let result = walker(&scope, Some("[unclosed"));
+        let result = walker(&scope, Some("[unclosed"), WalkConfig::default());
         match result {
             Err(TilthError::InvalidQuery { query, reason }) => {
                 assert_eq!(query, "[unclosed");

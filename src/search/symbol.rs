@@ -10,6 +10,7 @@ use tilth_core::lang::treesitter::{
     extract_implemented_interfaces, is_local_binding, is_or_body_of, node_text_simple,
     NodeTextMode, NAMESPACE_KINDS, PASS_THROUGH_KINDS, TYPE_KINDS, WRAPPER_KINDS,
 };
+use tilth_core::search::walk::WalkConfig;
 
 use crate::search::rank;
 use crate::types::{Match, OtherOwner, SearchResult};
@@ -70,10 +71,11 @@ pub fn search(
     scope: &Path,
     context: Option<&Path>,
     glob: Option<&str>,
+    walk: WalkConfig,
     full: bool,
 ) -> Result<SearchResult, TilthError> {
     let max_matches = if full { FULL_MAX_MATCHES } else { MAX_MATCHES };
-    search_capped(query, scope, context, glob, max_matches, max_matches)
+    search_capped(query, scope, context, glob, walk, max_matches, max_matches)
 }
 
 /// What a symbol query asks for. A qualified query (`B::run`, `B.run`) asks
@@ -115,6 +117,7 @@ fn search_capped(
     scope: &Path,
     context: Option<&Path>,
     glob: Option<&str>,
+    walk: WalkConfig,
     max_matches: usize,
     keep: usize,
 ) -> Result<SearchResult, TilthError> {
@@ -126,7 +129,7 @@ fn search_capped(
     // One clock for the per-file bound and the final sort, so both rank by
     // the same scores.
     let now = SystemTime::now();
-    let walked = walk(wanted, &usage, scope, context, glob, now, keep)?;
+    let walked = walk_scope(wanted, &usage, scope, context, glob, walk, now, keep)?;
 
     let definitions: usize = walked.per_file.iter().map(|f| f.definitions).sum();
     let code_definitions: usize = walked
@@ -207,12 +210,17 @@ struct FileDefs {
 /// are merged into the running first `keep` as the file is read. The display
 /// order is total across files, since it ends on path and line, so what is
 /// kept does not depend on the order files arrive in.
-fn walk(
+#[expect(
+    clippy::too_many_arguments,
+    reason = "per-call options become one Request in #307"
+)]
+fn walk_scope(
     wanted: Wanted,
     usage: &RegexMatcher,
     scope: &Path,
     context: Option<&Path>,
     glob: Option<&str>,
+    walk: WalkConfig,
     now: SystemTime,
     keep: usize,
 ) -> Result<Walked, TilthError> {
@@ -223,7 +231,7 @@ fn walk(
         other_owners: Vec::new(),
     });
 
-    let walker = tilth_core::search::walk::walker(scope, glob)?;
+    let walker = tilth_core::search::walk::walker(scope, glob, walk)?;
 
     walker.run(|| {
         let found = &found;
@@ -1575,7 +1583,15 @@ Body to end.
             )
             .expect("write");
         }
-        let first = search("exact_needle", dir.path(), None, None, false).expect("search");
+        let first = search(
+            "exact_needle",
+            dir.path(),
+            None,
+            None,
+            WalkConfig::default(),
+            false,
+        )
+        .expect("search");
         assert_eq!(first.definitions, 80, "every definition is counted");
         assert_eq!(first.usages, 80, "every usage line is counted");
         assert_eq!(first.total_found, 160);
@@ -1592,7 +1608,15 @@ Body to end.
             r.matches.iter().map(|m| (m.path.clone(), m.line)).collect()
         };
         for _ in 0..4 {
-            let again = search("exact_needle", dir.path(), None, None, false).expect("search");
+            let again = search(
+                "exact_needle",
+                dir.path(),
+                None,
+                None,
+                WalkConfig::default(),
+                false,
+            )
+            .expect("search");
             assert_eq!(again.total_found, first.total_found);
             assert_eq!(shown(&again), shown(&first), "same matches every run");
         }
@@ -1626,7 +1650,18 @@ Body to end.
                 .map(|m| (m.path.clone(), m.line, m.is_definition))
                 .collect()
         };
-        let run = |cap| search_capped("bound_probe", dir.path(), None, None, 10, cap).unwrap();
+        let run = |cap| {
+            search_capped(
+                "bound_probe",
+                dir.path(),
+                None,
+                None,
+                WalkConfig::default(),
+                10,
+                cap,
+            )
+            .unwrap()
+        };
         let bounded = run(10);
         let unbounded = run(usize::MAX);
         assert_eq!(bounded.total_found, 87);
@@ -1665,9 +1700,24 @@ Body to end.
             std::fs::write(&path, "pub fn WidelyUsedThing() {}\n").expect("write");
         }
 
-        let result_default =
-            search("WidelyUsedThing", scope, None, None, false).expect("search default");
-        let result_full = search("WidelyUsedThing", scope, None, None, true).expect("search full");
+        let result_default = search(
+            "WidelyUsedThing",
+            scope,
+            None,
+            None,
+            WalkConfig::default(),
+            false,
+        )
+        .expect("search default");
+        let result_full = search(
+            "WidelyUsedThing",
+            scope,
+            None,
+            None,
+            WalkConfig::default(),
+            true,
+        )
+        .expect("search full");
 
         // Default cap is 10 — should not exceed it.
         assert!(
@@ -1697,7 +1747,8 @@ Body to end.
             tilth_core::lang::go::GO_DECLARATIONS_FIXTURE,
         )
         .expect("write fixture");
-        let result = search(query, dir.path(), None, None, false).expect("search");
+        let result =
+            search(query, dir.path(), None, None, WalkConfig::default(), false).expect("search");
         result
             .matches
             .into_iter()
@@ -1825,7 +1876,8 @@ func run() {
     fn definition_lines(file: &str, fixture: &str, query: &str) -> Vec<u32> {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join(file), fixture).expect("write fixture");
-        let result = search(query, dir.path(), None, None, false).expect("search");
+        let result =
+            search(query, dir.path(), None, None, WalkConfig::default(), false).expect("search");
         let mut lines: Vec<u32> = result
             .matches
             .iter()
@@ -1874,7 +1926,8 @@ func run() {
             tilth_core::lang::c::C_DEFINITIONS_FIXTURE,
         )
         .expect("write fixture");
-        let result = search("add", dir.path(), None, None, false).expect("search");
+        let result =
+            search("add", dir.path(), None, None, WalkConfig::default(), false).expect("search");
         let def = result
             .matches
             .iter()
@@ -1968,7 +2021,8 @@ func run() {
     fn definition_range(file: &str, fixture: &str, query: &str) -> Option<(u32, u32)> {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join(file), fixture).expect("write fixture");
-        let result = search(query, dir.path(), None, None, false).expect("search");
+        let result =
+            search(query, dir.path(), None, None, WalkConfig::default(), false).expect("search");
         let defs: Vec<&Match> = result.matches.iter().filter(|m| m.is_definition).collect();
         assert_eq!(
             defs.len(),
@@ -2287,7 +2341,8 @@ pub trait Speak {
     fn qualified_search(file: &str, fixture: &str, query: &str) -> (Vec<u32>, SearchResult) {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join(file), fixture).expect("write fixture");
-        let result = search(query, dir.path(), None, None, false).expect("search");
+        let result =
+            search(query, dir.path(), None, None, WalkConfig::default(), false).expect("search");
         let bare = tilth_core::search::scope::split_qualified(query).1;
         let mut lines: Vec<u32> = result
             .matches
@@ -2417,7 +2472,15 @@ pub fn use_them(a: &A, b: &B) -> u8 {
             "@Injectable()\nclass Service {\n  @First()\n  method() {\n    return 1;\n  }\n}\n";
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("service.ts"), ts).expect("write");
-        let result = search("Service", dir.path(), None, None, false).expect("search");
+        let result = search(
+            "Service",
+            dir.path(),
+            None,
+            None,
+            WalkConfig::default(),
+            false,
+        )
+        .expect("search");
         assert_eq!(result.matches.len(), 1, "{result:?}");
         let m = &result.matches[0];
         assert_eq!(
@@ -2530,7 +2593,15 @@ impl Runner {
             "def slug(s):\n    return s\n",
         )
         .expect("write");
-        let result = search("utils.slug", dir.path(), None, None, false).expect("search");
+        let result = search(
+            "utils.slug",
+            dir.path(),
+            None,
+            None,
+            WalkConfig::default(),
+            false,
+        )
+        .expect("search");
         assert_eq!(result.definitions, 1, "{result:?}");
     }
 
@@ -2558,7 +2629,8 @@ impl Runner {
             let dir = tempfile::tempdir().expect("tempdir");
             std::fs::write(dir.path().join(free_file), free).expect("write");
             std::fs::write(dir.path().join(owned_file), owned).expect("write");
-            let result = search(query, dir.path(), None, None, false).expect("search");
+            let result = search(query, dir.path(), None, None, WalkConfig::default(), false)
+                .expect("search");
             let defs: Vec<&Path> = result
                 .matches
                 .iter()
@@ -2604,7 +2676,15 @@ impl Runner {
         let rb = "class User\n  def save!\n    true\n  end\nend\n\nUser.new.save!\n";
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("u.rb"), rb).expect("write");
-        let result = search("save!", dir.path(), None, None, false).expect("search");
+        let result = search(
+            "save!",
+            dir.path(),
+            None,
+            None,
+            WalkConfig::default(),
+            false,
+        )
+        .expect("search");
         assert_eq!((result.definitions, result.usages), (1, 1), "{result:?}");
     }
 
@@ -2624,7 +2704,8 @@ impl Runner {
         ] {
             let dir = tempfile::tempdir().expect("tempdir");
             std::fs::write(dir.path().join(file), fixture).expect("write");
-            let result = search(query, dir.path(), None, None, false).expect("search");
+            let result = search(query, dir.path(), None, None, WalkConfig::default(), false)
+                .expect("search");
             let def = result
                 .matches
                 .iter()
