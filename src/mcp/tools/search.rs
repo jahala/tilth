@@ -6,7 +6,7 @@ use serde_json::Value;
 use crate::session::Session;
 use tilth_core::cache::OutlineCache;
 use tilth_core::index::bloom::BloomFilterCache;
-use tilth_core::search::walk::WalkConfig;
+use tilth_core::search::walk::{Walk, WalkConfig};
 
 use super::{apply_budget, resolve_scope};
 
@@ -16,7 +16,7 @@ pub(in crate::mcp) fn tool_search(
     cache: &OutlineCache,
     session: &Session,
     bloom: &Arc<BloomFilterCache>,
-    walk: WalkConfig,
+    config: WalkConfig,
 ) -> Result<String, String> {
     let query = args
         .get("query")
@@ -41,7 +41,11 @@ pub(in crate::mcp) fn tool_search(
         .and_then(|v| v.as_str())
         .map(PathBuf::from);
     let context = context_path.as_deref();
-    let glob = args.get("glob").and_then(|v| v.as_str());
+    let walk = Walk {
+        scope: &scope,
+        glob: args.get("glob").and_then(|v| v.as_str()),
+        config,
+    };
     // Expanded search and the response cap must use the same budget.
     let budget = Some(
         args.get("budget")
@@ -61,8 +65,7 @@ pub(in crate::mcp) fn tool_search(
                 1 => {
                     session.record_search(queries[0]);
                     crate::search::search_symbol_expanded(
-                        queries[0], &scope, cache, session, bloom, expand, context, glob, walk,
-                        full, budget,
+                        queries[0], walk, cache, session, bloom, expand, context, full, budget,
                     )
                 }
                 2..=5 => {
@@ -70,8 +73,7 @@ pub(in crate::mcp) fn tool_search(
                         session.record_search(q);
                     }
                     crate::search::search_multi_symbol_expanded(
-                        &queries, &scope, cache, session, bloom, expand, context, glob, walk, full,
-                        budget,
+                        &queries, walk, cache, session, bloom, expand, context, full, budget,
                     )
                 }
                 _ => {
@@ -85,14 +87,13 @@ pub(in crate::mcp) fn tool_search(
         "content" => {
             session.record_search(query);
             crate::search::search_content_expanded(
-                query, &scope, cache, session, expand, context, glob, walk, full, budget,
+                query, walk, cache, session, expand, context, full, budget,
             )
         }
         "regex" => {
             session.record_search(query);
-            let result =
-                crate::search::content::search(query, &scope, true, context, glob, walk, full)
-                    .map_err(|e| e.to_string())?;
+            let result = crate::search::content::search(query, walk, true, context, full)
+                .map_err(|e| e.to_string())?;
             crate::search::format_raw_result(&result, cache)
         }
         "callers" => {
@@ -106,7 +107,7 @@ pub(in crate::mcp) fn tool_search(
                 1 => {
                     session.record_search(targets[0]);
                     crate::search::callers::search_callers_expanded(
-                        targets[0], &scope, bloom, expand, context, glob, walk, full,
+                        targets[0], walk, bloom, expand, context, full,
                     )
                 }
                 2..=5 => {
@@ -114,7 +115,7 @@ pub(in crate::mcp) fn tool_search(
                         session.record_search(t);
                     }
                     crate::search::callers::search_callers_multi_expanded(
-                        &targets, &scope, bloom, expand, context, glob, walk, full,
+                        &targets, walk, bloom, expand, context, full,
                     )
                 }
                 _ => {

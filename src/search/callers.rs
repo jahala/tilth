@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use crate::format::noun;
 use tilth_core::index::bloom::BloomFilterCache;
 use tilth_core::search::callers::{find_callers_and_owners, find_callers_batch, CallerMatch};
-use tilth_core::search::walk::WalkConfig;
+use tilth_core::search::walk::Walk;
 use tilth_core::TilthError;
 
 const MAX_MATCHES: usize = 10;
@@ -45,15 +45,13 @@ struct TargetSites {
 /// Also returns the code files skipped for size that hold a target.
 fn collect_sites(
     targets: &HashSet<String>,
-    scope: &Path,
+    walk: Walk<'_>,
     bloom: &BloomFilterCache,
-    glob: Option<&str>,
-    walk: WalkConfig,
     context: Option<&Path>,
     keep: usize,
 ) -> Result<(HashMap<String, TargetSites>, Vec<PathBuf>), TilthError> {
     let merged: Mutex<HashMap<String, TargetSites>> = Mutex::new(HashMap::new());
-    let walked = find_callers_batch(targets, scope, bloom, glob, walk, None, |sites| {
+    let walked = find_callers_batch(targets, walk, bloom, None, |sites| {
         let mut by_target: HashMap<String, TargetSites> = HashMap::new();
         for (target, m) in sites {
             let entry = by_target.entry(target).or_default();
@@ -73,7 +71,7 @@ fn collect_sites(
             entry.total += file.total;
             entry.caller_names.extend(file.caller_names);
             entry.kept.extend(file.kept);
-            rank_callers(&mut entry.kept, scope, context);
+            rank_callers(&mut entry.kept, walk.scope, context);
             entry.kept.truncate(keep);
         }
     })?;
@@ -83,13 +81,13 @@ fn collect_sites(
     Ok((merged, walked.skipped_large))
 }
 
-/// Scan `scope` for the literal `target` byte sequence. Used by the
-/// single-symbol `search_callers_expanded` path to distinguish "typo,
-/// doesn't exist" from "real symbol with no direct callers" (indirect
+/// Scan the files `walk` visits for the literal `target` byte sequence.
+/// Used by the single-symbol `search_callers_expanded` path to distinguish
+/// "typo, doesn't exist" from "real symbol with no direct callers" (indirect
 /// dispatch, dead code, framework registration, …) when the caller walk
 /// returned zero matches.
-fn target_seen_in_scope(target: &str, scope: &Path, glob: Option<&str>, walk: WalkConfig) -> bool {
-    let Ok(walker) = tilth_core::search::walk::walker(scope, glob, walk) else {
+fn target_seen_in_scope(target: &str, walk: Walk<'_>) -> bool {
+    let Ok(walker) = tilth_core::search::walk::walker(walk) else {
         return false;
     };
     let needle = target.as_bytes();
@@ -133,25 +131,19 @@ fn target_seen_in_scope(target: &str, scope: &Path, glob: Option<&str>, walk: Wa
 }
 
 /// Format and rank caller search results with optional expand.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "per-call options become one Request in #307"
-)]
 pub fn search_callers_expanded(
     target: &str,
-    scope: &Path,
+    walk: Walk<'_>,
     bloom: &BloomFilterCache,
     expand: usize,
     context: Option<&Path>,
-    glob: Option<&str>,
-    walk: WalkConfig,
     full: bool,
 ) -> Result<String, TilthError> {
+    let scope = walk.scope;
     let max_matches = if full { FULL_MAX_MATCHES } else { MAX_MATCHES };
     let name = called_name(target);
     let single: HashSet<String> = std::iter::once(name.to_string()).collect();
-    let (mut by_target, skipped_large) =
-        collect_sites(&single, scope, bloom, glob, walk, context, max_matches)?;
+    let (mut by_target, skipped_large) = collect_sites(&single, walk, bloom, context, max_matches)?;
     let sites = by_target.remove(name).unwrap_or_default();
     let held = crate::search::names_phrase([name]);
     let skipped_note = crate::search::skipped_files_note(&skipped_large, &held, scope)
@@ -159,23 +151,15 @@ pub fn search_callers_expanded(
         .unwrap_or_default();
 
     if sites.total == 0 {
-        let target_seen = target_seen_in_scope(name, scope, glob, walk);
-        let mut message = no_callers_message(target, scope, target_seen, glob);
+        let target_seen = target_seen_in_scope(name, walk);
+        let mut message = no_callers_message(target, scope, target_seen, walk.glob);
         message.push_str(&skipped_note);
         return Ok(message);
     }
 
     let mut output = String::new();
     write_caller_bucket(&mut output, target, scope, sites.total, &sites.kept, expand);
-    write_second_hop_impact(
-        &mut output,
-        &sites.caller_names,
-        &sites.kept,
-        scope,
-        bloom,
-        glob,
-        walk,
-    );
+    write_second_hop_impact(&mut output, &sites.caller_names, &sites.kept, walk, bloom);
 
     output.push_str(&skipped_note);
 
@@ -324,10 +308,8 @@ fn write_second_hop_impact(
     output: &mut String,
     all_caller_names: &HashSet<String>,
     sorted_callers: &[CallerMatch],
-    scope: &Path,
+    walk: Walk<'_>,
     bloom: &BloomFilterCache,
-    glob: Option<&str>,
-    walk: WalkConfig,
 ) {
     if all_caller_names.is_empty() || all_caller_names.len() > IMPACT_FANOUT_THRESHOLD {
         return;
@@ -358,10 +340,8 @@ fn write_second_hop_impact(
     let walked = find_callers_and_owners(
         &hop2_targets,
         &method_names,
-        scope,
-        bloom,
-        glob,
         walk,
+        bloom,
         |sites, owners| {
             let mut file = Hop2File {
                 path: sites
@@ -429,8 +409,8 @@ fn write_second_hop_impact(
         unique_total += functions.len();
     }
     listed.sort_by(|a, b| {
-        path_depth(&a.path, scope)
-            .cmp(&path_depth(&b.path, scope))
+        path_depth(&a.path, walk.scope)
+            .cmp(&path_depth(&b.path, walk.scope))
             .then_with(|| a.path.cmp(&b.path))
             .then_with(|| a.line.cmp(&b.line))
     });
@@ -444,7 +424,7 @@ fn write_second_hop_impact(
     for site in &listed {
         let rel_path = site
             .path
-            .strip_prefix(scope)
+            .strip_prefix(walk.scope)
             .unwrap_or(&site.path)
             .display();
         let _ = writeln!(
@@ -503,20 +483,15 @@ fn write_second_hop_impact(
 /// call for that target would produce (PR #138 review: HIGH — 2nd-hop parity;
 /// MED — header shape parity). The walk runs to the end and counts each
 /// target on its own, so a hit-rich target cannot starve a rarer one.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "per-call options become one Request in #307"
-)]
 pub fn search_callers_multi_expanded(
     targets: &[&str],
-    scope: &Path,
+    walk: Walk<'_>,
     bloom: &BloomFilterCache,
     expand: usize,
     context: Option<&Path>,
-    glob: Option<&str>,
-    walk: WalkConfig,
     full: bool,
 ) -> Result<String, TilthError> {
+    let scope = walk.scope;
     let max_matches = if full { FULL_MAX_MATCHES } else { MAX_MATCHES };
 
     // Dedupe targets, preserving first-seen order: a repeated target (e.g.
@@ -539,8 +514,7 @@ pub fn search_callers_multi_expanded(
         }
     }
     let target_set: HashSet<String> = names.iter().map(|n| (*n).to_string()).collect();
-    let (by_target, skipped_large) =
-        collect_sites(&target_set, scope, bloom, glob, walk, context, max_matches)?;
+    let (by_target, skipped_large) = collect_sites(&target_set, walk, bloom, context, max_matches)?;
 
     // Render in the caller-supplied target order so output is deterministic.
     // Two targets can share a name (`A.run,B.run`), so each reads its sites.
@@ -551,22 +525,14 @@ pub fn search_callers_multi_expanded(
         let sites = by_target.get(name).unwrap_or(&none);
 
         if sites.total == 0 {
-            let target_seen = target_seen_in_scope(name, scope, glob, walk);
-            output.push_str(&no_callers_message(target, scope, target_seen, glob));
+            let target_seen = target_seen_in_scope(name, walk);
+            output.push_str(&no_callers_message(target, scope, target_seen, walk.glob));
             output.push_str("\n\n");
             continue;
         }
 
         write_caller_bucket(&mut output, target, scope, sites.total, &sites.kept, expand);
-        write_second_hop_impact(
-            &mut output,
-            &sites.caller_names,
-            &sites.kept,
-            scope,
-            bloom,
-            glob,
-            walk,
-        );
+        write_second_hop_impact(&mut output, &sites.caller_names, &sites.kept, walk, bloom);
         output.push('\n');
     }
 
@@ -658,6 +624,7 @@ fn path_depth(path: &Path, scope: &Path) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tilth_core::search::walk::WalkConfig;
 
     /// The caller walk quit on a shared counter at 50 sites, so the header
     /// total was wherever the threads stopped: "175 call sites" for 625, and
@@ -676,12 +643,10 @@ mod tests {
         }
         let first = search_callers_expanded(
             "hot",
-            dir.path(),
+            Walk::new(dir.path(), WalkConfig::default()),
             &bloom,
             0,
             None,
-            None,
-            WalkConfig::default(),
             false,
         )
         .unwrap();
@@ -692,12 +657,10 @@ mod tests {
         for _ in 0..4 {
             let again = search_callers_expanded(
                 "hot",
-                dir.path(),
+                Walk::new(dir.path(), WalkConfig::default()),
                 &bloom,
                 0,
                 None,
-                None,
-                WalkConfig::default(),
                 false,
             )
             .unwrap();
@@ -705,12 +668,10 @@ mod tests {
         }
         let full = search_callers_expanded(
             "hot",
-            dir.path(),
+            Walk::new(dir.path(), WalkConfig::default()),
             &bloom,
             0,
             None,
-            None,
-            WalkConfig::default(),
             true,
         )
         .unwrap();
@@ -730,12 +691,10 @@ mod tests {
         std::fs::write(dir.path().join("lib.rs"), body).unwrap();
         let out = search_callers_expanded(
             "target_fn",
-            dir.path(),
+            Walk::new(dir.path(), WalkConfig::default()),
             &bloom,
             0,
             None,
-            None,
-            WalkConfig::default(),
             false,
         )
         .unwrap();
@@ -810,12 +769,10 @@ mod tests {
 
         let result = search_callers_expanded(
             "alpha",
-            dir.path(),
+            Walk::new(dir.path(), WalkConfig::default()),
             &bloom,
             0,
             None,
-            None,
-            WalkConfig::default(),
             false,
         )
         .unwrap();
@@ -860,12 +817,10 @@ mod tests {
 
         let result = search_callers_expanded(
             "target",
-            dir.path(),
+            Walk::new(dir.path(), WalkConfig::default()),
             &bloom,
             0,
             None,
-            None,
-            WalkConfig::default(),
             false,
         )
         .unwrap();
@@ -914,12 +869,10 @@ mod tests {
 
         let result = search_callers_expanded(
             "target_fn",
-            dir.path(),
+            Walk::new(dir.path(), WalkConfig::default()),
             &bloom,
             0,
             None,
-            None,
-            WalkConfig::default(),
             false,
         )
         .unwrap();
@@ -966,12 +919,10 @@ mod tests {
 
         let result = search_callers_expanded(
             "target",
-            dir.path(),
+            Walk::new(dir.path(), WalkConfig::default()),
             &bloom,
             0,
             None,
-            None,
-            WalkConfig::default(),
             false,
         )
         .unwrap();
@@ -1012,12 +963,10 @@ mod tests {
 
         let result = search_callers_expanded(
             "target",
-            dir.path(),
+            Walk::new(dir.path(), WalkConfig::default()),
             &bloom,
             0,
             None,
-            None,
-            WalkConfig::default(),
             false,
         )
         .unwrap();
@@ -1056,12 +1005,10 @@ mod tests {
         .unwrap();
         let bare = search_callers_expanded(
             "handle",
-            dir.path(),
+            Walk::new(dir.path(), WalkConfig::default()),
             &bloom,
             0,
             None,
-            None,
-            WalkConfig::default(),
             false,
         )
         .unwrap();
@@ -1069,12 +1016,10 @@ mod tests {
         for target in ["Engine.handle", "Engine::handle"] {
             let out = search_callers_expanded(
                 target,
-                dir.path(),
+                Walk::new(dir.path(), WalkConfig::default()),
                 &bloom,
                 0,
                 None,
-                None,
-                WalkConfig::default(),
                 false,
             )
             .unwrap();
@@ -1088,12 +1033,10 @@ mod tests {
         }
         let multi = search_callers_multi_expanded(
             &["Engine.handle", "ServeHTTP"],
-            dir.path(),
+            Walk::new(dir.path(), WalkConfig::default()),
             &bloom,
             0,
             None,
-            None,
-            WalkConfig::default(),
             false,
         )
         .unwrap();
@@ -1123,12 +1066,10 @@ mod tests {
         .unwrap();
         let out = search_callers_expanded(
             "fetch",
-            dir.path(),
+            Walk::new(dir.path(), WalkConfig::default()),
             &bloom,
             0,
             None,
-            None,
-            WalkConfig::default(),
             false,
         )
         .unwrap();
@@ -1147,12 +1088,10 @@ mod tests {
         .unwrap();
         let out = search_callers_expanded(
             "leaf",
-            dir.path(),
+            Walk::new(dir.path(), WalkConfig::default()),
             &bloom,
             0,
             None,
-            None,
-            WalkConfig::default(),
             false,
         )
         .unwrap();

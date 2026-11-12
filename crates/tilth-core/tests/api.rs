@@ -12,7 +12,7 @@ use tilth_core::{
     extract_imports, find_callers_batch, get_outline_entries, is_external, is_import_line,
     is_test_file, resolve_related_files_with_content, test_entries, BloomFilterCache, CallerMatch,
     Dependent, DepsResult, FileType, Import, Lang, LocalDep, OutlineEntry, OutlineKind, TestEntry,
-    TestKind, TilthError, WalkConfig,
+    TestKind, TilthError, Walk, WalkConfig,
 };
 
 struct Sample {
@@ -321,10 +321,8 @@ fn callers_across_two_files_name_the_calling_function_and_line() {
     let targets: HashSet<String> = ["greet".to_string()].into_iter().collect();
     let found: Vec<(String, CallerMatch)> = find_callers_batch(
         &targets,
-        dir.path(),
+        Walk::new(dir.path(), WalkConfig::default()),
         &bloom,
-        None,
-        WalkConfig::default(),
         None,
         |sites| sites,
     )

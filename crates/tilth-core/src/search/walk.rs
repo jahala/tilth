@@ -47,34 +47,13 @@ pub const SKIP_DIRS: &[&str] = &[
     ".metals",
 ];
 
-thread_local! {
-    static CALL_GITIGNORE_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-}
-
-pub fn call_gitignore_override() -> Option<bool> {
-    CALL_GITIGNORE_OVERRIDE.with(std::cell::Cell::get)
-}
-
-pub fn with_gitignore_override<T>(value: Option<bool>, f: impl FnOnce() -> T) -> T {
-    struct Restore(Option<bool>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            CALL_GITIGNORE_OVERRIDE.with(|current| current.set(self.0));
-        }
-    }
-    let previous = CALL_GITIGNORE_OVERRIDE.with(|current| current.replace(value));
-    let _restore = Restore(previous);
-    f()
-}
-
 /// How walks run. The binary builds it once at startup and passes it to
-/// every walk.
+/// every walk; an MCP call may set its own `respect_gitignore`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WalkConfig {
     /// Worker threads for a parallel walk. `None` lets the walker choose.
     pub threads: Option<NonZeroUsize>,
     /// Whether walks honor `.gitignore`, `.ignore` and Git exclude rules.
-    /// A per-call MCP override, when one is set, wins over it.
     pub respect_gitignore: bool,
 }
 
@@ -90,12 +69,6 @@ impl WalkConfig {
             NonZeroUsize::new(cores.get() / 2).map_or(TWO, |half| half.clamp(TWO, SIX))
         })
     }
-
-    /// Whether this walk honors gitignore-style files: the per-call MCP
-    /// override when one is set, else [`respect_gitignore`](Self::respect_gitignore).
-    fn honors_gitignore(self) -> bool {
-        call_gitignore_override().unwrap_or(self.respect_gitignore)
-    }
 }
 
 impl Default for WalkConfig {
@@ -104,6 +77,31 @@ impl Default for WalkConfig {
         Self {
             threads: Some(Self::default_threads()),
             respect_gitignore: false,
+        }
+    }
+}
+
+/// Where and how one walk runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Walk<'a> {
+    /// The directory the walk starts from.
+    pub scope: &'a Path,
+    /// A file pattern that narrows the walk: a whitelist such as `*.rs`, or
+    /// a negation such as `!*.md`. `None`, or an empty pattern, visits every
+    /// file.
+    pub glob: Option<&'a str>,
+    /// Threads, and whether gitignore-style files apply.
+    pub config: WalkConfig,
+}
+
+impl<'a> Walk<'a> {
+    /// A walk of every file under `scope`.
+    #[must_use]
+    pub const fn new(scope: &'a Path, config: WalkConfig) -> Self {
+        Self {
+            scope,
+            glob: None,
+            config,
         }
     }
 }
@@ -118,11 +116,8 @@ impl Default for WalkConfig {
 /// walker (the `tilth` binary's `map::generate`), which each apply their own final
 /// `.max_depth()`/`.threads()` and `.build()`/`.build_parallel()`.
 #[must_use]
-pub fn base_walk_builder(scope: &Path, walk: WalkConfig) -> WalkBuilder {
-    base_walk_builder_with_gitignore(scope, walk.honors_gitignore())
-}
-
-fn base_walk_builder_with_gitignore(scope: &Path, respect_gitignore: bool) -> WalkBuilder {
+pub fn base_walk_builder(scope: &Path, config: WalkConfig) -> WalkBuilder {
+    let respect_gitignore = config.respect_gitignore;
     let mut builder = WalkBuilder::new(scope);
     builder
         .follow_links(true)
@@ -150,21 +145,16 @@ fn include_entry(entry: &ignore::DirEntry) -> bool {
 
 /// Build a parallel directory walker over `.tilthignore`-filtered files except
 /// known junk directories. Gitignore-style files are opt-in.
-/// When `glob` is Some, applies a file-pattern filter (whitelist or negation).
+/// A `walk.glob` applies a file-pattern filter (whitelist or negation).
 /// With gitignore enabled, the glob cannot override ignore rules.
-pub fn walker(
-    scope: &Path,
-    glob: Option<&str>,
-    walk: WalkConfig,
-) -> Result<ignore::WalkParallel, TilthError> {
-    let respect_gitignore = walk.honors_gitignore();
-    let mut builder = base_walk_builder_with_gitignore(scope, respect_gitignore);
+pub fn walker(walk: Walk<'_>) -> Result<ignore::WalkParallel, TilthError> {
+    let mut builder = base_walk_builder(walk.scope, walk.config);
     // The walker reads 0 as "choose for me".
-    builder.threads(walk.threads.map_or(0, NonZeroUsize::get));
+    builder.threads(walk.config.threads.map_or(0, NonZeroUsize::get));
 
-    if let Some(pattern) = glob {
+    if let Some(pattern) = walk.glob {
         if !pattern.is_empty() {
-            let mut overrides = ignore::overrides::OverrideBuilder::new(scope);
+            let mut overrides = ignore::overrides::OverrideBuilder::new(walk.scope);
             overrides
                 .add(pattern)
                 .map_err(|e| TilthError::InvalidQuery {
@@ -175,7 +165,7 @@ pub fn walker(
                 query: pattern.to_string(),
                 reason: format!("invalid glob: {e}"),
             })?;
-            if respect_gitignore {
+            if walk.config.respect_gitignore {
                 // A glob narrows the walk without whitelisting ignored entries.
                 builder.filter_entry(move |entry| {
                     include_entry(entry)
@@ -204,13 +194,19 @@ mod tests {
 
     /// Collect all file paths from a walker into a sorted Vec.
     fn walk_paths(scope: &Path, glob: Option<&str>) -> Vec<PathBuf> {
-        let w = walker(scope, glob, WalkConfig::default()).expect("walker failed");
-        collect_walk_paths(w)
+        let walk = Walk {
+            glob,
+            ..Walk::new(scope, WalkConfig::default())
+        };
+        collect_walk_paths(walker(walk).expect("walker failed"))
     }
 
     fn walk_paths_with_gitignore(scope: &Path, respect_gitignore: bool) -> Vec<PathBuf> {
-        let w = base_walk_builder_with_gitignore(scope, respect_gitignore).build_parallel();
-        collect_walk_paths(w)
+        let config = WalkConfig {
+            respect_gitignore,
+            ..WalkConfig::default()
+        };
+        collect_walk_paths(walker(Walk::new(scope, config)).expect("walker failed"))
     }
 
     fn collect_walk_paths(w: ignore::WalkParallel) -> Vec<PathBuf> {
@@ -279,31 +275,6 @@ mod tests {
                 "unexpected gitignore behavior with enabled={enabled}: {rels:?}"
             );
         }
-    }
-
-    /// The walk's `WalkConfig` decides whether gitignore-style files apply,
-    /// and a per-call override, when set, wins over it.
-    #[test]
-    fn walker_takes_gitignore_from_its_config_unless_a_call_overrides() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir(tmp.path().join("ignored")).unwrap();
-        std::fs::write(tmp.path().join(".gitignore"), "ignored/\n").unwrap();
-        std::fs::write(tmp.path().join("visible.rs"), "fn visible() {}\n").unwrap();
-        std::fs::write(tmp.path().join("ignored/hidden.rs"), "fn hidden() {}\n").unwrap();
-        let hidden_walked = |respect_gitignore, call: Option<bool>| {
-            let walk = WalkConfig {
-                respect_gitignore,
-                ..WalkConfig::default()
-            };
-            let w = with_gitignore_override(call, || walker(tmp.path(), None, walk)).unwrap();
-            collect_walk_paths(w)
-                .iter()
-                .any(|p| p.ends_with("ignored/hidden.rs"))
-        };
-        assert!(hidden_walked(false, None));
-        assert!(!hidden_walked(true, None));
-        assert!(hidden_walked(true, Some(false)));
-        assert!(!hidden_walked(false, Some(true)));
     }
 
     #[test]
@@ -427,7 +398,10 @@ mod tests {
     #[test]
     fn walker_invalid_glob_returns_error() {
         let scope = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let result = walker(&scope, Some("[unclosed"), WalkConfig::default());
+        let result = walker(Walk {
+            glob: Some("[unclosed"),
+            ..Walk::new(&scope, WalkConfig::default())
+        });
         match result {
             Err(TilthError::InvalidQuery { query, reason }) => {
                 assert_eq!(query, "[unclosed");

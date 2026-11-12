@@ -10,7 +10,7 @@ use grep_regex::RegexMatcher;
 use grep_searcher::sinks::UTF8;
 use grep_searcher::Searcher;
 use tilth_core::error::TilthError;
-use tilth_core::search::walk::WalkConfig;
+use tilth_core::search::walk::Walk;
 
 const MAX_MATCHES: usize = 10;
 const FULL_MAX_MATCHES: usize = 100;
@@ -18,24 +18,13 @@ const FULL_MAX_MATCHES: usize = 100;
 /// Content search using ripgrep crates. Literal by default, regex if `is_regex`.
 pub fn search(
     pattern: &str,
-    scope: &Path,
+    walk: Walk<'_>,
     is_regex: bool,
     context: Option<&Path>,
-    glob: Option<&str>,
-    walk: WalkConfig,
     full: bool,
 ) -> Result<SearchResult, TilthError> {
     let max_matches = if full { FULL_MAX_MATCHES } else { MAX_MATCHES };
-    search_capped(
-        pattern,
-        scope,
-        is_regex,
-        context,
-        glob,
-        walk,
-        max_matches,
-        max_matches,
-    )
+    search_capped(pattern, walk, is_regex, context, max_matches, max_matches)
 }
 
 /// The display cap and the per-file collection bound are the same number in
@@ -45,17 +34,11 @@ pub fn search(
     clippy::too_many_lines,
     reason = "reading goes through one Source in #308"
 )]
-#[expect(
-    clippy::too_many_arguments,
-    reason = "per-call options become one Request in #307"
-)]
 fn search_capped(
     pattern: &str,
-    scope: &Path,
+    walk: Walk<'_>,
     is_regex: bool,
     context: Option<&Path>,
-    glob: Option<&str>,
-    walk: WalkConfig,
     max_matches: usize,
     per_file_cap: usize,
 ) -> Result<SearchResult, TilthError> {
@@ -80,7 +63,7 @@ fn search_capped(
     // Relaxed is correct: walker.run() joins all threads before we read the final value.
     let total_found = AtomicUsize::new(0);
 
-    let walker = tilth_core::search::walk::walker(scope, glob, walk)?;
+    let walker = tilth_core::search::walk::walker(walk)?;
     // One clock for the per-file bound and the final sort, so both rank by
     // the same scores.
     let now = std::time::SystemTime::now();
@@ -180,7 +163,7 @@ fn search_capped(
                 rank::retain_top_k(
                     &mut file_matches,
                     pattern,
-                    scope,
+                    walk.scope,
                     context,
                     now,
                     per_file_cap,
@@ -205,12 +188,12 @@ fn search_capped(
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    rank::sort(&mut all_matches, pattern, scope, context, now);
+    rank::sort(&mut all_matches, pattern, walk.scope, context, now);
     all_matches.truncate(max_matches);
 
     Ok(SearchResult {
         query: pattern.to_string(),
-        scope: scope.to_path_buf(),
+        scope: walk.scope.to_path_buf(),
         matches: all_matches,
         total_found: total,
         definitions: 0,
@@ -227,6 +210,7 @@ fn search_capped(
 mod completeness_tests {
     use super::*;
     use std::fmt::Write;
+    use tilth_core::search::walk::WalkConfig;
 
     /// One needle per file, in more files than the old shared-counter quit
     /// could ever have read: it stopped at 30 counted hits, and at the default
@@ -255,11 +239,9 @@ mod completeness_tests {
         let d = fixture();
         let r1 = search(
             "needle_alpha",
-            d.path(),
+            Walk::new(d.path(), WalkConfig::default()),
             false,
             None,
-            None,
-            WalkConfig::default(),
             false,
         )
         .unwrap();
@@ -271,11 +253,9 @@ mod completeness_tests {
         for _ in 0..4 {
             let r = search(
                 "needle_alpha",
-                d.path(),
+                Walk::new(d.path(), WalkConfig::default()),
                 false,
                 None,
-                None,
-                WalkConfig::default(),
                 false,
             )
             .unwrap();
@@ -313,11 +293,9 @@ mod completeness_tests {
         let run = |cap| {
             search_capped(
                 "needle_gamma",
-                d.path(),
+                Walk::new(d.path(), WalkConfig::default()),
                 false,
                 None,
-                None,
-                WalkConfig::default(),
                 10,
                 cap,
             )

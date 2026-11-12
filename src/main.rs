@@ -9,6 +9,7 @@ use clap::{CommandFactory, Parser};
 use clap_complete::Shell;
 use tilth::config::{env_var, Config};
 use tilth::{diag, FileScopeHint};
+use tilth_core::Walk;
 
 /// tilth — Tree-sitter indexed lookups, smart code reading for AI agents.
 /// One tool replaces `read_file`, grep, glob, `ast_grep`, and find.
@@ -360,18 +361,15 @@ fn main() {
     // ignored for FilePath and Glob.
     //
     let expand = compute_expand(cli.expand, cli.full);
+    let walk = Walk {
+        scope: &scope,
+        glob: cli.glob.as_deref(),
+        config: config.walk,
+    };
 
     // Callers mode
     if cli.callers {
-        let result = tilth::run_callers(
-            &query,
-            &scope,
-            expand,
-            cli.budget,
-            cli.glob.as_deref(),
-            config.walk,
-            cli.full,
-        );
+        let result = tilth::run_callers(&query, walk, expand, cli.budget, cli.full);
         emit_result(result, &query, cli.json, is_tty);
         return;
     }
@@ -401,40 +399,29 @@ fn main() {
     let result = if expand > 0 {
         tilth::run_expanded(
             &query,
-            &scope,
+            walk,
             cli.section.as_deref(),
             cli.budget,
-            full,
+            full.then_some(config.full_size_cap),
             expand,
-            cli.glob.as_deref(),
             &cache,
             cli.full,
-            &config,
         )
     } else if full {
-        // The last argument must stay `cli.full`, never the `full` above: a
-        // piped invocation reaches this branch with `full = !is_tty` and must
-        // not have its search match cap raised.
+        // `cli_full` must stay `cli.full`, never the `full` above: a piped
+        // invocation reaches this branch with `full = !is_tty` and must not
+        // have its search match cap raised.
         tilth::run_full(
             &query,
-            &scope,
+            walk,
             cli.section.as_deref(),
             cli.budget,
-            cli.glob.as_deref(),
             &cache,
             cli.full,
-            &config,
+            config.full_size_cap,
         )
     } else {
-        tilth::run(
-            &query,
-            &scope,
-            cli.section.as_deref(),
-            cli.budget,
-            cli.glob.as_deref(),
-            &cache,
-            &config,
-        )
+        tilth::run(&query, walk, cli.section.as_deref(), cli.budget, &cache)
     };
 
     emit_result(result, &query, cli.json, is_tty);

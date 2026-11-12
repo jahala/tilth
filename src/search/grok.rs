@@ -16,6 +16,7 @@ use tilth_core::lang::detect_file_type;
 use tilth_core::lang::outline::get_outline_entries;
 use tilth_core::search::callees::{extract_callee_names, resolve_callees, ResolvedCallee};
 use tilth_core::search::callers::{find_callers_batch, CallerMatch};
+use tilth_core::search::walk::Walk;
 use tilth_core::types::{is_test_file, FileType, Lang, OutlineEntry, OutlineKind};
 
 /// What grok resolved the user's target string to.
@@ -98,7 +99,7 @@ fn resolve_by_name(
     // Only the top-ranked definition is used, so the short match list is
     // enough; the count of the others comes from the exact total. Grok's own
     // caps come from `GrokCaps`.
-    let result = search_symbol_raw(name, scope, None, config.walk, false)?;
+    let result = search_symbol_raw(name, Walk::new(scope, config.walk), false)?;
     let Some(top) = result.matches.iter().find(|m| m.is_definition) else {
         let suggestion = (!result.other_owners.is_empty())
             .then(|| crate::search::owner_candidates(name, &result.other_owners, scope));
@@ -520,7 +521,8 @@ pub fn grok(
             .then_with(|| a.1.line.cmp(&b.1.line))
     };
     let split: std::sync::Mutex<CallerSplit> = std::sync::Mutex::new(CallerSplit::default());
-    let walked = find_callers_batch(&symbols, scope, bloom, None, config.walk, None, |sites| {
+    let walk = Walk::new(scope, config.walk);
+    let walked = find_callers_batch(&symbols, walk, bloom, None, |sites| {
         let mut file = CallerSplit::default();
         for (_, m) in sites {
             if is_recursive_call_site(&m, &canonical_target, &target) {
@@ -1296,14 +1298,12 @@ mod tests {
             let search = |session: &crate::session::Session| {
                 crate::search::search_symbol_expanded(
                     query,
-                    tmp.path(),
+                    Walk::new(tmp.path(), Config::default().walk),
                     &cache,
                     session,
                     &bloom,
                     1,
                     None,
-                    None,
-                    Config::default().walk,
                     false,
                     None,
                 )

@@ -23,7 +23,7 @@ use crate::session::Session;
 use crate::types::{estimate_tokens, Match, SearchResult};
 use tilth_core::cache::OutlineCache;
 use tilth_core::error::TilthError;
-use tilth_core::search::walk::WalkConfig;
+use tilth_core::search::walk::{Walk, WalkConfig};
 use tilth_core::types::FileType;
 
 use crate::format::rel;
@@ -287,13 +287,11 @@ pub(crate) fn file_metadata(path: &Path) -> (u32, SystemTime) {
 /// The totals are exact either way.
 pub fn search_symbol(
     query: &str,
-    scope: &Path,
+    walk: Walk<'_>,
     cache: &OutlineCache,
-    glob: Option<&str>,
-    walk: WalkConfig,
     full: bool,
 ) -> Result<String, TilthError> {
-    let result = symbol::search(query, scope, None, glob, walk, full)?;
+    let result = symbol::search(query, walk, None, full)?;
     let bloom = tilth_core::index::bloom::BloomFilterCache::new();
     format_search_result(&result, cache, None, &bloom, 0, None)
 }
@@ -304,18 +302,16 @@ pub fn search_symbol(
 )]
 pub fn search_symbol_expanded(
     query: &str,
-    scope: &Path,
+    walk: Walk<'_>,
     cache: &OutlineCache,
     session: &Session,
     bloom: &tilth_core::index::bloom::BloomFilterCache,
     expand: usize,
     context: Option<&Path>,
-    glob: Option<&str>,
-    walk: WalkConfig,
     full: bool,
     budget: Option<u64>,
 ) -> Result<String, TilthError> {
-    let result = symbol::search(query, scope, context, glob, walk, full)?;
+    let result = symbol::search(query, walk, context, full)?;
     format_search_result(&result, cache, Some(session), bloom, expand, budget)
 }
 
@@ -325,14 +321,12 @@ pub fn search_symbol_expanded(
 )]
 pub fn search_multi_symbol_expanded(
     queries: &[&str],
-    scope: &Path,
+    walk: Walk<'_>,
     cache: &OutlineCache,
     session: &Session,
     bloom: &tilth_core::index::bloom::BloomFilterCache,
     expand: usize,
     context: Option<&Path>,
-    glob: Option<&str>,
-    walk: WalkConfig,
     full: bool,
     budget: Option<u64>,
 ) -> Result<String, TilthError> {
@@ -349,7 +343,7 @@ pub fn search_multi_symbol_expanded(
     let mut expansions = Vec::new();
 
     for query in queries {
-        let result = symbol::search(query, scope, context, glob, walk, full)?;
+        let result = symbol::search(query, walk, context, full)?;
         let mut out = format::search_header(
             &result.query,
             &result.scope,
@@ -407,27 +401,23 @@ pub fn search_multi_symbol_expanded(
 
 pub fn search_content(
     query: &str,
-    scope: &Path,
+    walk: Walk<'_>,
     cache: &OutlineCache,
-    glob: Option<&str>,
-    walk: WalkConfig,
     full: bool,
 ) -> Result<String, TilthError> {
     let (pattern, is_regex) = parse_pattern(query);
-    let result = content::search(pattern, scope, is_regex, None, glob, walk, full)?;
+    let result = content::search(pattern, walk, is_regex, None, full)?;
     let bloom = tilth_core::index::bloom::BloomFilterCache::new();
     format_search_result(&result, cache, None, &bloom, 0, None)
 }
 
 pub fn search_regex(
     pattern: &str,
-    scope: &Path,
+    walk: Walk<'_>,
     cache: &OutlineCache,
-    glob: Option<&str>,
-    walk: WalkConfig,
     full: bool,
 ) -> Result<String, TilthError> {
-    let result = content::search(pattern, scope, true, None, glob, walk, full)?;
+    let result = content::search(pattern, walk, true, None, full)?;
     let bloom = tilth_core::index::bloom::BloomFilterCache::new();
     format_search_result(&result, cache, None, &bloom, 0, None)
 }
@@ -438,18 +428,16 @@ pub fn search_regex(
 )]
 pub fn search_content_expanded(
     query: &str,
-    scope: &Path,
+    walk: Walk<'_>,
     cache: &OutlineCache,
     session: &Session,
     expand: usize,
     context: Option<&Path>,
-    glob: Option<&str>,
-    walk: WalkConfig,
     full: bool,
     budget: Option<u64>,
 ) -> Result<String, TilthError> {
     let (pattern, is_regex) = parse_pattern(query);
-    let result = content::search(pattern, scope, is_regex, context, glob, walk, full)?;
+    let result = content::search(pattern, walk, is_regex, context, full)?;
     let bloom = tilth_core::index::bloom::BloomFilterCache::new();
     format_search_result(&result, cache, Some(session), &bloom, expand, budget)
 }
@@ -461,17 +449,15 @@ pub fn search_content_expanded(
 )]
 pub fn search_regex_expanded(
     pattern: &str,
-    scope: &Path,
+    walk: Walk<'_>,
     cache: &OutlineCache,
     session: &Session,
     expand: usize,
     context: Option<&Path>,
-    glob: Option<&str>,
-    walk: WalkConfig,
     full: bool,
     budget: Option<u64>,
 ) -> Result<String, TilthError> {
-    let result = content::search(pattern, scope, true, context, glob, walk, full)?;
+    let result = content::search(pattern, walk, true, context, full)?;
     let bloom = tilth_core::index::bloom::BloomFilterCache::new();
     format_search_result(&result, cache, Some(session), &bloom, expand, budget)
 }
@@ -479,35 +465,29 @@ pub fn search_regex_expanded(
 /// Raw symbol search — returns structured result for programmatic inspection.
 pub fn search_symbol_raw(
     query: &str,
-    scope: &Path,
-    glob: Option<&str>,
-    walk: WalkConfig,
+    walk: Walk<'_>,
     full: bool,
 ) -> Result<SearchResult, TilthError> {
-    symbol::search(query, scope, None, glob, walk, full)
+    symbol::search(query, walk, None, full)
 }
 
 /// Raw content search — returns structured result for programmatic inspection.
 pub fn search_content_raw(
     query: &str,
-    scope: &Path,
-    glob: Option<&str>,
-    walk: WalkConfig,
+    walk: Walk<'_>,
     full: bool,
 ) -> Result<SearchResult, TilthError> {
     let (pattern, is_regex) = parse_pattern(query);
-    content::search(pattern, scope, is_regex, None, glob, walk, full)
+    content::search(pattern, walk, is_regex, None, full)
 }
 
 /// Raw regex search — returns structured result for programmatic inspection.
 pub fn search_regex_raw(
     pattern: &str,
-    scope: &Path,
-    glob: Option<&str>,
-    walk: WalkConfig,
+    walk: Walk<'_>,
     full: bool,
 ) -> Result<SearchResult, TilthError> {
-    content::search(pattern, scope, true, None, glob, walk, full)
+    content::search(pattern, walk, true, None, full)
 }
 
 /// Format a raw search result (symbol or content — both use the same pipeline).
@@ -1789,31 +1769,33 @@ mod tests {
         let scope = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let all = content::search(
             "TilthError",
-            &scope,
+            Walk::new(&scope, WalkConfig::default()),
             false,
             None,
-            None,
-            WalkConfig::default(),
             false,
         )
         .expect("search failed");
         let rs_only = content::search(
             "TilthError",
-            &scope,
+            Walk {
+                scope: &scope,
+                glob: Some("*.rs"),
+                config: WalkConfig::default(),
+            },
             false,
             None,
-            Some("*.rs"),
-            WalkConfig::default(),
             false,
         )
         .expect("search with glob failed");
         let toml_only = content::search(
             "TilthError",
-            &scope,
+            Walk {
+                scope: &scope,
+                glob: Some("*.toml"),
+                config: WalkConfig::default(),
+            },
             false,
             None,
-            Some("*.toml"),
-            WalkConfig::default(),
             false,
         )
         .expect("search with toml glob failed");
@@ -1839,19 +1821,23 @@ mod tests {
         let scope = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let rs_result = symbol::search(
             "walker",
-            &scope,
+            Walk {
+                scope: &scope,
+                glob: Some("*.rs"),
+                config: WalkConfig::default(),
+            },
             None,
-            Some("*.rs"),
-            WalkConfig::default(),
             false,
         )
         .expect("symbol search failed");
         let toml_result = symbol::search(
             "walker",
-            &scope,
+            Walk {
+                scope: &scope,
+                glob: Some("*.toml"),
+                config: WalkConfig::default(),
+            },
             None,
-            Some("*.toml"),
-            WalkConfig::default(),
             false,
         )
         .expect("symbol search with toml failed");
@@ -1879,20 +1865,24 @@ mod tests {
             std::iter::once("walker".to_string()).collect();
         let rs_callers = tilth_core::find_callers_batch(
             &single,
-            &scope,
+            Walk {
+                scope: &scope,
+                glob: Some("*.rs"),
+                config: WalkConfig::default(),
+            },
             &bloom,
-            Some("*.rs"),
-            WalkConfig::default(),
             None,
             |sites| sites,
         )
         .expect("callers failed");
         let toml_callers = tilth_core::find_callers_batch(
             &single,
-            &scope,
+            Walk {
+                scope: &scope,
+                glob: Some("*.toml"),
+                config: WalkConfig::default(),
+            },
             &bloom,
-            Some("*.toml"),
-            WalkConfig::default(),
             None,
             |sites| sites,
         )
@@ -1937,11 +1927,9 @@ mod tests {
 
         let result = content::search(
             "unique_symlink_test_symbol",
-            tmp.path(),
+            Walk::new(tmp.path(), WalkConfig::default()),
             false,
             None,
-            None,
-            WalkConfig::default(),
             false,
         )
         .unwrap();
@@ -2597,14 +2585,12 @@ mod tests {
 
         let out = search_symbol_expanded(
             "budget_probe_target",
-            tmp.path(),
+            Walk::new(tmp.path(), WalkConfig::default()),
             &cache,
             &session,
             &bloom,
             2,
             None,
-            None,
-            WalkConfig::default(),
             false,
             Some(400),
         )
@@ -2648,14 +2634,12 @@ mod tests {
         let bloom = tilth_core::index::bloom::BloomFilterCache::new();
         let out = search_symbol_expanded(
             "big_target",
-            tmp.path(),
+            Walk::new(tmp.path(), WalkConfig::default()),
             &cache,
             &session,
             &bloom,
             1,
             None,
-            None,
-            WalkConfig::default(),
             false,
             Some(300),
         )
@@ -2692,14 +2676,12 @@ mod tests {
 
         let with_none = search_symbol_expanded(
             "budget_probe_target",
-            tmp.path(),
+            Walk::new(tmp.path(), WalkConfig::default()),
             &cache,
             &session,
             &bloom,
             2,
             None,
-            None,
-            WalkConfig::default(),
             false,
             None,
         )
@@ -2708,14 +2690,12 @@ mod tests {
         let session2 = Session::new();
         let with_explicit_default = search_symbol_expanded(
             "budget_probe_target",
-            tmp.path(),
+            Walk::new(tmp.path(), WalkConfig::default()),
             &cache,
             &session2,
             &bloom,
             2,
             None,
-            None,
-            WalkConfig::default(),
             false,
             Some(crate::budget::DEFAULT_BUDGET),
         )
@@ -2745,13 +2725,11 @@ mod tests {
 
         let out = search_content_expanded(
             "needle_alpha",
-            tmp.path(),
+            Walk::new(tmp.path(), WalkConfig::default()),
             &OutlineCache::new(),
             &Session::new(),
             0,
             None,
-            None,
-            WalkConfig::default(),
             false,
             None,
         )
@@ -2788,14 +2766,12 @@ mod tests {
         let bloom = tilth_core::index::bloom::BloomFilterCache::new();
         let single = search_symbol_expanded(
             "alpha_target",
-            tmp.path(),
+            Walk::new(tmp.path(), WalkConfig::default()),
             &cache,
             &session,
             &bloom,
             0,
             None,
-            None,
-            WalkConfig::default(),
             false,
             None,
         )
@@ -2817,14 +2793,12 @@ mod tests {
         let session = Session::new();
         let multi = search_multi_symbol_expanded(
             &["alpha_target"],
-            tmp.path(),
+            Walk::new(tmp.path(), WalkConfig::default()),
             &cache,
             &session,
             &bloom,
             0,
             None,
-            None,
-            WalkConfig::default(),
             false,
             None,
         )
@@ -2850,28 +2824,22 @@ mod tests {
         for out in [
             search_symbol(
                 "bom_func",
-                tmp.path(),
+                Walk::new(tmp.path(), WalkConfig::default()),
                 &cache,
-                None,
-                WalkConfig::default(),
                 false,
             )
             .unwrap(),
             search_content(
                 "bom_func",
-                tmp.path(),
+                Walk::new(tmp.path(), WalkConfig::default()),
                 &cache,
-                None,
-                WalkConfig::default(),
                 false,
             )
             .unwrap(),
             search_regex(
                 "bom_f.nc",
-                tmp.path(),
+                Walk::new(tmp.path(), WalkConfig::default()),
                 &cache,
-                None,
-                WalkConfig::default(),
                 false,
             )
             .unwrap(),
@@ -2903,10 +2871,8 @@ mod tests {
                 "needle_target_fn",
                 search_symbol(
                     "needle_target_fn",
-                    tmp.path(),
+                    Walk::new(tmp.path(), WalkConfig::default()),
                     &cache,
-                    None,
-                    WalkConfig::default(),
                     false,
                 )
                 .unwrap(),
@@ -2915,10 +2881,8 @@ mod tests {
                 "needle_target_fn",
                 search_content(
                     "needle_target_fn",
-                    tmp.path(),
+                    Walk::new(tmp.path(), WalkConfig::default()),
                     &cache,
-                    None,
-                    WalkConfig::default(),
                     false,
                 )
                 .unwrap(),
@@ -2927,10 +2891,8 @@ mod tests {
                 "needle_t.rget_fn",
                 search_regex(
                     "needle_t.rget_fn",
-                    tmp.path(),
+                    Walk::new(tmp.path(), WalkConfig::default()),
                     &cache,
-                    None,
-                    WalkConfig::default(),
                     false,
                 )
                 .unwrap(),
@@ -2943,10 +2905,8 @@ mod tests {
         }
         let quiet = search_symbol(
             "unrelated",
-            tmp.path(),
+            Walk::new(tmp.path(), WalkConfig::default()),
             &cache,
-            None,
-            WalkConfig::default(),
             false,
         )
         .unwrap();
@@ -2969,19 +2929,15 @@ mod tests {
         for out in [
             search_symbol(
                 "needle_target_fn",
-                tmp.path(),
+                Walk::new(tmp.path(), WalkConfig::default()),
                 &cache,
-                None,
-                WalkConfig::default(),
                 false,
             )
             .unwrap(),
             search_content(
                 "needle_target_fn",
-                tmp.path(),
+                Walk::new(tmp.path(), WalkConfig::default()),
                 &cache,
-                None,
-                WalkConfig::default(),
                 false,
             )
             .unwrap(),
@@ -3003,28 +2959,22 @@ mod tests {
         for out in [
             search_symbol(
                 "needle_target_fn",
-                tmp.path(),
+                Walk::new(tmp.path(), WalkConfig::default()),
                 &cache,
-                None,
-                WalkConfig::default(),
                 false,
             )
             .unwrap(),
             search_content(
                 "needle_target_fn",
-                tmp.path(),
+                Walk::new(tmp.path(), WalkConfig::default()),
                 &cache,
-                None,
-                WalkConfig::default(),
                 false,
             )
             .unwrap(),
             search_regex(
                 "needle_t.rget_fn",
-                tmp.path(),
+                Walk::new(tmp.path(), WalkConfig::default()),
                 &cache,
-                None,
-                WalkConfig::default(),
                 false,
             )
             .unwrap(),
@@ -3051,19 +3001,15 @@ mod tests {
         for out in [
             search_symbol(
                 "needle_target_fn",
-                tmp.path(),
+                Walk::new(tmp.path(), WalkConfig::default()),
                 &cache,
-                None,
-                WalkConfig::default(),
                 false,
             )
             .unwrap(),
             search_content(
                 "needle_target_fn",
-                tmp.path(),
+                Walk::new(tmp.path(), WalkConfig::default()),
                 &cache,
-                None,
-                WalkConfig::default(),
                 false,
             )
             .unwrap(),
@@ -3095,23 +3041,19 @@ mod tests {
 
         let callers = callers::search_callers_expanded(
             "big_callee",
-            tmp.path(),
+            Walk::new(tmp.path(), WalkConfig::default()),
             &bloom,
             0,
             None,
-            None,
-            WalkConfig::default(),
             false,
         )
         .unwrap();
         let multi = callers::search_callers_multi_expanded(
             &["big_callee", "small_caller"],
-            tmp.path(),
+            Walk::new(tmp.path(), WalkConfig::default()),
             &bloom,
             0,
             None,
-            None,
-            WalkConfig::default(),
             false,
         )
         .unwrap();
@@ -3212,10 +3154,8 @@ mod tests {
 
         let out = search_symbol(
             "B::run",
-            tmp.path(),
+            Walk::new(tmp.path(), WalkConfig::default()),
             &cache,
-            None,
-            WalkConfig::default(),
             false,
         )
         .unwrap();
@@ -3225,10 +3165,8 @@ mod tests {
 
         let out = search_symbol(
             "res.send",
-            tmp.path(),
+            Walk::new(tmp.path(), WalkConfig::default()),
             &cache,
-            None,
-            WalkConfig::default(),
             false,
         )
         .unwrap();
@@ -3239,12 +3177,10 @@ mod tests {
         let bloom = tilth_core::index::bloom::BloomFilterCache::new();
         let out = callers::search_callers_multi_expanded(
             &["A.run", "start", "B::run"],
-            tmp.path(),
+            Walk::new(tmp.path(), WalkConfig::default()),
             &bloom,
             0,
             None,
-            None,
-            WalkConfig::default(),
             false,
         )
         .unwrap();
@@ -3285,14 +3221,12 @@ mod tests {
         let bloom = tilth_core::index::bloom::BloomFilterCache::new();
         search_symbol_expanded(
             "target",
-            tmp.path(),
+            Walk::new(tmp.path(), WalkConfig::default()),
             &OutlineCache::new(),
             &Session::new(),
             &bloom,
             1,
             None,
-            None,
-            WalkConfig::default(),
             false,
             None,
         )

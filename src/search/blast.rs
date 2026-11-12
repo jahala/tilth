@@ -7,7 +7,7 @@ use crate::format::noun;
 use tilth_core::lang::detect_file_type_with_content;
 use tilth_core::lang::outline::get_outline_entries;
 use tilth_core::search::callers::find_callers_batch;
-use tilth_core::search::walk::WalkConfig;
+use tilth_core::search::walk::{Walk, WalkConfig};
 use tilth_core::types::{is_test_file, FileType, OutlineEntry, OutlineKind};
 
 pub(crate) struct TouchedSymbol {
@@ -93,20 +93,21 @@ pub(crate) fn blast_radius(
     // `canonical` even through a symlinked scope (`/tmp` on macOS).
     let canonical = path.canonicalize().ok()?;
     let scope = &scope.canonicalize().ok()?;
-    let own_calls: usize =
-        find_callers_batch(&symbol_names, &canonical, bloom, None, walk, None, |s| {
-            s.len()
-        })
-        .ok()?
-        .per_file
-        .iter()
-        .sum();
-    let walked = find_callers_batch(
+    let own_calls: usize = find_callers_batch(
         &symbol_names,
-        scope,
+        Walk::new(&canonical, walk),
         bloom,
         None,
-        walk,
+        |s| s.len(),
+    )
+    .ok()?
+    .per_file
+    .iter()
+    .sum();
+    let walked = find_callers_batch(
+        &symbol_names,
+        Walk::new(scope, walk),
+        bloom,
         Some(BLAST_STOP_AFTER + own_calls),
         |sites| {
             let mut file = FileCallers::default();

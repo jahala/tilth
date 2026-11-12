@@ -17,7 +17,7 @@ crates/tilth-core/src/
     detection.rs       Generated file detection (lockfiles, .min.js) and binary detection.
     <lang>.rs          One spec per language. c.rs, cpp.rs and go.rs also hold test fixtures, shared with the binary's tests through the `test-fixtures` feature.
   search/
-    walk.rs            The shared directory walker: WalkConfig (threads, gitignore), SKIP_DIRS, .tilthignore, glob overrides.
+    walk.rs            The shared directory walker: Walk (scope, glob, WalkConfig), WalkConfig (threads, gitignore), SKIP_DIRS, .tilthignore, glob overrides.
     callers.rs         Structural call-site detection (tree-sitter + memchr pre-filter): find_callers_batch(), CallerMatch.
     callees.rs         Callee extraction and resolution for expanded definitions.
     callee_query.rs    Per-language tree-sitter call-expression queries + compiled-Query cache, shared by callers.rs and callees.rs.

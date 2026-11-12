@@ -42,6 +42,6 @@ pub use lang::outline::{extract_import_source, get_outline_entries};
 pub use lang::{detect_file_type, detect_file_type_with_content};
 pub use search::callers::{find_callers_batch, CallerMatch, CallerWalk};
 pub use search::deps::{analyze_deps, Dependent, DepsResult, LocalDep};
-pub use search::walk::WalkConfig;
+pub use search::walk::{Walk, WalkConfig};
 pub use test_structure::{test_entries, TestEntry, TestKind};
 pub use types::{is_test_file, FileType, Lang, OutlineEntry, OutlineKind};

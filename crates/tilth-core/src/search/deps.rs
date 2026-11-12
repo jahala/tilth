@@ -13,7 +13,7 @@ use crate::lang::detect_file_type_with_content;
 use crate::lang::outline::get_outline_entries;
 use crate::search::callees::{extract_callee_names, resolve_callees};
 use crate::search::callers::find_callers_batch;
-use crate::search::walk::WalkConfig;
+use crate::search::walk::{Walk, WalkConfig};
 use crate::source::mentions;
 use crate::types::{is_test_file, FileType, Lang, OutlineKind};
 
@@ -69,7 +69,7 @@ pub struct Dependent {
 }
 
 /// Analyse the dependency graph for `path` within `scope`, walking it as
-/// `walk` says. The paths in the result are canonical.
+/// `config` says. The paths in the result are canonical.
 ///
 /// Phase 1: Extract exported symbols from the outline.
 /// Phase 2: Forward dependencies — what this file uses.
@@ -79,7 +79,7 @@ pub fn analyze_deps(
     path: &Path,
     scope: &Path,
     bloom: &crate::index::bloom::BloomFilterCache,
-    walk: WalkConfig,
+    config: WalkConfig,
 ) -> Result<DepsResult, TilthError> {
     // Canonicalize both, so the walk names files the way import resolution
     // and the target do: through a symlinked scope (any path under `/tmp`
@@ -93,6 +93,7 @@ pub fn analyze_deps(
         path: scope.to_path_buf(),
         source: e,
     })?;
+    let walk = Walk::new(scope, config);
 
     let content = crate::source::read_source(path).map_err(|e| TilthError::IoError {
         path: path.clone(),
@@ -148,7 +149,6 @@ pub fn analyze_deps(
     let mut skipped_importers = Vec::new();
     let direct = importers_of(
         std::slice::from_ref(path),
-        scope,
         walk,
         &|_| true,
         false,
@@ -217,7 +217,7 @@ pub fn analyze_deps(
         let symbols_set: HashSet<String> = searched.iter().cloned().collect();
         // One `Dependent` per file that calls the target's symbols. Calls from
         // within the target file itself are self-references, not dependents.
-        let found = find_callers_batch(&symbols_set, scope, bloom, None, walk, None, |sites| {
+        let found = find_callers_batch(&symbols_set, walk, bloom, None, |sites| {
             let dep_path = sites.first().map(|(_, m)| m.path.clone())?;
             if dep_path == *path {
                 return None;
@@ -252,14 +252,8 @@ pub fn analyze_deps(
     // does not depend on the target.
     let mut every_name = searched;
     every_name.extend(unsearched.iter().cloned());
-    let importers = with_reexport_importers(
-        path,
-        direct,
-        scope,
-        walk,
-        &every_name,
-        &mut skipped_importers,
-    )?;
+    let importers =
+        with_reexport_importers(path, direct, walk, &every_name, &mut skipped_importers)?;
     // A big file that names the target's module was not read for imports.
     let mut skipped_large = skipped_large;
     skipped_large.extend(skipped_importers);
@@ -357,8 +351,7 @@ fn choose_names(names: Vec<String>, importers: &[Importer]) -> (Vec<String>, Vec
 fn with_reexport_importers(
     target: &Path,
     direct: Vec<Importer>,
-    scope: &Path,
-    walk: WalkConfig,
+    walk: Walk<'_>,
     names: &[String],
     skipped_large: &mut Vec<PathBuf>,
 ) -> Result<Vec<Importer>, TilthError> {
@@ -380,7 +373,7 @@ fn with_reexport_importers(
     }
     let names_one = |text: &str| names.iter().any(|n| mentions(text.as_bytes(), n));
     while !barrels.is_empty() {
-        let found = importers_of(&barrels, scope, walk, &names_one, true, skipped_large)?;
+        let found = importers_of(&barrels, walk, &names_one, true, skipped_large)?;
         barrels = Vec::new();
         for importer in found {
             let canonical = importer
@@ -399,7 +392,7 @@ fn with_reexport_importers(
     Ok(out)
 }
 
-/// The files under `scope` whose imports resolve to one of `targets`
+/// The files `walk` visits whose imports resolve to one of `targets`
 /// (canonical paths) by a statement whose text `keep` accepts, sorted by
 /// path. A file is parsed only when its text names a target's module and
 /// passes `keep`, so the walk parses few files. With `through`, the
@@ -408,8 +401,7 @@ fn with_reexport_importers(
 /// target's `module_name` as a word are added to `skipped_large`.
 fn importers_of(
     targets: &[PathBuf],
-    scope: &Path,
-    walk: WalkConfig,
+    walk: Walk<'_>,
     keep: &(dyn Fn(&str) -> bool + Sync),
     through: bool,
     skipped_large: &mut Vec<PathBuf>,
@@ -418,7 +410,7 @@ fn importers_of(
     let names: HashSet<&std::ffi::OsStr> = targets.iter().filter_map(|t| t.file_name()).collect();
     let found: Mutex<Vec<Importer>> = Mutex::new(Vec::new());
     let too_large: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
-    let walker = super::walk::walker(scope, None, walk)?;
+    let walker = super::walk::walker(walk)?;
     walker.run(|| {
         let found = &found;
         let too_large = &too_large;

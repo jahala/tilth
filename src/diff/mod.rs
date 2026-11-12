@@ -9,7 +9,7 @@ use std::process::{Command, Stdio};
 
 use rayon::prelude::*;
 
-use tilth_core::search::walk::WalkConfig;
+use tilth_core::search::walk::{Walk, WalkConfig};
 use tilth_core::types::OutlineKind;
 
 #[derive(Debug)]
@@ -894,10 +894,8 @@ fn compute_blast(overlays: &[FileOverlay], scope: &Path, walk: WalkConfig) -> Ve
     // fast on a huge tree; the count then says it is a lower bound.
     let per_file = tilth_core::find_callers_batch(
         &sig_changed,
-        scope,
+        Walk::new(scope, walk),
         &bloom,
-        None,
-        walk,
         Some(crate::search::blast::BLAST_STOP_AFTER),
         |sites| {
             let mut counts: std::collections::HashMap<String, usize> =

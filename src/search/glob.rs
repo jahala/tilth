@@ -5,7 +5,7 @@ use globset::Glob;
 
 use crate::types::estimate_tokens;
 use tilth_core::error::TilthError;
-use tilth_core::search::walk::WalkConfig;
+use tilth_core::search::walk::{Walk, WalkConfig};
 
 const MAX_FILES: usize = 20;
 
@@ -34,7 +34,7 @@ pub fn search(pattern: &str, scope: &Path, walk: WalkConfig) -> Result<GlobResul
     let matched: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
     let extensions: std::sync::Mutex<HashSet<String>> = std::sync::Mutex::new(HashSet::new());
 
-    let walker = tilth_core::search::walk::walker(scope, None, walk)?;
+    let walker = tilth_core::search::walk::walker(Walk::new(scope, walk))?;
 
     walker.run(|| {
         let matcher = &matcher;

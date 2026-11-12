@@ -162,8 +162,10 @@ shell with its own concurrency model.
 (`Config::from_env`) and the flags that override it
 (`--respect-gitignore`, `--no-overview`). It passes the `Config`, or the
 one field a function needs, down as a parameter; the MCP server keeps it
-in `Services`. The field docs on `Config` list each `TILTH_*` variable and
-what it does. A value that does not parse falls back to its default.
+in `Services`, and each tool call works on its own copy, which the call's
+`gitignore` argument may change. The field docs on `Config` list each
+`TILTH_*` variable and what it does. A value that does not parse falls
+back to its default.
 
 `config::env_var` is the only read of the process environment, and
 nothing writes it. `clippy.toml` forbids `std::env::var`, `var_os`,
@@ -172,8 +174,9 @@ the `Config`, `env_var` reads the CLI's `PAGER` and `LINES` and the
 installer's `APPDATA` on Windows. Those locate things on the host, as
 `HOME` does, so they stay at their one use.
 
-The walk settings are `tilth_core::WalkConfig` (threads, gitignore), which
-every walk takes as an argument, so library users set them the same way.
+The walk settings are `tilth_core::WalkConfig` (threads, gitignore). A
+walk takes them in a `tilth_core::Walk`, with the directory it starts from
+and an optional glob, so library users set them the same way.
 
 ### CLI (`src/main.rs`)
 
@@ -401,10 +404,10 @@ tree-sitter `Query` objects live in `callee_query.rs`.
 
 ### Walker and ignore policy (`tilth-core` `search/walk.rs`)
 
-`walker(scope, glob, walk)` builds an `ignore::WalkParallel` with tilth's
-opinionated defaults, and `base_walk_builder(scope, walk)` the same
-walker for the sequential map and list walks. `walk` is the run's
-`WalkConfig`:
+`walker(walk)` builds an `ignore::WalkParallel` with tilth's opinionated
+defaults from a `Walk`: the scope, an optional glob, and the run's
+`WalkConfig`. `base_walk_builder(scope, config)` builds the same walker,
+without the glob, for the sequential map and list walks:
 
 - **Always-skipped directories** (`SKIP_DIRS`): build artifacts,
   dependency caches, VCS internals — `.git`, `node_modules`, `target`,

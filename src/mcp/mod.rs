@@ -377,40 +377,37 @@ fn handle_request(req: &JsonRpcRequest, services: &Services) -> JsonRpcResponse 
 /// Execute a tool by name with the given arguments. Returns formatted output or error string.
 /// No classifier involved — the caller specifies the tool explicitly.
 fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String, String> {
-    let gitignore = match args.get("gitignore") {
-        None => None,
-        Some(value) => Some(value.as_bool().ok_or("gitignore must be a boolean")?),
-    };
-    tilth_core::search::walk::with_gitignore_override(gitignore, || {
-        let edit_mode = services.edit_mode();
-        let config = services.config();
-        let walk = config.walk;
-        match tool {
-            "tilth_read" => tool_read(
-                args,
-                services.cache(),
-                services.session(),
-                edit_mode,
-                config,
-            ),
-            "tilth_search" => tool_search(
-                args,
-                services.cache(),
-                services.session(),
-                services.bloom(),
-                walk,
-            ),
-            "tilth_list" => tool_list(args, walk),
-            "tilth_deps" => tool_deps(args, services.bloom(), walk),
-            "tilth_grok" => tool_grok(args, services.bloom(), services.session(), config),
-            "tilth_diff" => tool_diff(args, walk),
-            "tilth_session" => tool_session(args, services.session()),
-            "tilth_write" if edit_mode => {
-                tool_write(args, services.session(), services.bloom(), walk)
-            }
-            _ => Err(format!("unknown tool: {tool}")),
-        }
-    })
+    // A call's `gitignore` argument overrides the server's setting for that
+    // call alone.
+    let mut config = *services.config();
+    if let Some(value) = args.get("gitignore") {
+        config.walk.respect_gitignore = value.as_bool().ok_or("gitignore must be a boolean")?;
+    }
+    let edit_mode = services.edit_mode();
+    let walk = config.walk;
+    match tool {
+        "tilth_read" => tool_read(
+            args,
+            services.cache(),
+            services.session(),
+            edit_mode,
+            &config,
+        ),
+        "tilth_search" => tool_search(
+            args,
+            services.cache(),
+            services.session(),
+            services.bloom(),
+            walk,
+        ),
+        "tilth_list" => tool_list(args, walk),
+        "tilth_deps" => tool_deps(args, services.bloom(), walk),
+        "tilth_grok" => tool_grok(args, services.bloom(), services.session(), &config),
+        "tilth_diff" => tool_diff(args, walk),
+        "tilth_session" => tool_session(args, services.session()),
+        "tilth_write" if edit_mode => tool_write(args, services.session(), services.bloom(), walk),
+        _ => Err(format!("unknown tool: {tool}")),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -697,6 +694,46 @@ mod tests {
         assert!(combined.contains(
             "DO NOT re-read files already shown in expanded search results.\n\ntilth_write replaces"
         ));
+    }
+
+    // -- dispatch_tool: per-call gitignore ------------------------------------
+
+    /// A call's `gitignore` argument decides for that call alone; without
+    /// one, the server's setting decides.
+    #[test]
+    fn a_calls_gitignore_argument_wins_over_the_server_setting() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("ignored")).unwrap();
+        std::fs::write(tmp.path().join(".gitignore"), "ignored/\n").unwrap();
+        std::fs::write(tmp.path().join("ignored/hidden.rs"), "fn needle() {}\n").unwrap();
+        let scope = tmp.path().to_str().unwrap();
+        let calls = [
+            (
+                "tilth_list",
+                serde_json::json!({ "scope": scope, "patterns": ["*.rs"] }),
+            ),
+            (
+                "tilth_search",
+                serde_json::json!({ "scope": scope, "query": "needle" }),
+            ),
+        ];
+        for (tool, args) in calls {
+            let hidden_found = |server: bool, call: Option<bool>| {
+                let mut config = Config::default();
+                config.walk.respect_gitignore = server;
+                let mut args = args.clone();
+                if let Some(call) = call {
+                    args["gitignore"] = call.into();
+                }
+                dispatch_tool(tool, &args, &Services::new(config, false))
+                    .unwrap()
+                    .contains("hidden.rs")
+            };
+            assert!(hidden_found(false, None), "{tool}");
+            assert!(!hidden_found(true, None), "{tool}");
+            assert!(hidden_found(true, Some(false)), "{tool}");
+            assert!(!hidden_found(false, Some(true)), "{tool}");
+        }
     }
 
     // -- dispatch_tool: removed tools ----------------------------------------

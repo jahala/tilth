@@ -27,10 +27,11 @@ are shared with the `tilth` binary and carry no stability promise.
 | `extract_import_source(&str, Option<Lang>) -> String` | The source an import statement's text names, read as one source. |
 | `is_external(&str, Lang) -> bool` | Whether that module lies outside the project. |
 | `resolve_related_files_with_content(&Path, &str) -> Vec<PathBuf>` | The local files a file's imports resolve to. |
-| `find_callers_batch(&HashSet<String>, &Path, &BloomFilterCache, Option<&str>, WalkConfig, stop_after: Option<usize>, per_file) -> Result<CallerWalk<T>, TilthError>` | Call sites of a set of symbols across a directory. `per_file` reduces each file's sites to what you keep; results come in path order, with the code files skipped for size that name a target. `stop_after` ends the walk once that many sites are found, and `reached_bound` then says the counts are lower bounds. |
-| `find_callers_and_owners(targets, owner_names, &Path, &BloomFilterCache, Option<&str>, WalkConfig, per_file) -> Result<CallerWalk<T>, TilthError>` | The same walk, which also hands `per_file` the types that define each of `owner_names`, found in the same parse. |
+| `find_callers_batch(&HashSet<String>, Walk, &BloomFilterCache, stop_after: Option<usize>, per_file) -> Result<CallerWalk<T>, TilthError>` | Call sites of a set of symbols in the files a walk visits. `per_file` reduces each file's sites to what you keep; results come in path order, with the code files skipped for size that name a target. `stop_after` ends the walk once that many sites are found, and `reached_bound` then says the counts are lower bounds. |
+| `find_callers_and_owners(targets, owner_names, Walk, &BloomFilterCache, per_file) -> Result<CallerWalk<T>, TilthError>` | The same walk, which also hands `per_file` the types that define each of `owner_names`, found in the same parse. |
 | `CallerWalk`, `CallerMatch`, `BloomFilterCache` | A walk's results; one call site; the per-file pre-filter the walk shares. |
 | `analyze_deps(&Path, &Path, &BloomFilterCache, WalkConfig) -> Result<DepsResult, TilthError>` | What a file uses and what uses it. |
+| `Walk` | Where and how one walk runs: its directory, an optional glob that narrows the files it visits (`*.rs`, or `!*.md` to leave some out), and its `WalkConfig`. `Walk::new(scope, config)` visits every file. |
 | `WalkConfig` | How a walk runs: its worker threads (`None` lets the walker choose) and whether `.gitignore`, `.ignore` and Git exclude rules apply. `WalkConfig::default()` uses half the cores, between 2 and 6, and ignores gitignore-style files. |
 | `DepsResult`, `LocalDep`, `Dependent` | The shape of a dependency report. |
 | `TilthError` | The crate's error type: `std::error::Error + Send + Sync`. |
