@@ -5,12 +5,13 @@ pub mod parse;
 
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use rayon::prelude::*;
 
 use tilth_core::search::walk::{Walk, WalkConfig};
 use tilth_core::types::OutlineKind;
+
+use crate::git::{self, Git, GitError};
 
 #[derive(Debug)]
 pub enum DiffSource {
@@ -283,7 +284,7 @@ pub(crate) struct Sides {
 ///   `a` and `b` with `b`, as `git diff` does. An empty end means `HEAD`.
 /// - A single revision compares it with the working tree.
 /// - Before the first commit, `HEAD` is the empty tree.
-fn resolve_sides(source: &DiffSource, repo: &Path) -> Result<Sides, String> {
+fn resolve_sides(source: &DiffSource, repo: &Path) -> Result<Sides, GitError> {
     let or_head = |rev: &str| {
         if rev.is_empty() {
             "HEAD".to_string()
@@ -304,7 +305,7 @@ fn resolve_sides(source: &DiffSource, repo: &Path) -> Result<Sides, String> {
             if let Some((a, b)) = r.split_once("...") {
                 let (a, b) = (or_head(a), or_head(b));
                 Sides {
-                    old: Side::Rev(merge_base(&a, &b, repo)?),
+                    old: Side::Rev(git::merge_base(repo, &a, &b)?),
                     new: Side::Rev(b),
                 }
             } else if let Some((a, b)) = r.split_once("..") {
@@ -330,55 +331,15 @@ fn resolve_sides(source: &DiffSource, repo: &Path) -> Result<Sides, String> {
     })
 }
 
-/// A `git` command that runs in `repo`.
-fn git_command(repo: &Path) -> Command {
-    let mut cmd = Command::new("git");
-    cmd.current_dir(repo);
-    cmd
-}
-
-/// Run a git command that prints one value, and return it trimmed.
-fn git_value(mut cmd: Command, what: &str) -> Result<String, String> {
-    let output = cmd
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("failed to run git {what}: {e}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("git {what} failed: {}", stderr.trim()));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-/// The repository's top-level directory. Git prints every diff path
-/// relative to it, wherever git runs.
-fn git_toplevel(repo: &Path) -> Result<PathBuf, String> {
-    let mut cmd = git_command(repo);
-    cmd.args(["rev-parse", "--show-toplevel"]);
-    git_value(cmd, "rev-parse").map(PathBuf::from)
-}
-
 /// `HEAD`, or the empty tree in a repository with no commit yet.
-fn head_or_empty_tree(repo: &Path) -> Result<String, String> {
-    let mut cmd = git_command(repo);
-    cmd.args(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]);
-    if git_value(cmd, "rev-parse").is_ok() {
-        return Ok("HEAD".to_string());
+fn head_or_empty_tree(repo: &Path) -> Result<String, GitError> {
+    let head = Git::new(repo, "rev-parse")
+        .args(&["--verify", "--quiet", "HEAD^{commit}"])
+        .run();
+    match head {
+        Ok(_) => Ok("HEAD".to_string()),
+        Err(_) => git::empty_tree(repo),
     }
-    empty_tree(repo)
-}
-
-/// The id of the empty tree, in this repository's hash format.
-fn empty_tree(repo: &Path) -> Result<String, String> {
-    let mut cmd = git_command(repo);
-    cmd.args(["hash-object", "-t", "tree", "--stdin"]);
-    git_value(cmd, "hash-object")
-}
-
-fn merge_base(a: &str, b: &str, repo: &Path) -> Result<String, String> {
-    let mut cmd = git_command(repo);
-    cmd.args(["merge-base", "--end-of-options", a, b]);
-    git_value(cmd, "merge-base")
 }
 
 /// Execute a git diff command and return raw unified diff output.
@@ -405,15 +366,11 @@ fn run_git_diff(source: &DiffSource, sides: &Sides, repo: &Path) -> Result<Strin
         _ => {}
     }
 
-    let mut cmd = git_command(repo);
     // Pin the output shape. User git config can otherwise swap in an external
-    // diff tool, colour the patch, drop or rename the `a/` `b/` prefixes,
-    // make paths cwd-relative, or blank out empty context lines — every one
-    // of which the parser misreads as "no changes" or a wrong path (#208).
-    cmd.args(["-c", "core.quotePath=false"]);
-    cmd.args(["-c", "diff.suppressBlankEmpty=false"]);
-    cmd.arg("diff");
-    cmd.args([
+    // diff tool, colour the patch, drop or rename the `a/` `b/` prefixes, or
+    // make paths cwd-relative, and the parser misreads each one as "no
+    // changes" or a wrong path (#208). The runner pins the rest.
+    let git = Git::new(repo, "diff").args(&[
         "--no-ext-diff",
         "--no-textconv",
         "--no-color",
@@ -421,49 +378,24 @@ fn run_git_diff(source: &DiffSource, sides: &Sides, repo: &Path) -> Result<Strin
         "--src-prefix=a/",
         "--dst-prefix=b/",
     ]);
-
-    match source {
+    let git = match source {
         DiffSource::GitUncommitted => {
             // working tree vs HEAD (unstaged + staged)
             let Side::Rev(head) = &sides.old else {
                 return Err("an uncommitted diff compares with a revision".to_string());
             };
-            cmd.arg(head);
+            git.revision(head)
         }
-        DiffSource::GitStaged => {
-            cmd.arg("--staged");
-        }
-        DiffSource::GitRef(r) => {
-            // Whatever the caller passed is a revision, never an option.
-            cmd.arg("--end-of-options").arg(r);
-        }
-        DiffSource::Files(fa, fb) => {
-            cmd.arg("--no-index").arg("--").arg(fa).arg(fb);
-        }
+        DiffSource::GitStaged => git.args(&["--staged"]),
+        DiffSource::GitRef(r) => git.revision(r),
+        // `git diff --no-index` exits 1 when the files differ. Any other
+        // failure is an error, never an empty patch that reads as "No
+        // changes."
+        DiffSource::Files(fa, fb) => git.args(&["--no-index"]).path(fa).path(fb).success_on(1),
         // Patch and Log are handled above
         DiffSource::Patch(_) | DiffSource::Log(_) => unreachable!(),
-    }
-
-    let output = cmd
-        .output()
-        .map_err(|e| format!("failed to run git diff: {e}"))?;
-
-    // `git diff --no-index` exits 1 when the files differ; every other variant
-    // exits 0 on success. Anything else is a git error, and parsing its empty
-    // stdout would report "No changes." for a diff that was never produced.
-    let ok = match source {
-        DiffSource::Files(..) => matches!(output.status.code(), Some(0 | 1)),
-        _ => output.status.success(),
     };
-    if !ok {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "git diff failed ({}): {}",
-            output.status,
-            stderr.trim()
-        ));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    git.run().map_err(|e| e.to_string())
 }
 
 /// Parse a patch and build one overlay per file, then match moves across
@@ -520,7 +452,7 @@ pub fn diff(
         return diff_log(range, repo, scope.as_ref(), budget);
     }
 
-    let sides = resolve_sides(source, repo)?;
+    let sides = resolve_sides(source, repo).map_err(|e| e.to_string())?;
     let raw = run_git_diff(source, &sides, repo)?;
     let mut files = build_overlays(&raw, &sides, repo);
     // A patch with text in it but no file header is not a clean result.
@@ -621,9 +553,11 @@ pub fn diff(
 /// that lies outside it names its own instead: a scope in another worktree
 /// diffs that worktree, and blast counts callers there (#321).
 fn checkout(base: &Path, scope: Option<&str>) -> Result<(PathBuf, PathBuf), String> {
-    let top = git_toplevel(base);
+    let top = git::toplevel(base);
     let Some((path, _)) = scope.map(split_function) else {
-        return top.map(|t| (base.to_path_buf(), t));
+        return top
+            .map(|t| (base.to_path_buf(), t))
+            .map_err(|e| e.to_string());
     };
     let full = lexical_normalize(&base.join(path));
     if let Ok(t) = top {
@@ -634,7 +568,7 @@ fn checkout(base: &Path, scope: Option<&str>) -> Result<(PathBuf, PathBuf), Stri
     // A scope may name a file or directory the diff removed, so its
     // repository is found from the nearest directory that still exists.
     let dir = full.ancestors().find(|a| a.is_dir()).unwrap_or(base);
-    let top = git_toplevel(dir).map_err(|e| format!("scope '{path}': {e}"))?;
+    let top = git::toplevel(dir).map_err(|e| format!("scope '{path}': {e}"))?;
     Ok((top.clone(), top))
 }
 
@@ -962,23 +896,11 @@ fn diff_log(
 
     // Fields end in NUL so a subject may hold any other character; the
     // subject comes last because only it may be empty or hold spaces.
-    let mut cmd = git_command(repo);
-    let output = cmd
-        .args([
-            "log",
-            "--format=%H%x00%P%x00%at%x00%an%x00%s",
-            "--end-of-options",
-            range,
-        ])
-        .output()
-        .map_err(|e| format!("failed to run git log: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("git log failed: {stderr}"));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = Git::new(repo, "log")
+        .args(&["--format=%H%x00%P%x00%at%x00%an%x00%s"])
+        .revision(range)
+        .run()
+        .map_err(|e| e.to_string())?;
     let mut summaries: Vec<CommitSummary> = Vec::new();
     let mut empty = None;
 
@@ -1000,7 +922,7 @@ fn diff_log(
             p.to_string()
         } else {
             if empty.is_none() {
-                empty = Some(empty_tree(repo)?);
+                empty = Some(git::empty_tree(repo).map_err(|e| e.to_string())?);
             }
             empty.clone().unwrap_or_default()
         };
@@ -1061,6 +983,7 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::Path;
+    use std::process::Command;
 
     /// Every git call that takes a caller's revision ends option parsing
     /// before it, so a revision that reaches git without passing through

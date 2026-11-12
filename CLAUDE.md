@@ -93,6 +93,7 @@ src/
   timeout.rs           Per-request wall-clock timeout for sync tool calls — worker thread + bounded channel, tracks abandoned threads on expiry.
   util.rs              atomic_write_bytes() — shared by edit.rs and install.rs.
   diag.rs              The one stderr sink: emit(). clippy.toml forbids std::io::stderr elsewhere.
+  git.rs               The one git runner: Git (pinned config, caller revisions after --end-of-options, optional time limit) and GitError. tests/git_runner.rs fails on any other Command::new("git").
   types.rs             Binary-only types (QueryType, ViewMode, Match, SearchResult, FacetTotals) and estimate_tokens().
 npm/                   npm wrapper — postinstall downloads binary, run.js proxies to it.
 scripts/fixtures/      setup_repos.py clones four real-world repos at pinned commits (README examples, speed table, parity checks).
