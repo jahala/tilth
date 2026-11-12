@@ -95,13 +95,19 @@ pub fn analyze_deps(
     })?;
     let walk = Walk::new(scope, config);
 
-    let content = crate::source::read_source(path).map_err(|e| TilthError::IoError {
+    let text = crate::source::read_source(path).map_err(|e| TilthError::IoError {
         path: path.clone(),
         source: e,
     })?;
+    let code = text.and_then(
+        |content| match detect_file_type_with_content(path, &content) {
+            FileType::Code(lang) => Some((content, lang)),
+            _ => None,
+        },
+    );
 
-    let FileType::Code(lang) = detect_file_type_with_content(path, &content) else {
-        // Non-code file: return empty deps gracefully.
+    let Some((content, lang)) = code else {
+        // A file that is not code, a binary one included, has no deps.
         return Ok(DepsResult {
             target: path.clone(),
             uses_local: Vec::new(),
@@ -507,7 +513,7 @@ fn importer_from(
     keep: &(dyn Fn(&str) -> bool + Sync),
     through: bool,
 ) -> Option<Importer> {
-    let content = crate::source::read_source(file).ok()?;
+    let content = crate::source::read_source(file).ok().flatten()?;
     if !stems
         .iter()
         .any(|s| memchr::memmem::find(content.as_bytes(), s.as_bytes()).is_some())

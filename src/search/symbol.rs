@@ -285,8 +285,9 @@ fn walk_scope(
 /// definition's line dropped in favour of the definition.
 ///
 /// Single-read design: reads the file once, checks for the symbol via
-/// `memchr::memmem` (SIMD), then reuses the buffer for both the tree-sitter
-/// definition pass and the word-boundary usage pass. Definitions fall back
+/// `memchr::memmem` (SIMD), then decodes it once by the text rule of
+/// `tilth_core::source::into_text` for both the tree-sitter definition pass
+/// and the word-boundary usage pass. Definitions fall back
 /// to a keyword heuristic for code without a grammar.
 fn matches_in_file(path: &Path, wanted: Wanted, usage: &RegexMatcher) -> Scan {
     let none = || Scan::Matches(FileDefs::default());
@@ -318,42 +319,44 @@ fn matches_in_file(path: &Path, wanted: Wanted, usage: &RegexMatcher) -> Scan {
         Err(_) => 0,
     };
 
-    let Ok(raw) = tilth_core::source::read(path) else {
+    let Ok(bytes) = tilth_core::source::read(path) else {
         return none();
     };
-    let bytes = tilth_core::source::strip_bom_bytes(&raw);
 
     // Fast byte check — a word-boundary usage or a definition both need the
     // name's bytes somewhere in the file.
-    if memchr::memmem::find(bytes, wanted.name.as_bytes()).is_none() {
+    if memchr::memmem::find(&bytes, wanted.name.as_bytes()).is_none() {
         return none();
     }
 
+    // A binary file has no definitions and no usages, by the rule every
+    // read uses.
+    let Some(text) = tilth_core::source::into_text(bytes) else {
+        return none();
+    };
+    let content = tilth_core::source::strip_bom(&text);
+
     // Catch unmarked minified bundles that slipped past the filename check.
     if file_size >= tilth_core::lang::detection::MINIFIED_CHECK_THRESHOLD
-        && tilth_core::lang::detection::is_minified_by_content(bytes)
+        && tilth_core::lang::detection::is_minified_by_content(content.as_bytes())
     {
         return none();
     }
 
     let (file_lines, mtime) = file_metadata(path);
 
-    // A file that is not UTF-8 yields no definitions; one decoding rule in #308.
     let FileDefs {
         mut matches,
         others,
-    } = std::str::from_utf8(bytes).map_or_else(
-        |_| FileDefs::default(),
-        |content| definitions_in(path, wanted, content, file_lines, mtime),
-    );
+    } = definitions_in(path, wanted, content, file_lines, mtime);
     let def_count = matches.len();
 
     let mut searcher = Searcher::new();
-    // The UTF8 sink ends this file's usage scan at its first matching line
-    // that is not UTF-8, and the error is dropped here: #308.
+    // The sink fails only on a line that is not UTF-8, and the text holds
+    // none, so the scan cannot fail.
     let _ = searcher.search_slice(
         usage,
-        bytes,
+        content.as_bytes(),
         UTF8(|line_num, line| {
             let line_num = line_num as u32;
             let on_definition = matches[..def_count].iter().any(|d| d.line == line_num);
@@ -2825,5 +2828,64 @@ impl Runner {
                 ("frozen", &[]),
             ],
         );
+    }
+
+    /// The matches of `query` under `dir`, as `(file, line, definition?)`.
+    fn symbol_hits(dir: &Path, query: &str) -> Vec<(String, u32, bool)> {
+        let result = search(query, Walk::new(dir, WalkConfig::default()), None, false).unwrap();
+        let mut hits: Vec<_> = result
+            .matches
+            .iter()
+            .map(|m| {
+                let name = m.path.file_name().unwrap().to_string_lossy().into_owned();
+                (name, m.line, m.is_definition)
+            })
+            .collect();
+        hits.sort();
+        assert_eq!(result.total_found, hits.len());
+        hits
+    }
+
+    /// A byte that is not UTF-8 reads as U+FFFD and costs nothing else: the
+    /// usage scan reads past a matched line that holds one, and the
+    /// definition pass still runs over a file that holds one.
+    #[test]
+    fn a_file_that_is_not_utf8_keeps_its_definitions_and_usages() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("latin1.txt"),
+            b"needle_delta caf\xe9\nneedle_delta two\nneedle_delta three\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.path().join("latin1.c"),
+            b"/* caf\xe9 */\nint needle_delta(void) { return 0; }\nint y = needle_delta();\nint z = needle_delta();\n",
+        )
+        .unwrap();
+        let hit = |file: &str, line, def| (file.to_string(), line, def);
+        assert_eq!(
+            symbol_hits(d.path(), "needle_delta"),
+            [
+                hit("latin1.c", 2, true),
+                hit("latin1.c", 3, false),
+                hit("latin1.c", 4, false),
+                hit("latin1.txt", 1, false),
+                hit("latin1.txt", 2, false),
+                hit("latin1.txt", 3, false),
+            ]
+        );
+    }
+
+    /// A file is binary when a NUL byte falls in its first 512 bytes, the
+    /// rule a read uses, and a binary file has no definitions and no usages.
+    #[test]
+    fn a_binary_file_has_no_definitions_or_usages() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("blob.c"),
+            b"int needle_delta(void) { return 0; }\n\0\nint y = needle_delta();\n",
+        )
+        .unwrap();
+        assert_eq!(symbol_hits(d.path(), "needle_delta"), []);
     }
 }

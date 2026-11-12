@@ -71,7 +71,7 @@ pub(crate) fn blast_radius(
     bloom: &tilth_core::index::bloom::BloomFilterCache,
     walk: WalkConfig,
 ) -> Option<String> {
-    let content = tilth_core::source::read_source(path).ok()?;
+    let content = tilth_core::source::read_source(path).ok().flatten()?;
 
     let FileType::Code(lang) = detect_file_type_with_content(path, &content) else {
         return None;

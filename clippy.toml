@@ -15,6 +15,13 @@ allow-dbg-in-tests = true
 # MCP transport's writer, diagnostics through `diag::emit`. `print_stdout`
 # and `print_stderr` cover the macros.
 
+# A file's bytes become text by one rule, `tilth_core::source::into_text`:
+# binary when a NUL falls in the first 512 bytes, else lossy UTF-8. A strict
+# decode drops a whole file, or a search's later matches, over one byte.
+# The hash-anchored writes decode strictly, through
+# `tilth_core::source::read_to_string`, and each other strict read carries
+# an #[expect] that names its issue.
+
 # Every directory walk starts from `tilth_core::search::walk`, so each one
 # skips `SKIP_DIRS` and `.tilthignore` and follows the gitignore setting.
 
@@ -37,6 +44,11 @@ disallowed-methods = [
   { path = "std::fs::read", reason = "read through `tilth_core::source`, whose open never waits on a pipe" },
   { path = "std::fs::read_to_string", reason = "read through `tilth_core::source`, whose open never waits on a pipe" },
   { path = "std::fs::File::open", reason = "open through `tilth_core::source::OpenFile`, which never waits on a pipe" },
+  { path = "std::str::from_utf8", reason = "read a file's bytes as text through `tilth_core::source::into_text`, the one text and binary rule" },
+  { path = "std::string::String::from_utf8", reason = "read a file's bytes as text through `tilth_core::source::into_text`, the one text and binary rule" },
+  { path = "std::io::Read::read_to_string", reason = "read a file's bytes as text through `tilth_core::source::into_text`, the one text and binary rule" },
+  { path = "std::io::read_to_string", reason = "read a file's bytes as text through `tilth_core::source::into_text`, the one text and binary rule" },
+  { path = "tilth_core::source::read_to_string", reason = "a strict read, for the hash-anchored writes only; read text through `tilth_core::source::read_source` or `into_text`" },
   { path = "ignore::WalkBuilder::new", reason = "walk through `tilth_core::search::walk`, which holds the one ignore policy" },
   { path = "ignore::Walk::new", reason = "walk through `tilth_core::search::walk`, which holds the one ignore policy" },
 ]

@@ -160,7 +160,7 @@ fn read_code_file(path: &Path, cap: u64) -> Result<(String, Lang), TilthError> {
             reason: "not a code file — grok needs source code".to_string(),
         });
     };
-    // The binary probe below only inspects the first 512B, so a clean head
+    // The binary rule of `into_text` below looks only at the first 512B, so a clean head
     // followed by megabytes of garbage would still reach the lossy decode and
     // the outline parser. Refuse on size first, before reading any bytes.
     if meta.len() > cap {
@@ -176,20 +176,14 @@ fn read_code_file(path: &Path, cap: u64) -> Result<(String, Lang), TilthError> {
         path: path.to_path_buf(),
         source: e,
     })?;
-    // Match the read path: refuse binary content instead of letting a strict
-    // UTF-8 decode surface a raw "stream did not contain valid UTF-8" error.
-    if tilth_core::lang::detection::is_binary(&bytes) {
+    let Some(mut content) = tilth_core::source::into_text(bytes) else {
         return Err(TilthError::InvalidQuery {
             query: path.display().to_string(),
             reason: "binary or non-text file (null bytes in first 512B) — grok needs source; \
                      use tilth_search \"<symbol>\" for matches in this file"
                 .to_string(),
         });
-    }
-    // Try the strict conversion first: it takes ownership of the buffer, so
-    // the (near-universal) valid-UTF-8 case decodes without a second copy.
-    let mut content = String::from_utf8(bytes)
-        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+    };
     let bom = content.len() - tilth_core::source::strip_bom(&content).len();
     content.drain(..bom);
     let lang = tilth_core::lang::refine_lang(lang, path, &content);
@@ -336,7 +330,7 @@ fn read_delegate_content(
     if callee_file == target_path {
         Some(target_content.to_string())
     } else if std::fs::metadata(callee_file).is_ok_and(|m| m.len() <= cap) {
-        tilth_core::source::read_source(callee_file).ok()
+        tilth_core::source::read_source(callee_file).ok().flatten()
     } else {
         None
     }
@@ -1714,10 +1708,11 @@ mod tests {
     fn resolve_by_name_refusal_names_the_query_not_the_path() {
         // The refusal fires inside enrich_from_outline after the symbol search
         // already resolved a path; the error must still name what the user
-        // asked for, not the file the search walked to.
+        // asked for, not the file the search walked to. A doc heading is the
+        // one definition here, and grok refuses a file that is not code.
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("tainted.rs");
-        fs::write(&path, b"fn alpha() {}\n\x00\x01\x02").unwrap();
+        let path = tmp.path().join("notes.md");
+        fs::write(&path, "# alpha\ntext\n").unwrap();
         let err = resolve_by_name("alpha", tmp.path(), &Config::default()).unwrap_err();
         match err {
             TilthError::InvalidQuery { query, .. } => assert_eq!(query, "alpha"),

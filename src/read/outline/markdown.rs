@@ -5,10 +5,7 @@
 /// `fenced_code_block` nodes and never produce false-positive headings.
 use tilth_core::lang::outline::{heading_level, heading_text, parse_markdown};
 
-pub fn outline(buf: &[u8], max_lines: usize) -> String {
-    let Ok(content) = std::str::from_utf8(buf) else {
-        return String::new();
-    };
+pub fn outline(content: &str, max_lines: usize) -> String {
     let Some(tree) = parse_markdown(content) else {
         return String::new();
     };
@@ -106,7 +103,7 @@ mod tests {
 
     #[test]
     fn basic_headings() {
-        let input = b"# H1\nSome text\n## H2\nMore text\n";
+        let input = "# H1\nSome text\n## H2\nMore text\n";
         let result = outline(input, 100);
         let lines: Vec<&str> = result.lines().collect();
 
@@ -119,7 +116,7 @@ mod tests {
 
     #[test]
     fn code_blocks_skipped() {
-        let input = b"# Real Heading\n\n```\ncode\n```\n";
+        let input = "# Real Heading\n\n```\ncode\n```\n";
         let result = outline(input, 100);
 
         // Should only find the real heading, not any inside code block
@@ -130,7 +127,7 @@ mod tests {
 
     #[test]
     fn code_block_count() {
-        let input = b"# Heading\n```\ncode\n```\n```\nmore\n```\n";
+        let input = "# Heading\n```\ncode\n```\n```\nmore\n```\n";
         let result = outline(input, 100);
 
         assert!(result.contains("(2 code blocks)"));
@@ -138,7 +135,7 @@ mod tests {
 
     #[test]
     fn nested_heading_ranges() {
-        let input = b"# A\ntext\n## B\ntext\n## C\ntext\n# D\ntext\n";
+        let input = "# A\ntext\n## B\ntext\n## C\ntext\n# D\ntext\n";
         let result = outline(input, 100);
         let lines: Vec<&str> = result.lines().collect();
 
@@ -155,7 +152,7 @@ mod tests {
 
     #[test]
     fn last_heading_to_eof() {
-        let input = b"# Heading\nline 2\nline 3\nline 4\n";
+        let input = "# Heading\nline 2\nline 3\nline 4\n";
         let result = outline(input, 100);
 
         // Heading should extend to line 4 (total line count)
@@ -164,7 +161,7 @@ mod tests {
 
     #[test]
     fn empty_file() {
-        let input = b"";
+        let input = "";
         let result = outline(input, 100);
 
         assert_eq!(result, "");
@@ -176,7 +173,7 @@ mod tests {
     /// pre-pass to avoid treating it as a heading; the AST gets this for free.
     #[test]
     fn hash_inside_fenced_code_does_not_become_heading() {
-        let input = b"# Real\n\n```python\n# fake heading\nprint('x')\n```\n\n## Also Real\n";
+        let input = "# Real\n\n```python\n# fake heading\nprint('x')\n```\n\n## Also Real\n";
         let result = outline(input, 100);
         let lines: Vec<&str> = result.lines().collect();
         let heading_lines: Vec<&&str> = lines.iter().filter(|l| l.starts_with('[')).collect();
@@ -191,7 +188,7 @@ mod tests {
     /// The old hand-rolled scanner only matched ATX too; we preserve that.
     #[test]
     fn setext_headings_silently_ignored() {
-        let input = b"Top\n===\n\ncontent\n";
+        let input = "Top\n===\n\ncontent\n";
         let result = outline(input, 100);
         assert_eq!(result, "");
     }

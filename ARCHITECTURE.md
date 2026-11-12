@@ -50,9 +50,10 @@ crates/tilth-core/src/
 ├── imports.rs       Imports as data (one per module named), import lines, related-file resolution
 ├── test_structure.rs describe/it/test calls as TestEntry data
 ├── source.rs        OpenFile, the one way tilth opens a file to read
-│                    it; read_source: reads a file for parsing or search
-│                    without its byte-order mark; MAX_FILE_SIZE, the
-│                    one size limit every parse and search walk shares
+│                    it; into_text, the one rule for text and binary;
+│                    read_source: reads a file's text for parsing or
+│                    search without its byte-order mark; MAX_FILE_SIZE,
+│                    the one size limit every parse and search walk shares
 │
 ├── search/          Cross-file queries
 │   ├── walk.rs          Walker and ignore policy (WalkConfig, SKIP_DIRS,
@@ -727,16 +728,27 @@ gateway. The decision tree, in order:
 
 Every read opens the file through `tilth_core::source::OpenFile`, as
 do `read_source`, `source::read` and `source::read_to_string`, which
-every parse, search and edit read goes through. On Unix it opens with
+every parse, search and edit read goes through. Bytes become text by
+one rule, `source::into_text`: a NUL byte in the first 512 bytes makes a
+file binary, and any other file is text, each sequence that is not
+UTF-8 read as U+FFFD. Search, the symbol definition and usage passes,
+callers, deps, outlines and reads all follow it, so a Latin-1 file is
+searched, parsed and shown, and a binary one is skipped by all of them.
+A section read shows any file's lines as asked. The hash-anchored edit
+reads strictly (`source::read_to_string`), because it writes the file
+back: it refuses a file that is not UTF-8 rather than turn its bytes
+into U+FFFD. The structural diff (until #312) and the write tool's
+echo of earlier content (until #353) read strictly too. `clippy.toml` forbids the strict decoders
+(`str::from_utf8`, `String::from_utf8`, `Read::read_to_string`) and
+`source::read_to_string` elsewhere. On Unix it opens with
 `O_NONBLOCK`, checks the handle's own metadata and clears the flag on a
 regular file, so a pipe swapped in after the path was checked is still
 never read. A pipe, socket or device reads as empty everywhere. The one
 read that waits on a pipe is `tilth diff --patch`, which may be handed
 one.
 
-The signature and stripped views reshape only code. Any other file gets
-its default view, after a streamed check that it is UTF-8, so it fails
-as those views always made it fail.
+The signature and stripped views reshape only code. Any other file,
+and a binary one, gets its default view.
 
 The `outline/` submodule dispatches on `FileType` through
 `outline::View`, the one mapping from file type to view:

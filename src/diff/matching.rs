@@ -552,6 +552,10 @@ impl Header {
         let end = body_start(node).unwrap_or_else(|| node.end_byte());
         let mut tokens: Vec<Range<usize>> = Vec::new();
         header_tokens(node, end, &mut tokens);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "by design: a token's bytes in text that is already UTF-8, cut where tree-sitter cuts"
+        )]
         let text = |r: &Range<usize>| std::str::from_utf8(&source[r.clone()]).unwrap_or("");
 
         // A comma before a closing bracket is a trailing comma, which

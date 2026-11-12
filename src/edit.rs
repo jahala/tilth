@@ -1,5 +1,6 @@
 use std::fmt::Write as _;
 use std::fs;
+use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 
@@ -34,6 +35,10 @@ static IN_FLIGHT: LazyLock<DashMap<String, Arc<Mutex<()>>>> = LazyLock::new(Dash
 fn file_guard(path: &Path) -> Arc<Mutex<()>> {
     Arc::clone(&IN_FLIGHT.entry(normalize_path_key(path)).or_default())
 }
+
+/// Why a hash edit refuses a file that is not UTF-8.
+const NOT_UTF8: &str =
+    "holds bytes that are not UTF-8, which a hash edit would rewrite as U+FFFD; nothing was written";
 
 /// A single edit operation targeting a line range by hash anchors.
 #[derive(Debug, Clone)]
@@ -109,8 +114,19 @@ fn apply_edits(path: &Path, edits: &[Edit]) -> Result<EditResult, TilthError> {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     // Read file
-    let content = tilth_core::source::read_to_string(path)
-        .map_err(|e| TilthError::from_io(path, e, || None))?;
+    // Strict: the file is written back line by line, and the lossy text
+    // would turn every byte that is not UTF-8 into U+FFFD.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "by design: a hash edit writes the file back and must keep every byte"
+    )]
+    let content = tilth_core::source::read_to_string(path).map_err(|e| match e.kind() {
+        io::ErrorKind::InvalidData => TilthError::IoError {
+            path: path.to_path_buf(),
+            source: io::Error::new(io::ErrorKind::InvalidData, NOT_UTF8),
+        },
+        _ => TilthError::from_io(path, e, || None),
+    })?;
 
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len();
@@ -1492,5 +1508,40 @@ mod tests {
             !out.contains("\u{2500}\u{2500} parse \u{2500}\u{2500}"),
             "clean edit must not surface a parse block: {out}"
         );
+    }
+
+    /// A hash edit on a file that is not UTF-8 refuses and leaves every
+    /// byte as it was, with an anchor taken from the file's own read.
+    /// Written back from its lossy text, each byte that is not UTF-8
+    /// outside the edited lines would become U+FFFD.
+    #[test]
+    fn a_hash_edit_refuses_a_file_that_is_not_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("latin1.c");
+        let bytes = b"/* caf\xe9 */\nint a;\nint b;\n";
+        std::fs::write(&path, bytes).unwrap();
+        let cache = tilth_core::cache::OutlineCache::new();
+        let view = crate::read::read_file(&path, None, None, &cache, true, None).unwrap();
+        let anchor = view
+            .lines()
+            .find_map(|line| line.strip_suffix("|int a;"))
+            .unwrap();
+        let (line, hash) = format::parse_anchor(anchor).unwrap();
+        let edits = [Edit {
+            start_line: line,
+            start_hash: hash,
+            end_line: line,
+            end_hash: hash,
+            content: "int c;".into(),
+        }];
+        let err = apply_edits(&path, &edits).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "{}: holds bytes that are not UTF-8, which a hash edit would rewrite as U+FFFD; nothing was written",
+                path.display()
+            )
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
     }
 }

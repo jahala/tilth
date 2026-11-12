@@ -297,7 +297,7 @@ fn resolve_same_package(
             break;
         }
 
-        let Ok(content) = crate::source::read_source(&go_path) else {
+        let Ok(Some(content)) = crate::source::read_source(&go_path) else {
             continue;
         };
 
@@ -351,7 +351,7 @@ fn resolve_second_hop(
     bloom: &crate::index::bloom::BloomFilterCache,
     visited: &HashSet<(PathBuf, u32)>,
 ) -> Vec<ResolvedCallee> {
-    let Ok(content) = crate::source::read_source(&parent.file) else {
+    let Ok(Some(content)) = crate::source::read_source(&parent.file) else {
         return Vec::new();
     };
     let file_type = crate::lang::detect_file_type_with_content(&parent.file, &content);

@@ -158,6 +158,10 @@ pub(crate) fn signature_warnings<'a>(
 /// Scan a file for merge conflict markers and extract conflict blocks.
 pub(crate) fn detect_conflicts(path: &Path, repo: &Path) -> Vec<Conflict> {
     let disk = repo.join(path);
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the structural diff reads strictly until #312"
+    )]
     let Ok(content) = tilth_core::source::read_to_string(&disk) else {
         return Vec::new();
     };
@@ -318,6 +322,10 @@ fn file_contents(
 }
 
 /// Read `path` (repository-relative) from one side of a diff.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the structural diff reads strictly until #312"
+)]
 fn read_side(side: &Side, path: &Path, repo: &Path) -> Result<String, String> {
     let path_str = path.to_string_lossy();
     match side {
