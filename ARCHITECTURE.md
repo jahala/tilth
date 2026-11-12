@@ -736,8 +736,11 @@ searched, parsed and shown, and a binary one is skipped by all of them.
 A section read shows any file's lines as asked. The hash-anchored edit
 reads strictly (`source::read_to_string`), because it writes the file
 back: it refuses a file that is not UTF-8 rather than turn its bytes
-into U+FFFD. The structural diff (until #312) and the write tool's
-echo of earlier content (until #353) read strictly too. `clippy.toml` forbids the strict decoders
+into U+FFFD. The structural diff (until #312) reads strictly too. The
+overwrite and append modes show a file's earlier content by the one
+rule in their echo and diff, and never write that text back: an append
+adds the call's bytes after the file's own, and an overwrite writes the
+call's bytes alone. `clippy.toml` forbids the strict decoders
 (`str::from_utf8`, `String::from_utf8`, `Read::read_to_string`) and
 `source::read_to_string` elsewhere. On Unix it opens with
 `O_NONBLOCK`, checks the handle's own metadata and clears the flag on a
