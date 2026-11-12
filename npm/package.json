@@ -1,6 +1,6 @@
 {
   "name": "tilth",
-  "version": "0.14.0",
+  "version": "0.15.0",
   "description": "Smart code reading for AI agents. Definitions, callers, deps and function-level diffs from tree-sitter.",
   "bin": {
     "tilth": "run.js"
