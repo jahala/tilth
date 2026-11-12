@@ -938,7 +938,9 @@ single tool each.
    its own, so a scope in another worktree diffs that worktree.
 2. **`run_git_diff`** runs `git diff` with the right args through the
    git runner (or reads the patch file). Before the first commit, `HEAD`
-   is the empty tree.
+   is the empty tree. A file pair's sides are opened first, and one that
+   cannot be read fails as a read of it fails: `git diff --no-index`
+   exits 1 for it, the code it gives for files that differ.
 3. **`resolve_sides`** decides where each side reads file content from
    (`Side`: a revision, the index, the working tree, a file). It is the
    one place that knows what a range means: `a..b` compares `a` with `b`,

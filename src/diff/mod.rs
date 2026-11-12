@@ -4,14 +4,18 @@ pub mod overlay;
 pub mod parse;
 
 use std::collections::HashSet;
+use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use rayon::prelude::*;
 
+use tilth_core::error::TilthError;
 use tilth_core::search::walk::{Walk, WalkConfig};
+use tilth_core::source::OpenFile;
 use tilth_core::types::OutlineKind;
 
 use crate::git::{self, Git, GitError};
+use crate::read;
 
 #[derive(Debug)]
 pub enum DiffSource {
@@ -363,6 +367,14 @@ fn run_git_diff(source: &DiffSource, sides: &Sides, repo: &Path) -> Result<Strin
                 .map_err(|e| format!("failed to read patch file: {e}"))?;
             return Ok(content);
         }
+        // `git diff --no-index` exits 1 for a file it cannot access, the
+        // code it also gives for files that differ, so its patch would be
+        // empty and read as "No changes." (#358). Each side opens first.
+        DiffSource::Files(fa, fb) => {
+            for path in [fa, fb] {
+                open_side(&repo.join(path)).map_err(|e| e.to_string())?;
+            }
+        }
         _ => {}
     }
 
@@ -389,13 +401,23 @@ fn run_git_diff(source: &DiffSource, sides: &Sides, repo: &Path) -> Result<Strin
         DiffSource::GitStaged => git.args(&["--staged"]),
         DiffSource::GitRef(r) => git.revision(r),
         // `git diff --no-index` exits 1 when the files differ. Any other
-        // failure is an error, never an empty patch that reads as "No
-        // changes."
+        // failure is an error.
         DiffSource::Files(fa, fb) => git.args(&["--no-index"]).path(fa).path(fb).success_on(1),
         // Patch and Log are handled above
         DiffSource::Patch(_) | DiffSource::Log(_) => unreachable!(),
     };
     git.run().map_err(|e| e.to_string())
+}
+
+/// Open one side of a file pair the way a read opens it, so a side that is
+/// missing or unreadable fails with the read's error. A directory is left to
+/// git, which walks it.
+fn open_side(path: &Path) -> Result<(), TilthError> {
+    let meta = fs::metadata(path).map_err(|e| read::path_error(path, e))?;
+    if !meta.is_dir() {
+        OpenFile::open(path).map_err(|e| read::path_error(path, e))?;
+    }
+    Ok(())
 }
 
 /// Parse a patch and build one overlay per file, then match moves across
@@ -1615,6 +1637,59 @@ diff --git a/src/main.rs b/src/main.rs
             !result.contains("No changes"),
             "expected changes between files:\n{result}"
         );
+    }
+
+    /// `git diff --no-index` exits 1 for a file it cannot access, as it does
+    /// for files that differ, so a missing side read as "No changes." (#358).
+    /// It fails the way a read of it fails, resolved against the checkout.
+    #[test]
+    fn a_missing_side_of_a_file_pair_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.rs"), "fn a() {}\n").unwrap();
+        fs::write(dir.path().join("b.rs"), "fn b() {}\n").unwrap();
+        let pair_error = |a: &str, b: &str| {
+            let source = DiffSource::Files(PathBuf::from(a), PathBuf::from(b));
+            diff(&source, dir.path(), None, None, None, 0, None).unwrap_err()
+        };
+        let missing = |name: &str, suggestion: &str| {
+            format!(
+                "not found: {} — did you mean: {suggestion}",
+                dir.path().join(name).display()
+            )
+        };
+
+        assert_eq!(pair_error("a.rx", "b.rs"), missing("a.rx", "a.rs"));
+        assert_eq!(pair_error("a.rs", "b.rx"), missing("b.rx", "b.rs"));
+        assert_eq!(pair_error("a.rx", "b.rx"), missing("a.rx", "a.rs"));
+    }
+
+    /// A side that exists but cannot be opened names itself too, in the
+    /// words a read of it uses, before git reports it in its own.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_side_of_a_file_pair_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a.rs"), dir.path().join("b.rs"));
+        fs::write(&a, "fn a() {}\n").unwrap();
+        fs::write(&b, "fn b() {}\n").unwrap();
+        fs::set_permissions(&b, fs::Permissions::from_mode(0o000)).unwrap();
+        if OpenFile::open(&b).is_ok() {
+            eprintln!("skipped: permissions do not bind this user, so no file can be locked");
+            return;
+        }
+        let err = diff(
+            &DiffSource::Files(a, b.clone()),
+            dir.path(),
+            None,
+            None,
+            None,
+            0,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(err, format!("{} [permission denied]", b.display()));
     }
 
     /// A count of one takes the singular noun in the overview (#294).
