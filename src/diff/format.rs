@@ -27,6 +27,8 @@ use super::{
 ///
 /// ## package-lock.json (generated, N lines changed — summarized)
 ///
+/// ## path (symbols unavailable: why a side could not be read)
+///
 /// ## [~] path:Type::name — body changed (L88-138)
 ///   -  90| removed line (old-file line number)
 ///   +  90| added line
@@ -88,6 +90,11 @@ pub(crate) fn format_overview(
                 "## {rel_path} (generated, {changed_lines} {} changed — summarized)",
                 noun(changed_lines, "line", "lines")
             );
+            continue;
+        }
+
+        if let Some(error) = &overlay.read_error {
+            let _ = writeln!(out, "## {rel_path} (symbols unavailable: {error})");
             continue;
         }
 
@@ -166,13 +173,18 @@ pub(crate) fn format_file_detail(
         .filter(|c| !matches!(c.change, ChangeType::Unchanged))
         .count();
 
+    let symbols = overlay.read_error.as_ref().map_or_else(
+        || {
+            let symbols = noun(sym_touched, "symbol", "symbols");
+            format!("{sym_touched} {symbols} touched")
+        },
+        |error| format!("symbols unavailable: {error}"),
+    );
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "# Diff: {rel_path} — {sym_touched} {} touched, +{}/\u{2212}{} lines",
-        noun(sym_touched, "symbol", "symbols"),
-        overlay.added,
-        overlay.removed
+        "# Diff: {rel_path} — {symbols}, +{}/\u{2212}{} lines",
+        overlay.added, overlay.removed
     );
 
     for change in &overlay.symbol_changes {
@@ -237,8 +249,14 @@ pub(crate) fn format_function_detail(overlay: &FileOverlay, fn_name: &str) -> St
 
     let change = match candidates.as_slice() {
         [] => {
+            let why = overlay
+                .read_error
+                .as_ref()
+                .map_or_else(String::new, |error| {
+                    format!(" (symbols unavailable: {error})")
+                });
             return format!(
-                "# Diff: {} — `{fn_name}` not found in diff",
+                "# Diff: {} — `{fn_name}` not found in diff{why}",
                 overlay.path.display()
             );
         }
@@ -573,6 +591,7 @@ mod tests {
             conflicts: Vec::new(),
             is_generated: false,
             is_binary: false,
+            read_error: None,
         }
     }
 

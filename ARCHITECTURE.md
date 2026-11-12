@@ -942,10 +942,10 @@ single tool each.
    cannot be read fails as a read of it fails: `git diff --no-index`
    exits 1 for it, the code it gives for files that differ.
 3. **`resolve_sides`** decides where each side reads file content from
-   (`Side`: a revision, the index, the working tree, a file). It is the
-   one place that knows what a range means: `a..b` compares `a` with `b`,
-   `a...b` compares their merge base with `b`, a bare revision compares
-   it with the working tree.
+   (`Side`: a revision, the index, the working tree, or a file pair's
+   file or directory). It is the one place that knows what a range
+   means: `a..b` compares `a` with `b`, `a...b` compares their merge base
+   with `b`, a bare revision compares it with the working tree.
 4. **`parse::parse_unified_diff`** turns the raw text into
    `Vec<FileDiff>` — header, hunks, and lines numbered in the old file
    (removed lines) or the new file (the rest). A file starts at a
@@ -963,14 +963,17 @@ single tool each.
    innermost symbol of any kind, so an unchanged symbol keeps its own
    context out of sight. Lines no symbol takes, and all lines of a
    non-code file, stay in `other_lines`. The overlay's `+N/−M` counts
-   come from the patch itself.
+   come from the patch itself. Each side reads the file by the path the
+   patch names on that side; in a file pair that path starts at the
+   side's own root. When a side cannot be read, the file keeps its lines
+   and has no symbols, and the formatters say why (`read_error`).
 6. **`overlay::cross_file_matching`** detects symbols moved between
    files.
 7. **Scope** (`ScopeSpec`) — a `--scope` resolves against the base to a
-   path from the repository top. A changed file at that path
-   (or at its path before a rename) gives the file detail; a directory
-   gives the overview of the changed files under it; a trailing part of
-   a path (`main.rs`) must name one changed file. An existing path with
+   path from the repository top. A changed file at that path (or at its
+   old side's path, as after a rename) gives the file detail; a
+   directory gives the overview of the changed files under it; a
+   trailing part of a path (`main.rs`) must name one changed file. An existing path with
    no changes says so; anything else is an error. A patch or a file pair
    has no repository top, so an absolute scope there is refused.
 8. **`overlay::signature_warnings`** flags a signature changed in several
