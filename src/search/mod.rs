@@ -3286,12 +3286,11 @@ mod tests {
         let bloom = tilth_core::index::bloom::BloomFilterCache::new();
         search_symbol_expanded(
             "target",
-            tmp.path(),
+            Walk::new(tmp.path(), WalkConfig::default()),
             &OutlineCache::new(),
             &Session::new(),
             &bloom,
             1,
-            None,
             None,
             false,
             None,
@@ -3351,12 +3350,11 @@ mod tests {
         let bloom = tilth_core::index::bloom::BloomFilterCache::new();
         let out = search_symbol_expanded(
             "target",
-            tmp.path(),
+            Walk::new(tmp.path(), WalkConfig::default()),
             &OutlineCache::new(),
             &Session::new(),
             &bloom,
             1,
-            None,
             None,
             false,
             None,
