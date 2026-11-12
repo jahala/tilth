@@ -107,7 +107,7 @@ fn expansion_line(m: &Match, start: u32) -> u32 {
         return start;
     }
     let decorated = || {
-        let content = tilth_core::source::read_source(&m.path).ok()?;
+        let content = tilth_core::source::read_source(&m.path).ok().flatten()?;
         let FileType::Code(lang) =
             tilth_core::lang::detect_file_type_with_content(&m.path, &content)
         else {
@@ -795,7 +795,7 @@ fn format_single_match(
     // the existing outline / single-line preview branches.
     if m.is_definition && m.def_weight == 30 {
         if let Some((heading_line_1, section_end_1)) = m.def_range {
-            if let Ok(content) = tilth_core::source::read_source(&m.path) {
+            if let Ok(Some(content)) = tilth_core::source::read_source(&m.path) {
                 let lines: Vec<&str> = content.lines().collect();
                 // def_range is `(heading_line, section_end)` in 1-indexed
                 // inclusive form (see `find_defs_markdown_buf`). The body
@@ -1174,20 +1174,16 @@ fn basename_file_outline(
         .or_else(|| find_basename_fallback(walk, &query_lower))?;
 
     // Read file and generate outline
-    let content = tilth_core::source::read_source(&matched_path).ok()?;
+    let content = tilth_core::source::read_source(&matched_path)
+        .ok()
+        .flatten()?;
     let file_type = tilth_core::lang::detect_file_type_with_content(&matched_path, &content);
     let mtime = std::fs::metadata(&matched_path)
         .and_then(|m| m.modified())
         .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
 
     let outline = cache.get_or_compute(&matched_path, mtime, || {
-        crate::read::outline::generate(
-            &matched_path,
-            file_type,
-            &content,
-            content.as_bytes(),
-            false,
-        )
+        crate::read::outline::generate(&matched_path, file_type, &content, false)
     });
 
     if outline.trim().is_empty() {
@@ -1443,7 +1439,7 @@ fn format_search_result(
 /// For definitions: use tree-sitter node range (`def_range`).
 /// For usages: ±10 lines around the match.
 fn expand_match(m: &Match, scope: &Path) -> Option<(String, String)> {
-    let content = tilth_core::source::read_source(&m.path).ok()?;
+    let content = tilth_core::source::read_source(&m.path).ok().flatten()?;
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len() as u32;
 
@@ -1568,9 +1564,12 @@ fn get_outline_str(path: &std::path::Path, cache: &OutlineCache) -> Option<std::
     Some(cache.get_or_compute(path, mtime, || {
         // An unreadable file gets an empty outline, so its matches show no
         // outline context; the matches themselves are reported either way.
-        let content = tilth_core::source::read_source(path).unwrap_or_default();
+        let content = tilth_core::source::read_source(path)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
         let file_type = tilth_core::lang::detect_file_type_with_content(path, &content);
-        read::outline::generate(path, file_type, &content, content.as_bytes(), false)
+        read::outline::generate(path, file_type, &content, false)
     }))
 }
 
@@ -1644,7 +1643,7 @@ fn markdown_enclosing_scope(path: &std::path::Path, match_line: u32) -> Option<S
     if match_line == 0 {
         return None;
     }
-    let content = tilth_core::source::read_source(path).ok()?;
+    let content = tilth_core::source::read_source(path).ok().flatten()?;
     let tree = tilth_core::lang::outline::parse_markdown(&content)?;
     let lines: Vec<&str> = content.lines().collect();
     let mut best: Option<(tree_sitter::Node, u32)> = None;
@@ -3133,8 +3132,7 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         let file_type = tilth_core::lang::detect_file_type_with_content(&path, &content);
         assert_eq!(file_type, FileType::Code(tilth_core::types::Lang::Cpp));
-        let expected =
-            read::outline::generate(&path, file_type, &content, content.as_bytes(), false);
+        let expected = read::outline::generate(&path, file_type, &content, false);
         let cache = OutlineCache::new();
         assert_eq!(
             get_outline_str(&path, &cache).as_deref(),

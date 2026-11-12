@@ -387,6 +387,10 @@ pub(in crate::mcp) fn tool_write(
                     continue;
                 };
                 let pre_existed = path.try_exists().unwrap_or(false);
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "a file that is not UTF-8 reads as empty here until #353"
+                )]
                 let before = (show_diff && pre_existed)
                     .then(|| tilth_core::source::read_to_string(&path).ok())
                     .flatten();
@@ -435,6 +439,10 @@ pub(in crate::mcp) fn tool_write(
                 // re-read: re-reading would race a concurrent appender, whose
                 // extra lines inflate the count and mis-number the echoed hash
                 // anchors — the agent then hash-edits against wrong line numbers.
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "a file that is not UTF-8 reads as empty here until #353"
+                )]
                 let before = tilth_core::source::read_to_string(&path).ok();
                 match crate::mcp::write::write_append(&path, content) {
                     Ok(()) => {

@@ -221,11 +221,11 @@ fn read_signature_file(path: &Path, cache: &OutlineCache) -> Result<String, Tilt
     // The path says whether a file is code; its content only settles which
     // language a `.h` is. Any other file gets its default view, streamed.
     let FileType::Code(lang) = detect_file_type(path) else {
-        return crate::read::non_code_view(path, cache);
+        return crate::read::default_view(path, cache);
     };
-    // A pipe, socket or device has no fixed contents and shows as empty.
+    // A binary file, and a pipe, socket or device, show as a read shows them.
     let Some((content, byte_len)) = crate::read::read_text(path)? else {
-        return Ok(crate::read::empty_view(path));
+        return crate::read::default_view(path, cache);
     };
     let lang = tilth_core::lang::refine_lang(lang, path, &content);
     let line_count = u32::try_from(content.lines().count()).unwrap_or(u32::MAX);
@@ -271,11 +271,11 @@ fn render_signature_entries(entries: &[OutlineEntry], lines: &[&str], out: &mut 
 fn read_stripped_file(path: &Path, cache: &OutlineCache) -> Result<String, TilthError> {
     // Any file that is not code gets its default view, streamed.
     if !matches!(detect_file_type(path), FileType::Code(_)) {
-        return crate::read::non_code_view(path, cache);
+        return crate::read::default_view(path, cache);
     }
-    // A pipe, socket or device has no fixed contents and shows as empty.
+    // A binary file, and a pipe, socket or device, show as a read shows them.
     let Some((raw, byte_len)) = crate::read::read_text(path)? else {
-        return Ok(crate::read::empty_view(path));
+        return crate::read::default_view(path, cache);
     };
     // A non-editable view, so it reads like search does: without the mark.
     let content = tilth_core::source::strip_bom(&raw);
@@ -325,10 +325,6 @@ fn fair_share(sizes: &[u64], budget: u64) -> Option<u64> {
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "by design: tests read the files they check directly"
-)]
 mod tests {
     use super::*;
 
@@ -360,8 +356,7 @@ mod tests {
     }
 
     /// A file that is not code gets its default view in the signature and
-    /// stripped views. One that is not UTF-8 fails with the error reading
-    /// it to a string gives, as those views always made it fail.
+    /// stripped views, one that is not UTF-8 included.
     #[test]
     fn signature_and_stripped_views_of_a_non_code_file() {
         use std::fmt::Write as _;
@@ -380,17 +375,32 @@ mod tests {
 
         let bad = dir.path().join("bad.log");
         std::fs::write(&bad, b"ok\n\xff\n").unwrap();
-        let expected = TilthError::IoError {
-            path: bad.clone(),
-            source: std::fs::read_to_string(&bad).unwrap_err(),
-        }
-        .to_string();
-        for view in [
-            read_signature_file(&bad, &cache),
-            read_stripped_file(&bad, &cache),
-        ] {
-            assert_eq!(view.unwrap_err().to_string(), expected);
-        }
+        let default = crate::read::read_file(&bad, None, None, &cache, false, None).unwrap();
+        assert!(default.ends_with("ok\n\u{fffd}\n"), "{default}");
+        assert_eq!(read_signature_file(&bad, &cache).unwrap(), default);
+        assert_eq!(read_stripped_file(&bad, &cache).unwrap(), default);
+    }
+
+    /// The signature and stripped views read a code file that is not UTF-8
+    /// from its lossy text, as search and the default read do, and show a
+    /// binary one as the default read does.
+    #[test]
+    fn signature_and_stripped_views_of_a_code_file_that_is_not_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = OutlineCache::new();
+        let latin1 = dir.path().join("latin1.rs");
+        std::fs::write(&latin1, b"// caf\xe9\nfn alpha() {}\n").unwrap();
+        let signature = read_signature_file(&latin1, &cache).unwrap();
+        assert!(signature.ends_with("|fn alpha() {}"), "{signature}");
+        let stripped = read_stripped_file(&latin1, &cache).unwrap();
+        assert!(stripped.ends_with("2  fn alpha() {}"), "{stripped}");
+
+        let binary = dir.path().join("blob.rs");
+        std::fs::write(&binary, b"fn alpha() {}\n\0\n").unwrap();
+        let default = crate::read::read_file(&binary, None, None, &cache, false, None).unwrap();
+        assert!(default.contains("(binary, "), "{default}");
+        assert_eq!(read_signature_file(&binary, &cache).unwrap(), default);
+        assert_eq!(read_stripped_file(&binary, &cache).unwrap(), default);
     }
 
     use crate::mcp::tools::tool_definitions;

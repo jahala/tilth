@@ -176,7 +176,7 @@ impl OutlineCache {
         let crate::types::FileType::Code(lang) = crate::lang::detect_file_type(path) else {
             return None;
         };
-        let content = crate::source::read_source(path).ok()?;
+        let content = crate::source::read_source(path).ok().flatten()?;
         let lang = crate::lang::refine_lang(lang, path, &content);
         let ts_lang = crate::lang::outline::outline_language(lang)?;
         let mut parser = tree_sitter::Parser::new();

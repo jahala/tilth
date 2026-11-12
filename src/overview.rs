@@ -460,7 +460,9 @@ fn parse_cargo_toml(root: &Path) -> Option<ManifestInfo> {
         version: Option<String>,
     }
 
-    let content = tilth_core::source::read_source(&root.join("Cargo.toml")).ok()?;
+    let content = tilth_core::source::read_source(&root.join("Cargo.toml"))
+        .ok()
+        .flatten()?;
     let parsed: CargoToml = toml::from_str(&content).ok()?;
     let (name, version) = parsed.package.map_or((None, None), |p| (p.name, p.version));
     let mut deps: Vec<String> = parsed
@@ -483,7 +485,9 @@ fn parse_package_json(root: &Path) -> Option<ManifestInfo> {
         dependencies: Option<serde_json::Map<String, serde_json::Value>>,
     }
 
-    let content = tilth_core::source::read_source(&root.join("package.json")).ok()?;
+    let content = tilth_core::source::read_source(&root.join("package.json"))
+        .ok()
+        .flatten()?;
     let parsed: PackageJson = serde_json::from_str(&content).ok()?;
     let mut deps: Vec<String> = parsed
         .dependencies
@@ -498,7 +502,9 @@ fn parse_package_json(root: &Path) -> Option<ManifestInfo> {
 }
 
 fn parse_go_mod(root: &Path) -> Option<ManifestInfo> {
-    let content = tilth_core::source::read_source(&root.join("go.mod")).ok()?;
+    let content = tilth_core::source::read_source(&root.join("go.mod"))
+        .ok()
+        .flatten()?;
     let mut name = None;
     let mut deps: Vec<String> = Vec::new();
     let mut in_require = false;
@@ -549,7 +555,9 @@ fn parse_pyproject_toml(root: &Path) -> Option<ManifestInfo> {
         dependencies: Option<Vec<String>>,
     }
 
-    let content = tilth_core::source::read_source(&root.join("pyproject.toml")).ok()?;
+    let content = tilth_core::source::read_source(&root.join("pyproject.toml"))
+        .ok()
+        .flatten()?;
     let parsed: PyProject = toml::from_str(&content).ok()?;
     let project = parsed.project.unwrap_or_default();
     let mut deps: Vec<String> = project
@@ -597,6 +605,10 @@ fn git_output(root: &Path, args: &[&str]) -> Option<String> {
                     return None;
                 }
                 let out = child.stdout.take()?;
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "by design: a child process's output, not a file"
+                )]
                 let s = std::io::read_to_string(out).ok()?;
                 let trimmed = s.trim().to_string();
                 return if trimmed.is_empty() {
@@ -694,8 +706,8 @@ fn test_style(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opt
             .take(5)
             .any(|(path, _)| {
                 let full = root.join(path);
-                tilth_core::source::read_to_string(&full)
-                    .is_ok_and(|content| content.contains("#[cfg(test)]"))
+                tilth_core::source::read_source(&full)
+                    .is_ok_and(|content| content.is_some_and(|c| c.contains("#[cfg(test)]")))
             });
         if has_cfg_test {
             styles.push("in-source #[cfg(test)]".to_string());
@@ -732,7 +744,7 @@ fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opti
 
     for (rel_path, _) in &files {
         let full = root.join(rel_path);
-        let Ok(content) = tilth_core::source::read_source(&full) else {
+        let Ok(Some(content)) = tilth_core::source::read_source(&full) else {
             continue;
         };
 

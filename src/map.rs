@@ -62,10 +62,12 @@ pub fn generate(
                 let outline_str = cache.get_or_compute(path, mtime, || {
                     // Best-effort: an unreadable file contributes no outline symbols rather than
                     // aborting the map. Errors are intentionally swallowed here.
-                    let content = tilth_core::source::read_source(path).unwrap_or_default();
-                    let buf = content.as_bytes();
+                    let content = tilth_core::source::read_source(path)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default();
                     let file_type = detect_file_type_with_content(path, &content);
-                    outline::generate(path, file_type, &content, buf, true)
+                    outline::generate(path, file_type, &content, true)
                 });
 
                 Some(extract_symbol_names(&outline_str))
