@@ -17,6 +17,7 @@ pub struct GlobResult {
     pub pattern: String,
     pub files: Vec<GlobFileEntry>,
     pub total_found: usize,
+    /// Every file extension in scope, sorted, when nothing matched.
     pub available_extensions: Vec<String>,
 }
 
@@ -97,7 +98,6 @@ pub fn search(pattern: &str, scope: &Path) -> Result<GlobResult, TilthError> {
     let available_extensions: Vec<String> = if files.is_empty() {
         let mut exts: Vec<String> = extensions.into_iter().collect();
         exts.sort();
-        exts.truncate(10);
         exts
     } else {
         Vec::new()

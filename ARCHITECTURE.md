@@ -1012,7 +1012,9 @@ A handful of small files cut across every subsystem.
   `number_lines(content, start)` and `hashlines(content, start)` are
   the line-numbering / hash-anchored variants. `noun(n, one, many)`
   picks the noun after every count in tilth's output, so a count of
-  one reads `1 line`.
+  one reads `1 line`. `and_more(total, limit)` ends a list cut to its
+  first `limit` with `and N more`, and `capped_list` sets a comma list
+  that way, as in `a, b, and 3 more`.
 - **`budget.rs`** — `apply(output, budget)` truncates a finished
   output string to a token budget. Used by every entry point and tool.
 - **`error.rs`** (`tilth-core`) — `TilthError` enum (`NotFound`, `PermissionDenied`,
