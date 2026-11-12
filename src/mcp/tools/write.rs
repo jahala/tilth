@@ -105,17 +105,72 @@ fn parse_overwrite_flag(f: &Value) -> Option<bool> {
     }
 }
 
-fn render_text_diff(before: Option<&str>, after: &str) -> String {
-    let mut out = String::from("── diff ──\n--- before\n+++ after\n");
-    if let Some(before) = before {
-        for line in before.lines() {
-            let _ = writeln!(out, "- {line}");
-        }
+/// The line diff of a direct write, every line removed then every line
+/// added. `None` is a binary side: its header says so, and it shows no lines.
+fn render_text_diff(before: Option<&str>, after: Option<&str>) -> String {
+    let binary = |text: Option<&str>| if text.is_some() { "" } else { " (binary)" };
+    let mut out = format!(
+        "── diff ──\n--- before{}\n+++ after{}\n",
+        binary(before),
+        binary(after)
+    );
+    for line in before.unwrap_or_default().lines() {
+        let _ = writeln!(out, "- {line}");
     }
-    for line in after.lines() {
+    for line in after.unwrap_or_default().lines() {
         let _ = writeln!(out, "+ {line}");
     }
     out
+}
+
+/// What an append of `content` reports, given the file's text `before` it
+/// (`None` for a binary file). A text file echoes the appended region's
+/// hashlines alone, so a log-shaped file does not balloon the response; a
+/// binary file has no lines to number, so it echoes none.
+fn append_echo(before: Option<&str>, content: &str, show_diff: bool) -> String {
+    let bytes = format!("{} {}", content.len(), noun(content.len(), "byte", "bytes"));
+    let Some(before) = before else {
+        let mut echo = format!("append: {bytes} to a binary file, not echoed\n");
+        if show_diff {
+            echo.push_str(&render_text_diff(None, None));
+        }
+        return echo;
+    };
+    let after = format!("{before}{content}");
+    // No trailing newline on the prior content means the first appended line
+    // merges onto the last existing line, so the echoed region starts one
+    // line earlier.
+    let merged = !before.is_empty() && !before.ends_with('\n');
+    let pre_count = before.lines().count();
+    let after_lines: Vec<&str> = after.lines().collect();
+    let total = after_lines.len();
+    let start_idx = if merged {
+        pre_count.saturating_sub(1)
+    } else {
+        pre_count
+    }
+    .min(total);
+    let tail = after_lines[start_idx..].join("\n");
+    let start_line = (start_idx + 1) as u32;
+    let mut echo = format!(
+        "append: {bytes} (echoing last {} of {total} {})\n{}",
+        total - start_idx,
+        noun(total, "line", "lines"),
+        crate::format::hashlines(&tail, start_line),
+    );
+    if show_diff {
+        echo.push_str(&render_text_diff(Some(before), Some(&after)));
+    }
+    echo
+}
+
+/// The text of the file at `path` before a write, by the one rule of
+/// [`tilth_core::source::into_text`], for the echo and the diff alone:
+/// `None` for a binary file. A file that is absent or cannot be read has
+/// no earlier text, so it reads as empty.
+fn earlier_text(path: &Path) -> Option<String> {
+    tilth_core::source::read(path)
+        .map_or_else(|_| Some(String::new()), tilth_core::source::into_text)
 }
 
 /// Returns true if `path` resolves under `scope` (canonical path containment).
@@ -387,13 +442,11 @@ pub(in crate::mcp) fn tool_write(
                     continue;
                 };
                 let pre_existed = path.try_exists().unwrap_or(false);
-                #[expect(
-                    clippy::disallowed_methods,
-                    reason = "a file that is not UTF-8 reads as empty here until #353"
-                )]
-                let before = (show_diff && pre_existed)
-                    .then(|| tilth_core::source::read_to_string(&path).ok())
-                    .flatten();
+                let before = if show_diff && pre_existed {
+                    earlier_text(&path)
+                } else {
+                    Some(String::new())
+                };
                 match crate::mcp::write::write_overwrite(&path, content, overwrite) {
                     Ok(()) => {
                         let line_count = content.lines().count();
@@ -407,7 +460,7 @@ pub(in crate::mcp) fn tool_write(
                             crate::format::hashlines(content, 1),
                         );
                         if show_diff {
-                            block.push_str(&render_text_diff(before.as_deref(), content));
+                            block.push_str(&render_text_diff(before.as_deref(), Some(content)));
                         }
                         // Warn when a relative path (no `root`) crosses a worktree boundary.
                         if let Some(warn) = crossed_worktree(path_str, &path) {
@@ -439,44 +492,14 @@ pub(in crate::mcp) fn tool_write(
                 // re-read: re-reading would race a concurrent appender, whose
                 // extra lines inflate the count and mis-number the echoed hash
                 // anchors — the agent then hash-edits against wrong line numbers.
-                #[expect(
-                    clippy::disallowed_methods,
-                    reason = "a file that is not UTF-8 reads as empty here until #353"
-                )]
-                let before = tilth_core::source::read_to_string(&path).ok();
+                let before = earlier_text(&path);
                 match crate::mcp::write::write_append(&path, content) {
                     Ok(()) => {
-                        let before_str = before.as_deref().unwrap_or("");
-                        let after = format!("{before_str}{content}");
-                        // No trailing newline on the prior content means the first
-                        // appended line merges onto the last existing line, so the
-                        // echoed region starts one line earlier.
-                        let merged = !before_str.is_empty() && !before_str.ends_with('\n');
-                        let pre_count = before_str.lines().count();
-                        let after_lines: Vec<&str> = after.lines().collect();
-                        let total = after_lines.len();
-                        let start_idx = if merged {
-                            pre_count.saturating_sub(1)
-                        } else {
-                            pre_count
-                        }
-                        .min(total);
-                        let tail = after_lines[start_idx..].join("\n");
-                        let start_line = (start_idx + 1) as u32;
-                        // Echo only the appended region's hashlines so log-shaped
-                        // append targets don't balloon the response.
                         let mut block = format!(
-                            "## {}\nappend: {} {} (echoing last {} of {total} {})\n{}",
+                            "## {}\n{}",
                             resolved_display(&path),
-                            content.len(),
-                            noun(content.len(), "byte", "bytes"),
-                            total - start_idx,
-                            noun(total, "line", "lines"),
-                            crate::format::hashlines(&tail, start_line),
+                            append_echo(before.as_deref(), content, show_diff)
                         );
-                        if show_diff {
-                            block.push_str(&render_text_diff(before.as_deref(), &after));
-                        }
                         // Warn when a relative path (no `root`) crosses a worktree boundary.
                         if let Some(warn) = crossed_worktree(path_str, &path) {
                             block.push_str(&warn);
@@ -905,6 +928,112 @@ mod tests {
             "appended line should be hashlined as line 4: {out}"
         );
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "a\nb\nc\nd\n");
+    }
+
+    /// One `tilth_write` call with `diff: true` on the files in `dir`.
+    fn write_with_diff(dir: &Path, files: &Value) -> String {
+        let args = serde_json::json!({
+            "scope": dir.to_str().unwrap(),
+            "diff": true,
+            "files": files,
+        });
+        tool_write(
+            &args,
+            &Session::new(),
+            &fresh_bloom(),
+            WalkConfig::default(),
+            None,
+        )
+        .unwrap()
+    }
+
+    /// A file that is not UTF-8 is text by the one rule, so an append
+    /// numbers its lines from the file's real line count and the diff shows
+    /// its earlier lines, each Latin-1 byte as U+FFFD. The file keeps its
+    /// bytes.
+    #[test]
+    fn append_to_latin1_file_numbers_from_its_line_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("notes.txt");
+        std::fs::write(&p, b"one\ncaf\xe9\nthree\n").unwrap();
+        let out = write_with_diff(
+            dir.path(),
+            &serde_json::json!([{"path": p.to_str().unwrap(), "mode": "append", "content": "four\n"}]),
+        );
+        assert!(out.contains("echoing last 1 of 4 lines"), "{out}");
+        assert!(out.contains("\n4:"), "the appended line is line 4: {out}");
+        assert!(
+            out.contains("- one\n- caf\u{fffd}\n- three\n+ one\n+ caf\u{fffd}\n"),
+            "{out}"
+        );
+        assert_eq!(std::fs::read(&p).unwrap(), b"one\ncaf\xe9\nthree\nfour\n");
+    }
+
+    /// An append onto a Latin-1 line with no newline echoes the merged line
+    /// as text, and writes only the appended bytes after the file's own.
+    #[test]
+    fn append_merging_onto_latin1_line_keeps_its_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("notes.txt");
+        std::fs::write(&p, b"one\ncaf\xe9").unwrap();
+        let out = write_with_diff(
+            dir.path(),
+            &serde_json::json!([{"path": p.to_str().unwrap(), "mode": "append", "content": "s\n"}]),
+        );
+        assert!(out.contains("echoing last 1 of 2 lines"), "{out}");
+        assert!(out.contains("|caf\u{fffd}s\n"), "{out}");
+        assert_eq!(std::fs::read(&p).unwrap(), b"one\ncaf\xe9s\n");
+    }
+
+    /// An overwrite's diff shows a Latin-1 file's earlier lines, and the file
+    /// then holds exactly the new content.
+    #[test]
+    fn overwrite_diff_of_latin1_file_shows_its_old_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("notes.txt");
+        std::fs::write(&p, b"old caf\xe9\nold two\n").unwrap();
+        let out = write_with_diff(
+            dir.path(),
+            &serde_json::json!([{
+                "path": p.to_str().unwrap(), "mode": "overwrite", "overwrite": true, "content": "new\n",
+            }]),
+        );
+        assert!(
+            out.contains("--- before\n+++ after\n- old caf\u{fffd}\n- old two\n+ new\n"),
+            "{out}"
+        );
+        assert_eq!(std::fs::read(&p).unwrap(), b"new\n");
+    }
+
+    /// A binary file has no text by the one rule: an append to one echoes
+    /// no lines, and a diff names the binary side instead of showing it as
+    /// empty. The file keeps its bytes.
+    #[test]
+    fn writes_to_binary_file_show_no_text_for_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("blob.bin");
+        let ovr = dir.path().join("old.bin");
+        std::fs::write(&app, b"\x89PNG\0\xff\n").unwrap();
+        std::fs::write(&ovr, b"\x89PNG\0\xff\n").unwrap();
+        let out = write_with_diff(
+            dir.path(),
+            &serde_json::json!([
+                {"path": app.to_str().unwrap(), "mode": "append", "content": "tail\n"},
+                {"path": ovr.to_str().unwrap(), "mode": "overwrite", "overwrite": true, "content": "text\n"},
+            ]),
+        );
+        assert!(
+            out.contains(
+                "append: 5 bytes to a binary file, not echoed\n── diff ──\n--- before (binary)\n+++ after (binary)\n"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("--- before (binary)\n+++ after\n+ text\n"),
+            "{out}"
+        );
+        assert_eq!(std::fs::read(&app).unwrap(), b"\x89PNG\0\xff\ntail\n");
+        assert_eq!(std::fs::read(&ovr).unwrap(), b"text\n");
     }
 
     // -- root parameter tests (issue #73) --
