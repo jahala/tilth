@@ -456,16 +456,9 @@ fn run_inner(
             let mut out = read::read_file(&path, section, full, cache, false, budget_tokens)?;
             if section.is_none() && !full && read::would_outline(&path) {
                 let related = tilth_core::imports::resolve_related_files(&path, cache);
-                if !related.is_empty() {
-                    let hints: Vec<String> = related
-                        .iter()
-                        .take(read::RELATED_HINT_LIMIT)
-                        .filter_map(|p| p.strip_prefix(scope).ok().or(Some(p.as_path())))
-                        .map(|p| p.display().to_string())
-                        .collect();
-                    out.push_str("\n\n> Related: ");
-                    out.push_str(&hints.join(", "));
-                }
+                out.push_str(&read::related_hint(
+                    related.iter().map(|p| p.strip_prefix(scope).unwrap_or(p)),
+                ));
             }
             out
         }
@@ -1007,5 +1000,35 @@ mod tests {
         let err = run("src/nothing_here.rs", dir.path(), None, None, None, &cache)
             .expect_err("a missing path is an error");
         assert!(err.to_string().starts_with("not found: "), "{err}");
+    }
+
+    /// The `> Related:` line under an outlined read named the first eight
+    /// local imports and said nothing of the rest.
+    #[test]
+    fn read_related_line_counts_the_imports_it_leaves_out() {
+        use std::fmt::Write as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let scope = dir.path().canonicalize().unwrap();
+        let mut src = String::new();
+        for i in 0..12 {
+            writeln!(src, "import {{ helper{i:02} }} from './helper{i:02}';").unwrap();
+            std::fs::write(
+                scope.join(format!("helper{i:02}.js")),
+                format!("export function helper{i:02}() {{}}\n"),
+            )
+            .unwrap();
+        }
+        for i in 0..6000 {
+            writeln!(src, "export function f{i:05}(a, b) {{ return a + b; }}").unwrap();
+        }
+        std::fs::write(scope.join("dense.js"), src).unwrap();
+
+        let out = run("dense.js", &scope, None, None, None, &OutlineCache::new()).unwrap();
+        let shown: Vec<String> = (0..8).map(|i| format!("helper{i:02}.js")).collect();
+        assert!(
+            out.ends_with(&format!("\n\n> Related: {}, and 4 more", shown.join(", "))),
+            "{}",
+            &out[out.floor_char_boundary(out.len().saturating_sub(400))..]
+        );
     }
 }

@@ -715,8 +715,9 @@ Two helpers feed the MCP layer:
   is going to see an outline.
 - `tilth_core::imports::resolve_related_files` does the related-file
   resolution for the same hint. It returns every local import; the
-  hint names the first `RELATED_HINT_LIMIT` (8). Deps and callee
-  resolution use the full list.
+  hint names the first `RELATED_HINT_LIMIT` (8) and counts the rest
+  (`and 4 more`). `read::related_hint` writes the line for the CLI and
+  MCP reads alike. Deps and callee resolution use the full list.
 
 ## Language layer (`crates/tilth-core/src/lang/`)
 
