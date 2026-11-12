@@ -11,7 +11,7 @@ use streaming_iterator::StreamingIterator;
 
 use crate::error::TilthError;
 use crate::lang::outline::outline_language;
-use crate::lang::treesitter::is_bodiless_declaration;
+use crate::lang::treesitter::{compiled_query, is_bodiless_declaration};
 use crate::lang::{detect_file_type, detect_file_type_with_content};
 use crate::search::walk::Walk;
 use crate::types::FileType;
@@ -332,80 +332,76 @@ fn find_callers_treesitter_batch(
     // Test code the path alone does not reveal (see `test_site`).
     let test_site = crate::lang::spec::spec(lang).test_site;
 
-    let Some(callers) = super::callee_query::with_callee_query(ts_lang, query_str, |query| {
-        let Some(callee_idx) = query.capture_index_for_name("callee") else {
-            return Vec::new();
-        };
-
-        let mut cursor = tree_sitter::QueryCursor::new();
-        let mut matches = cursor.matches(query, tree.root_node(), content_bytes);
-        let mut callers = Vec::new();
-
-        while let Some(m) = matches.next() {
-            for cap in m.captures() {
-                if cap.index != callee_idx {
-                    continue;
-                }
-
-                // Check if the captured text matches any of our target symbols
-                let Ok(text) = cap.node.utf8_text(content_bytes) else {
-                    continue;
-                };
-
-                if !targets.contains(text) {
-                    continue;
-                }
-
-                // Some patterns match more than a call (see `callee_filter`).
-                if callee_filter.is_some_and(|keep| !keep(&cap.node)) {
-                    continue;
-                }
-
-                let matched_target = text.to_string();
-
-                // Found a call site! Now walk up to find the calling function
-                let line = cap.node.start_position().row as u32 + 1;
-
-                // Get the call text (the whole call expression, not just the
-                // callee). When the parent spans lines no single line is the
-                // call, so show the callee's own line instead of the bare name.
-                // Applies to every language; a macro's token tree makes it the
-                // common case for Rust.
-                let call_node = cap.node.parent().unwrap_or(cap.node);
-                let same_line = call_node.start_position().row == call_node.end_position().row;
-                let row = if same_line {
-                    call_node.start_position().row
-                } else {
-                    cap.node.start_position().row
-                };
-                let call_text: String = lines
-                    .get(row)
-                    .map_or_else(|| matched_target.clone(), |l| l.trim().to_string());
-
-                // Walk up the tree to find the enclosing function
-                let (calling_function, caller_range) =
-                    find_enclosing_function(cap.node, &lines, lang);
-
-                callers.push((
-                    matched_target,
-                    CallerMatch {
-                        path: path.to_path_buf(),
-                        line,
-                        calling_function,
-                        call_text,
-                        caller_range,
-                        in_test: test_site
-                            .is_some_and(|in_test| in_test(&cap.node, content_bytes, path, scope)),
-                        content: Arc::clone(&shared_content),
-                    },
-                ));
-            }
-        }
-
-        callers
-    }) else {
+    let Some(query) = compiled_query(ts_lang, query_str) else {
         return (Vec::new(), owners);
     };
+    let Some(callee_idx) = query.capture_index_for_name("callee") else {
+        return (Vec::new(), owners);
+    };
+
+    let mut cursor = tree_sitter::QueryCursor::new();
+    let mut matches = cursor.matches(query, tree.root_node(), content_bytes);
+    let mut callers = Vec::new();
+
+    while let Some(m) = matches.next() {
+        for cap in m.captures() {
+            if cap.index != callee_idx {
+                continue;
+            }
+
+            // Check if the captured text matches any of our target symbols
+            let Ok(text) = cap.node.utf8_text(content_bytes) else {
+                continue;
+            };
+
+            if !targets.contains(text) {
+                continue;
+            }
+
+            // Some patterns match more than a call (see `callee_filter`).
+            if callee_filter.is_some_and(|keep| !keep(&cap.node)) {
+                continue;
+            }
+
+            let matched_target = text.to_string();
+
+            // Found a call site! Now walk up to find the calling function
+            let line = cap.node.start_position().row as u32 + 1;
+
+            // Get the call text (the whole call expression, not just the
+            // callee). When the parent spans lines no single line is the
+            // call, so show the callee's own line instead of the bare name.
+            // Applies to every language; a macro's token tree makes it the
+            // common case for Rust.
+            let call_node = cap.node.parent().unwrap_or(cap.node);
+            let same_line = call_node.start_position().row == call_node.end_position().row;
+            let row = if same_line {
+                call_node.start_position().row
+            } else {
+                cap.node.start_position().row
+            };
+            let call_text: String = lines
+                .get(row)
+                .map_or_else(|| matched_target.clone(), |l| l.trim().to_string());
+
+            // Walk up the tree to find the enclosing function
+            let (calling_function, caller_range) = find_enclosing_function(cap.node, &lines, lang);
+
+            callers.push((
+                matched_target,
+                CallerMatch {
+                    path: path.to_path_buf(),
+                    line,
+                    calling_function,
+                    call_text,
+                    caller_range,
+                    in_test: test_site
+                        .is_some_and(|in_test| in_test(&cap.node, content_bytes, path, scope)),
+                    content: Arc::clone(&shared_content),
+                },
+            ));
+        }
+    }
 
     (callers, owners)
 }

@@ -1,5 +1,6 @@
 //! Shared tree-sitter utilities used by symbol search and caller search.
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 
@@ -668,45 +669,40 @@ pub(crate) fn definition_weight(kind: &str) -> u16 {
     }
 }
 
-/// Global cache of compiled tree-sitter queries, shared by symbol/caller
-/// search (`search::siblings`) and per-language extractors (e.g. Go's
-/// receiver-name lookup). Keyed by `(node_kind_count, field_count,
-/// query_str_ptr)` so that distinct query strings for the same language are
-/// stored under separate keys. We avoid `Language::name()` because ABI < 15
-/// grammars (e.g. tree-sitter-kotlin-ng) return `None`.
-#[expect(
-    clippy::type_complexity,
-    reason = "by design: a key tuple and a map under a lock; a type alias would only rename it"
-)]
-static QUERY_CACHE: LazyLock<Mutex<HashMap<(usize, usize, usize), tree_sitter::Query>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// A stable key for a grammar: `(node_kind_count, field_count)`, which
+/// differs for every grammar tilth ships. `Language::name()` would not do,
+/// because grammars older than ABI 15 (tree-sitter-kotlin-ng) return `None`.
+fn grammar_key(ts_lang: &tree_sitter::Language) -> (usize, usize) {
+    (ts_lang.node_kind_count(), ts_lang.field_count())
+}
 
-/// Look up or compile `query_str` for `ts_lang`, then invoke `f` with a
-/// reference to the cached `Query`. Returns `None` if compilation fails.
+/// `query_str` compiled for `ts_lang`, compiled on first use and kept for
+/// the life of the process. Returns `None` if it does not compile.
 ///
-/// `query_str` must be `'static` so its pointer address is stable across
-/// calls and can serve as part of the cache key.
-pub fn with_query<R>(
+/// The lock is held only to look the query up, or to compile it once, so
+/// threads matching files in parallel run their matches side by side.
+/// Each query is leaked to get the `'static` borrow that lets matching run
+/// without the lock. The leak is bounded: one query per grammar and query
+/// text, and tilth passes only the fixed query strings in its source.
+pub fn compiled_query(
     ts_lang: &tree_sitter::Language,
     query_str: &'static str,
-    f: impl FnOnce(&tree_sitter::Query) -> R,
-) -> Option<R> {
-    use std::collections::hash_map::Entry;
-    // Pointer address distinguishes different queries for the same language.
-    let key = (
-        ts_lang.node_kind_count(),
-        ts_lang.field_count(),
-        query_str.as_ptr() as usize,
-    );
-    let mut cache = QUERY_CACHE
+) -> Option<&'static tree_sitter::Query> {
+    #[expect(
+        clippy::type_complexity,
+        reason = "by design: a key tuple and a map under a lock; a type alias would only rename it"
+    )]
+    static COMPILED: LazyLock<Mutex<HashMap<((usize, usize), &str), &tree_sitter::Query>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    let mut compiled = COMPILED
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    // `f` borrows the query from the cache, so the lock is held while it runs.
-    match cache.entry(key) {
-        Entry::Occupied(e) => Some(f(e.get())),
+    match compiled.entry((grammar_key(ts_lang), query_str)) {
+        Entry::Occupied(e) => Some(*e.get()),
         Entry::Vacant(e) => {
             let query = tree_sitter::Query::new(ts_lang, query_str).ok()?;
-            Some(f(e.insert(query)))
+            Some(*e.insert(Box::leak(Box::new(query))))
         }
     }
 }
@@ -951,5 +947,56 @@ mod tests {
             extract_definition_name(typedef, &lines).as_deref(),
             Some("cmp_fn")
         );
+    }
+
+    #[test]
+    fn grammar_keys_are_unique() {
+        // A collision would make one language's queries serve another's.
+        let grammars: Vec<(&str, tree_sitter::Language)> = vec![
+            ("rust", tree_sitter_rust::LANGUAGE.into()),
+            (
+                "typescript",
+                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            ),
+            ("tsx", tree_sitter_typescript::LANGUAGE_TSX.into()),
+            ("javascript", tree_sitter_javascript::LANGUAGE.into()),
+            ("python", tree_sitter_python::LANGUAGE.into()),
+            ("go", tree_sitter_go::LANGUAGE.into()),
+            ("java", tree_sitter_java::LANGUAGE.into()),
+            ("c", tree_sitter_c::LANGUAGE.into()),
+            ("cpp", tree_sitter_cpp::LANGUAGE.into()),
+            ("ruby", tree_sitter_ruby::LANGUAGE.into()),
+            ("php", tree_sitter_php::LANGUAGE_PHP.into()),
+            ("scala", tree_sitter_scala::LANGUAGE.into()),
+            ("csharp", tree_sitter_c_sharp::LANGUAGE.into()),
+            ("swift", tree_sitter_swift::LANGUAGE.into()),
+            ("kotlin", tree_sitter_kotlin_ng::LANGUAGE.into()),
+            ("elixir", tree_sitter_elixir::LANGUAGE.into()),
+            ("bash", tree_sitter_bash::LANGUAGE.into()),
+        ];
+        let mut seen = HashMap::new();
+        for (name, lang) in &grammars {
+            let key = grammar_key(lang);
+            if let Some(prev) = seen.insert(key, name) {
+                panic!("grammar key collision: {prev} and {name} both produce {key:?}");
+            }
+        }
+    }
+
+    /// The leak in `compiled_query` stays bounded only if a second call
+    /// returns the query the first one compiled.
+    #[test]
+    fn compiled_query_compiles_once_per_grammar_and_text() {
+        const QUERY: &str = "(identifier) @name";
+        let rust = outline_language(Lang::Rust).expect("rust grammar");
+        let go = outline_language(Lang::Go).expect("go grammar");
+        let first = compiled_query(&rust, QUERY).expect("query compiles for rust");
+        // The same text at another address is the same query.
+        let copy: &'static str = String::from(QUERY).leak();
+        let again = compiled_query(&rust, copy).expect("query compiles for rust");
+        assert!(std::ptr::eq(first, again));
+        let other = compiled_query(&go, QUERY).expect("query compiles for go");
+        assert!(!std::ptr::eq(first, other));
+        assert!(compiled_query(&rust, "(no_such_node) @x").is_none());
     }
 }
