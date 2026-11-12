@@ -93,11 +93,11 @@ pub(in crate::mcp) fn tool_list(args: &Value) -> Result<String, String> {
         if extensions.is_empty() {
             result.push_str("\nno matches\n");
         } else {
-            let exts: Vec<String> = extensions.into_iter().take(10).collect();
+            const SHOWN: usize = 10;
             let _ = write!(
                 result,
                 "\nno matches; found extensions: {}\n",
-                exts.join(", ")
+                crate::format::capped_list(extensions.iter(), SHOWN)
             );
         }
     }
@@ -256,5 +256,28 @@ mod tests {
             out.contains("no matches; found extensions:") && out.contains("rs"),
             "expected no-match extension hint: {out}"
         );
+    }
+
+    /// A list that matched nothing named the first ten extensions in scope
+    /// and said nothing of the rest (#330).
+    #[test]
+    fn tool_list_no_match_counts_the_extensions_it_leaves_out() {
+        let names = |n: usize| (0..n).map(|i| format!("e{i:02}")).collect::<Vec<_>>();
+        for (count, tail) in [(11, ", and 1 more"), (10, "")] {
+            let project = tempfile::tempdir().unwrap();
+            for ext in names(count) {
+                std::fs::write(project.path().join(format!("a.{ext}")), "x\n").unwrap();
+            }
+            let args = serde_json::json!({
+                "patterns": ["*.nomatch"],
+                "scope": project.path().to_str().unwrap(),
+            });
+            let out = tool_list(&args).expect("tool_list should succeed");
+            let shown = names(10).join(", ");
+            assert!(
+                out.ends_with(&format!("no matches; found extensions: {shown}{tail}\n")),
+                "{out}"
+            );
+        }
     }
 }

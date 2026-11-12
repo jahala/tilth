@@ -476,21 +476,13 @@ pub fn read_file(
 /// are `related`, in import order: the first [`RELATED_HINT_LIMIT`], then
 /// how many more there are. Empty when there are none.
 pub(crate) fn related_hint<'a>(related: impl ExactSizeIterator<Item = &'a Path>) -> String {
-    let total = related.len();
-    if total == 0 {
+    if related.len() == 0 {
         return String::new();
     }
-    let mut hint = String::from("\n\n> Related: ");
-    for (i, path) in related.take(RELATED_HINT_LIMIT).enumerate() {
-        if i > 0 {
-            hint.push_str(", ");
-        }
-        let _ = write!(hint, "{}", path.display());
-    }
-    if total > RELATED_HINT_LIMIT {
-        let _ = write!(hint, ", and {} more", total - RELATED_HINT_LIMIT);
-    }
-    hint
+    format!(
+        "\n\n> Related: {}",
+        format::capped_list(related.map(Path::display), RELATED_HINT_LIMIT)
+    )
 }
 
 /// Would this file produce an outline (rather than full content) in default read mode?

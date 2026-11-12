@@ -14,9 +14,6 @@ pub struct ResolvedSibling {
     pub end_line: u32,
 }
 
-/// Max siblings to surface in the footer.
-const MAX_SIBLINGS: usize = 6;
-
 /// Tree-sitter query for self/this field and method references by language.
 /// Each pattern captures `@ref` on the accessed member name.
 fn sibling_query_str(lang: Lang) -> Option<&'static str> {
@@ -144,7 +141,8 @@ pub fn extract_sibling_references(content: &str, lang: Lang, def_range: (u32, u3
 
 /// Match extracted sibling names against a parent entry's children.
 ///
-/// Returns up to `MAX_SIBLINGS` resolved siblings, preferring methods over fields.
+/// Returns every resolved sibling, methods before fields; the footer that
+/// shows them decides how many to list.
 pub fn resolve_siblings(
     sibling_names: &[String],
     parent_children: &[OutlineEntry],
@@ -177,7 +175,6 @@ pub fn resolve_siblings(
         b_is_fn.cmp(&a_is_fn).then_with(|| a.name.cmp(&b.name))
     });
 
-    resolved.truncate(MAX_SIBLINGS);
     resolved
 }
 
@@ -289,13 +286,13 @@ mod tests {
     }
 
     #[test]
-    fn resolve_siblings_truncates_at_max_siblings() {
-        let children: Vec<OutlineEntry> = (0..MAX_SIBLINGS + 3)
-            .map(|i| child(OutlineKind::Function, &format!("m{i}"), None, i as u32))
+    fn resolve_siblings_keeps_every_match_for_the_footer_to_count() {
+        let children: Vec<OutlineEntry> = (0..9)
+            .map(|i| child(OutlineKind::Function, &format!("m{i}"), None, i))
             .collect();
         let names: Vec<String> = children.iter().map(|c| c.name.clone()).collect();
         let resolved = resolve_siblings(&names, &children);
-        assert_eq!(resolved.len(), MAX_SIBLINGS);
+        assert_eq!(resolved.len(), 9);
     }
 
     #[test]
