@@ -22,6 +22,9 @@ use tools::{
 };
 
 /// Shared dependencies passed through the request → dispatch pipeline.
+///
+/// Each tool call runs on a clone, so it keeps the `root` it started with
+/// even when a roots/list answer replaces the server's root mid-call.
 #[derive(Clone)]
 struct Services {
     cache: Arc<OutlineCache>,
@@ -30,10 +33,17 @@ struct Services {
     tracker: Arc<ThreadTracker>,
     config: Config,
     edit_mode: bool,
+    /// The project root: what a call without `root` resolves against, and
+    /// what it searches when it names no scope. `None` when the launch
+    /// directory could not be read and no other root has arrived.
+    root: Option<PathBuf>,
+    /// Something the next tool result must say first, because it changed
+    /// what the call answers for: a client root the server could not use.
+    notice: Option<Arc<str>>,
 }
 
 impl Services {
-    fn new(config: Config, edit_mode: bool) -> Self {
+    fn new(config: Config, edit_mode: bool, root: Option<PathBuf>) -> Self {
         Self {
             cache: Arc::new(OutlineCache::new()),
             session: Arc::new(Session::new()),
@@ -41,6 +51,8 @@ impl Services {
             tracker: Arc::new(ThreadTracker::new()),
             config,
             edit_mode,
+            root,
+            notice: None,
         }
     }
 
@@ -67,6 +79,31 @@ impl Services {
     fn edit_mode(&self) -> bool {
         self.edit_mode
     }
+
+    fn root(&self) -> Option<&Path> {
+        self.root.as_deref()
+    }
+
+    /// Make the client's `root` the server's root. A root the server cannot
+    /// read leaves the old one, and both stderr and the next tool result say
+    /// so: stderr often goes unread.
+    fn take_client_root(&mut self, root: &Path) {
+        match readable_dir(root) {
+            Ok(dir) => self.root = Some(dir),
+            Err(e) => {
+                let kept = self.root().map_or_else(
+                    || "the server has no project root".to_string(),
+                    |r| format!("searches keep resolving against {}", r.display()),
+                );
+                let notice = format!(
+                    "cannot enter the client's root {}: {e}; {kept}.",
+                    root.display()
+                );
+                diag::emit(format_args!("tilth: warning: {notice}"));
+                self.notice = Some(notice.into());
+            }
+        }
+    }
 }
 
 // Sent to the LLM via the MCP `instructions` field during initialization.
@@ -82,15 +119,44 @@ const EDIT_MODE_EXTRA: &str = include_str!("../../prompts/mcp-edit.md");
 /// Read-only deployments (no `--edit`) omit `tilth_write` and its large
 /// schema entirely, so they pay no edit-protocol context tax.
 ///
-/// `scope` overrides the default search root. When provided, tilth chdir's to it
-/// at startup so all tools, git commands, and searches use the correct project root.
-/// This fixes MCP hosts that launch tilth with cwd=/ (e.g., Codex).
-pub fn run(config: Config, edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
+/// The project root is resolved here, once: an explicit `scope` (`--scope`),
+/// else the package around `launch_dir`, else `launch_dir` itself. A client
+/// that supports MCP roots replaces it with its first root, unless `scope`
+/// was given. This fixes MCP hosts that launch tilth with cwd=/ (e.g., Codex).
+pub fn run(
+    config: Config,
+    edit_mode: bool,
+    scope: Option<PathBuf>,
+    launch_dir: io::Result<PathBuf>,
+) -> io::Result<()> {
     let scope_is_explicit = scope.is_some();
+    // The root, or why there is none. A scope the server cannot read stops
+    // the launch instead.
+    let start = match scope {
+        Some(scope) => Ok(readable_dir(&scope).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("cannot enter scope {}: {e}", scope.display()),
+            )
+        })?),
+        None => launch_dir.map(project_root),
+    };
+    let (root, no_root) = match start {
+        Ok(root) => (Some(root), None),
+        Err(e) => (None, Some(e)),
+    };
+    // Only a client that will not send roots leaves the server without one,
+    // so the warning waits until that is known.
+    let warn_no_root = |services: &Services| {
+        if let (None, Some(e)) = (services.root(), &no_root) {
+            diag::emit(format_args!(
+                "tilth: warning: {e}; relative paths will not resolve. \
+                 Pass --scope or use absolute paths."
+            ));
+        }
+    };
 
-    enter_project_root(scope)?;
-
-    let services = Services::new(config, edit_mode);
+    let mut services = Services::new(config, edit_mode, root);
     let stdin = io::stdin();
     #[expect(
         clippy::disallowed_methods,
@@ -101,8 +167,6 @@ pub fn run(config: Config, edit_mode: bool, scope: Option<&Path>) -> io::Result<
 
     // Track pending roots/list request (for MCP roots protocol)
     let mut pending_roots_id: Option<Value> = None;
-    // Set once any tool has been dispatched — see `roots_handoff_allowed`.
-    let mut tool_dispatched = false;
 
     for line in stdin.lock().lines() {
         let line = line?;
@@ -123,25 +187,10 @@ pub fn run(config: Config, edit_mode: bool, scope: Option<&Path>) -> io::Result<
         if let Some(ref roots_id) = pending_roots_id {
             if msg.get("id") == Some(roots_id) {
                 pending_roots_id = None;
-                // Only apply roots on success and if --scope was NOT explicitly provided
-                if let Some(root_path) = extract_root_from_response(&msg) {
-                    if roots_handoff_allowed(scope_is_explicit, tool_dispatched) {
-                        if let Err(e) = std::env::set_current_dir(&root_path) {
-                            diag::emit(format_args!(
-                                "tilth: warning: cannot enter the client's root {}: {e}; \
-                                 searches keep resolving against {}.",
-                                root_path.display(),
-                                search_dir()
-                            ));
-                        }
-                    } else if !scope_is_explicit {
-                        diag::emit(format_args!(
-                            "tilth: warning: ignoring roots/list response that arrived after \
-                             tools started; searches keep resolving against {}.",
-                            search_dir()
-                        ));
-                    }
+                if let Some(root) = extract_root_from_response(&msg) {
+                    services.take_client_root(&root);
                 }
+                warn_no_root(&services);
                 continue;
             }
         }
@@ -168,17 +217,19 @@ pub fn run(config: Config, edit_mode: bool, scope: Option<&Path>) -> io::Result<
             params,
         };
 
-        tool_dispatched |= method == "tools/call";
         let response = handle_request(&req, &services);
+        if method == "tools/call" {
+            services.notice = None;
+        }
         serde_json::to_writer(&mut stdout, &response)?;
         stdout.write_all(b"\n")?;
         stdout.flush()?;
 
         // After initialize response: send roots/list if client supports it
         // and we don't already have an explicit --scope
-        if method == "initialize" && !scope_is_explicit && pending_roots_id.is_none() {
+        if method == "initialize" && pending_roots_id.is_none() {
             let client_caps = req.params.get("capabilities").unwrap_or(&Value::Null);
-            if client_caps.get("roots").is_some() {
+            if !scope_is_explicit && client_caps.get("roots").is_some() {
                 let roots_id = Value::String("tilth_roots_1".to_string());
                 let roots_req = serde_json::json!({
                     "jsonrpc": "2.0",
@@ -189,6 +240,8 @@ pub fn run(config: Config, edit_mode: bool, scope: Option<&Path>) -> io::Result<
                 stdout.write_all(b"\n")?;
                 stdout.flush()?;
                 pending_roots_id = Some(roots_id);
+            } else {
+                warn_no_root(&services);
             }
         }
     }
@@ -196,59 +249,20 @@ pub fn run(config: Config, edit_mode: bool, scope: Option<&Path>) -> io::Result<
     Ok(())
 }
 
-/// Resolve the project root and chdir to it.
-/// Priority: explicit `--scope` > MCP roots (handled later) >
-/// `package_root(cwd)` > cwd.
-/// A scope that cannot be entered is an error; a failure to find or enter
-/// the project root is reported and the server starts where it was launched.
-fn enter_project_root(scope: Option<&Path>) -> io::Result<()> {
-    if let Some(s) = scope {
-        // A file or a missing path fails here too, with its own cause.
-        std::env::set_current_dir(s).map_err(|e| {
-            io::Error::new(e.kind(), format!("cannot enter scope {}: {e}", s.display()))
-        })?;
-    } else {
-        match std::env::current_dir() {
-            Ok(cwd) => {
-                if let Some(root) = tilth_core::lang::package_root(&cwd) {
-                    if let Err(e) = std::env::set_current_dir(root) {
-                        diag::emit(format_args!(
-                            "tilth: warning: cannot enter the project root {}: {e}; \
-                             searches resolve against the launch directory.",
-                            root.display()
-                        ));
-                    }
-                }
-            }
-            Err(e) => diag::emit(format_args!(
-                "tilth: warning: cannot read the current directory: {e}; \
-                 relative paths will not resolve. Pass --scope or use absolute paths."
-            )),
-        }
-    }
-    Ok(())
+/// The root for a server launched in `dir`: the package around it, or `dir`
+/// itself outside any package.
+fn project_root(dir: PathBuf) -> PathBuf {
+    tilth_core::lang::package_root(&dir)
+        .map(Path::to_path_buf)
+        .unwrap_or(dir)
 }
 
-/// The directory searches resolve against, for a warning that they stay
-/// there. [`enter_project_root`] may have moved it from the launch directory.
-fn search_dir() -> String {
-    std::env::current_dir().map_or_else(
-        |e| format!("a working directory that cannot be read ({e})"),
-        |cwd| cwd.display().to_string(),
-    )
-}
-
-/// Whether a roots/list response may still move the server's working
-/// directory.
-///
-/// The handoff mutates process-global state that every in-flight tool reads,
-/// and a tool that outlived its timeout keeps running after the main loop has
-/// moved on — so it would resolve its relative paths against a directory that
-/// changed underneath it. Honoring the handoff only before the first tool call
-/// keeps the mutation inside initialization, where nothing else is running.
-/// An explicit `--scope` outranks roots entirely.
-fn roots_handoff_allowed(scope_is_explicit: bool, tool_dispatched: bool) -> bool {
-    !scope_is_explicit && !tool_dispatched
+/// `path` as a root: a directory the server can read, with its symlinks
+/// resolved.
+fn readable_dir(path: &Path) -> io::Result<PathBuf> {
+    let dir = path.canonicalize()?;
+    std::fs::read_dir(&dir)?;
+    Ok(dir)
 }
 
 /// Extract the first root directory path from a roots/list response.
@@ -301,19 +315,11 @@ fn handle_request(req: &JsonRpcRequest, services: &Services) -> JsonRpcResponse 
     let edit_mode = services.edit_mode();
     match req.method.as_str() {
         "initialize" => {
-            let overview = if services.config().overview {
-                match std::env::current_dir() {
-                    Ok(cwd) => crate::overview::fingerprint(&cwd),
-                    Err(e) => {
-                        diag::emit(format_args!(
-                            "tilth: warning: no project overview: \
-                             cannot read the current directory: {e}"
-                        ));
-                        String::new()
-                    }
-                }
-            } else {
-                String::new()
+            // Without a root there is nothing to describe; `run` says why
+            // once it knows no root is coming.
+            let overview = match services.root() {
+                Some(root) if services.config().overview => crate::overview::fingerprint(root),
+                _ => String::new(),
             };
             let instructions = if edit_mode {
                 if overview.is_empty() {
@@ -385,6 +391,7 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
     }
     let edit_mode = services.edit_mode();
     let walk = config.walk;
+    let root = services.root();
     match tool {
         "tilth_read" => tool_read(
             args,
@@ -399,13 +406,16 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
             services.session(),
             services.bloom(),
             walk,
+            root,
         ),
-        "tilth_list" => tool_list(args, walk),
-        "tilth_deps" => tool_deps(args, services.bloom(), walk),
-        "tilth_grok" => tool_grok(args, services.bloom(), services.session(), &config),
-        "tilth_diff" => tool_diff(args, walk),
+        "tilth_list" => tool_list(args, walk, root),
+        "tilth_deps" => tool_deps(args, services.bloom(), walk, root),
+        "tilth_grok" => tool_grok(args, services.bloom(), services.session(), &config, root),
+        "tilth_diff" => tool_diff(args, walk, root),
         "tilth_session" => tool_session(args, services.session()),
-        "tilth_write" if edit_mode => tool_write(args, services.session(), services.bloom(), walk),
+        "tilth_write" if edit_mode => {
+            tool_write(args, services.session(), services.bloom(), walk, root)
+        }
         _ => Err(format!("unknown tool: {tool}")),
     }
 }
@@ -427,6 +437,13 @@ fn handle_tool_call(req: &JsonRpcRequest, services: &Services) -> JsonRpcRespons
         )
     } else {
         run_tool_with_timeout(services, tool_name, args, services.config().request_timeout)
+    };
+    // A notice changes what the call answered for, so it comes first.
+    let result = match services.notice.as_deref() {
+        Some(notice) => result
+            .map(|text| format!("{notice}\n\n{text}"))
+            .map_err(|text| format!("{notice}\n\n{text}")),
+        None => result,
     };
 
     build_tool_response(req.id.clone(), result)
@@ -500,39 +517,7 @@ fn write_error(w: &mut impl Write, id: Option<Value>, code: i32, msg: &str) -> i
 mod tests {
     use super::*;
 
-    /// An explicit scope that is a file used to be skipped without a word, so
-    /// the server answered for its launch directory. The failure path never
-    /// changes directory, so this test leaves the process where it was.
-    #[test]
-    fn a_scope_that_is_not_a_directory_is_an_error() {
-        let d = tempfile::tempdir().unwrap();
-        let file = d.path().join("file.txt");
-        std::fs::write(&file, "").unwrap();
-        let err = enter_project_root(Some(&file)).unwrap_err();
-        assert!(
-            err.to_string().contains("cannot enter scope"),
-            "the scope must be named as the cause, got: {err}"
-        );
-    }
-
     // -- extract_root_from_response -------------------------------------------
-
-    #[test]
-    fn roots_handoff_is_confined_to_initialization() {
-        assert!(
-            roots_handoff_allowed(false, false),
-            "the handoff is the whole point before any tool runs"
-        );
-        assert!(
-            !roots_handoff_allowed(false, true),
-            "a chdir after tools start moves ground under an in-flight tool"
-        );
-        assert!(
-            !roots_handoff_allowed(true, false),
-            "an explicit --scope outranks roots"
-        );
-        assert!(!roots_handoff_allowed(true, true));
-    }
 
     #[test]
     fn extract_root_valid_file_uri() {
@@ -725,7 +710,7 @@ mod tests {
                 if let Some(call) = call {
                     args["gitignore"] = call.into();
                 }
-                dispatch_tool(tool, &args, &Services::new(config, false))
+                dispatch_tool(tool, &args, &Services::new(config, false, None))
                     .unwrap()
                     .contains("hidden.rs")
             };
@@ -747,7 +732,7 @@ mod tests {
     #[test]
     fn tilth_files_is_not_dispatched() {
         let args = serde_json::json!({ "patterns": ["*.rs"] });
-        let services = Services::new(Config::default(), false);
+        let services = Services::new(Config::default(), false, None);
         let err = dispatch_tool("tilth_files", &args, &services)
             .expect_err("tilth_files must not dispatch");
         assert!(
@@ -760,7 +745,7 @@ mod tests {
     fn tilth_savings_is_not_dispatched() {
         let args = serde_json::json!({});
         for edit_mode in [false, true] {
-            let services = Services::new(Config::default(), edit_mode);
+            let services = Services::new(Config::default(), edit_mode, None);
             let err = dispatch_tool("tilth_savings", &args, &services)
                 .expect_err("tilth_savings must not dispatch");
             assert!(

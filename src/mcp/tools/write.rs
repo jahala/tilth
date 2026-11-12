@@ -27,7 +27,7 @@ use tilth_core::search::walk::WalkConfig;
 pub(in crate::mcp) fn parse_file_edit(
     index: usize,
     val: &Value,
-    root: Option<&Path>,
+    path: PathBuf,
 ) -> crate::edit::FileEditTask {
     use crate::edit::FileEditTask;
 
@@ -64,10 +64,7 @@ pub(in crate::mcp) fn parse_file_edit(
         }
     }
 
-    FileEditTask::Ready {
-        path: resolve_write_path(path_str, root),
-        edits,
-    }
+    FileEditTask::Ready { path, edits }
 }
 
 /// Parse a single `edits[]` entry. Errors carry the edit index so the LLM
@@ -153,17 +150,14 @@ fn path_within_scope(path: &Path, scope: &Path) -> bool {
     full.starts_with(&scope_canon)
 }
 
-/// Resolve a write path: a relative `path_str` is anchored under `root` when one
-/// was supplied; absolute paths are used as-is regardless of `root`.
-fn resolve_write_path(path_str: &str, root: Option<&Path>) -> PathBuf {
+/// Resolve a write path: a relative `path_str` is anchored under `base` (the
+/// call's `root`, else the server's root); absolute paths are used as-is.
+fn resolve_write_path(path_str: &str, base: Option<&Path>) -> Result<PathBuf, String> {
     let p = PathBuf::from(path_str);
     if p.is_absolute() {
-        return p;
+        return Ok(p);
     }
-    match root {
-        Some(r) => r.join(&p),
-        None => p,
-    }
+    Ok(super::require_root(base)?.join(p))
 }
 
 /// Walk up from `path` to the nearest directory containing a `.git` entry
@@ -186,55 +180,24 @@ fn find_git_root(path: &Path) -> Option<PathBuf> {
 
 /// Build a cross-worktree warning string. Called when a relative path write
 /// (no `root` argument) resolves into a different git worktree than the
-/// server's process cwd. Returns `None` when no warning is needed.
-fn cross_worktree_warning(path: &Path, cwd: &Path) -> Option<String> {
+/// server's root. Returns `None` when no warning is needed.
+fn cross_worktree_warning(path: &Path, server_root: &Path) -> Option<String> {
     // Callers pass only paths a write landed at. Only warn for those that
     // resolve into a git repo.
     let resolved = path.canonicalize().ok()?;
     let write_root = find_git_root(&resolved)?;
-    let cwd_root = find_git_root(cwd)?;
-    if write_root == cwd_root {
+    let server_git_root = find_git_root(server_root)?;
+    if write_root == server_git_root {
         return None;
     }
     Some(format!(
         "\n⚠️  cross-worktree write: resolved path is {} (git root: {}), \
-         server cwd git root: {}. Pass `root` or use an absolute path to \
+         server root's git root: {}. Pass `root` or use an absolute path to \
          make the target explicit.",
         resolved.display(),
         write_root.display(),
-        cwd_root.display(),
+        server_git_root.display(),
     ))
-}
-
-/// The cross-worktree check for the relative writes of one batch, against
-/// the server's working directory as read once for that batch.
-struct RelativeWrites<'a> {
-    cwd: &'a std::io::Result<PathBuf>,
-    /// A relative write landed while `cwd` could not be read.
-    unchecked: bool,
-}
-
-impl RelativeWrites<'_> {
-    /// The [`cross_worktree_warning`] for a relative write that landed at
-    /// `path`. An unreadable working directory leaves nothing to compare
-    /// with, so the write is only counted for [`Self::skipped`].
-    fn landed(&mut self, path: &Path) -> Option<String> {
-        if let Ok(cwd) = self.cwd {
-            cross_worktree_warning(path, cwd)
-        } else {
-            self.unchecked = true;
-            None
-        }
-    }
-
-    /// Why the batch's relative writes went unchecked, if any did.
-    fn skipped(&self) -> Option<&std::io::Error> {
-        if self.unchecked {
-            self.cwd.as_ref().err()
-        } else {
-            None
-        }
-    }
 }
 
 /// Returns the resolved absolute path of `path` for success output, falling
@@ -253,6 +216,7 @@ pub(in crate::mcp) fn tool_write(
     session: &Session,
     bloom: &Arc<BloomFilterCache>,
     walk: WalkConfig,
+    server_root: Option<&Path>,
 ) -> Result<String, String> {
     let files_val = args
         .get("files")
@@ -294,7 +258,7 @@ pub(in crate::mcp) fn tool_write(
 
     // Optional per-call anchor root. When provided it must be absolute;
     // relative file paths in this call are anchored to it instead of the
-    // server's process cwd.
+    // server's root.
     let root: Option<PathBuf> = match args.get("root").and_then(|v| v.as_str()) {
         Some(r) => {
             let p = PathBuf::from(r);
@@ -311,38 +275,39 @@ pub(in crate::mcp) fn tool_write(
     // anchors it. When `scope` is absent, default to `root` if one was
     // supplied — `root` names the caller's actual checkout, so it is the
     // correct containment boundary for a root-anchored write; falling back to
-    // the server's process cwd here would refuse a legitimate root-only write
-    // whenever the server was launched from a different directory than
-    // `root` (the headline cross-worktree scenario `root` exists to solve).
-    // Only when BOTH `scope` and `root` are absent does this fall back to the
-    // server cwd, exactly as before. A relative `scope` resolves against the
-    // cwd too. A cwd that cannot be read leaves those without a boundary, so
-    // their writes are refused with that cause.
-    //
-    // The cwd is read once for the batch: it is also what relative writes
-    // are checked against for a cross-worktree landing.
-    let cwd = std::env::current_dir().map_err(|e| {
-        std::io::Error::new(e.kind(), format!("cannot read the current directory: {e}"))
-    });
-    let mut relative_writes = RelativeWrites {
-        cwd: &cwd,
-        unchecked: false,
-    };
+    // the server's root here would refuse a legitimate root-only write
+    // whenever the server was started for a different directory than `root`
+    // (the headline cross-worktree scenario `root` exists to solve). Only
+    // when BOTH `scope` and `root` are absent does this fall back to the
+    // server's root. A relative `scope` resolves against the server's root
+    // too. A server without a root leaves those without a boundary, so their
+    // writes are refused with that cause.
     let scope_arg = args.get("scope").and_then(Value::as_str).map(Path::new);
-    let cwd_error = |e: &std::io::Error| std::io::Error::new(e.kind(), e.to_string());
-    let scope_root: std::io::Result<PathBuf> = match (scope_arg, &root) {
+    let scope_root: Result<PathBuf, String> = match (scope_arg, &root) {
         (Some(scope), _) if scope.is_relative() => {
-            cwd.as_ref().map(|_| scope.to_path_buf()).map_err(cwd_error)
+            super::require_root(server_root).map(|r| r.join(scope))
         }
         (Some(scope), _) => Ok(scope.to_path_buf()),
         (None, Some(root)) => Ok(root.clone()),
-        (None, None) => cwd.as_ref().cloned().map_err(cwd_error),
+        (None, None) => super::require_root(server_root).map(Path::to_path_buf),
     };
     // Canonicalize the scope once for the overwrite/append containment check.
     // Fail closed on canonicalize failure: an unresolvable scope refuses
     // writes rather than silently disabling the guard.
-    let scope_canon: Result<PathBuf, std::io::Error> =
-        scope_root.and_then(|scope| scope.canonicalize());
+    let scope_canon: Result<PathBuf, String> =
+        scope_root.and_then(|scope| scope.canonicalize().map_err(|e| e.to_string()));
+    // A relative path is anchored under `root` when supplied, else under the
+    // server's root.
+    let base = root.as_deref().or(server_root);
+    // The cross-worktree warning for a write that landed at `path`: only a
+    // relative path with no `root` can land somewhere the caller did not
+    // name, so only those are checked, against the server's root.
+    let crossed_worktree = |path_str: &str, path: &Path| -> Option<String> {
+        if root.is_some() || Path::new(path_str).is_absolute() {
+            return None;
+        }
+        cross_worktree_warning(path, server_root?)
+    };
     // A refusal names the parameter that moves the boundary: an explicit
     // `scope` sets it, otherwise `root` does.
     let widen_hint = if scope_arg.is_some() {
@@ -352,9 +317,9 @@ pub(in crate::mcp) fn tool_write(
     };
 
     let mut hash_tasks: Vec<crate::edit::FileEditTask> = Vec::new();
-    // Resolved paths for hash-mode files that were relative with no `root`, so
-    // the cross-worktree warning can fire after apply_batch.
-    let mut hash_relative_paths: Vec<PathBuf> = Vec::new();
+    // The path each hash-mode file was given as, by resolved path, so the
+    // cross-worktree warning can fire after apply_batch.
+    let mut hash_given: Vec<(PathBuf, &str)> = Vec::new();
     let mut direct_results: Vec<String> = Vec::new();
     let mut direct_applied: Vec<PathBuf> = Vec::new();
 
@@ -366,9 +331,15 @@ pub(in crate::mcp) fn tool_write(
         };
         // A relative path is anchored under `root` when supplied; absolute
         // paths are used as-is. With no `root`, a relative path falls back to
-        // the server cwd but a cross-worktree warning fires below if that
-        // resolves into a different git worktree than the server.
-        let path = resolve_write_path(path_str, root.as_deref());
+        // the server's root, and a cross-worktree warning fires below if it
+        // resolves into a different git worktree than the server's root.
+        let path = match resolve_write_path(path_str, base) {
+            Ok(path) => path,
+            Err(e) => {
+                direct_results.push(format!("## {path_str}\nerror: {e}"));
+                continue;
+            }
+        };
 
         // Scope guard for ALL modes. hash mode delegates to apply_batch, which
         // computes a package_root only for blast-radius reporting — it does NOT
@@ -397,10 +368,8 @@ pub(in crate::mcp) fn tool_write(
 
         match mode {
             "hash" | "h" => {
-                if root.is_none() && !PathBuf::from(path_str).is_absolute() {
-                    hash_relative_paths.push(path.clone());
-                }
-                hash_tasks.push(parse_file_edit(i, f, root.as_deref()));
+                hash_given.push((path.clone(), path_str));
+                hash_tasks.push(parse_file_edit(i, f, path));
             }
             "overwrite" | "w" => {
                 let Some(content) = f.get("content").and_then(|v| v.as_str()) else {
@@ -437,10 +406,8 @@ pub(in crate::mcp) fn tool_write(
                             block.push_str(&render_text_diff(before.as_deref(), content));
                         }
                         // Warn when a relative path (no `root`) crosses a worktree boundary.
-                        if root.is_none() && !PathBuf::from(path_str).is_absolute() {
-                            if let Some(warn) = relative_writes.landed(&path) {
-                                block.push_str(&warn);
-                            }
+                        if let Some(warn) = crossed_worktree(path_str, &path) {
+                            block.push_str(&warn);
                         }
                         direct_results.push(block);
                         direct_applied.push(path);
@@ -503,10 +470,8 @@ pub(in crate::mcp) fn tool_write(
                             block.push_str(&render_text_diff(before.as_deref(), &after));
                         }
                         // Warn when a relative path (no `root`) crosses a worktree boundary.
-                        if root.is_none() && !PathBuf::from(path_str).is_absolute() {
-                            if let Some(warn) = relative_writes.landed(&path) {
-                                block.push_str(&warn);
-                            }
+                        if let Some(warn) = crossed_worktree(path_str, &path) {
+                            block.push_str(&warn);
                         }
                         direct_results.push(block);
                         direct_applied.push(path);
@@ -522,7 +487,9 @@ pub(in crate::mcp) fn tool_write(
     }
 
     let mut output = String::new();
-    if !hash_tasks.is_empty() {
+    // A hash task exists only once its path passed the containment check
+    // against `scope_canon`, so there are none unless that resolved.
+    if let (false, Ok(scope)) = (hash_tasks.is_empty(), &scope_canon) {
         // Record reads up front: record_read counts attempts, not just
         // committed edits.
         for task in &hash_tasks {
@@ -530,16 +497,15 @@ pub(in crate::mcp) fn tool_write(
                 session.record_read(path);
             }
         }
-        match crate::edit::apply_batch(hash_tasks, bloom, walk, show_diff) {
+        match crate::edit::apply_batch(hash_tasks, bloom, walk, show_diff, scope) {
             Ok(batch) => {
                 output.push_str(&batch.output);
                 // Cross-worktree warning for the hash-mode relative paths whose
                 // edits applied.
                 for path in &batch.applied {
-                    if hash_relative_paths.contains(path) {
-                        if let Some(warn) = relative_writes.landed(path) {
-                            output.push_str(&warn);
-                        }
+                    let given = hash_given.iter().find(|(p, _)| p == path);
+                    if let Some(warn) = given.and_then(|(_, s)| crossed_worktree(s, path)) {
+                        output.push_str(&warn);
                     }
                 }
             }
@@ -563,11 +529,6 @@ pub(in crate::mcp) fn tool_write(
             session.record_read(p);
         }
     }
-    if let Some(e) = relative_writes.skipped() {
-        crate::diag::emit(format_args!(
-            "tilth: warning: no cross-worktree check for this batch's relative paths: {e}"
-        ));
-    }
     Ok(output)
 }
 
@@ -586,7 +547,7 @@ mod tests {
     #[test]
     fn parse_file_edit_rejects_empty_edits_array() {
         let val = serde_json::json!({ "path": "noop.txt", "edits": [] });
-        match parse_file_edit(0, &val, None) {
+        match parse_file_edit(0, &val, PathBuf::from("noop.txt")) {
             crate::edit::FileEditTask::ParseError { label, msg } => {
                 assert_eq!(label, "noop.txt");
                 assert!(msg.contains("empty"), "unexpected msg: {msg}");
@@ -624,6 +585,7 @@ mod tests {
             &Session::new(),
             &fresh_bloom(),
             WalkConfig::default(),
+            None,
         )
         .unwrap();
         assert!(out.contains("created"), "expected 'created' verb: {out}");
@@ -644,6 +606,7 @@ mod tests {
             &Session::new(),
             &fresh_bloom(),
             WalkConfig::default(),
+            None,
         )
         .unwrap();
         assert!(
@@ -671,6 +634,7 @@ mod tests {
             &Session::new(),
             &fresh_bloom(),
             WalkConfig::default(),
+            None,
         )
         .unwrap();
         assert!(
@@ -693,6 +657,7 @@ mod tests {
             &Session::new(),
             &fresh_bloom(),
             WalkConfig::default(),
+            None,
         )
         .unwrap();
         assert!(out.contains("append"), "expected 'append' summary: {out}");
@@ -716,6 +681,7 @@ mod tests {
             &Session::new(),
             &fresh_bloom(),
             WalkConfig::default(),
+            None,
         )
         .expect_err("duplicate paths must be rejected");
         assert!(err.contains("duplicate file path"), "unexpected err: {err}");
@@ -736,6 +702,7 @@ mod tests {
             &Session::new(),
             &fresh_bloom(),
             WalkConfig::default(),
+            None,
         )
         .unwrap();
         assert!(
@@ -764,6 +731,7 @@ mod tests {
             &Session::new(),
             &fresh_bloom(),
             WalkConfig::default(),
+            None,
         )
         .unwrap();
         assert!(
@@ -791,6 +759,7 @@ mod tests {
             &Session::new(),
             &fresh_bloom(),
             WalkConfig::default(),
+            None,
         )
         .unwrap();
         assert!(
@@ -819,6 +788,7 @@ mod tests {
             &Session::new(),
             &fresh_bloom(),
             WalkConfig::default(),
+            None,
         )
         .unwrap();
         assert!(
@@ -835,8 +805,9 @@ mod tests {
     #[test]
     fn refusal_outside_launch_folder_names_root() {
         // #319: with neither `scope` nor `root`, the boundary is the server's
-        // cwd. An absolute path outside it is refused, and the refusal must
+        // root. An absolute path outside it is refused, and the refusal must
         // name the parameter that moves the boundary.
+        let server_root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let p = outside.path().join("probe.txt");
         let args = serde_json::json!({
@@ -847,6 +818,7 @@ mod tests {
             &Session::new(),
             &fresh_bloom(),
             WalkConfig::default(),
+            Some(server_root.path()),
         )
         .unwrap();
         assert!(
@@ -866,6 +838,7 @@ mod tests {
             &Session::new(),
             &fresh_bloom(),
             WalkConfig::default(),
+            None,
         )
         .unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "probe\n");
@@ -887,6 +860,7 @@ mod tests {
             &Session::new(),
             &fresh_bloom(),
             WalkConfig::default(),
+            None,
         )
         .unwrap();
         assert!(
@@ -909,6 +883,7 @@ mod tests {
             &Session::new(),
             &fresh_bloom(),
             WalkConfig::default(),
+            None,
         )
         .unwrap();
         // 3 pre-existing lines → the appended line is numbered 4, and only it is
@@ -927,8 +902,8 @@ mod tests {
     // -- root parameter tests (issue #73) --
 
     #[test]
-    fn root_param_anchors_relative_path_to_root_not_cwd() {
-        // A relative path + explicit `root` must land under `root`, not cwd.
+    fn root_param_anchors_relative_path_to_root_not_server_root() {
+        // A relative path + explicit `root` must land under `root`, not the server root.
         let root_dir = tempfile::tempdir().unwrap();
         let root_path = root_dir.path();
         let args = serde_json::json!({
@@ -945,6 +920,7 @@ mod tests {
             &Session::new(),
             &fresh_bloom(),
             WalkConfig::default(),
+            None,
         )
         .expect("create succeeds");
         let expected = root_path.join("relative/file.txt");
@@ -982,6 +958,7 @@ mod tests {
             &Session::new(),
             &fresh_bloom(),
             WalkConfig::default(),
+            None,
         )
         .expect("create succeeds");
         assert!(
@@ -1021,6 +998,7 @@ mod tests {
             &Session::new(),
             &fresh_bloom(),
             WalkConfig::default(),
+            None,
         )
         .expect("create succeeds");
         let abs_path = p.canonicalize().unwrap();
@@ -1046,6 +1024,7 @@ mod tests {
             &Session::new(),
             &fresh_bloom(),
             WalkConfig::default(),
+            None,
         )
         .expect_err("relative root must be rejected");
         assert!(
@@ -1058,29 +1037,16 @@ mod tests {
     fn root_only_no_scope_write_succeeds_into_root() {
         // KNOWN HIGH (review on #158): `root` reaches path resolution
         // (resolve_write_path) but NOT the containment guard — `scope_root`
-        // fell back to `current_dir()` whenever `scope` was omitted, ignoring
-        // `root` entirely. Headline scenario: server process cwd is one
-        // directory (call it dirA — here, whatever `current_dir()` naturally
-        // is under `cargo test`), the caller passes `root` = a DIFFERENT
+        // fell back to the server's directory whenever `scope` was omitted,
+        // ignoring `root` entirely. Headline scenario: the server's root is
+        // one directory (dirA), the caller passes `root` = a DIFFERENT
         // directory (dirB) plus a relative path under dirB, and supplies NO
         // `scope`. Before the fix, `scope_root` defaulted to dirA, the write
         // resolved into dirB (correctly, via resolve_write_path), and
         // `path_within_scope(dirB_path, dirA)` refused it — a false-positive
         // containment failure for a legitimate root-anchored write.
-        //
-        // No `set_current_dir` here — the codebase's own tests document that
-        // mutating process cwd inside a test races other parallel tests (see
-        // edit.rs's `normalize_path_key_is_cwd_independent` comment). Using
-        // the ambient `current_dir()` as the implicit "dirA" and a fresh
-        // tempdir as "dirB" reproduces the divergence without mutating global
-        // state.
-        let dir_a = std::env::current_dir().expect("ambient cwd (\"dirA\") must be readable");
+        let dir_a = tempfile::tempdir().expect("dirA tempdir");
         let dir_b = tempfile::tempdir().expect("dirB tempdir");
-        assert_ne!(
-            dir_a.canonicalize().unwrap(),
-            dir_b.path().canonicalize().unwrap(),
-            "test setup requires dirA (ambient cwd) and dirB (tempdir) to differ"
-        );
 
         let args = serde_json::json!({
             "root": dir_b.path().to_str().unwrap(),
@@ -1095,6 +1061,7 @@ mod tests {
             &Session::new(),
             &fresh_bloom(),
             WalkConfig::default(),
+            Some(dir_a.path()),
         )
         .expect("root-only write (no scope) must succeed into root, not refuse");
         assert!(
@@ -1109,7 +1076,7 @@ mod tests {
         let expected = dir_b.path().join("nested/file.txt");
         assert!(
             expected.exists(),
-            "file must land under root (dirB), not under the server's cwd (dirA): {}",
+            "file must land under root (dirB), not under the server's root (dirA): {}",
             expected.display()
         );
         assert_eq!(
@@ -1118,10 +1085,52 @@ mod tests {
         );
     }
 
+    /// A relative path with no `root` lands under the server's root, never
+    /// under the process's working directory.
+    #[test]
+    fn relative_path_without_root_lands_under_the_server_root() {
+        let server_root = tempfile::tempdir().unwrap();
+        let args = serde_json::json!({
+            "files": [{ "path": "nested/new.txt", "mode": "overwrite", "content": "x\n" }],
+        });
+        let out = tool_write(
+            &args,
+            &Session::new(),
+            &fresh_bloom(),
+            WalkConfig::default(),
+            Some(server_root.path()),
+        )
+        .unwrap();
+        assert!(out.contains("created"), "{out}");
+        assert!(server_root.path().join("nested/new.txt").exists());
+    }
+
+    /// With no root anywhere, a relative path has nowhere to land, and the
+    /// result says why instead of writing under the process's directory.
+    #[test]
+    fn relative_path_without_any_root_is_refused() {
+        let args = serde_json::json!({
+            "files": [{ "path": "tilth-no-root-probe.txt", "mode": "overwrite", "content": "x\n" }],
+        });
+        let out = tool_write(
+            &args,
+            &Session::new(),
+            &fresh_bloom(),
+            WalkConfig::default(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            out.contains("## tilth-no-root-probe.txt") && out.contains(super::super::NO_ROOT),
+            "{out}"
+        );
+        assert!(!Path::new("tilth-no-root-probe.txt").exists());
+    }
+
     #[test]
     fn cross_worktree_warning_fires_for_different_git_roots() {
         // Two fake worktrees (each with a .git dir): write path git root differs
-        // from the cwd-analog git root.
+        // from the server root's git root.
         let server_wt = tempfile::tempdir().unwrap();
         let write_wt = tempfile::tempdir().unwrap();
         std::fs::create_dir(server_wt.path().join(".git")).unwrap();
@@ -1137,7 +1146,7 @@ mod tests {
         let warn = cross_worktree_warning(&target, server_wt.path());
         assert!(
             warn.is_some(),
-            "cross-worktree warning must fire when write and cwd are in different git roots"
+            "cross-worktree warning must fire when write and server root are in different git roots"
         );
         assert!(
             warn.unwrap().contains("cross-worktree"),
@@ -1223,6 +1232,7 @@ mod tests {
             &Session::new(),
             &fresh_bloom(),
             WalkConfig::default(),
+            None,
         )
         .expect("hash edit succeeds");
 
@@ -1275,7 +1285,7 @@ mod tests {
 
     #[test]
     fn hash_mode_no_warning_for_in_tree_write() {
-        // hash-mode write within the same git root as cwd → no warning.
+        // hash-mode write within the same git root as the server root → no warning.
         let wt = tempfile::tempdir().unwrap();
         std::fs::create_dir(wt.path().join(".git")).unwrap();
         let target = wt.path().join("inplace.rs");

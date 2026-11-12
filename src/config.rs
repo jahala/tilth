@@ -2,7 +2,9 @@
 //! environment and the command-line flags, and passes it, or the field a
 //! function needs, to every use. Nothing else reads the environment.
 
+use std::io;
 use std::num::NonZeroUsize;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -91,6 +93,25 @@ pub fn env_var(name: &str) -> Option<String> {
         reason = "by design: the one read of the process environment"
     )]
     std::env::var(name).ok()
+}
+
+/// The directory the process was started in. This is the one read of the
+/// working directory: `main` calls it once, and the project root it yields
+/// is passed to everything that resolves a path. Nothing changes the working
+/// directory, so the relative paths the CLI hands the OS resolve against
+/// this same directory.
+///
+/// # Errors
+///
+/// When the directory cannot be read, for example because it was deleted.
+/// The error says so, and every use reports it as it is.
+pub fn launch_dir() -> io::Result<PathBuf> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "by design: the one read of the process working directory"
+    )]
+    std::env::current_dir()
+        .map_err(|e| io::Error::new(e.kind(), format!("cannot read the current directory: {e}")))
 }
 
 #[cfg(test)]

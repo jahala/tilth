@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -13,16 +14,15 @@ pub(in crate::mcp) fn tool_grok(
     bloom: &Arc<BloomFilterCache>,
     session: &Session,
     config: &Config,
+    server_root: Option<&Path>,
 ) -> Result<String, String> {
     let target = args
         .get("target")
         .and_then(|v| v.as_str())
         .ok_or("missing required parameter: target")?;
-    let root = args
-        .get("root")
-        .and_then(|v| v.as_str())
-        .map(std::path::Path::new);
-    let (scope, scope_warning) = resolve_scope(args, root, crate::FileScopeHint::Directory)?;
+    let root = args.get("root").and_then(|v| v.as_str()).map(Path::new);
+    let (scope, scope_warning) =
+        resolve_scope(args, root, server_root, crate::FileScopeHint::Directory)?;
     let full = args.get("full").and_then(Value::as_bool).unwrap_or(false);
     let caps = if full {
         crate::search::grok::GrokCaps::full()
@@ -54,7 +54,7 @@ mod tests {
             "root": tmp.path().to_str().unwrap(),
         });
         let bloom = Arc::new(BloomFilterCache::new());
-        let err = tool_grok(&args, &bloom, &Session::new(), &Config::default())
+        let err = tool_grok(&args, &bloom, &Session::new(), &Config::default(), None)
             .expect_err("a file scope must be refused, not widened to root");
         assert!(
             err.contains("scope \"src/x.py\" is a file")

@@ -1,11 +1,17 @@
+use std::path::Path;
+
 use serde_json::Value;
 use tilth_core::search::walk::WalkConfig;
 
 use crate::diff::DiffSource;
 
-use super::anchor_path;
+use super::{anchor_path, require_root};
 
-pub(in crate::mcp) fn tool_diff(args: &Value, walk: WalkConfig) -> Result<String, String> {
+pub(in crate::mcp) fn tool_diff(
+    args: &Value,
+    walk: WalkConfig,
+    server_root: Option<&Path>,
+) -> Result<String, String> {
     let source = args.get("source").and_then(|v| v.as_str());
     let scope = args.get("scope").and_then(|v| v.as_str());
     let a = args.get("a").and_then(|v| v.as_str());
@@ -16,14 +22,11 @@ pub(in crate::mcp) fn tool_diff(args: &Value, walk: WalkConfig) -> Result<String
     let blast = args.get("blast").and_then(Value::as_bool).unwrap_or(false);
     let expand = args.get("expand").and_then(Value::as_u64).unwrap_or(0) as usize;
     let budget = args.get("budget").and_then(Value::as_u64);
-    let root = args
-        .get("root")
-        .and_then(|v| v.as_str())
-        .map(std::path::Path::new);
+    let root = args.get("root").and_then(|v| v.as_str()).map(Path::new);
 
     // `root` selects WHERE the diff happens: git-based sources run in it and
     // relative file/patch args anchor under it. Falling back to the server's
-    // frozen cwd on a bad root would silently diff the wrong checkout — the
+    // root on a bad root would silently diff the wrong checkout — the
     // worktree hazard `root` exists to remove — so it fails closed instead.
     if let Some(r) = root {
         if !r.is_absolute() {
@@ -53,9 +56,10 @@ pub(in crate::mcp) fn tool_diff(args: &Value, walk: WalkConfig) -> Result<String
         }
         _ => {}
     }
+    let base = root.map_or_else(|| require_root(server_root), Ok)?;
     crate::diff::diff(
         &diff_source,
-        root,
+        base,
         scope,
         search,
         blast.then_some(walk),
@@ -106,21 +110,14 @@ mod tests {
         dir
     }
 
-    /// Call `tool_diff` with the process cwd pinned to `cwd` (the "server
-    /// checkout"), serialized via the crate-wide `CWD_LOCK` because cwd is
-    /// process-global state shared with the diff module's own tests.
-    fn run_tool_diff_in(cwd: &Path, args: &serde_json::Value) -> Result<String, String> {
-        let _lock = crate::diff::CWD_LOCK.lock().unwrap();
-        let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(cwd).unwrap();
-        let result = tool_diff(args, WalkConfig::default());
-        std::env::set_current_dir(&prev).unwrap();
-        result
+    /// Call `tool_diff` on a server whose root is `server_root`.
+    fn run_tool_diff_in(server_root: &Path, args: &serde_json::Value) -> Result<String, String> {
+        tool_diff(args, WalkConfig::default(), Some(server_root))
     }
 
     #[test]
-    fn tool_diff_root_selects_caller_worktree_not_server_cwd() {
-        // The server's process cwd is frozen at spawn (repo A here); a caller
+    fn tool_diff_root_selects_caller_worktree_not_server_root() {
+        // The server's root is fixed at startup (repo A here); a caller
         // working in a different checkout passes `root` (repo B). The diff must
         // come from B — silently diffing A instead returns a wrong delta (or a
         // false "No changes.") that reads as positive evidence about the
@@ -139,31 +136,41 @@ mod tests {
         );
         assert!(
             !result.contains("change_x_marker"),
-            "diff must not leak repo A's (server cwd) change, got:\n{result}"
+            "diff must not leak repo A's (server root) change, got:\n{result}"
         );
     }
 
     #[test]
-    fn tool_diff_absent_root_diffs_server_cwd() {
-        // Absent `root` must keep the default flow exactly as on main: the
-        // diff runs in the server's process cwd. The require-root discipline
-        // fires only on explicit args, never on omitted ones.
+    fn tool_diff_absent_root_diffs_the_server_root() {
+        // Absent `root` keeps the default flow: the diff runs in the server's
+        // root. The require-root discipline fires only on explicit args,
+        // never on omitted ones.
         let repo_a = repo_with_uncommitted_fn("change_x_marker");
         let args = serde_json::json!({ "source": "uncommitted" });
         let result = run_tool_diff_in(repo_a.path(), &args).unwrap();
         assert!(
             result.contains("change_x_marker"),
-            "absent root must diff the server cwd as before, got:\n{result}"
+            "absent root must diff the server root, got:\n{result}"
         );
+    }
+
+    /// With no root anywhere, there is no checkout to diff, and the result
+    /// says so.
+    #[test]
+    fn tool_diff_without_any_root_is_refused() {
+        let args = serde_json::json!({ "source": "uncommitted" });
+        let err = tool_diff(&args, WalkConfig::default(), None).unwrap_err();
+        assert_eq!(err, super::super::NO_ROOT);
     }
 
     #[test]
     fn tool_diff_relative_file_pair_without_root_refused() {
         // A relative `a`/`b` without an absolute root used to resolve silently
-        // against the server cwd — the wrong-checkout hazard. The standard
-        // refusal (anchor_path) applies, naming the arg and the escape hatch.
+        // against the server's working directory, the wrong-checkout hazard.
+        // The standard refusal (anchor_path) applies, naming the arg and the
+        // escape hatch.
         let args = serde_json::json!({ "a": "rel/a.rs", "b": "rel/b.rs" });
-        let err = tool_diff(&args, WalkConfig::default()).unwrap_err();
+        let err = tool_diff(&args, WalkConfig::default(), None).unwrap_err();
         assert!(
             err.contains("relative a") && err.contains("root"),
             "refusal must name the arg and the root escape hatch: {err}"
@@ -172,11 +179,11 @@ mod tests {
 
     #[test]
     fn tool_diff_relative_root_refused() {
-        // A relative root re-resolves against the server cwd — the exact
-        // hazard `root` exists to remove — so it is refused, never silently
-        // ignored or defaulted.
+        // A relative root has nothing to resolve against but the server's
+        // working directory, the exact hazard `root` exists to remove, so it
+        // is refused, never silently ignored or defaulted.
         let args = serde_json::json!({ "source": "uncommitted", "root": "some/checkout" });
-        let err = tool_diff(&args, WalkConfig::default()).unwrap_err();
+        let err = tool_diff(&args, WalkConfig::default(), None).unwrap_err();
         assert!(
             err.contains("root") && err.contains("absolute"),
             "refusal must direct the caller to an absolute root: {err}"
@@ -199,7 +206,7 @@ mod tests {
                 key: format!("--output={}", victim.display()),
                 "root": repo.path().to_str().unwrap(),
             });
-            let err = tool_diff(&args, WalkConfig::default())
+            let err = tool_diff(&args, WalkConfig::default(), None)
                 .expect_err("an option-shaped value must be refused");
             assert!(
                 err.contains(key) && err.contains("must not start with '-'"),
@@ -222,7 +229,7 @@ mod tests {
             "source": "uncommitted",
             "root": "/nonexistent/checkout/zzz",
         });
-        let err = tool_diff(&args, WalkConfig::default()).unwrap_err();
+        let err = tool_diff(&args, WalkConfig::default(), None).unwrap_err();
         assert!(
             err.contains("/nonexistent/checkout/zzz") && err.contains("not a valid directory"),
             "refusal must name the bad root: {err}"

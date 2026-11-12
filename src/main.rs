@@ -7,7 +7,7 @@ use std::process;
 
 use clap::{CommandFactory, Parser};
 use clap_complete::Shell;
-use tilth::config::{env_var, Config};
+use tilth::config::{env_var, launch_dir, Config};
 use tilth::{diag, FileScopeHint};
 use tilth_core::Walk;
 
@@ -190,10 +190,7 @@ enum Command {
     },
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "config and root handling move out of here in #307"
-)]
+#[expect(clippy::too_many_lines, reason = "split by responsibility in #315")]
 fn main() {
     let cli = Cli::parse();
 
@@ -202,6 +199,7 @@ fn main() {
     config.walk.respect_gitignore |= cli.respect_gitignore;
     config.overview &= !cli.no_overview;
     configure_thread_pools(config.walk.threads);
+    let launch_dir = launch_dir();
 
     // Shell completions
     if let Some(shell) = cli.completions {
@@ -221,10 +219,8 @@ fn main() {
                 }
             }
             Command::Overview => {
-                let cwd = std::env::current_dir().unwrap_or_else(|e| {
-                    diag::emit(format_args!(
-                        "overview error: cannot read the current directory: {e}"
-                    ));
+                let cwd = launch_dir.unwrap_or_else(|e| {
+                    diag::emit(format_args!("overview error: {e}"));
                     process::exit(1);
                 });
                 let output = tilth::overview::fingerprint(&cwd);
@@ -278,9 +274,13 @@ fn main() {
                     }
                 };
                 let budget_opt = if budget == 0 { None } else { Some(budget) };
+                let cwd = launch_dir.unwrap_or_else(|e| {
+                    diag::emit(format_args!("diff error: {e}"));
+                    process::exit(1);
+                });
                 match tilth::diff::diff(
                     &diff_source,
-                    None, // repo: the CLI already runs in the caller's checkout
+                    &cwd,
                     scope.as_deref(),
                     search.as_deref(),
                     blast.then_some(config.walk),
@@ -308,7 +308,7 @@ fn main() {
         } else {
             Some(cli_scope(&cli.scope, FileScopeHint::Directory).unwrap_or_else(|e| usage_exit(&e)))
         };
-        if let Err(e) = tilth::mcp::run(config, cli.edit, mcp_scope.as_deref()) {
+        if let Err(e) = tilth::mcp::run(config, cli.edit, mcp_scope, launch_dir) {
             diag::emit(format_args!("mcp error: {e}"));
             process::exit(1);
         }
@@ -385,7 +385,7 @@ fn main() {
             } else {
                 // An unreadable working directory offers no second place to
                 // look, so the scope path stands and analyze_deps reports it.
-                match std::env::current_dir().map(|cwd| cwd.join(&query)) {
+                match launch_dir.map(|cwd| cwd.join(&query)) {
                     Ok(cwd_path) if cwd_path.exists() => cwd_path,
                     _ => scope_path,
                 }

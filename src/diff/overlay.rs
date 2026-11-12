@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use tilth_core::lang::detect_file_type_with_content;
 use tilth_core::lang::outline::get_outline_entries;
@@ -22,11 +22,7 @@ use super::{
 /// symbol that holds it (see `attribute_lines`). Lines no symbol takes, and
 /// all lines of a file with no outline, stay visible in `other_lines`.
 /// `repo` anchors git commands and working-tree reads.
-pub(crate) fn compute_overlay(
-    file_diff: &FileDiff,
-    sides: &Sides,
-    repo: Option<&Path>,
-) -> FileOverlay {
+pub(crate) fn compute_overlay(file_diff: &FileDiff, sides: &Sides, repo: &Path) -> FileOverlay {
     let (added, removed) = count_changed_lines(&file_diff.hunks);
     let mut overlay = FileOverlay {
         path: file_diff.path.clone(),
@@ -159,8 +155,8 @@ pub(crate) fn signature_warnings<'a>(
 }
 
 /// Scan a file for merge conflict markers and extract conflict blocks.
-pub(crate) fn detect_conflicts(path: &Path, repo: Option<&Path>) -> Vec<Conflict> {
-    let disk = on_disk(repo, path);
+pub(crate) fn detect_conflicts(path: &Path, repo: &Path) -> Vec<Conflict> {
+    let disk = repo.join(path);
     let Ok(content) = tilth_core::source::read_to_string(&disk) else {
         return Vec::new();
     };
@@ -304,7 +300,7 @@ fn innermost_owner(changes: &[SymbolChange], line: &DiffLine) -> Option<usize> {
 fn file_contents(
     file_diff: &FileDiff,
     sides: &Sides,
-    repo: Option<&Path>,
+    repo: &Path,
 ) -> Result<(String, String), String> {
     let old = if file_diff.status == FileStatus::Added {
         String::new()
@@ -321,13 +317,14 @@ fn file_contents(
 }
 
 /// Read `path` (repository-relative) from one side of a diff.
-fn read_side(side: &Side, path: &Path, repo: Option<&Path>) -> Result<String, String> {
+fn read_side(side: &Side, path: &Path, repo: &Path) -> Result<String, String> {
     let path_str = path.to_string_lossy();
     match side {
         Side::Rev(rev) => git_show(&format!("{rev}:{path_str}"), repo),
         Side::Index => git_show(&format!(":{path_str}"), repo),
         Side::WorkingTree => {
-            let disk = on_disk(repo, path);
+            // Git emits paths relative to the repository top.
+            let disk = repo.join(path);
             tilth_core::source::read_to_string(&disk)
                 .map_err(|e| format!("read {}: {e}", disk.display()))
         }
@@ -337,15 +334,7 @@ fn read_side(side: &Side, path: &Path, repo: Option<&Path>) -> Result<String, St
     }
 }
 
-/// Working-tree location of a repo-relative diff path. Git emits paths
-/// relative to the repo top-level; when the diff is anchored to a `repo`
-/// other than the process cwd they must be joined under it before any
-/// filesystem access.
-fn on_disk(repo: Option<&Path>, path: &Path) -> PathBuf {
-    repo.map_or_else(|| path.to_path_buf(), |r| r.join(path))
-}
-
-pub(super) fn git_show(spec: &str, repo: Option<&Path>) -> Result<String, String> {
+pub(super) fn git_show(spec: &str, repo: &Path) -> Result<String, String> {
     let output = super::git_command(repo)
         .args([
             "-c",
@@ -398,13 +387,15 @@ mod tests {
         // A single ref (no `..`) diffs against the working tree, so the new
         // content must come from the file on disk — not `git show HEAD:<path>`,
         // which would return empty here and silently mis-attribute the diff.
-        let content = read_side(&Side::WorkingTree, &file, None).expect("working-tree read");
+        let content = read_side(&Side::WorkingTree, &file, dir.path()).expect("working-tree read");
         assert!(content.contains("worktree_only"), "{content:?}");
     }
 
     #[test]
     fn revision_ranges_pick_both_sides() {
-        let sides = |r: &str| resolve_sides(&DiffSource::GitRef(r.to_string()), None).unwrap();
+        // None of these ranges runs git, so the repository is never entered.
+        let repo = Path::new("/nonexistent");
+        let sides = |r: &str| resolve_sides(&DiffSource::GitRef(r.to_string()), repo).unwrap();
         // A bare ref compares that ref with the working tree.
         assert_eq!(
             sides("HEAD~1"),
@@ -444,7 +435,7 @@ mod tests {
             old: Side::File(missing),
             new: Side::File(file.clone()),
         };
-        assert!(read_side(&sides.old, &file, None).is_err());
+        assert!(read_side(&sides.old, &file, dir.path()).is_err());
 
         let file_diff = FileDiff {
             path: file,
@@ -471,7 +462,7 @@ mod tests {
             is_generated: false,
             is_binary: false,
         };
-        let overlay = compute_overlay(&file_diff, &sides, None);
+        let overlay = compute_overlay(&file_diff, &sides, dir.path());
         assert!(overlay.symbol_changes.is_empty(), "{overlay:?}");
         assert_eq!(overlay.other_lines.len(), 2, "{overlay:?}");
         assert_eq!((overlay.added, overlay.removed), (1, 1));

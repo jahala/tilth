@@ -296,7 +296,7 @@ pub fn run_full(
 /// raise the cap (see `piped_invocation_does_not_auto_expand` pin).
 #[expect(
     clippy::too_many_arguments,
-    reason = "per-call options become one Request in #307"
+    reason = "per-call options become one Request in #350"
 )]
 pub fn run_expanded(
     query: &str,
@@ -380,7 +380,7 @@ pub fn run_grok(
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "per-call options become one Request in #307"
+    reason = "per-call options become one Request in #350"
 )]
 fn run_inner(
     query: &str,
