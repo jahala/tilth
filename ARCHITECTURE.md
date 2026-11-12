@@ -178,6 +178,15 @@ The walk settings are `tilth_core::WalkConfig` (threads, gitignore). A
 walk takes them in a `tilth_core::Walk`, with the directory it starts from
 and an optional glob, so library users set them the same way.
 
+`config::launch_dir` is the only read of the working directory, and
+nothing changes it: `clippy.toml` forbids `std::env::current_dir`,
+`set_current_dir` and `std::path::absolute`. `main` calls it once. The
+CLI uses that directory as its root (the overview, the `--deps`
+fallback, the diff's checkout), and the relative paths it hands the OS
+resolve against the same directory. The MCP server derives its root from
+it, keeps the root in `Services`, and passes it to every tool. A missing
+root fails a call with one message, `tools::NO_ROOT`.
+
 ### CLI (`src/main.rs`)
 
 A clap `derive`-style parser (`Cli` struct) accepts a free-form `query`
@@ -211,12 +220,16 @@ over stdio. The body is a hand-rolled loop, not a framework.
 
 Startup (`mcp::run`) resolves a project root in priority order:
 explicit `--scope` argument > MCP `roots/list` response > nearest
-`package_root(cwd)` > `cwd`. The chosen root becomes the process's
-working directory, so every later tool call resolves relative paths
-against it. This was added specifically to handle MCP hosts (Codex was
-the documented case) that launch tilth with `cwd=/`. A `--scope` that
-is not a directory stops the launch with a usage error naming the
-close directories (`missing_scope_hint`).
+`package_root(cwd)` > `cwd`. The root is a value in `Services`: a call
+with no `root` argument resolves its relative paths against it, and one
+with no `scope` searches it. The process's working directory never
+changes. This was added specifically to handle MCP hosts (Codex was the
+documented case) that launch tilth with `cwd=/`. A `--scope` that is
+not a directory stops the launch with a usage error naming the close
+directories (`missing_scope_hint`). When the launch directory cannot be
+read and no other root arrives, the server warns on stderr once it knows
+none is coming, and each call that needs the root fails with
+`tools::NO_ROOT` in its result.
 
 Per call, a `scope` that does not exist falls back to the caller's
 `root` with a warning that carries the same hint, so a typo still
@@ -240,7 +253,8 @@ methods worth describing in detail:
   as a pre-flight gate naming the exact Bash commands and host tools to
   avoid, with concrete `<bad>→<good>` rewrites. When
   `Config::overview` is on (no `TILTH_NO_OVERVIEW`, no `--no-overview`),
-  `overview::fingerprint(cwd)` is prepended — a project summary built in <250ms (a stderr warning fires
+  `overview::fingerprint(root)` is prepended, for the server's root at
+  that moment — a project summary built in <250ms (a stderr warning fires
   if it overruns).
 - `tools/list` — returns the tool schemas. `tools/call` is the workhorse
   and goes through `handle_tool_call`.
@@ -789,7 +803,7 @@ the overview's language counts stay path-only.
 (`Cargo.toml`, `package.json`, `pyproject.toml`, `go.mod`, etc.) and is
 used by both ranking (`scope_proximity`) and faceting
 (`is_same_package`). It's also what the MCP server uses at startup to
-resolve a project root from cwd.
+resolve a project root from its launch directory.
 
 ## Caches and indexes
 
@@ -894,8 +908,9 @@ single tool each.
    (read a `.patch` file), `Log(range)` (per-commit summaries). For a git
    source, every git command and working-tree read then runs at the
    repository top (`git rev-parse --show-toplevel`), because git prints
-   paths from there. `checkout` picks the repository: the one `root` (or
-   the cwd) is in, unless the scope lies outside it. Then the scope names
+   paths from there. `checkout` picks the repository: the one the base
+   (the call's `root`, the server's root, or the CLI's working directory)
+   is in, unless the scope lies outside it. Then the scope names
    its own, so a scope in another worktree diffs that worktree.
 2. **`run_git_diff`** shells out to `git diff` with the right args
    (or reads the patch file). Before the first commit, `HEAD` is the
@@ -925,8 +940,8 @@ single tool each.
    come from the patch itself.
 6. **`overlay::cross_file_matching`** detects symbols moved between
    files.
-7. **Scope** (`ScopeSpec`) — a `--scope` resolves against `root` (or the
-   cwd) to a path from the repository top. A changed file at that path
+7. **Scope** (`ScopeSpec`) — a `--scope` resolves against the base to a
+   path from the repository top. A changed file at that path
    (or at its path before a rename) gives the file detail; a directory
    gives the overview of the changed files under it; a trailing part of
    a path (`main.rs`) must name one changed file. An existing path with
@@ -980,7 +995,9 @@ also in `edit.rs`) produces the diff string itself.
 
 The callee-callers warning lives one layer up. `mcp::tool_edit`, on a
 successful `Applied` result, calls `search::blast::blast_radius` with
-the same `Edit` list and appends its output. The check is
+the same `Edit` list and appends its output. It searches the file's
+package, or, for a file outside any package, the call's write boundary
+(its `scope`, else its `root`, else the server's root). The check is
 unconditional in MCP (every successful edit gets the warning); the
 `diff: true` argument controls whether the per-edit `-`/`+` block is
 shown alongside the hashlined context, *not* whether the blast
@@ -996,9 +1013,13 @@ beyond the surface API are worth understanding:
 
 **Roots discovery.** After answering `initialize`, if the client
 declared `roots` capability and `--scope` wasn't explicit, the server
-sends a `roots/list` request to the client. The client's response (if
-any) becomes the new working directory. This is what makes tilth work
-correctly with hosts that launch it from a non-project directory.
+sends a `roots/list` request to the client. The first root in the
+response that names a directory becomes the server's root, whenever it
+arrives. Each tool call runs on its own copy of `Services`, so a call in
+flight keeps the root it started with and the next call sees the new
+one; nothing is shared that could change under it. This is what makes
+tilth work correctly with hosts that launch it from a non-project
+directory.
 
 **Per-request thread model.** Every `tools/call` is run on a fresh
 `std::thread::spawn`-ed worker. The main loop waits with
@@ -1023,7 +1044,7 @@ strategic guidance every host gets at `initialize`. It lives in
 agents kept reaching for those despite earlier "DO NOT use
 Grep/Read/Glob" rules. Edit mode appends an `EDIT_MODE_EXTRA` block
 from `prompts/mcp-edit.md` with the `tilth_write` instructions.
-`overview::fingerprint(cwd)` is prepended unless `Config::overview` is
+`overview::fingerprint(root)` is prepended unless `Config::overview` is
 off — a brief summary of language counts, manifests, hot files,
 and git context.
 

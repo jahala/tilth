@@ -298,7 +298,7 @@ pub fn search_symbol(
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "per-call options become one Request in #307"
+    reason = "per-call options become one Request in #350"
 )]
 pub fn search_symbol_expanded(
     query: &str,
@@ -317,7 +317,7 @@ pub fn search_symbol_expanded(
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "per-call options become one Request in #307"
+    reason = "per-call options become one Request in #350"
 )]
 pub fn search_multi_symbol_expanded(
     queries: &[&str],
@@ -424,7 +424,7 @@ pub fn search_regex(
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "per-call options become one Request in #307"
+    reason = "per-call options become one Request in #350"
 )]
 pub fn search_content_expanded(
     query: &str,
@@ -445,7 +445,7 @@ pub fn search_content_expanded(
 /// Expanded regex search — takes raw pattern, no slash wrapping needed.
 #[expect(
     clippy::too_many_arguments,
-    reason = "per-call options become one Request in #307"
+    reason = "per-call options become one Request in #350"
 )]
 pub fn search_regex_expanded(
     pattern: &str,

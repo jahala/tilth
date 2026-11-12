@@ -352,7 +352,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     },
                     "root": {
                         "type": "string",
-                        "description": "Optional absolute path. When provided, every RELATIVE file path in this call is anchored under `root` instead of the server's process cwd. Absolute file paths are used as-is. Writes must land inside `root`, or inside the folder the server was launched in when `root` is omitted; set `root` to a directory that contains every path in the call. Use this when the server was launched from a different directory than the worktree you are editing."
+                        "description": "Optional absolute path. When provided, every RELATIVE file path in this call is anchored under `root` instead of the server's project root. Absolute file paths are used as-is. Writes must land inside `root`, or inside the folder the server was launched in when `root` is omitted; set `root` to a directory that contains every path in the call. Use this when the server was launched from a different directory than the worktree you are editing."
                     }
                 }
             }

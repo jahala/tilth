@@ -16,7 +16,9 @@ allow-dbg-in-tests = true
 # and `print_stderr` cover the macros.
 
 # The environment is read in one place, `tilth::config::env_var`, and never
-# written: `main` builds one `Config` from it and passes it down.
+# written: `main` builds one `Config` from it and passes it down. The working
+# directory is read in one place, `tilth::config::launch_dir`, and never
+# changed: `main` resolves the project root from it once and passes it down.
 disallowed-methods = [
   { path = "std::env::var", reason = "read the environment through `tilth::config::env_var`; settings come from `Config`" },
   { path = "std::env::var_os", reason = "read the environment through `tilth::config::env_var`; settings come from `Config`" },
@@ -24,6 +26,9 @@ disallowed-methods = [
   { path = "std::env::vars_os", reason = "read the environment through `tilth::config::env_var`; settings come from `Config`" },
   { path = "std::env::set_var", reason = "the environment is process-global; pass settings in a `Config`" },
   { path = "std::env::remove_var", reason = "the environment is process-global; pass settings in a `Config`" },
+  { path = "std::env::current_dir", reason = "read the working directory through `tilth::config::launch_dir`; resolve paths against the root passed in" },
+  { path = "std::env::set_current_dir", reason = "the working directory is process-global; pass the root as a value" },
+  { path = "std::path::absolute", reason = "it reads the working directory; join a relative path to the root passed in" },
   { path = "std::io::stdout", reason = "write results through `write_stdout` (CLI) or the MCP transport's writer" },
   { path = "std::io::stderr", reason = "write diagnostics through `diag::emit`" },
   { path = "std::fs::read", reason = "read through `tilth_core::source`, whose open never waits on a pipe" },
