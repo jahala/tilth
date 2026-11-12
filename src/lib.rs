@@ -606,17 +606,17 @@ fn single_query_search(
     };
 
     if accept_sym {
-        return search::format_raw_result(&sym_result, cache);
+        return search::format_raw_result(&sym_result, walk, cache);
     }
 
     let content_result = search::search_content_raw(text, walk, full_search)?;
     if content_result.total_found > 0 {
-        return search::format_raw_result(&content_result, cache);
+        return search::format_raw_result(&content_result, walk, cache);
     }
 
     // For concept queries: if symbol had usages but no definitions, show those
     if prefer_definitions && sym_result.total_found > 0 {
-        return search::format_raw_result(&sym_result, cache);
+        return search::format_raw_result(&sym_result, walk, cache);
     }
 
     // Fallthrough only carries path-shaped queries (`src/foo.rs`) that name
@@ -627,7 +627,7 @@ fn single_query_search(
             suggestion: read::suggest_similar_file(walk.scope, text),
         });
     }
-    no_matches(&content_result, cache, walk.scope, text)
+    no_matches(&content_result, walk, cache, text)
 }
 
 /// A word or phrase that matched nothing: the standard `0 matches` result,
@@ -636,12 +636,12 @@ fn single_query_search(
 /// exited 2, as if the query had named a missing file.
 fn no_matches(
     result: &types::SearchResult,
+    walk: Walk<'_>,
     cache: &OutlineCache,
-    scope: &Path,
     name: &str,
 ) -> Result<String, TilthError> {
-    let out = search::format_raw_result(result, cache)?;
-    Ok(match read::suggest_similar_file(scope, name) {
+    let out = search::format_raw_result(result, walk, cache)?;
+    Ok(match read::suggest_similar_file(walk.scope, name) {
         Some(file) => format!("{out}\n\n> A file has a similar name: {file}"),
         None => out,
     })
@@ -658,7 +658,7 @@ fn multi_word_concept_search(
     let mut content_result = search::search_content_raw(text, walk, full_search)?;
     content_result.query = text.to_string();
     if content_result.total_found > 0 {
-        return search::format_raw_result(&content_result, cache);
+        return search::format_raw_result(&content_result, walk, cache);
     }
 
     // Relaxed: match all words in any order
@@ -683,11 +683,11 @@ fn multi_word_concept_search(
     let mut relaxed_result = search::search_regex_raw(&relaxed, walk, full_search)?;
     relaxed_result.query = text.to_string();
     if relaxed_result.total_found > 0 {
-        return search::format_raw_result(&relaxed_result, cache);
+        return search::format_raw_result(&relaxed_result, walk, cache);
     }
 
     let first_word = words.first().copied().unwrap_or(text);
-    no_matches(&content_result, cache, walk.scope, first_word)
+    no_matches(&content_result, walk, cache, first_word)
 }
 
 #[cfg(test)]

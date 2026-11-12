@@ -118,6 +118,10 @@ impl<'a> Walk<'a> {
 #[must_use]
 pub fn base_walk_builder(scope: &Path, config: WalkConfig) -> WalkBuilder {
     let respect_gitignore = config.respect_gitignore;
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "by design: the one walker every other walk builds on"
+    )]
     let mut builder = WalkBuilder::new(scope);
     builder
         .follow_links(true)
@@ -148,10 +152,16 @@ fn include_entry(entry: &ignore::DirEntry) -> bool {
 /// A `walk.glob` applies a file-pattern filter (whitelist or negation).
 /// With gitignore enabled, the glob cannot override ignore rules.
 pub fn walker(walk: Walk<'_>) -> Result<ignore::WalkParallel, TilthError> {
-    let mut builder = base_walk_builder(walk.scope, walk.config);
+    let mut builder = walk_builder(walk)?;
     // The walker reads 0 as "choose for me".
     builder.threads(walk.config.threads.map_or(0, NonZeroUsize::get));
+    Ok(builder.build_parallel())
+}
 
+/// The builder [`walker`] runs, for a caller that needs a sequential walk
+/// or its own `.max_depth()`: [`base_walk_builder`] narrowed by `walk.glob`.
+pub fn walk_builder(walk: Walk<'_>) -> Result<WalkBuilder, TilthError> {
+    let mut builder = base_walk_builder(walk.scope, walk.config);
     if let Some(pattern) = walk.glob {
         if !pattern.is_empty() {
             let mut overrides = ignore::overrides::OverrideBuilder::new(walk.scope);
@@ -181,8 +191,7 @@ pub fn walker(walk: Walk<'_>) -> Result<ignore::WalkParallel, TilthError> {
             }
         }
     }
-
-    Ok(builder.build_parallel())
+    Ok(builder)
 }
 
 #[cfg(test)]
