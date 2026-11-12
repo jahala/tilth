@@ -15,6 +15,9 @@ allow-dbg-in-tests = true
 # MCP transport's writer, diagnostics through `diag::emit`. `print_stdout`
 # and `print_stderr` cover the macros.
 
+# Every directory walk starts from `tilth_core::search::walk`, so each one
+# skips `SKIP_DIRS` and `.tilthignore` and follows the gitignore setting.
+
 # The environment is read in one place, `tilth::config::env_var`, and never
 # written: `main` builds one `Config` from it and passes it down.
 disallowed-methods = [
@@ -29,4 +32,6 @@ disallowed-methods = [
   { path = "std::fs::read", reason = "read through `tilth_core::source`, whose open never waits on a pipe" },
   { path = "std::fs::read_to_string", reason = "read through `tilth_core::source`, whose open never waits on a pipe" },
   { path = "std::fs::File::open", reason = "open through `tilth_core::source::OpenFile`, which never waits on a pipe" },
+  { path = "ignore::WalkBuilder::new", reason = "walk through `tilth_core::search::walk`, which holds the one ignore policy" },
+  { path = "ignore::Walk::new", reason = "walk through `tilth_core::search::walk`, which holds the one ignore policy" },
 ]
