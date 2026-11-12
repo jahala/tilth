@@ -94,7 +94,7 @@ tilth diff HEAD~1                 # vs prior commit
 tilth diff main..feat             # branch comparison
 tilth diff --log HEAD~5..HEAD     # per-commit symbol summaries
 tilth diff --blast                # warn on signature-changed exports
-tilth diff --expand 3             # inline source for top 3 changed symbols
+tilth diff --expand 3             # changed lines of the first 3 changed symbols
 ```
 
 Function-level change detection — `[+]` added, `[-]` removed, `[~]` modified, `[~:sig]` signature changed. Replaces `git diff` for symbol-level review.
