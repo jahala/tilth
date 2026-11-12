@@ -643,8 +643,15 @@ fn checkout(base: &Path, scope: Option<&str>) -> Result<(PathBuf, PathBuf), Stri
 
 /// Split `path:function` into its parts. A trailing `:` names no function.
 fn split_function(scope: &str) -> (&str, Option<&str>) {
-    match scope.split_once(':') {
-        Some((p, f)) if !f.is_empty() => (p, Some(f)),
+    // A Windows drive colon is part of the path, even on a non-Windows host.
+    let prefix_len = match scope.as_bytes() {
+        [drive, b':', b'\\' | b'/', ..] if drive.is_ascii_alphabetic() => 2,
+        _ => 0,
+    };
+    match scope[prefix_len..].split_once(':') {
+        Some((path, function)) if !function.is_empty() => {
+            (&scope[..prefix_len + path.len()], Some(function))
+        }
         _ => (scope, None),
     }
 }
@@ -1920,6 +1927,21 @@ diff --git a/src/main.rs b/src/main.rs
     fn commit_all(root: &Path, message: &str) {
         git(root, &["add", "-A"]);
         git(root, &["commit", "-q", "-m", message]);
+    }
+
+    #[test]
+    fn diff_scope_preserves_windows_drive_prefix() {
+        for (scope, expected) in [
+            (r"C:\a\b.rs", (r"C:\a\b.rs", None)),
+            (r"C:\a\b.rs:run", (r"C:\a\b.rs", Some("run"))),
+            ("c:/a/b.rs", ("c:/a/b.rs", None)),
+            ("c:/a/b.rs:run", ("c:/a/b.rs", Some("run"))),
+            ("src/a.rs:run", ("src/a.rs", Some("run"))),
+            ("src/a.rs:Type::run", ("src/a.rs", Some("Type::run"))),
+            ("src/a.rs:", ("src/a.rs:", None)),
+        ] {
+            assert_eq!(split_function(scope), expected, "scope: {scope}");
+        }
     }
 
     fn diff_at(root: &Path, source: &DiffSource, scope: Option<&str>) -> Result<String, String> {
