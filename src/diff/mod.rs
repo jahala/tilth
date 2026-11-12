@@ -4,14 +4,18 @@ pub mod overlay;
 pub mod parse;
 
 use std::collections::HashSet;
+use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use rayon::prelude::*;
 
+use tilth_core::error::TilthError;
 use tilth_core::search::walk::{Walk, WalkConfig};
+use tilth_core::source::OpenFile;
 use tilth_core::types::OutlineKind;
 
 use crate::git::{self, Git, GitError};
+use crate::read;
 
 #[derive(Debug)]
 pub enum DiffSource {
@@ -26,6 +30,8 @@ pub enum DiffSource {
 #[derive(Debug)]
 pub struct FileDiff {
     pub path: PathBuf,
+    /// The old side's path, when the patch names it apart from `path`: a
+    /// rename, or a file of a pair outside git.
     pub old_path: Option<PathBuf>,
     pub status: FileStatus,
     pub hunks: Vec<Hunk>,
@@ -156,7 +162,7 @@ pub enum MatchConfidence {
 #[derive(Debug)]
 pub struct FileOverlay {
     pub path: PathBuf,
-    /// The path before a rename.
+    /// The old side's path, when it differs from `path`.
     pub old_path: Option<PathBuf>,
     pub symbol_changes: Vec<SymbolChange>,
     /// Patch lines outside every changed symbol: all of them for a file
@@ -169,6 +175,8 @@ pub struct FileOverlay {
     /// A lockfile or other generated file, summarized by its line counts.
     pub is_generated: bool,
     pub is_binary: bool,
+    /// Why the file has no symbols when a side of it could not be read.
+    pub read_error: Option<String>,
 }
 
 #[derive(Debug)]
@@ -363,6 +371,14 @@ fn run_git_diff(source: &DiffSource, sides: &Sides, repo: &Path) -> Result<Strin
                 .map_err(|e| format!("failed to read patch file: {e}"))?;
             return Ok(content);
         }
+        // `git diff --no-index` exits 1 for a file it cannot access, the
+        // code it also gives for files that differ, so its patch would be
+        // empty and read as "No changes." (#358). Each side opens first.
+        DiffSource::Files(fa, fb) => {
+            for path in [fa, fb] {
+                open_side(&repo.join(path)).map_err(|e| e.to_string())?;
+            }
+        }
         _ => {}
     }
 
@@ -389,13 +405,23 @@ fn run_git_diff(source: &DiffSource, sides: &Sides, repo: &Path) -> Result<Strin
         DiffSource::GitStaged => git.args(&["--staged"]),
         DiffSource::GitRef(r) => git.revision(r),
         // `git diff --no-index` exits 1 when the files differ. Any other
-        // failure is an error, never an empty patch that reads as "No
-        // changes."
+        // failure is an error.
         DiffSource::Files(fa, fb) => git.args(&["--no-index"]).path(fa).path(fb).success_on(1),
         // Patch and Log are handled above
         DiffSource::Patch(_) | DiffSource::Log(_) => unreachable!(),
     };
     git.run().map_err(|e| e.to_string())
+}
+
+/// Open one side of a file pair the way a read opens it, so a side that is
+/// missing or unreadable fails with the read's error. A directory is left to
+/// git, which walks it.
+fn open_side(path: &Path) -> Result<(), TilthError> {
+    let meta = fs::metadata(path).map_err(|e| read::path_error(path, e))?;
+    if !meta.is_dir() {
+        OpenFile::open(path).map_err(|e| read::path_error(path, e))?;
+    }
+    Ok(())
 }
 
 /// Parse a patch and build one overlay per file, then match moves across
@@ -1615,6 +1641,139 @@ diff --git a/src/main.rs b/src/main.rs
             !result.contains("No changes"),
             "expected changes between files:\n{result}"
         );
+    }
+
+    /// `git diff --no-index` exits 1 for a file it cannot access, as it does
+    /// for files that differ, so a missing side read as "No changes." (#358).
+    /// It fails the way a read of it fails, resolved against the checkout.
+    #[test]
+    fn a_missing_side_of_a_file_pair_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.rs"), "fn a() {}\n").unwrap();
+        fs::write(dir.path().join("b.rs"), "fn b() {}\n").unwrap();
+        let pair_error = |a: &str, b: &str| {
+            let source = DiffSource::Files(PathBuf::from(a), PathBuf::from(b));
+            diff(&source, dir.path(), None, None, None, 0, None).unwrap_err()
+        };
+        let missing = |name: &str, suggestion: &str| {
+            format!(
+                "not found: {} — did you mean: {suggestion}",
+                dir.path().join(name).display()
+            )
+        };
+
+        assert_eq!(pair_error("a.rx", "b.rs"), missing("a.rx", "a.rs"));
+        assert_eq!(pair_error("a.rs", "b.rx"), missing("b.rx", "b.rs"));
+        assert_eq!(pair_error("a.rx", "b.rx"), missing("a.rx", "a.rs"));
+    }
+
+    /// A side that exists but cannot be opened names itself too, in the
+    /// words a read of it uses, before git reports it in its own.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_side_of_a_file_pair_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a.rs"), dir.path().join("b.rs"));
+        fs::write(&a, "fn a() {}\n").unwrap();
+        fs::write(&b, "fn b() {}\n").unwrap();
+        fs::set_permissions(&b, fs::Permissions::from_mode(0o000)).unwrap();
+        if OpenFile::open(&b).is_ok() {
+            eprintln!("skipped: permissions do not bind this user, so no file can be locked");
+            return;
+        }
+        let err = diff(
+            &DiffSource::Files(a, b.clone()),
+            dir.path(),
+            None,
+            None,
+            None,
+            0,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(err, format!("{} [permission denied]", b.display()));
+    }
+
+    /// A pair of directories reads each file from the side it lies in, so
+    /// a changed, added, deleted or nested file shows its symbols (#364).
+    /// So does a file paired with a directory, which git compares with the
+    /// file of the same name in it. Git prints relative and absolute roots
+    /// differently, and both are read.
+    #[test]
+    fn a_pair_of_directories_reads_each_file_from_its_side() {
+        let dir = tempfile::tempdir().unwrap();
+        for (path, content) in [
+            ("d1/x.rs", "fn a() {\n    1\n}\n"),
+            ("d2/x.rs", "fn a() {\n    2\n}\n"),
+            ("d1/gone.rs", "fn gone() {}\n"),
+            ("d2/fresh.rs", "fn fresh() {}\n"),
+            ("d1/sub/s.rs", "fn s() { 1 }\n"),
+            ("d2/sub/s.rs", "fn s() { 2 }\n"),
+        ] {
+            let path = dir.path().join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, content).unwrap();
+        }
+        let pair = |a: PathBuf, b: PathBuf| {
+            diff(
+                &DiffSource::Files(a, b),
+                dir.path(),
+                None,
+                None,
+                None,
+                0,
+                None,
+            )
+            .unwrap()
+        };
+
+        for root in [Path::new(""), dir.path()] {
+            let out = pair(root.join("d1"), root.join("d2"));
+            assert!(out.contains("4 files, 2 modified, 1 added"), "{out}");
+            for line in [
+                "x.rs (1 symbol)\n  [~]      a ",
+                "s.rs (1 symbol)\n  [~]      s ",
+                "fresh.rs (1 symbol)\n  [+]      fresh ",
+                "gone.rs (1 symbol)\n  [-]      gone ",
+            ] {
+                assert!(out.contains(line), "{line:?} in:\n{out}");
+            }
+        }
+        for (a, b) in [("d1/x.rs", "d2"), ("d1", "d2/x.rs")] {
+            let out = pair(PathBuf::from(a), PathBuf::from(b));
+            assert!(
+                out.contains("x.rs (1 symbol)\n  [~]      a "),
+                "{a} vs {b}:\n{out}"
+            );
+        }
+    }
+
+    /// A side that cannot be read leaves its file without symbols, and the
+    /// file says why rather than claim it has none.
+    #[test]
+    fn a_file_whose_side_cannot_be_read_says_why_it_has_no_symbols() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.rs"), "fn a() {\n    1\n}\n").unwrap();
+        // Text git diffs, but not UTF-8, which the structural diff reads strictly.
+        fs::write(dir.path().join("b.rs"), b"fn a() {\n    2 // \xe9\n}\n").unwrap();
+        let source = DiffSource::Files(PathBuf::from("a.rs"), PathBuf::from("b.rs"));
+        let run = |scope| diff(&source, dir.path(), scope, None, None, 0, None).unwrap();
+        let why = "symbols unavailable: cannot read b.rs: stream did not contain valid UTF-8";
+
+        let overview = run(None);
+        assert!(
+            overview.contains(&format!("## b.rs ({why})\n")),
+            "{overview}"
+        );
+        let file = run(Some("b.rs"));
+        assert!(
+            file.starts_with(&format!("# Diff: b.rs — {why}, +1/−1 lines\n")),
+            "{file}"
+        );
+        let function = run(Some("b.rs:a"));
+        assert!(function.contains(why), "{function}");
     }
 
     /// A count of one takes the singular noun in the overview (#294).

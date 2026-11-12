@@ -188,7 +188,7 @@ fn fingerprint_inner(root: &Path) -> String {
             }
 
             // Git context
-            if let Some(git) = git_context(root) {
+            if let Some(git) = git_context(root, Instant::now() + GIT_LIMIT) {
                 lines.push(format!("  git: {git}"));
             }
 
@@ -213,7 +213,7 @@ fn fingerprint_inner(root: &Path) -> String {
         if let Some(hot) = hot_files(root, &walk, primary_lang) {
             lines.push(format!("  hot (× = importers): {hot}"));
         }
-        if let Some(git) = git_context(root) {
+        if let Some(git) = git_context(root, Instant::now() + GIT_LIMIT) {
             lines.push(format!("  git: {git}"));
         }
         if let Some(tests) = test_style(root, &walk, primary_lang) {
@@ -584,33 +584,51 @@ fn parse_pyproject_toml(root: &Path) -> Option<ManifestInfo> {
 // Git context
 // ---------------------------------------------------------------------------
 
-/// How long each git command of the `git:` line may take.
+/// How long the `git:` line may take, all its git commands together.
 const GIT_LIMIT: Duration = Duration::from_millis(200);
 
-/// What `git <command> <args>` printed, trimmed, or `None` if it printed
-/// nothing, failed or ran past [`GIT_LIMIT`]. Every failure is swallowed:
-/// git context is a cosmetic fingerprint and must never break the primary
-/// read/search path.
-fn git_output(root: &Path, command: &'static str, args: &[&'static str]) -> Option<String> {
-    let out = Git::new(root, command)
-        .args(args)
-        .time_limit(GIT_LIMIT)
+/// The `git:` line: the branch, or the short commit id on a detached HEAD,
+/// and how many files have uncommitted changes.
+///
+/// `None` unless git answered in full by `deadline`. A count git could not
+/// finish is left out with the rest of the line rather than shown as
+/// `clean` (#356). Every failure is swallowed: git context is a cosmetic
+/// fingerprint and must never break the primary read/search path.
+fn git_context(root: &Path, deadline: Instant) -> Option<String> {
+    // One command gives both the branch and the changes. Every header line
+    // starts with `# `, and every other line is one changed file.
+    let status = Git::new(root, "status")
+        .args(&["--porcelain=v2", "--branch"])
+        .deadline(deadline)
         .run()
         .ok()?;
-    let trimmed = out.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_string())
-}
+    let head = status
+        .lines()
+        .find_map(|line| line.strip_prefix("# branch.head "))?;
+    let changes = status
+        .lines()
+        .filter(|line| !line.starts_with("# "))
+        .count();
 
-fn git_context(root: &Path) -> Option<String> {
-    let branch = git_output(root, "branch", &["--show-current"])
-        .or_else(|| git_output(root, "rev-parse", &["--short", "HEAD"]))?;
+    let branch = if head == "(detached)" {
+        Git::new(root, "rev-parse")
+            .args(&["--short", "HEAD"])
+            .deadline(deadline)
+            .run()
+            .ok()?
+            .trim()
+            .to_string()
+    } else {
+        head.to_string()
+    };
 
-    let dirty_count = git_output(root, "status", &["--porcelain"]).map_or(0, |s| s.lines().count());
-
-    let dirty_str = if dirty_count == 0 {
+    let dirty_str = if changes == 0 {
         "clean".to_string()
     } else {
-        format!("{dirty_count} uncommitted files")
+        format!(
+            "{changes} uncommitted {}",
+            crate::format::noun(changes, "file", "files")
+        )
     };
 
     Some(format!("branch {branch}, {dirty_str}"))
@@ -805,6 +823,7 @@ fn hot_files(root: &Path, walk: &WalkResult, primary_lang: Option<Lang>) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git::tests::git;
 
     #[test]
     fn test_fingerprint_on_tilth() {
@@ -986,6 +1005,77 @@ mod tests {
         .unwrap();
         let manifest = parse_package_json(tmp.path()).expect("manifest parsed");
         assert_eq!(manifest.name.as_deref(), Some("bom-app"));
+    }
+
+    /// Git's output was read only once git exited, and a pipe holds 64 KiB,
+    /// so a `git status` that printed more waited for the time limit, and the
+    /// line then said `clean` (#356).
+    #[test]
+    fn a_status_longer_than_a_pipe_is_counted() {
+        let repo = crate::git::tests::repo();
+        for i in 0..2500 {
+            fs::write(
+                repo.path()
+                    .join(format!("untracked-file-with-a-long-name-{i}.txt")),
+                "",
+            )
+            .unwrap();
+        }
+        let line = git_context(repo.path(), far_off()).expect("a git line");
+        assert!(line.ends_with(", 2500 uncommitted files"), "{line}");
+    }
+
+    /// A deadline only a hung git would miss.
+    fn far_off() -> Instant {
+        Instant::now() + Duration::from_secs(60)
+    }
+
+    /// The branch is named, and on a detached HEAD the short commit id,
+    /// each as git itself names it.
+    #[test]
+    fn the_git_line_names_the_branch_or_the_detached_commit() {
+        let repo = crate::git::tests::repo();
+        let dir = repo.path();
+        git(
+            dir,
+            &[
+                "-c",
+                "user.name=tilth",
+                "-c",
+                "user.email=tilth@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "--no-verify",
+                "--allow-empty",
+                "-m",
+                "first",
+            ],
+        );
+        let branch = git(dir, &["branch", "--show-current"]);
+        assert_eq!(
+            git_context(dir, far_off()),
+            Some(format!("branch {branch}, clean"))
+        );
+
+        git(dir, &["checkout", "-q", "--detach"]);
+        let commit = git(dir, &["rev-parse", "--short", "HEAD"]);
+        assert_eq!(
+            git_context(dir, far_off()),
+            Some(format!("branch {commit}, clean"))
+        );
+    }
+
+    /// A `git:` line git could not finish in time is left out, so it never
+    /// calls a dirty checkout `clean` (#356).
+    #[test]
+    fn a_git_line_out_of_time_is_left_out() {
+        let repo = crate::git::tests::repo();
+        fs::write(repo.path().join("new.txt"), "").unwrap();
+        let line = git_context(repo.path(), far_off()).expect("a git line");
+        assert!(line.ends_with(", 1 uncommitted file"), "{line}");
+        assert_eq!(git_context(repo.path(), Instant::now()), None);
     }
 
     #[test]

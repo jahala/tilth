@@ -938,12 +938,14 @@ single tool each.
    its own, so a scope in another worktree diffs that worktree.
 2. **`run_git_diff`** runs `git diff` with the right args through the
    git runner (or reads the patch file). Before the first commit, `HEAD`
-   is the empty tree.
+   is the empty tree. A file pair's sides are opened first, and one that
+   cannot be read fails as a read of it fails: `git diff --no-index`
+   exits 1 for it, the code it gives for files that differ.
 3. **`resolve_sides`** decides where each side reads file content from
-   (`Side`: a revision, the index, the working tree, a file). It is the
-   one place that knows what a range means: `a..b` compares `a` with `b`,
-   `a...b` compares their merge base with `b`, a bare revision compares
-   it with the working tree.
+   (`Side`: a revision, the index, the working tree, or a file pair's
+   file or directory). It is the one place that knows what a range
+   means: `a..b` compares `a` with `b`, `a...b` compares their merge base
+   with `b`, a bare revision compares it with the working tree.
 4. **`parse::parse_unified_diff`** turns the raw text into
    `Vec<FileDiff>` — header, hunks, and lines numbered in the old file
    (removed lines) or the new file (the rest). A file starts at a
@@ -961,14 +963,17 @@ single tool each.
    innermost symbol of any kind, so an unchanged symbol keeps its own
    context out of sight. Lines no symbol takes, and all lines of a
    non-code file, stay in `other_lines`. The overlay's `+N/−M` counts
-   come from the patch itself.
+   come from the patch itself. Each side reads the file by the path the
+   patch names on that side; in a file pair that path starts at the
+   side's own root. When a side cannot be read, the file keeps its lines
+   and has no symbols, and the formatters say why (`read_error`).
 6. **`overlay::cross_file_matching`** detects symbols moved between
    files.
 7. **Scope** (`ScopeSpec`) — a `--scope` resolves against the base to a
-   path from the repository top. A changed file at that path
-   (or at its path before a rename) gives the file detail; a directory
-   gives the overview of the changed files under it; a trailing part of
-   a path (`main.rs`) must name one changed file. An existing path with
+   path from the repository top. A changed file at that path (or at its
+   old side's path, as after a rename) gives the file detail; a
+   directory gives the overview of the changed files under it; a
+   trailing part of a path (`main.rs`) must name one changed file. An existing path with
    no changes says so; anything else is an error. A patch or a file pair
    has no repository top, so an absolute scope there is refused.
 8. **`overlay::signature_warnings`** flags a signature changed in several
@@ -1099,7 +1104,9 @@ A handful of small files cut across every subsystem.
   `&'static str`, so only text tilth wrote can be one, and a caller's
   revision or path goes after `--end-of-options` or `--` (#277). Every
   command pins `core.quotePath` and `diff.suppressBlankEmpty` and reads
-  no stdin. `time_limit` stops a command that runs too long. A failure
+  no stdin. `deadline` stops a command still running at a given
+  instant, and reads its output while it runs, so output larger than a
+  pipe cannot hold git up (#356). A failure
   is a `GitError` (`Io`, `NotARepository`, `Failed`, `TimedOut`) whose
   text is git's own words after the command that failed; nothing parses
   git's stderr, because git translates it. `tests/git_runner.rs` fails
@@ -1121,8 +1128,9 @@ user-facing.
 - **`overview.rs`** — `fingerprint(root)` walks files (depth 2),
   detects primary language, parses the project manifest (`Cargo.toml`,
   `package.json`, `go.mod`, `pyproject.toml`), reads `git` context
-  (branch and uncommitted file count, each git command limited to
-  200 ms), and emits a few
+  (branch and uncommitted file count from one `git status`, with one
+  200 ms deadline for the whole line, which is left out when git does
+  not answer by then), and emits a few
   hot-file lines. Wrapped in `catch_unwind` and a 250ms wall-clock
   budget; warn-on-overrun via stderr. Output is the project summary
   that the MCP `initialize` response prepends to `SERVER_INSTRUCTIONS`.

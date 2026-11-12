@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::{DiffLine, DiffLineKind, FileDiff, FileStatus, Hunk};
 use tilth_core::lang::detection::is_generated_by_name;
@@ -165,8 +165,14 @@ pub(crate) fn parse_unified_diff(raw: &str) -> Vec<FileDiff> {
             git_header_open = false;
             if src == "/dev/null" {
                 status = FileStatus::Added;
+            } else if let Some(old) = header_path(src).and_then(|p| p.strip_prefix("a/")) {
+                // The old side's own path. It differs from the new one in a
+                // rename, and in a pair of files or directories outside
+                // git, where each side's path starts at its own root.
+                if path.as_deref() != Some(Path::new(old)) {
+                    old_path.get_or_insert_with(|| PathBuf::from(old));
+                }
             }
-            // Otherwise it's just the old path header — already captured from diff --git.
             continue;
         }
         if let Some(dst) = line.strip_prefix("+++ ") {
@@ -399,6 +405,26 @@ rename to new_name.rs
         assert_eq!(f.status, FileStatus::Renamed);
         assert_eq!(f.old_path, Some(PathBuf::from("old_name.rs")));
         assert_eq!(f.path, PathBuf::from("new_name.rs"));
+    }
+
+    /// A pair of directories outside git names each side's file from its
+    /// own root, so the old side keeps its own path (#364).
+    #[test]
+    fn a_file_pair_keeps_the_old_side_s_path() {
+        let raw = "\
+diff --git a/d1/x.rs b/d2/x.rs
+index 1b39008..846ab66 100644
+--- a/d1/x.rs
++++ b/d2/x.rs
+@@ -1 +1 @@
+-fn a() { 1 }
++fn a() { 2 }
+";
+        let diffs = parse_unified_diff(raw);
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].status, FileStatus::Modified);
+        assert_eq!(diffs[0].old_path, Some(PathBuf::from("d1/x.rs")));
+        assert_eq!(diffs[0].path, PathBuf::from("d2/x.rs"));
     }
 
     // ── 5. Binary file ────────────────────────────────────────────────────────
