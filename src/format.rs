@@ -1,4 +1,4 @@
-use std::fmt::Write;
+use std::fmt::{Display, Write};
 use std::path::Path;
 
 use crate::types::{estimate_tokens, ViewMode};
@@ -16,6 +16,25 @@ pub(crate) fn noun<'a, N: Copy + PartialEq + From<u8>>(
     } else {
         many
     }
+}
+
+/// What a list of `total` items cut to its first `limit` leaves out:
+/// "and 3 more", or `None` when nothing was cut. Every cut list ends with it,
+/// so a reader never takes a shortened list for the whole.
+pub(crate) fn and_more(total: usize, limit: usize) -> Option<String> {
+    (total > limit).then(|| format!("and {} more", total - limit))
+}
+
+/// The first `limit` of `items`, joined with ", ", then [`and_more`] when
+/// the list was cut: "a, b, c, and 4 more".
+pub(crate) fn capped_list(
+    items: impl ExactSizeIterator<Item = impl Display>,
+    limit: usize,
+) -> String {
+    let total = items.len();
+    let mut parts: Vec<String> = items.take(limit).map(|item| item.to_string()).collect();
+    parts.extend(and_more(total, limit));
+    parts.join(", ")
 }
 
 /// Build the standard header line:
@@ -171,6 +190,14 @@ pub(crate) fn rel(path: &Path, scope: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_capped_list_counts_only_what_it_cuts() {
+        assert_eq!(capped_list(["a", "b", "c"].iter(), 2), "a, b, and 1 more");
+        assert_eq!(capped_list(["a", "b"].iter(), 2), "a, b");
+        assert_eq!(capped_list(["a"].iter(), 0), "and 1 more");
+        assert_eq!(capped_list(std::iter::empty::<&str>(), 2), "");
+    }
 
     #[test]
     fn counts_of_one_take_the_singular() {
