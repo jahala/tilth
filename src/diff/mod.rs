@@ -30,6 +30,8 @@ pub enum DiffSource {
 #[derive(Debug)]
 pub struct FileDiff {
     pub path: PathBuf,
+    /// The old side's path, when the patch names it apart from `path`: a
+    /// rename, or a file of a pair outside git.
     pub old_path: Option<PathBuf>,
     pub status: FileStatus,
     pub hunks: Vec<Hunk>,
@@ -160,7 +162,7 @@ pub enum MatchConfidence {
 #[derive(Debug)]
 pub struct FileOverlay {
     pub path: PathBuf,
-    /// The path before a rename.
+    /// The old side's path, when it differs from `path`.
     pub old_path: Option<PathBuf>,
     pub symbol_changes: Vec<SymbolChange>,
     /// Patch lines outside every changed symbol: all of them for a file
@@ -173,6 +175,8 @@ pub struct FileOverlay {
     /// A lockfile or other generated file, summarized by its line counts.
     pub is_generated: bool,
     pub is_binary: bool,
+    /// Why the file has no symbols when a side of it could not be read.
+    pub read_error: Option<String>,
 }
 
 #[derive(Debug)]
@@ -1690,6 +1694,86 @@ diff --git a/src/main.rs b/src/main.rs
         )
         .unwrap_err();
         assert_eq!(err, format!("{} [permission denied]", b.display()));
+    }
+
+    /// A pair of directories reads each file from the side it lies in, so
+    /// a changed, added, deleted or nested file shows its symbols (#364).
+    /// So does a file paired with a directory, which git compares with the
+    /// file of the same name in it. Git prints relative and absolute roots
+    /// differently, and both are read.
+    #[test]
+    fn a_pair_of_directories_reads_each_file_from_its_side() {
+        let dir = tempfile::tempdir().unwrap();
+        for (path, content) in [
+            ("d1/x.rs", "fn a() {\n    1\n}\n"),
+            ("d2/x.rs", "fn a() {\n    2\n}\n"),
+            ("d1/gone.rs", "fn gone() {}\n"),
+            ("d2/fresh.rs", "fn fresh() {}\n"),
+            ("d1/sub/s.rs", "fn s() { 1 }\n"),
+            ("d2/sub/s.rs", "fn s() { 2 }\n"),
+        ] {
+            let path = dir.path().join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, content).unwrap();
+        }
+        let pair = |a: PathBuf, b: PathBuf| {
+            diff(
+                &DiffSource::Files(a, b),
+                dir.path(),
+                None,
+                None,
+                None,
+                0,
+                None,
+            )
+            .unwrap()
+        };
+
+        for root in [Path::new(""), dir.path()] {
+            let out = pair(root.join("d1"), root.join("d2"));
+            assert!(out.contains("4 files, 2 modified, 1 added"), "{out}");
+            for line in [
+                "x.rs (1 symbol)\n  [~]      a ",
+                "s.rs (1 symbol)\n  [~]      s ",
+                "fresh.rs (1 symbol)\n  [+]      fresh ",
+                "gone.rs (1 symbol)\n  [-]      gone ",
+            ] {
+                assert!(out.contains(line), "{line:?} in:\n{out}");
+            }
+        }
+        for (a, b) in [("d1/x.rs", "d2"), ("d1", "d2/x.rs")] {
+            let out = pair(PathBuf::from(a), PathBuf::from(b));
+            assert!(
+                out.contains("x.rs (1 symbol)\n  [~]      a "),
+                "{a} vs {b}:\n{out}"
+            );
+        }
+    }
+
+    /// A side that cannot be read leaves its file without symbols, and the
+    /// file says why rather than claim it has none.
+    #[test]
+    fn a_file_whose_side_cannot_be_read_says_why_it_has_no_symbols() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.rs"), "fn a() {\n    1\n}\n").unwrap();
+        // Text git diffs, but not UTF-8, which the structural diff reads strictly.
+        fs::write(dir.path().join("b.rs"), b"fn a() {\n    2 // \xe9\n}\n").unwrap();
+        let source = DiffSource::Files(PathBuf::from("a.rs"), PathBuf::from("b.rs"));
+        let run = |scope| diff(&source, dir.path(), scope, None, None, 0, None).unwrap();
+        let why = "symbols unavailable: cannot read b.rs: stream did not contain valid UTF-8";
+
+        let overview = run(None);
+        assert!(
+            overview.contains(&format!("## b.rs ({why})\n")),
+            "{overview}"
+        );
+        let file = run(Some("b.rs"));
+        assert!(
+            file.starts_with(&format!("# Diff: b.rs — {why}, +1/−1 lines\n")),
+            "{file}"
+        );
+        let function = run(Some("b.rs:a"));
+        assert!(function.contains(why), "{function}");
     }
 
     /// A count of one takes the singular noun in the overview (#294).

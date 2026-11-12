@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tilth_core::lang::detect_file_type_with_content;
 use tilth_core::lang::outline::get_outline_entries;
@@ -35,6 +35,7 @@ pub(crate) fn compute_overlay(file_diff: &FileDiff, sides: &Sides, repo: &Path) 
         conflicts: Vec::new(),
         is_generated: file_diff.is_generated,
         is_binary: file_diff.is_binary,
+        read_error: None,
     };
 
     // Binary or generated files: counts only, the formatter summarizes them.
@@ -44,8 +45,12 @@ pub(crate) fn compute_overlay(file_diff: &FileDiff, sides: &Sides, repo: &Path) 
 
     let mut changes = match file_contents(file_diff, sides, repo) {
         // When either side cannot be read, matching would report every
-        // symbol as added or deleted. Skip it; the lines still show.
-        Err(_) => Vec::new(),
+        // symbol as added or deleted. Skip it and keep the reason; the lines
+        // still show.
+        Err(e) => {
+            overlay.read_error = Some(e);
+            Vec::new()
+        }
         Ok((old, new)) => {
             let old_path = file_diff.old_path.as_deref().unwrap_or(&file_diff.path);
             symbol_changes(old_path, &file_diff.path, &old, &new)
@@ -321,26 +326,48 @@ fn file_contents(
     Ok((old, new))
 }
 
-/// Read `path` (repository-relative) from one side of a diff.
+/// Read the file the patch names `path` from one side of a diff. Git runs
+/// in `repo` and names a file from there: from the repository top, or for
+/// a file pair from the side's own root.
 #[expect(
     clippy::disallowed_methods,
     reason = "the structural diff reads strictly until #312"
 )]
 fn read_side(side: &Side, path: &Path, repo: &Path) -> Result<String, String> {
     let path_str = path.to_string_lossy();
+    let read = |file: &Path| {
+        tilth_core::source::read_to_string(&repo.join(file))
+            .map_err(|e| format!("cannot read {}: {e}", file.display()))
+    };
     match side {
         Side::Rev(rev) => git_show(&format!("{rev}:{path_str}"), repo).map_err(|e| e.to_string()),
         Side::Index => git_show(&format!(":{path_str}"), repo).map_err(|e| e.to_string()),
-        Side::WorkingTree => {
-            // Git emits paths relative to the repository top.
-            let disk = repo.join(path);
-            tilth_core::source::read_to_string(&disk)
-                .map_err(|e| format!("read {}: {e}", disk.display()))
-        }
-        Side::File(file) => tilth_core::source::read_to_string(file)
-            .map_err(|e| format!("read {}: {e}", file.display())),
+        Side::WorkingTree => read(path),
+        Side::File(root) => read(&file_under(root, path).ok_or_else(|| {
+            format!(
+                "cannot read {}: the patch names it outside {}",
+                path.display(),
+                root.display()
+            )
+        })?),
         Side::Unavailable => Ok(String::new()),
     }
+}
+
+/// The file the patch names `path` in one side of a file pair, whose root
+/// is a file or a directory. Git names it as the root followed by its path
+/// inside, and drops an absolute root's leading `/`. A root that is a file
+/// is the file itself.
+fn file_under(root: &Path, path: &Path) -> Option<PathBuf> {
+    fn unrooted(p: &Path) -> &Path {
+        p.strip_prefix("/").unwrap_or(p)
+    }
+    let inside = unrooted(path).strip_prefix(unrooted(root)).ok()?;
+    Some(if inside.as_os_str().is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(inside)
+    })
 }
 
 /// The content `spec` (`<rev>:<path>`, or `:<path>` for the index) names.
@@ -421,20 +448,18 @@ mod tests {
     fn unreadable_side_skips_symbol_analysis_but_keeps_lines() {
         // When one side cannot be read, matching would report every symbol
         // of the other side as added or deleted. The overlay has no symbols
-        // instead, and the patch lines stay visible.
+        // instead and says why, and the patch lines stay visible.
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("foo.rs");
         std::fs::write(&file, "fn new_fn() {}\n").unwrap();
         let missing = dir.path().join("does_not_exist.rs");
         let sides = Sides {
-            old: Side::File(missing),
+            old: Side::File(missing.clone()),
             new: Side::File(file.clone()),
         };
-        assert!(read_side(&sides.old, &file, dir.path()).is_err());
-
         let file_diff = FileDiff {
             path: file,
-            old_path: None,
+            old_path: Some(missing.clone()),
             status: FileStatus::Modified,
             hunks: vec![Hunk {
                 old_start: 1,
@@ -459,6 +484,11 @@ mod tests {
         };
         let overlay = compute_overlay(&file_diff, &sides, dir.path());
         assert!(overlay.symbol_changes.is_empty(), "{overlay:?}");
+        let error = overlay.read_error.as_deref().unwrap_or_default();
+        assert!(
+            error.starts_with(&format!("cannot read {}: ", missing.display())),
+            "{overlay:?}"
+        );
         assert_eq!(overlay.other_lines.len(), 2, "{overlay:?}");
         assert_eq!((overlay.added, overlay.removed), (1, 1));
     }
