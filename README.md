@@ -38,7 +38,7 @@ The examples in this README are real output from the [FastAPI](https://github.co
 
 ````
 $ tilth get_typed_signature --scope fastapi --expand=1
-# Search: "get_typed_signature" in fastapi — 2 matches (1 definitions, 1 usages)
+# Search: "get_typed_signature" in fastapi — 2 matches (1 definition, 1 usage)
 
 ### dependencies/utils.py:218-232 [definition]
   [203-215]    fn _get_signature

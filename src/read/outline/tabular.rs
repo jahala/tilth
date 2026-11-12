@@ -1,3 +1,4 @@
+use crate::format::noun;
 use crate::read::ends::{Ends, Shape};
 
 /// The CSV/TSV view: the header line and 5 rows, then the last 3 rows.
@@ -22,10 +23,9 @@ pub(crate) fn render(ends: &Ends<'_>) -> String {
     out.push(String::new());
     out.extend(rows.iter().map(ToString::to_string));
     if !ends.shows_all() {
-        out.push(format!(
-            "... {} rows omitted",
-            total - head.len() - tail.len()
-        ));
+        let omitted = total - head.len() - tail.len();
+        let rows = noun(omitted, "row", "rows");
+        out.push(format!("... {omitted} {rows} omitted"));
         out.push(String::new());
     }
     out.extend(tail.iter().map(ToString::to_string));

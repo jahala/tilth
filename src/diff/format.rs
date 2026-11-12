@@ -2,7 +2,7 @@ use std::fmt::Write;
 use std::path::Path;
 
 use crate::budget;
-use crate::format::rel;
+use crate::format::{noun, rel};
 use crate::types::estimate_tokens;
 
 use super::{
@@ -58,7 +58,7 @@ pub(crate) fn format_overview(
         "# Diff: {} — {} {}, {} modified, {} added",
         source_label,
         file_count,
-        if file_count == 1 { "file" } else { "files" },
+        noun(file_count, "file", "files"),
         fn_modified,
         fn_added,
     );
@@ -77,7 +77,8 @@ pub(crate) fn format_overview(
             let changed_lines = overlay.added + overlay.removed;
             let _ = writeln!(
                 out,
-                "## {rel_path} (generated, {changed_lines} lines changed — summarized)"
+                "## {rel_path} (generated, {changed_lines} {} changed — summarized)",
+                noun(changed_lines, "line", "lines")
             );
             continue;
         }
@@ -90,7 +91,8 @@ pub(crate) fn format_overview(
             .collect();
 
         let sym_count = visible.len();
-        let _ = writeln!(out, "## {rel_path} ({sym_count} symbols)");
+        let symbols = noun(sym_count, "symbol", "symbols");
+        let _ = writeln!(out, "## {rel_path} ({sym_count} {symbols})");
 
         for change in &visible {
             let line = format_symbol_line(change);
@@ -108,7 +110,7 @@ pub(crate) fn format_overview(
             "# Diff: {} — {} {}, {} modified, {} added (~{} tokens)",
             source_label,
             file_count,
-            if file_count == 1 { "file" } else { "files" },
+            noun(file_count, "file", "files"),
             fn_modified,
             fn_added,
             token_count,
@@ -158,8 +160,10 @@ pub(crate) fn format_file_detail(
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "# Diff: {rel_path} — {sym_touched} symbols touched, +{}/\u{2212}{} lines",
-        overlay.added, overlay.removed
+        "# Diff: {rel_path} — {sym_touched} {} touched, +{}/\u{2212}{} lines",
+        noun(sym_touched, "symbol", "symbols"),
+        overlay.added,
+        overlay.removed
     );
 
     for change in &overlay.symbol_changes {
@@ -322,9 +326,10 @@ pub(crate) fn format_log(summaries: &[CommitSummary], scope: &str, budget: Optio
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "# Log: {scope} — {n_commits} {}, {total_files} {}, {total_fns} functions touched",
-        if n_commits == 1 { "commit" } else { "commits" },
-        if total_files == 1 { "file" } else { "files" },
+        "# Log: {scope} — {n_commits} {}, {total_files} {}, {total_fns} {} touched",
+        noun(n_commits, "commit", "commits"),
+        noun(total_files, "file", "files"),
+        noun(total_fns, "function", "functions"),
     );
 
     let now = std::time::SystemTime::now()
@@ -423,17 +428,21 @@ fn format_symbol_line(change: &SymbolChange) -> String {
     match &change.change {
         ChangeType::BodyChanged => {
             if let (Some(old), Some(new)) = (change.old_span, change.new_span) {
-                let _ = write!(s, "  (body, {}→{} lines)", span_len(old), span_len(new));
+                let (old, new) = (span_len(old), span_len(new));
+                let lines = noun(new, "line", "lines");
+                let _ = write!(s, "  (body, {old}→{new} {lines})");
             }
         }
         ChangeType::Added => {
             if let Some(new) = change.new_span {
-                let _ = write!(s, "  (new, {} lines)", span_len(new));
+                let new = span_len(new);
+                let _ = write!(s, "  (new, {new} {})", noun(new, "line", "lines"));
             }
         }
         ChangeType::Deleted => {
             if let Some(old) = change.old_span {
-                let _ = write!(s, "  (deleted, {} lines)", span_len(old));
+                let old = span_len(old);
+                let _ = write!(s, "  (deleted, {old} {})", noun(old, "line", "lines"));
             }
         }
         _ => {}
@@ -731,7 +740,7 @@ mod tests {
         overlay.removed = 1;
         let out = format_file_detail(&overlay, &[], None);
         assert!(
-            out.starts_with("# Diff: src/lib.rs — 1 symbols touched, +2/\u{2212}1 lines"),
+            out.starts_with("# Diff: src/lib.rs — 1 symbol touched, +2/\u{2212}1 lines"),
             "bad header:\n{out}"
         );
     }

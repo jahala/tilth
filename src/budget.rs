@@ -1,3 +1,4 @@
+use crate::format::noun;
 use crate::types::estimate_tokens;
 
 /// Default cap applied to MCP tool responses when no explicit `budget` is given.
@@ -17,8 +18,9 @@ pub fn apply(output: &str, budget: u64) -> String {
 
     let remaining_tokens = estimate_tokens((output.len() - kept) as u64);
     format!(
-        "{}\n\n... truncated ({remaining_tokens} tokens omitted, budget: {budget})",
-        &output[..kept]
+        "{}\n\n... truncated ({remaining_tokens} {} omitted, budget: {budget})",
+        &output[..kept],
+        noun(remaining_tokens, "token", "tokens")
     )
 }
 

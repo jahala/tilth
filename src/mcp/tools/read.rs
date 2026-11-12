@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+use crate::format::noun;
 use crate::session::Session;
 use crate::types::ViewMode;
 use tilth_core::cache::OutlineCache;
@@ -78,10 +79,10 @@ pub(in crate::mcp) fn tool_read(
             // Check deadline before each file
             if std::time::Instant::now() > deadline {
                 results.push(format!(
-                    "# batch read stopped — deadline exceeded after {}/{} files. \
+                    "# batch read stopped — deadline exceeded after {i}/{} {}. \
                      Reduce batch size or set TILTH_BATCH_TIMEOUT=<seconds>.",
-                    i,
-                    paths_arr.len()
+                    paths_arr.len(),
+                    noun(paths_arr.len(), "file", "files")
                 ));
                 break;
             }
@@ -308,7 +309,8 @@ fn read_stripped_file(path: &Path, cache: &OutlineCache) -> Result<String, Tilth
     let stripped = total_lines.saturating_sub(kept);
     let header = crate::format::file_header(path, byte_len, total_lines, ViewMode::Stripped);
     let note = format!(
-        "// stripped {stripped} of {total_lines} lines (plain comments, debug logs, blank collapse) — non-editable view"
+        "// stripped {stripped} of {total_lines} {} (plain comments, debug logs, blank collapse) — non-editable view",
+        noun(total_lines, "line", "lines")
     );
     Ok(format!("{header}\n{note}\n\n{}", body.trim_end()))
 }

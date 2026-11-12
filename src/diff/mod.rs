@@ -931,8 +931,8 @@ fn compute_blast(overlays: &[FileOverlay], scope: &Path) -> Vec<String> {
                 );
             }
             format!(
-                "blast: `{name}` signature changed — {at_least}{count} caller{} may need updating",
-                if count == 1 { "" } else { "s" }
+                "blast: `{name}` signature changed — {at_least}{count} {} may need updating",
+                crate::format::noun(count, "caller", "callers")
             )
         })
         .chain(skipped.map(|sentence| format!("blast: {sentence}")))
@@ -1346,7 +1346,7 @@ mod tests {
             "expected file detail header in:\n{result}"
         );
         assert!(
-            result.contains("symbols touched"),
+            result.contains("1 symbol touched"),
             "expected symbols touched in:\n{result}"
         );
     }
@@ -1692,6 +1692,29 @@ diff --git a/src/main.rs b/src/main.rs
             !result.contains("No changes"),
             "expected changes between files:\n{result}"
         );
+    }
+
+    /// A count of one takes the singular noun in the overview (#294).
+    #[test]
+    fn overview_counts_of_one_are_singular() {
+        let dir = tempfile::tempdir().unwrap();
+        let pair = |a: &str, b: &str| {
+            let (file_a, file_b) = (dir.path().join("a.rs"), dir.path().join("b.rs"));
+            fs::write(&file_a, a).unwrap();
+            fs::write(&file_b, b).unwrap();
+            let source = DiffSource::Files(file_a, file_b);
+            diff(&source, Some(dir.path()), None, None, false, 0, None).unwrap()
+        };
+
+        let added = pair("fn a() {}\n", "fn a() {}\nfn b() {}\n");
+        assert!(added.contains("b.rs (1 symbol)\n"), "{added}");
+        assert!(added.contains("(new, 1 line)"), "{added}");
+
+        let edited = pair("fn a() { 1 }\n", "fn a() { 2 }\n");
+        assert!(edited.contains("(body, 1→1 line)"), "{edited}");
+
+        let deleted = pair("fn a() {}\nfn b() {}\n", "fn a() {}\n");
+        assert!(deleted.contains("(deleted, 1 line)"), "{deleted}");
     }
 
     // 17. test_log_mode
@@ -2465,7 +2488,7 @@ diff --git a/src/main.rs b/src/main.rs
             None,
         )
         .unwrap();
-        assert!(out.contains("## src/lib.rs (1 symbols)"), "{out}");
+        assert!(out.contains("## src/lib.rs (1 symbol)"), "{out}");
         assert!(!out.contains("generated"), "{out}");
     }
 

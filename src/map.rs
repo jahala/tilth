@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
-use crate::format::fmt_tokens;
+use crate::format::{fmt_tokens, noun};
 use crate::read::outline;
 use crate::types::estimate_tokens;
 use tilth_core::cache::OutlineCache;
@@ -201,7 +201,8 @@ fn format_tree(
         for f in files {
             if let Some(ref symbols) = f.symbols {
                 if symbols.is_empty() {
-                    let _ = writeln!(out, "{prefix}{} (~{} tokens)", f.name, f.tokens);
+                    let tokens = noun(f.tokens, "token", "tokens");
+                    let _ = writeln!(out, "{prefix}{} (~{} {tokens})", f.name, f.tokens);
                 } else {
                     let syms = symbols.join(", ");
                     let truncated = if syms.len() > 80 {
@@ -212,7 +213,8 @@ fn format_tree(
                     let _ = writeln!(out, "{prefix}{}: {truncated}", f.name);
                 }
             } else {
-                let _ = writeln!(out, "{prefix}{} (~{} tokens)", f.name, f.tokens);
+                let tokens = noun(f.tokens, "token", "tokens");
+                let _ = writeln!(out, "{prefix}{} (~{} {tokens})", f.name, f.tokens);
             }
         }
     }
@@ -222,7 +224,8 @@ fn format_tree(
     for subdir in subdirs {
         let dir_name = subdir.file_name().and_then(|n| n.to_str()).unwrap_or("?");
         let total = totals.get(subdir).copied().unwrap_or(0);
-        let _ = writeln!(out, "{prefix}{dir_name}/ (~{} tokens)", fmt_tokens(total));
+        let tokens = noun(total, "token", "tokens");
+        let _ = writeln!(out, "{prefix}{dir_name}/ (~{} {tokens})", fmt_tokens(total));
         format_tree(tree, totals, subdir, indent + 1, out);
     }
 }

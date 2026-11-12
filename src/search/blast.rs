@@ -3,6 +3,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::edit::Edit;
+use crate::format::noun;
 use tilth_core::lang::detect_file_type_with_content;
 use tilth_core::lang::outline::get_outline_entries;
 use tilth_core::search::callers::find_callers_batch;
@@ -213,10 +214,10 @@ fn format_blast_radius(
 
         let _ = writeln!(
             out,
-            "{}: {} caller{}",
+            "{}: {} {}",
             ts.name,
             lower_bound(total, partial),
-            if total == 1 { "" } else { "s" }
+            noun(total, "caller", "callers")
         );
 
         let listed = files
@@ -253,9 +254,9 @@ fn format_blast_radius(
         if unlisted > 0 {
             let _ = write!(
                 summary,
-                ", and {} more file{}",
+                ", and {} more {}",
                 lower_bound(unlisted, partial),
-                if unlisted == 1 { "" } else { "s" }
+                noun(unlisted, "file", "files")
             );
         } else if partial {
             summary.push_str(", and possibly more files");

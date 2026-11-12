@@ -828,7 +828,10 @@ fn collect_blocks(
         if start > total {
             return Err(TilthError::InvalidQuery {
                 query: (*range).to_string(),
-                reason: format!("starts past the end of the file, which has {total} lines"),
+                reason: format!(
+                    "starts past the end of the file, which has {total} {}",
+                    format::noun(total, "line", "lines")
+                ),
             });
         }
         // An end past the last line clamps to it.
@@ -987,13 +990,19 @@ fn list_directory(path: &Path) -> Result<String, TilthError> {
             Some(t) if t.is_dir() => "/".to_string(),
             Some(t) if t.is_symlink() => " →".to_string(),
             _ => meta.map_or_else(String::new, |m| {
-                format!("  ({} tokens)", estimate_tokens(m.len()))
+                let tokens = estimate_tokens(m.len());
+                format!("  ({tokens} {})", format::noun(tokens, "token", "tokens"))
             }),
         };
         entries.push(format!("  {name}{suffix}"));
     }
 
-    let header = format!("# {} ({} items)", path.display(), items.len());
+    let header = format!(
+        "# {} ({} {})",
+        path.display(),
+        items.len(),
+        format::noun(items.len(), "item", "items")
+    );
     Ok(format!("{header}\n\n{}", entries.join("\n")))
 }
 
@@ -1648,23 +1657,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cache = OutlineCache::new();
         for (content, lines) in [
-            ("one\n", 1),
-            ("one\ntwo\n", 2),
-            ("one\ntwo", 2),
-            ("one\n\n", 2),
-            ("\n", 1),
+            ("one\n", "1 line"),
+            ("one\ntwo\n", "2 lines"),
+            ("one\ntwo", "2 lines"),
+            ("one\n\n", "2 lines"),
+            ("\n", "1 line"),
         ] {
             let path = dir.path().join("f.txt");
             std::fs::write(&path, content).unwrap();
             let full = read_file(&path, None, true, &cache, false, None).unwrap();
             assert!(
-                full.contains(&format!("({lines} lines")),
-                "{content:?} should read as {lines} lines: {full}"
+                full.contains(&format!("({lines},")),
+                "{content:?} should read as {lines}: {full}"
             );
             let all = read_ranges(&path, &["1-1000"], false).unwrap();
             assert!(
-                all.contains(&format!("({lines} lines")),
-                "{content:?} section should cover {lines} lines: {all}"
+                all.contains(&format!("({lines},")),
+                "{content:?} section should cover {lines}: {all}"
             );
         }
     }
@@ -2101,7 +2110,7 @@ mod tests {
         );
         // An end past EOF still clamps to the last line.
         let out = read_ranges(&path, &["2-100"], false).unwrap();
-        assert!(out.contains("(1 lines") && out.contains("2  beta"), "{out}");
+        assert!(out.contains("(1 line,") && out.contains("2  beta"), "{out}");
     }
 
     /// The CSV outline counted the final newline as a row too.

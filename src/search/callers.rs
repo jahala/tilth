@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
+use crate::format::noun;
 use tilth_core::index::bloom::BloomFilterCache;
 use tilth_core::search::callers::{find_callers_and_owners, find_callers_batch, CallerMatch};
 use tilth_core::TilthError;
@@ -208,11 +209,11 @@ fn write_caller_bucket(
     };
     let _ = writeln!(
         output,
-        "# Callers of \"{}\" in {} — {shown}{} call site{}",
+        "# Callers of \"{}\" in {} — {shown}{} {}",
         target,
         scope.display(),
         total,
-        if total == 1 { "" } else { "s" }
+        noun(total, "call site", "call sites")
     );
     let name = called_name(target);
     if name != target {
@@ -269,8 +270,8 @@ fn write_caller_bucket(
     if hidden > 0 {
         let _ = writeln!(
             output,
-            "\n... and {hidden} more call site{}. Narrow with scope.",
-            if hidden == 1 { "" } else { "s" }
+            "\n... and {hidden} more {}. Narrow with scope.",
+            noun(hidden, "call site", "call sites")
         );
     }
 }
@@ -459,8 +460,8 @@ fn write_second_hop_impact(
     for (name, sites, types) in unattributed {
         let _ = writeln!(
             output,
-            "  {name}: {sites} call site{}, not attributed ({types} types define it)",
-            if sites == 1 { "" } else { "s" },
+            "  {name}: {sites} {}, not attributed ({types} types define it)",
+            noun(sites, "call site", "call sites"),
         );
     }
 
@@ -469,10 +470,11 @@ fn write_second_hop_impact(
     // post-truncation display count, which under-reports once the
     // `IMPACT_MAX_RESULTS` cap stops the listing while more unique callers
     // still exist beyond the cap).
+    let affected = all_caller_names.len() + unique_total;
     let _ = writeln!(
         output,
-        "\n{} functions affected across 2 hops{}.",
-        all_caller_names.len() + unique_total,
+        "\n{affected} {} affected across 2 hops{}.",
+        noun(affected, "function", "functions"),
         if by_method_name {
             " (method calls matched by name)"
         } else {

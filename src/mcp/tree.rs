@@ -3,7 +3,7 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use crate::format::fmt_tokens;
+use crate::format::{fmt_tokens, noun};
 use crate::types::estimate_tokens;
 
 #[derive(Debug, Default)]
@@ -30,14 +30,28 @@ impl DirNode {
     }
 }
 
+/// A size as the tree shows it: `~1.2k tokens`, `~1 token`.
+fn tokens_label(bytes: u64) -> String {
+    let tokens = estimate_tokens(bytes);
+    format!(
+        "~{} {}",
+        fmt_tokens(tokens),
+        noun(tokens, "token", "tokens")
+    )
+}
+
+/// A file count as the tree shows it: `3 files`, `1 file`.
+fn files_label(n: u64) -> String {
+    format!("{n} {}", noun(n, "file", "files"))
+}
+
 fn render_dir(name: &str, node: &DirNode, prefix: &str, out: &mut String, is_root: bool) {
-    let total_tokens = estimate_tokens(node.total_bytes);
     if is_root {
         let _ = writeln!(
             out,
-            "{name}/      ~{tok} tokens   {n} files",
-            tok = fmt_tokens(total_tokens),
-            n = node.file_count
+            "{name}/      {}   {}",
+            tokens_label(node.total_bytes),
+            files_label(node.file_count)
         );
     }
 
@@ -59,17 +73,17 @@ fn render_dir(name: &str, node: &DirNode, prefix: &str, out: &mut String, is_roo
         if let Some(child) = child {
             let _ = writeln!(
                 out,
-                "{prefix}{connector}{name}/      ~{tok} tokens   {fc} files",
-                tok = fmt_tokens(estimate_tokens(*bytes)),
-                fc = child.file_count
+                "{prefix}{connector}{name}/      {}   {}",
+                tokens_label(*bytes),
+                files_label(child.file_count)
             );
             let new_prefix = format!("{prefix}{child_prefix}");
             render_dir(name, child, &new_prefix, out, false);
         } else {
             let _ = writeln!(
                 out,
-                "{prefix}{connector}{name}      ~{tok} tokens",
-                tok = fmt_tokens(estimate_tokens(*bytes))
+                "{prefix}{connector}{name}      {}",
+                tokens_label(*bytes)
             );
         }
     }

@@ -7,6 +7,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::format::noun;
 use crate::search::search_symbol_raw;
 use tilth_core::error::TilthError;
 use tilth_core::index::bloom::BloomFilterCache;
@@ -743,7 +744,8 @@ fn slice_body(content: &str, start_line: u32, end_line: u32, max_lines: usize) -
     }
     let _ = writeln!(
         out,
-        "... ({elided} lines elided — use tilth_read for full body)"
+        "... ({elided} {} elided — use tilth_read for full body)",
+        noun(elided, "line", "lines")
     );
     for line in &lines[lines.len() - tail_n..] {
         out.push_str(line);

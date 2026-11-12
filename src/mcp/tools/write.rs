@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+use crate::format::noun;
 use crate::session::Session;
 use tilth_core::index::bloom::BloomFilterCache;
 
@@ -423,9 +424,11 @@ pub(in crate::mcp) fn tool_write(
                         let line_count = content.lines().count();
                         let verb = if pre_existed { "overwrote" } else { "created" };
                         let mut block = format!(
-                            "## {}\n{verb}: {} bytes, {line_count} lines\n{}",
+                            "## {}\n{verb}: {} {}, {line_count} {}\n{}",
                             resolved_display(&path),
                             content.len(),
+                            noun(content.len(), "byte", "bytes"),
+                            noun(line_count, "line", "lines"),
                             crate::format::hashlines(content, 1),
                         );
                         if show_diff {
@@ -486,10 +489,12 @@ pub(in crate::mcp) fn tool_write(
                         // Echo only the appended region's hashlines so log-shaped
                         // append targets don't balloon the response.
                         let mut block = format!(
-                            "## {}\nappend: {} bytes (echoing last {} of {total} lines)\n{}",
+                            "## {}\nappend: {} {} (echoing last {} of {total} {})\n{}",
                             resolved_display(&path),
                             content.len(),
+                            noun(content.len(), "byte", "bytes"),
                             total - start_idx,
+                            noun(total, "line", "lines"),
                             crate::format::hashlines(&tail, start_line),
                         );
                         if show_diff {

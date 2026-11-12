@@ -3,6 +3,21 @@ use std::path::Path;
 
 use crate::types::{estimate_tokens, ViewMode};
 
+/// The noun that follows a count of `n`: `one` when `n` is exactly 1 and
+/// `many` otherwise, as in "0 lines", "1 line", "2 lines". In "3 of 5 lines"
+/// or "4→1 line" the noun agrees with the last count.
+pub(crate) fn noun<'a, N: Copy + PartialEq + From<u8>>(
+    n: N,
+    one: &'a str,
+    many: &'a str,
+) -> &'a str {
+    if n == N::from(1) {
+        one
+    } else {
+        many
+    }
+}
+
 /// Build the standard header line:
 /// `# path/to/file.ts (N lines, ~X.Xk tokens) [mode]`
 pub fn file_header(path: &Path, byte_len: u64, line_count: u32, mode: ViewMode) -> String {
@@ -10,11 +25,12 @@ pub fn file_header(path: &Path, byte_len: u64, line_count: u32, mode: ViewMode) 
     let token_str = if tokens >= 1000 {
         format!("~{}.{}k tokens", tokens / 1000, (tokens % 1000) / 100)
     } else {
-        format!("~{tokens} tokens")
+        format!("~{tokens} {}", noun(tokens, "token", "tokens"))
     };
     format!(
-        "# {} ({line_count} lines, {token_str}) [{mode}]",
-        path.display()
+        "# {} ({line_count} {}, {token_str}) [{mode}]",
+        path.display(),
+        noun(line_count, "line", "lines")
     )
 }
 
@@ -41,14 +57,19 @@ pub fn search_header(
 ) -> String {
     // When the display cap bit, say so — a bare capped count reads as a
     // complete result and silently under-reports (the #51 bug).
+    let matches = noun(total, "match", "matches");
     let count = if total > shown {
-        format!("{shown} of {total} matches")
+        format!("{shown} of {total} {matches}")
     } else {
-        format!("{total} matches")
+        format!("{total} {matches}")
     };
     let parts = match (defs, usages) {
         (0, _) => count,
-        (d, u) => format!("{count} ({d} definitions, {u} usages)"),
+        (d, u) => format!(
+            "{count} ({d} {}, {u} {})",
+            noun(d, "definition", "definitions"),
+            noun(u, "usage", "usages")
+        ),
     };
     format!("# Search: \"{query}\" in {} — {parts}", scope.display())
 }
@@ -150,6 +171,20 @@ pub(crate) fn rel(path: &Path, scope: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn counts_of_one_take_the_singular() {
+        let header = file_header(Path::new("a.rs"), 2, 1, ViewMode::Full);
+        assert_eq!(header, "# a.rs (1 line, ~1 token) [full]");
+        let header = file_header(Path::new("a.rs"), 0, 0, ViewMode::Full);
+        assert_eq!(header, "# a.rs (0 lines, ~0 tokens) [full]");
+
+        let search = search_header("q", Path::new("src"), 1, 1, 1, 0);
+        assert_eq!(
+            search,
+            "# Search: \"q\" in src — 1 match (1 definition, 0 usages)"
+        );
+    }
 
     #[test]
     fn fmt_tokens_thresholds() {
