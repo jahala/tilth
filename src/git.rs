@@ -114,7 +114,13 @@ impl<'a> Git<'a> {
 
     fn to_command(&self) -> Command {
         let mut cmd = Command::new("git");
-        cmd.current_dir(self.dir)
+        // tilth only reads, so git skips the locks it takes only to write
+        // back a refreshed index. A `git status` stopped by a time limit
+        // would otherwise leave `.git/index.lock` behind (#357). The
+        // variable, unlike `--no-optional-locks`, is ignored by a git
+        // older than 2.15 instead of failing the command.
+        cmd.env("GIT_OPTIONAL_LOCKS", "0")
+            .current_dir(self.dir)
             .args(PINNED)
             .arg(self.command)
             .args(&self.args);
@@ -246,6 +252,20 @@ impl std::error::Error for GitError {
 )]
 mod tests {
     use super::*;
+
+    /// tilth only reads a repository, so git must never take the index lock
+    /// for it: a `git status` stopped by the overview's time limit would
+    /// leave `.git/index.lock` behind and break the user's next commit
+    /// (#357).
+    #[test]
+    fn every_command_takes_no_optional_locks() {
+        let cmd = Git::new(Path::new("."), "status").to_command();
+        let locks = cmd
+            .get_envs()
+            .find(|(name, _)| *name == "GIT_OPTIONAL_LOCKS")
+            .and_then(|(_, value)| value);
+        assert_eq!(locks, Some(std::ffi::OsStr::new("0")));
+    }
 
     /// What git itself prints on stderr for `args` in `dir`, so a test
     /// compares with git's words in whatever language git speaks here.
