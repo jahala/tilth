@@ -109,7 +109,6 @@ pub(crate) fn extract_go_receiver_name(
     content: &str,
     ts_lang: &tree_sitter::Language,
 ) -> Option<String> {
-    // `'static` so its pointer address is a stable cache key.
     const GO_RECV_QUERY: &str = "(method_declaration receiver: (parameter_list (parameter_declaration name: (identifier) @recv)))";
 
     let mut parser = tree_sitter::Parser::new();
@@ -118,23 +117,20 @@ pub(crate) fn extract_go_receiver_name(
 
     let bytes = content.as_bytes();
 
-    // `with_query` returns `Option<Option<String>>`; flatten to `Option<String>`.
-    crate::lang::treesitter::with_query(ts_lang, GO_RECV_QUERY, |query| {
-        let recv_idx = query.capture_index_for_name("recv")?;
-        let mut cursor = tree_sitter::QueryCursor::new();
-        let mut matches = cursor.matches(query, tree.root_node(), bytes);
+    let query = crate::lang::treesitter::compiled_query(ts_lang, GO_RECV_QUERY)?;
+    let recv_idx = query.capture_index_for_name("recv")?;
+    let mut cursor = tree_sitter::QueryCursor::new();
+    let mut matches = cursor.matches(query, tree.root_node(), bytes);
 
-        if let Some(m) = matches.next() {
-            for cap in m.captures() {
-                if cap.index == recv_idx {
-                    return cap.node.utf8_text(bytes).ok().map(String::from);
-                }
+    if let Some(m) = matches.next() {
+        for cap in m.captures() {
+            if cap.index == recv_idx {
+                return cap.node.utf8_text(bytes).ok().map(String::from);
             }
         }
+    }
 
-        None
-    })
-    .flatten()
+    None
 }
 
 /// Package-level Go declarations of every kind the outline, symbol search and

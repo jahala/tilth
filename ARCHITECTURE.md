@@ -60,8 +60,8 @@ crates/tilth-core/src/
 │   │                    .tilthignore, gitignore switch, glob overrides)
 │   ├── callers.rs       find_callers_batch: call sites of N symbols in one walk
 │   ├── callees.rs       Resolve function calls inside a definition
-│   ├── callee_query.rs  Cached tree-sitter `Query` objects for callee
-│   │                    extraction across languages
+│   ├── callee_query.rs  Per-language tree-sitter call-expression queries,
+│   │                    shared by callers and callees
 │   ├── deps.rs          analyze_deps → DepsResult
 │   ├── bloom_walk.rs    Shared walker preamble (size gating, mtime,
 │   │                    bloom filter) factored out of callers/callees
@@ -74,7 +74,8 @@ crates/tilth-core/src/
 │   ├── mod.rs           detect_file_type, package_root, FileType ↔ Lang
 │   ├── spec.rs          Per-language spec table, one `<lang>.rs` per language
 │   ├── detection.rs     Binary / generated / minified detection
-│   ├── treesitter.rs    DEFINITION_KINDS, extract_definition_name
+│   ├── treesitter.rs    DEFINITION_KINDS, extract_definition_name,
+│   │                    compiled_query (the compiled-`Query` cache)
 │   └── outline.rs       outline_language(Lang) → tree_sitter::Language;
 │                        node_to_entry walker (the bulk of this file);
 │                        parse_markdown / heading_level / heading_text
@@ -414,8 +415,15 @@ binary's `src/search/`. The cross-file queries that return data live in
 `tilth-core`'s `search/`: the walker, call sites, callees, enclosing
 scopes and dependency analysis. The walker preamble (size gating +
 mtime + bloom filter) is factored into `bloom_walk.rs` so all
-relational paths share it; AST-scope walking is in `scope.rs`; cached
-tree-sitter `Query` objects live in `callee_query.rs`.
+relational paths share it; AST-scope walking is in `scope.rs`; the
+call-expression queries live in `callee_query.rs`.
+
+Every tree-sitter `Query` tilth matches with (call sites, callees,
+siblings, the Go receiver, import statements) comes from
+`lang::treesitter::compiled_query`. It compiles each query on first use
+and leaks it, so it hands out a `&'static Query` and the lock covers only
+the lookup. Threads in a parallel walk then match side by side. The leak
+is one query per grammar and query text, a fixed set.
 
 ### Walker and ignore policy (`tilth-core` `search/walk.rs`)
 
@@ -619,14 +627,10 @@ machinery:
   framework registration).
 - **Callees** (`callees.rs`) — resolve outgoing calls inside a
   definition body. Drives the `── calls ──` footer under each
-  expanded match. Cached `Query` compilation lives in
-  `callee_query.rs`.
+  expanded match.
 - **Siblings** (`siblings.rs`) — extract the surrounding outline
   context (the entries immediately before and after the matched
-  definition). Compiles tree-sitter `Query` objects lazily and caches
-  them in a process-wide `LazyLock<Mutex<HashMap>>`. The cache key
-  uses the query string's pointer address (`&'static str`) so distinct
-  queries against the same language stay separated.
+  definition).
 - **Deps** (`deps.rs`, both crates) — `analyze_deps` (`tilth-core`)
   is what `tilth_deps` runs. Returns a `DepsResult` with `Uses` (local
   + external) and every dependent in `Used by`. A dependent calls one
