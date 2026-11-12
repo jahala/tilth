@@ -281,6 +281,31 @@ mod tests {
         }
     }
 
+    /// The walk's `WalkConfig` decides whether gitignore-style files apply,
+    /// and a per-call override, when set, wins over it.
+    #[test]
+    fn walker_takes_gitignore_from_its_config_unless_a_call_overrides() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("ignored")).unwrap();
+        std::fs::write(tmp.path().join(".gitignore"), "ignored/\n").unwrap();
+        std::fs::write(tmp.path().join("visible.rs"), "fn visible() {}\n").unwrap();
+        std::fs::write(tmp.path().join("ignored/hidden.rs"), "fn hidden() {}\n").unwrap();
+        let hidden_walked = |respect_gitignore, call: Option<bool>| {
+            let walk = WalkConfig {
+                respect_gitignore,
+                ..WalkConfig::default()
+            };
+            let w = with_gitignore_override(call, || walker(tmp.path(), None, walk)).unwrap();
+            collect_walk_paths(w)
+                .iter()
+                .any(|p| p.ends_with("ignored/hidden.rs"))
+        };
+        assert!(hidden_walked(false, None));
+        assert!(!hidden_walked(true, None));
+        assert!(hidden_walked(true, Some(false)));
+        assert!(!hidden_walked(false, Some(true)));
+    }
+
     #[test]
     fn walker_respects_tilthignore_by_default() {
         let tmp = tempfile::tempdir().unwrap();
