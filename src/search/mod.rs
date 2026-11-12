@@ -37,11 +37,15 @@ struct Expansion {
     end: usize,
 }
 
-/// Preserve dedup within the response without updating the shared session
-/// until the final budget is known.
+type ExpansionKey = (PathBuf, u32, SystemTime);
+
+/// Dedup while rendering without updating the shared session until the final
+/// budget is known. Within a section, staged entries avoid duplicate bodies;
+/// only fitted entries from that section can dedup later sections.
 struct RenderSession<'a> {
     previous: Option<&'a Session>,
-    staged: HashSet<(PathBuf, u32, SystemTime)>,
+    staged: HashSet<ExpansionKey>,
+    fitted: HashSet<ExpansionKey>,
 }
 
 impl<'a> RenderSession<'a> {
@@ -49,13 +53,19 @@ impl<'a> RenderSession<'a> {
         Self {
             previous,
             staged: HashSet::new(),
+            fitted: HashSet::new(),
         }
     }
 
     fn is_expanded(&self, path: &Path, line: u32, mtime: SystemTime) -> bool {
-        self.previous
+        if self
+            .previous
             .is_some_and(|session| session.is_expanded(path, line, mtime))
-            || self.staged.contains(&(path.to_path_buf(), line, mtime))
+        {
+            return true;
+        }
+        let key = (path.to_path_buf(), line, mtime);
+        self.staged.contains(&key) || self.fitted.contains(&key)
     }
 }
 
@@ -377,8 +387,14 @@ pub fn search_multi_symbol_expanded(
             combined.push_str("\n\n---\n");
         }
         let offset = combined.len();
+        render_session.staged.clear();
         expansions.extend(segments.into_iter().filter_map(|block| {
             let mut expansion = block.expansion?;
+            // A later section may say "shown earlier" only if this body
+            // survived the per-section fit. The final cut keeps a prefix.
+            render_session
+                .fitted
+                .insert((expansion.path.clone(), expansion.line, expansion.mtime));
             expansion.end += offset;
             Some(expansion)
         }));
