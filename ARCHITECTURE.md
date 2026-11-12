@@ -877,10 +877,12 @@ single tool each.
    qualified by their type (`A::run`), so same-named methods stay apart.
    A function's signature is its whole header from the syntax tree,
    compared by tokens, so a re-wrapped header is not a signature change
-   and a change on its third line is one. Each patch line goes to the
-   innermost changed symbol that holds it; lines outside every changed
-   symbol, and all lines of a non-code file, stay in `other_lines`. The
-   overlay's `+N/−M` counts come from the patch itself.
+   and a change on its third line is one. Each changed line goes to the
+   innermost changed symbol that holds it, and each context line to the
+   innermost symbol of any kind, so an unchanged symbol keeps its own
+   context out of sight. Lines no symbol takes, and all lines of a
+   non-code file, stay in `other_lines`. The overlay's `+N/−M` counts
+   come from the patch itself.
 6. **`overlay::cross_file_matching`** detects symbols moved between
    files.
 7. **Scope** (`ScopeSpec`) — a `--scope` resolves against `root` (or the
