@@ -13,6 +13,7 @@ use crate::error::TilthError;
 use crate::lang::outline::outline_language;
 use crate::lang::treesitter::is_bodiless_declaration;
 use crate::lang::{detect_file_type, detect_file_type_with_content};
+use crate::search::walk::Walk;
 use crate::types::FileType;
 
 /// A single caller match — a call site of a target symbol.
@@ -46,8 +47,9 @@ pub struct CallerWalk<T> {
     pub reached_bound: bool,
 }
 
-/// Find every call site of any symbol in `targets` under `scope`, in one
-/// parallel walk that runs to the end unless `stop_after` is set.
+/// Find every call site of any symbol in `targets` in the files `walk`
+/// visits, in one parallel walk that runs to the end unless `stop_after` is
+/// set.
 ///
 /// `per_file` receives one file's call sites as (`target_name`, match)
 /// pairs in line order, and reduces them to what the caller keeps. It runs
@@ -68,9 +70,8 @@ pub struct CallerWalk<T> {
 )]
 pub fn find_callers_batch<T, F>(
     targets: &HashSet<String>,
-    scope: &Path,
+    walk: Walk<'_>,
     bloom: &crate::index::bloom::BloomFilterCache,
-    glob: Option<&str>,
     stop_after: Option<usize>,
     per_file: F,
 ) -> Result<CallerWalk<T>, TilthError>
@@ -79,15 +80,9 @@ where
     F: Fn(Vec<(String, CallerMatch)>) -> T + Sync,
 {
     let none = HashSet::new();
-    walk_callers(
-        targets,
-        &none,
-        scope,
-        bloom,
-        glob,
-        stop_after,
-        |sites, _| per_file(sites),
-    )
+    walk_callers(targets, &none, walk, bloom, stop_after, |sites, _| {
+        per_file(sites)
+    })
 }
 
 /// [`find_callers_batch`] that also reports, from the same parse, the types
@@ -109,24 +104,22 @@ where
 pub fn find_callers_and_owners<T, F>(
     targets: &HashSet<String>,
     owner_names: &HashSet<String>,
-    scope: &Path,
+    walk: Walk<'_>,
     bloom: &crate::index::bloom::BloomFilterCache,
-    glob: Option<&str>,
     per_file: F,
 ) -> Result<CallerWalk<T>, TilthError>
 where
     T: Send,
     F: Fn(Vec<(String, CallerMatch)>, Vec<(String, String)>) -> T + Sync,
 {
-    walk_callers(targets, owner_names, scope, bloom, glob, None, per_file)
+    walk_callers(targets, owner_names, walk, bloom, None, per_file)
 }
 
 fn walk_callers<T, F>(
     targets: &HashSet<String>,
     owner_names: &HashSet<String>,
-    scope: &Path,
+    walk: Walk<'_>,
     bloom: &crate::index::bloom::BloomFilterCache,
-    glob: Option<&str>,
     stop_after: Option<usize>,
     per_file: F,
 ) -> Result<CallerWalk<T>, TilthError>
@@ -139,7 +132,7 @@ where
     let sites_found = AtomicUsize::new(0);
     let reached = |n: usize| stop_after.is_some_and(|bound| n >= bound);
 
-    let walker = super::walk::walker(scope, glob)?;
+    let walker = super::walk::walker(walk)?;
     let words: Vec<&str> = targets.iter().map(String::as_str).collect();
 
     walker.run(|| {
@@ -203,7 +196,7 @@ where
 
             let (mut file_callers, owners) = find_callers_treesitter_batch(
                 path,
-                scope,
+                walk.scope,
                 targets,
                 owner_names,
                 &ts_lang,
@@ -433,6 +426,7 @@ fn find_enclosing_function(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::search::walk::WalkConfig;
     use std::collections::{BTreeSet, HashMap};
 
     /// Each name maps to the types whose definitions of it a caller label
@@ -450,8 +444,14 @@ mod tests {
         .unwrap();
         let bloom = crate::index::bloom::BloomFilterCache::new();
         let names: HashSet<String> = ["new", "only", "free"].map(String::from).into();
-        let walk =
-            find_callers_and_owners(&names, &names, dir.path(), &bloom, None, |_, o| o).unwrap();
+        let walk = find_callers_and_owners(
+            &names,
+            &names,
+            Walk::new(dir.path(), WalkConfig::default()),
+            &bloom,
+            |_, o| o,
+        )
+        .unwrap();
         let mut owners: HashMap<String, BTreeSet<String>> = HashMap::new();
         for (name, owner) in walk.per_file.into_iter().flatten() {
             owners.entry(name).or_default().insert(owner);
@@ -484,12 +484,18 @@ mod tests {
 
         let bloom = crate::index::bloom::BloomFilterCache::new();
         let targets: HashSet<String> = std::iter::once("helper_after".to_string()).collect();
-        let found = find_callers_batch(&targets, dir.path(), &bloom, None, None, |sites| {
-            sites
-                .into_iter()
-                .map(|(_, m)| m.calling_function)
-                .collect::<Vec<_>>()
-        })
+        let found = find_callers_batch(
+            &targets,
+            Walk::new(dir.path(), WalkConfig::default()),
+            &bloom,
+            None,
+            |sites| {
+                sites
+                    .into_iter()
+                    .map(|(_, m)| m.calling_function)
+                    .collect::<Vec<_>>()
+            },
+        )
         .unwrap();
         let callers: Vec<&str> = found
             .per_file
@@ -506,12 +512,18 @@ mod tests {
         std::fs::write(dir.path().join(file), source).unwrap();
         let bloom = crate::index::bloom::BloomFilterCache::new();
         let targets: HashSet<String> = std::iter::once(target.to_string()).collect();
-        let found = find_callers_batch(&targets, dir.path(), &bloom, None, None, |sites| {
-            sites
-                .into_iter()
-                .map(|(_, m)| (m.line, m.calling_function))
-                .collect::<Vec<_>>()
-        })
+        let found = find_callers_batch(
+            &targets,
+            Walk::new(dir.path(), WalkConfig::default()),
+            &bloom,
+            None,
+            |sites| {
+                sites
+                    .into_iter()
+                    .map(|(_, m)| (m.line, m.calling_function))
+                    .collect::<Vec<_>>()
+            },
+        )
         .unwrap();
         let mut labels: Vec<(u32, String)> = found.per_file.into_iter().flatten().collect();
         labels.sort();
@@ -640,8 +652,14 @@ mod tests {
         .unwrap();
         let bloom = crate::index::bloom::BloomFilterCache::new();
         let targets: HashSet<String> = std::iter::once("new".to_string()).collect();
-        let walk =
-            find_callers_batch(&targets, dir.path(), &bloom, None, None, |s| s.len()).unwrap();
+        let walk = find_callers_batch(
+            &targets,
+            Walk::new(dir.path(), WalkConfig::default()),
+            &bloom,
+            None,
+            |s| s.len(),
+        )
+        .unwrap();
         let names: Vec<_> = walk
             .skipped_large
             .iter()
@@ -663,7 +681,14 @@ mod tests {
         let bloom = crate::index::bloom::BloomFilterCache::new();
         let targets: HashSet<String> = std::iter::once("go".to_string()).collect();
         let walk = |stop_after| {
-            find_callers_batch(&targets, dir.path(), &bloom, None, stop_after, |s| s.len()).unwrap()
+            find_callers_batch(
+                &targets,
+                Walk::new(dir.path(), WalkConfig::default()),
+                &bloom,
+                stop_after,
+                |s| s.len(),
+            )
+            .unwrap()
         };
 
         let unbounded = walk(None);

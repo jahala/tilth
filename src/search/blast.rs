@@ -7,6 +7,7 @@ use crate::format::noun;
 use tilth_core::lang::detect_file_type_with_content;
 use tilth_core::lang::outline::get_outline_entries;
 use tilth_core::search::callers::find_callers_batch;
+use tilth_core::search::walk::{Walk, WalkConfig};
 use tilth_core::types::{is_test_file, FileType, OutlineEntry, OutlineKind};
 
 pub(crate) struct TouchedSymbol {
@@ -68,6 +69,7 @@ pub(crate) fn blast_radius(
     edits: &[Edit],
     scope: &Path,
     bloom: &tilth_core::index::bloom::BloomFilterCache,
+    walk: WalkConfig,
 ) -> Option<String> {
     let content = tilth_core::source::read_source(path).ok()?;
 
@@ -91,17 +93,21 @@ pub(crate) fn blast_radius(
     // `canonical` even through a symlinked scope (`/tmp` on macOS).
     let canonical = path.canonicalize().ok()?;
     let scope = &scope.canonicalize().ok()?;
-    let own_calls: usize =
-        find_callers_batch(&symbol_names, &canonical, bloom, None, None, |s| s.len())
-            .ok()?
-            .per_file
-            .iter()
-            .sum();
-    let walk = find_callers_batch(
+    let own_calls: usize = find_callers_batch(
         &symbol_names,
-        scope,
+        Walk::new(&canonical, walk),
         bloom,
         None,
+        |s| s.len(),
+    )
+    .ok()?
+    .per_file
+    .iter()
+    .sum();
+    let walked = find_callers_batch(
+        &symbol_names,
+        Walk::new(scope, walk),
+        bloom,
         Some(BLAST_STOP_AFTER + own_calls),
         |sites| {
             let mut file = FileCallers::default();
@@ -124,9 +130,9 @@ pub(crate) fn blast_radius(
         },
     )
     .ok()?;
-    let files = walk.per_file;
+    let files = walked.per_file;
     // The edited file was left out on purpose, not for its size.
-    let mut skipped_large = walk.skipped_large;
+    let mut skipped_large = walked.skipped_large;
     skipped_large.retain(|p| *p != canonical);
 
     if files.iter().all(|f| f.by_symbol.is_empty() && f.tests == 0) && skipped_large.is_empty() {
@@ -134,7 +140,7 @@ pub(crate) fn blast_radius(
     }
 
     // A file skipped for size may hold callers the counts miss.
-    let mut out = format_blast_radius(&touched, &files, walk.reached_bound, scope);
+    let mut out = format_blast_radius(&touched, &files, walked.reached_bound, scope);
     let held = crate::search::names_phrase(symbol_names.iter().map(String::as_str));
     if let Some(sentence) = crate::search::skipped_files_note(&skipped_large, &held, scope) {
         out.push_str("> ");
@@ -403,7 +409,14 @@ mod tests {
 
         let bloom = tilth_core::index::bloom::BloomFilterCache::new();
         let scope = dir.path().canonicalize().unwrap();
-        blast_radius(&lib, &[make_edit(1, 1)], &scope, &bloom).expect("blast radius")
+        blast_radius(
+            &lib,
+            &[make_edit(1, 1)],
+            &scope,
+            &bloom,
+            WalkConfig::default(),
+        )
+        .expect("blast radius")
     }
 
     #[test]
@@ -452,7 +465,14 @@ mod tests {
         }
         let bloom = tilth_core::index::bloom::BloomFilterCache::new();
         let scope = dir.path().canonicalize().unwrap();
-        let out = blast_radius(&lib, &[make_edit(1, 5)], &scope, &bloom).expect("blast radius");
+        let out = blast_radius(
+            &lib,
+            &[make_edit(1, 5)],
+            &scope,
+            &bloom,
+            WalkConfig::default(),
+        )
+        .expect("blast radius");
         assert!(out.contains("target: at least "), "{out}");
         assert!(out.contains("quiet: callers not counted"), "{out}");
     }
@@ -478,7 +498,14 @@ mod tests {
         .unwrap();
         let bloom = tilth_core::index::bloom::BloomFilterCache::new();
         let scope = dir.path().canonicalize().unwrap();
-        let out = blast_radius(&lib, &[make_edit(1, 1)], &scope, &bloom).expect("blast radius");
+        let out = blast_radius(
+            &lib,
+            &[make_edit(1, 1)],
+            &scope,
+            &bloom,
+            WalkConfig::default(),
+        )
+        .expect("blast radius");
         assert!(out.contains("target: 1 caller\n"), "{out}");
         assert!(
             out.contains("\n> 1 file over 500 KB contains `target` and was not searched: big.rs"),
@@ -506,7 +533,14 @@ mod tests {
         std::fs::write(real.join("c.rs"), "fn caller() {\n    target(1);\n}\n").unwrap();
         let bloom = tilth_core::index::bloom::BloomFilterCache::new();
         let lib = scope.join("lib.rs");
-        let out = blast_radius(&lib, &[make_edit(1, 1)], &scope, &bloom).expect("blast radius");
+        let out = blast_radius(
+            &lib,
+            &[make_edit(1, 1)],
+            &scope,
+            &bloom,
+            WalkConfig::default(),
+        )
+        .expect("blast radius");
         assert!(out.contains("target: 1 caller\n"), "{out}");
         assert!(out.contains("  c.rs:2  caller"), "{out}");
     }
@@ -532,7 +566,14 @@ mod tests {
         .unwrap();
         let bloom = tilth_core::index::bloom::BloomFilterCache::new();
         let scope = dir.path().canonicalize().unwrap();
-        let out = blast_radius(&lib, &[make_edit(1, 1)], &scope, &bloom).expect("blast radius");
+        let out = blast_radius(
+            &lib,
+            &[make_edit(1, 1)],
+            &scope,
+            &bloom,
+            WalkConfig::default(),
+        )
+        .expect("blast radius");
         assert!(out.contains("target: 1 caller\n"), "{out}");
         assert!(!out.contains("not searched"), "{out}");
     }
@@ -556,7 +597,14 @@ mod tests {
         .unwrap();
         let bloom = tilth_core::index::bloom::BloomFilterCache::new();
         let scope = dir.path().canonicalize().unwrap();
-        let out = blast_radius(&lib, &[make_edit(1, 1)], &scope, &bloom).expect("blast radius");
+        let out = blast_radius(
+            &lib,
+            &[make_edit(1, 1)],
+            &scope,
+            &bloom,
+            WalkConfig::default(),
+        )
+        .expect("blast radius");
         assert!(out.contains("target: 1 caller\n"), "{out}");
     }
 }

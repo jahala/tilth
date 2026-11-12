@@ -168,17 +168,6 @@ pub(crate) enum SpawnFailure {
     Panic,
 }
 
-/// Per-request timeout for tool calls. If a tool doesn't respond within this
-/// duration, the MCP server returns a timeout error instead of hanging.
-/// Override with `TILTH_TIMEOUT` env var (seconds). Default: 90s.
-pub(crate) fn request_timeout() -> Duration {
-    let secs = std::env::var("TILTH_TIMEOUT")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(90);
-    Duration::from_secs(secs)
-}
-
 /// Run an arbitrary closure on a fresh thread with a wall-clock timeout.
 /// Returns `Ok(result)` on success. On timeout, returns `Err(SpawnFailure::Timeout)`
 /// and detaches the worker; the tracker is incremented and the worker will
@@ -250,12 +239,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// Serializes env-var tests so parallel `cargo test` execution doesn't
-    /// race on process-global `TILTH_TIMEOUT`. Any test that mutates this
-    /// env var must take this lock for its duration.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// Drives the real CAS path: a short-timeout `spawn_with_timeout` call
     /// races against a worker that sleeps past the deadline. The main thread
@@ -306,16 +289,5 @@ mod tests {
         assert!(!tracker.is_at_cap());
         tracker.saturate();
         assert!(tracker.is_at_cap());
-    }
-
-    #[test]
-    fn request_timeout_reads_env() {
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::env::set_var("TILTH_TIMEOUT", "7");
-        assert_eq!(request_timeout(), Duration::from_secs(7));
-        std::env::remove_var("TILTH_TIMEOUT");
-        assert_eq!(request_timeout(), Duration::from_secs(90));
     }
 }

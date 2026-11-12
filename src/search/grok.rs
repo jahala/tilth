@@ -7,6 +7,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::config::Config;
 use crate::format::noun;
 use crate::search::search_symbol_raw;
 use tilth_core::error::TilthError;
@@ -15,6 +16,7 @@ use tilth_core::lang::detect_file_type;
 use tilth_core::lang::outline::get_outline_entries;
 use tilth_core::search::callees::{extract_callee_names, resolve_callees, ResolvedCallee};
 use tilth_core::search::callers::{find_callers_batch, CallerMatch};
+use tilth_core::search::walk::Walk;
 use tilth_core::types::{is_test_file, FileType, Lang, OutlineEntry, OutlineKind};
 
 /// What grok resolved the user's target string to.
@@ -70,16 +72,17 @@ fn parse_target_spec(s: &str) -> TargetSpec {
 fn resolve_with_source(
     spec: &str,
     scope: &Path,
+    config: &Config,
 ) -> Result<(ResolvedTarget, String, Lang), TilthError> {
     match parse_target_spec(spec) {
-        TargetSpec::Symbol(name) => resolve_by_name(&name, scope),
+        TargetSpec::Symbol(name) => resolve_by_name(&name, scope, config),
         TargetSpec::PathLine { path, line } => {
             let path = if path.is_absolute() {
                 path
             } else {
                 scope.join(path)
             };
-            resolve_by_path_line(&path, line)
+            resolve_by_path_line(&path, line, config.full_size_cap)
         }
     }
 }
@@ -88,11 +91,15 @@ fn resolve_with_source(
 /// (`Type::method`, `Type.method`) resolves among the definitions its owner
 /// holds. When the owner holds none, the error lists the definitions of the
 /// name there are, so the next call can name one.
-fn resolve_by_name(name: &str, scope: &Path) -> Result<(ResolvedTarget, String, Lang), TilthError> {
+fn resolve_by_name(
+    name: &str,
+    scope: &Path,
+    config: &Config,
+) -> Result<(ResolvedTarget, String, Lang), TilthError> {
     // Only the top-ranked definition is used, so the short match list is
     // enough; the count of the others comes from the exact total. Grok's own
     // caps come from `GrokCaps`.
-    let result = search_symbol_raw(name, scope, None, false)?;
+    let result = search_symbol_raw(name, Walk::new(scope, config.walk), false)?;
     let Some(top) = result.matches.iter().find(|m| m.is_definition) else {
         let suggestion = (!result.other_owners.is_empty())
             .then(|| crate::search::owner_candidates(name, &result.other_owners, scope));
@@ -108,14 +115,22 @@ fn resolve_by_name(name: &str, scope: &Path) -> Result<(ResolvedTarget, String, 
         reason: format!("definition match for `{name}` had no def_range"),
     })?;
     let def_name = top.def_name.clone().unwrap_or_else(|| name.to_string());
-    enrich_from_outline(top.path.clone(), start, def_name, name, other_def_count)
+    enrich_from_outline(
+        top.path.clone(),
+        start,
+        def_name,
+        name,
+        other_def_count,
+        config.full_size_cap,
+    )
 }
 
 fn resolve_by_path_line(
     path: &Path,
     line: u32,
+    size_cap: u64,
 ) -> Result<(ResolvedTarget, String, Lang), TilthError> {
-    let (content, lang) = read_code_file(path)?;
+    let (content, lang) = read_code_file(path, size_cap)?;
     let entries = get_outline_entries(&content, lang);
     // A decorator or attribute line belongs to the definition it decorates,
     // though that definition's outline entry may start below it.
@@ -130,8 +145,9 @@ fn resolve_by_path_line(
 }
 
 /// Read `path` and detect its language. Errors if the file isn't a code file —
-/// grok requires source-level analysis, not a markdown / config / data file.
-fn read_code_file(path: &Path) -> Result<(String, Lang), TilthError> {
+/// grok requires source-level analysis, not a markdown / config / data file —
+/// or is over `cap` bytes.
+fn read_code_file(path: &Path, cap: u64) -> Result<(String, Lang), TilthError> {
     // Stat before judging the extension: a missing path must report
     // file-not-found, not "not a code file", whatever its suffix.
     let meta = fs::metadata(path).map_err(|e| TilthError::IoError {
@@ -147,7 +163,6 @@ fn read_code_file(path: &Path) -> Result<(String, Lang), TilthError> {
     // The binary probe below only inspects the first 512B, so a clean head
     // followed by megabytes of garbage would still reach the lossy decode and
     // the outline parser. Refuse on size first, before reading any bytes.
-    let cap = crate::read::full_read_size_cap();
     if meta.len() > cap {
         return Err(TilthError::InvalidQuery {
             query: path.display().to_string(),
@@ -191,10 +206,11 @@ fn enrich_from_outline(
     name: String,
     query: &str,
     other_def_count: usize,
+    size_cap: u64,
 ) -> Result<(ResolvedTarget, String, Lang), TilthError> {
     // On the symbol route the user asked for `query`, not the path the search
     // resolved it to — a refusal must name their query, not our detour.
-    let (content, lang) = read_code_file(&path).map_err(|e| match e {
+    let (content, lang) = read_code_file(&path, size_cap).map_err(|e| match e {
         TilthError::InvalidQuery { reason, .. } => TilthError::InvalidQuery {
             query: query.to_string(),
             reason,
@@ -439,8 +455,9 @@ pub fn grok(
     bloom: &BloomFilterCache,
     session: &crate::session::Session,
     caps: GrokCaps,
+    config: &Config,
 ) -> Result<GrokResult, TilthError> {
-    let (target, content, lang) = resolve_with_source(target_spec, scope)?;
+    let (target, content, lang) = resolve_with_source(target_spec, scope, config)?;
     let entries = get_outline_entries(&content, lang);
 
     // --- Callees -----------------------------------------------------------
@@ -504,7 +521,8 @@ pub fn grok(
             .then_with(|| a.1.line.cmp(&b.1.line))
     };
     let split: std::sync::Mutex<CallerSplit> = std::sync::Mutex::new(CallerSplit::default());
-    let walk = find_callers_batch(&symbols, scope, bloom, None, None, |sites| {
+    let walk = Walk::new(scope, config.walk);
+    let walked = find_callers_batch(&symbols, walk, bloom, None, |sites| {
         let mut file = CallerSplit::default();
         for (_, m) in sites {
             if is_recursive_call_site(&m, &canonical_target, &target) {
@@ -648,7 +666,7 @@ pub fn grok(
         total_siblings,
         total_tests,
         delegate_body,
-        skipped_large: walk.skipped_large,
+        skipped_large: walked.skipped_large,
     })
 }
 
@@ -1148,7 +1166,15 @@ mod tests {
     fn grok_target(dir: &Path, spec: &str) -> Result<ResolvedTarget, TilthError> {
         let bloom = BloomFilterCache::default();
         let session = crate::session::Session::default();
-        grok(spec, dir, &bloom, &session, GrokCaps::default()).map(|r| r.target)
+        grok(
+            spec,
+            dir,
+            &bloom,
+            &session,
+            GrokCaps::default(),
+            &Config::default(),
+        )
+        .map(|r| r.target)
     }
 
     /// A qualified target resolves to the definition its owner holds, with
@@ -1272,12 +1298,11 @@ mod tests {
             let search = |session: &crate::session::Session| {
                 crate::search::search_symbol_expanded(
                     query,
-                    tmp.path(),
+                    Walk::new(tmp.path(), Config::default().walk),
                     &cache,
                     session,
                     &bloom,
                     1,
-                    None,
                     None,
                     false,
                     None,
@@ -1286,7 +1311,15 @@ mod tests {
             };
 
             let session = crate::session::Session::default();
-            grok(query, tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
+            grok(
+                query,
+                tmp.path(),
+                &bloom,
+                &session,
+                GrokCaps::default(),
+                &Config::default(),
+            )
+            .unwrap();
             let out = search(&session);
             assert!(
                 out.contains("[shown earlier]"),
@@ -1295,7 +1328,15 @@ mod tests {
 
             let session = crate::session::Session::default();
             search(&session);
-            let again = grok(query, tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
+            let again = grok(
+                query,
+                tmp.path(),
+                &bloom,
+                &session,
+                GrokCaps::default(),
+                &Config::default(),
+            )
+            .unwrap();
             assert!(
                 again.body.contains("body shown earlier"),
                 "{file}: search, then grok: {}",
@@ -1352,7 +1393,8 @@ mod tests {
             (&rs, 2, "case"),
             (&rs, 3, "case"),
         ] {
-            let (target, _, _) = resolve_by_path_line(path, line).unwrap();
+            let (target, _, _) =
+                resolve_by_path_line(path, line, Config::default().full_size_cap).unwrap();
             assert_eq!(target.name, name, "{}:{line}", path.display());
         }
     }
@@ -1376,6 +1418,7 @@ mod tests {
             &bloom,
             &session,
             GrokCaps::default(),
+            &Config::default(),
         )
         .unwrap();
         let callers: Vec<&str> = result
@@ -1418,6 +1461,7 @@ mod tests {
             &bloom,
             &session,
             GrokCaps::default(),
+            &Config::default(),
         )
         .unwrap();
         assert_eq!((result.callers.len(), result.total_callers), (5, 75));
@@ -1536,7 +1580,8 @@ mod tests {
         let body = "fn alpha() {\n    let x = 1;\n}\n\nfn beta() {\n    let y = 2;\n}\n";
         let path = write_fixture(tmp.path(), "src/a.rs", body);
 
-        let (target, content, lang) = resolve_by_path_line(&path, 2).unwrap();
+        let (target, content, lang) =
+            resolve_by_path_line(&path, 2, Config::default().full_size_cap).unwrap();
         assert_eq!(target.name, "alpha");
         assert_eq!(target.kind, OutlineKind::Function);
         assert_eq!(target.start_line, 1);
@@ -1553,7 +1598,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let body = "fn alpha() {}\n";
         let path = write_fixture(tmp.path(), "src/a.rs", body);
-        let err = resolve_by_path_line(&path, 99).unwrap_err();
+        let err = resolve_by_path_line(&path, 99, Config::default().full_size_cap).unwrap_err();
         assert!(matches!(err, TilthError::NotFound { .. }));
     }
 
@@ -1561,7 +1606,7 @@ mod tests {
     fn resolve_by_path_line_rejects_non_code_file() {
         let tmp = tempfile::tempdir().unwrap();
         let path = write_fixture(tmp.path(), "notes.txt", "hello\n");
-        let err = resolve_by_path_line(&path, 1).unwrap_err();
+        let err = resolve_by_path_line(&path, 1, Config::default().full_size_cap).unwrap_err();
         assert!(matches!(err, TilthError::InvalidQuery { .. }));
     }
 
@@ -1573,7 +1618,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         for missing in ["nope.rs", "nope.md"] {
             let path = tmp.path().join(missing);
-            let err = resolve_by_path_line(&path, 1).unwrap_err();
+            let err = resolve_by_path_line(&path, 1, Config::default().full_size_cap).unwrap_err();
             assert!(
                 matches!(err, TilthError::IoError { .. }),
                 "{missing}: expected IoError, got {err}"
@@ -1593,7 +1638,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("tainted.rs");
         fs::write(&path, b"fn alpha() {}\n\x00\x01\x02").unwrap();
-        let err = resolve_by_path_line(&path, 1).unwrap_err();
+        let err = resolve_by_path_line(&path, 1, Config::default().full_size_cap).unwrap_err();
         match err {
             TilthError::InvalidQuery { reason, .. } => {
                 assert_eq!(
@@ -1613,7 +1658,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("latin1.rs");
         fs::write(&path, b"fn alpha() {} // caf\xff\n").unwrap();
-        let (target, _content, lang) = resolve_by_path_line(&path, 1).unwrap();
+        let (target, _content, lang) =
+            resolve_by_path_line(&path, 1, Config::default().full_size_cap).unwrap();
         assert_eq!(target.name, "alpha");
         assert_eq!(lang, Lang::Rust);
     }
@@ -1634,7 +1680,7 @@ mod tests {
             (state >> 24) as u8
         }));
         fs::write(&path, &body).unwrap();
-        let err = resolve_by_path_line(&path, 1).unwrap_err();
+        let err = resolve_by_path_line(&path, 1, Config::default().full_size_cap).unwrap_err();
         match err {
             TilthError::InvalidQuery { reason, .. } => {
                 assert!(
@@ -1659,7 +1705,8 @@ mod tests {
         write_fixture(tmp.path(), "src/a.rs", body);
 
         // Relative path is joined with scope.
-        let (target, _, _) = resolve_with_source("src/a.rs:3", tmp.path()).unwrap();
+        let (target, _, _) =
+            resolve_with_source("src/a.rs:3", tmp.path(), &Config::default()).unwrap();
         assert_eq!(target.name, "two");
     }
 
@@ -1671,7 +1718,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("tainted.rs");
         fs::write(&path, b"fn alpha() {}\n\x00\x01\x02").unwrap();
-        let err = resolve_by_name("alpha", tmp.path()).unwrap_err();
+        let err = resolve_by_name("alpha", tmp.path(), &Config::default()).unwrap_err();
         match err {
             TilthError::InvalidQuery { query, .. } => assert_eq!(query, "alpha"),
             other => panic!("expected InvalidQuery, got {other}"),
@@ -1800,6 +1847,7 @@ fn test_calls_target() {
             &bloom,
             &session,
             GrokCaps::default(),
+            &Config::default(),
         )
         .unwrap();
 
@@ -1881,6 +1929,7 @@ pub fn caller_fn() {
             &bloom,
             &session,
             GrokCaps::default(),
+            &Config::default(),
         )
         .unwrap();
 
@@ -1916,6 +1965,7 @@ pub fn caller_fn() {
                 &bloom,
                 &session,
                 GrokCaps::default(),
+                &Config::default(),
             )
             .unwrap()
         };
@@ -1972,6 +2022,7 @@ fn integration_calls_target() {
             &bloom,
             &session,
             GrokCaps::default(),
+            &Config::default(),
         )
         .unwrap();
 
@@ -2007,7 +2058,15 @@ pub fn target() {
         write_fixture(tmp.path(), "src/lib.rs", lib);
         let bloom = BloomFilterCache::default();
         let session = crate::session::Session::default();
-        let result = grok("target", tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
+        let result = grok(
+            "target",
+            tmp.path(),
+            &bloom,
+            &session,
+            GrokCaps::default(),
+            &Config::default(),
+        )
+        .unwrap();
         let rendered = format_grok(&result, tmp.path());
 
         assert!(
@@ -2163,6 +2222,7 @@ pub fn target_fn() -> u32 {
             &bloom,
             &session,
             GrokCaps::default(),
+            &Config::default(),
         )
         .unwrap();
         assert!(
@@ -2206,7 +2266,15 @@ fn h() {}
             max_body_lines: 60,
         };
         let session = crate::session::Session::default();
-        let result = grok("target", tmp.path(), &bloom, &session, caps).unwrap();
+        let result = grok(
+            "target",
+            tmp.path(),
+            &bloom,
+            &session,
+            caps,
+            &Config::default(),
+        )
+        .unwrap();
         assert_eq!(result.callees_internal.len(), 3, "callees capped");
         assert_eq!(result.siblings.len(), 2, "siblings capped");
         assert!(
@@ -2235,13 +2303,29 @@ fn h() {}
         let bloom = BloomFilterCache::default();
         let session = crate::session::Session::default();
 
-        let r1 = grok("big", tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
+        let r1 = grok(
+            "big",
+            tmp.path(),
+            &bloom,
+            &session,
+            GrokCaps::default(),
+            &Config::default(),
+        )
+        .unwrap();
         assert!(
             !r1.body.contains("shown earlier"),
             "first call must be full body"
         );
 
-        let r2 = grok("big", tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
+        let r2 = grok(
+            "big",
+            tmp.path(),
+            &bloom,
+            &session,
+            GrokCaps::default(),
+            &Config::default(),
+        )
+        .unwrap();
         assert!(
             r2.body.contains("shown earlier"),
             "second call must degrade"
@@ -2266,11 +2350,27 @@ fn h() {}
         let (a, b) = std::thread::scope(|s| {
             let ta = s.spawn(|| {
                 barrier.wait();
-                grok("shared", tmp.path(), &bloom, &session, GrokCaps::default()).unwrap()
+                grok(
+                    "shared",
+                    tmp.path(),
+                    &bloom,
+                    &session,
+                    GrokCaps::default(),
+                    &Config::default(),
+                )
+                .unwrap()
             });
             let tb = s.spawn(|| {
                 barrier.wait();
-                grok("shared", tmp.path(), &bloom, &session, GrokCaps::default()).unwrap()
+                grok(
+                    "shared",
+                    tmp.path(),
+                    &bloom,
+                    &session,
+                    GrokCaps::default(),
+                    &Config::default(),
+                )
+                .unwrap()
             });
             (ta.join().unwrap(), tb.join().unwrap())
         });
@@ -2292,8 +2392,24 @@ fn h() {}
         let bloom = BloomFilterCache::default();
         let session = crate::session::Session::default();
 
-        let r1 = grok("tiny", tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
-        let r2 = grok("tiny", tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
+        let r1 = grok(
+            "tiny",
+            tmp.path(),
+            &bloom,
+            &session,
+            GrokCaps::default(),
+            &Config::default(),
+        )
+        .unwrap();
+        let r2 = grok(
+            "tiny",
+            tmp.path(),
+            &bloom,
+            &session,
+            GrokCaps::default(),
+            &Config::default(),
+        )
+        .unwrap();
         assert_eq!(r1.body, r2.body, "sub-threshold body should never degrade");
         assert!(!r2.body.contains("shown earlier"));
     }
@@ -2306,13 +2422,29 @@ fn h() {}
         let bloom = BloomFilterCache::default();
         let session = crate::session::Session::default();
 
-        let _ = grok("stale", tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
+        let _ = grok(
+            "stale",
+            tmp.path(),
+            &bloom,
+            &session,
+            GrokCaps::default(),
+            &Config::default(),
+        )
+        .unwrap();
 
         // Bump mtime by overwriting (sleep 10ms to guarantee mtime tick on coarse FS).
         std::thread::sleep(std::time::Duration::from_millis(10));
         std::fs::write(&path, long_body_fixture("stale")).unwrap();
 
-        let r2 = grok("stale", tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
+        let r2 = grok(
+            "stale",
+            tmp.path(),
+            &bloom,
+            &session,
+            GrokCaps::default(),
+            &Config::default(),
+        )
+        .unwrap();
         assert!(
             !r2.body.contains("shown earlier"),
             "post-edit re-grok must re-inline full body, got: {}",
@@ -2335,7 +2467,15 @@ pub fn caller_b() { target(); }
         write_fixture(tmp.path(), "src/lib.rs", lib);
         let bloom = BloomFilterCache::default();
         let session = crate::session::Session::default();
-        let result = grok("target", tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
+        let result = grok(
+            "target",
+            tmp.path(),
+            &bloom,
+            &session,
+            GrokCaps::default(),
+            &Config::default(),
+        )
+        .unwrap();
         let rendered = format_grok(&result, tmp.path());
 
         // File header appears once, then per-site lines are indented.
@@ -2380,6 +2520,7 @@ pub fn target_fn() {
             &bloom,
             &session,
             GrokCaps::default(),
+            &Config::default(),
         )
         .unwrap();
         let rendered = format_grok(&result, tmp.path());
@@ -2455,7 +2596,15 @@ pub fn wrapper(x: u32) -> u32 {
         write_fixture(tmp.path(), "src/lib.rs", lib);
         let bloom = BloomFilterCache::default();
         let session = crate::session::Session::default();
-        let result = grok("wrapper", tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
+        let result = grok(
+            "wrapper",
+            tmp.path(),
+            &bloom,
+            &session,
+            GrokCaps::default(),
+            &Config::default(),
+        )
+        .unwrap();
 
         // The delegate body field must be set.
         assert!(
@@ -2512,7 +2661,15 @@ pub fn wrapper(x: u32) -> u32 {
         write_fixture(tmp.path(), "src/lib.rs", &lib);
         let bloom = BloomFilterCache::default();
         let session = crate::session::Session::default();
-        let result = grok("big_fn", tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
+        let result = grok(
+            "big_fn",
+            tmp.path(),
+            &bloom,
+            &session,
+            GrokCaps::default(),
+            &Config::default(),
+        )
+        .unwrap();
 
         // Body is large — no delegate expansion.
         assert!(
@@ -2540,7 +2697,15 @@ pub fn multi(x: u32) -> u32 {
         write_fixture(tmp.path(), "src/lib.rs", lib);
         let bloom = BloomFilterCache::default();
         let session = crate::session::Session::default();
-        let result = grok("multi", tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
+        let result = grok(
+            "multi",
+            tmp.path(),
+            &bloom,
+            &session,
+            GrokCaps::default(),
+            &Config::default(),
+        )
+        .unwrap();
 
         assert!(
             result.delegate_body.is_none(),
@@ -2577,7 +2742,15 @@ pub fn outer(x: u32) -> u32 {
         write_fixture(tmp.path(), "src/lib.rs", lib);
         let bloom = BloomFilterCache::default();
         let session = crate::session::Session::default();
-        let result = grok("outer", tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
+        let result = grok(
+            "outer",
+            tmp.path(),
+            &bloom,
+            &session,
+            GrokCaps::default(),
+            &Config::default(),
+        )
+        .unwrap();
 
         // Delegate body is set (outer is a thin wrapper around mid).
         assert!(
@@ -2626,7 +2799,15 @@ pub fn outer(x: u32) -> u32 {
         let bloom = BloomFilterCache::default();
         let session = crate::session::Session::default();
 
-        let r1 = grok("biggish", tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
+        let r1 = grok(
+            "biggish",
+            tmp.path(),
+            &bloom,
+            &session,
+            GrokCaps::default(),
+            &Config::default(),
+        )
+        .unwrap();
         assert!(
             r1.delegate_body.is_none(),
             "large fn must not expand on first grok"
@@ -2634,7 +2815,15 @@ pub fn outer(x: u32) -> u32 {
 
         // Re-grok: body is dedup-degraded to a short preview, but the definition
         // span is unchanged (> WRAPPER_MAX_BODY_LINES) so it must still not expand.
-        let r2 = grok("biggish", tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
+        let r2 = grok(
+            "biggish",
+            tmp.path(),
+            &bloom,
+            &session,
+            GrokCaps::default(),
+            &Config::default(),
+        )
+        .unwrap();
         assert!(
             r2.delegate_body.is_none(),
             "large fn must not expand on re-grok despite degraded body"
@@ -2665,7 +2854,7 @@ impl OutlineCache {
         write_fixture(tmp.path(), "src/cache.rs", body);
 
         for spec in ["OutlineCache::get_or_parse", "OutlineCache.get_or_parse"] {
-            let (target, _, _) = resolve_with_source(spec, tmp.path())
+            let (target, _, _) = resolve_with_source(spec, tmp.path(), &Config::default())
                 .unwrap_or_else(|e| panic!("`{spec}` must resolve, got: {e}"));
             assert_eq!(
                 target.name, "get_or_parse",
@@ -2702,8 +2891,15 @@ impl OutlineCache {
             ("Server", OutlineKind::Struct, 9),
             ("StatusActive", OutlineKind::Constant, 4),
         ] {
-            let result = grok(name, tmp.path(), &bloom, &session, GrokCaps::default())
-                .unwrap_or_else(|e| panic!("grok {name} failed: {e}"));
+            let result = grok(
+                name,
+                tmp.path(),
+                &bloom,
+                &session,
+                GrokCaps::default(),
+                &Config::default(),
+            )
+            .unwrap_or_else(|e| panic!("grok {name} failed: {e}"));
             assert_eq!(result.target.name, name);
             assert_eq!(result.target.kind, kind, "{name} kind");
             assert_eq!(
@@ -2727,7 +2923,15 @@ impl OutlineCache {
         }
         let bloom = BloomFilterCache::default();
         let session = crate::session::Session::default();
-        let result = grok("target", tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
+        let result = grok(
+            "target",
+            tmp.path(),
+            &bloom,
+            &session,
+            GrokCaps::default(),
+            &Config::default(),
+        )
+        .unwrap();
         assert_eq!(result.total_callers, 1);
         assert_eq!(result.total_tests, 1);
         assert!(result.callers[0].path.ends_with(fixtures[1].0));
@@ -2788,7 +2992,15 @@ impl OutlineCache {
         );
         let bloom = BloomFilterCache::default();
         let session = crate::session::Session::default();
-        let result = grok("target", tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
+        let result = grok(
+            "target",
+            tmp.path(),
+            &bloom,
+            &session,
+            GrokCaps::default(),
+            &Config::default(),
+        )
+        .unwrap();
         let rendered = format_grok(&result, tmp.path());
         assert!(
             rendered.contains("## callees (1 internal, 3 extern)"),

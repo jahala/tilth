@@ -14,7 +14,16 @@ allow-dbg-in-tests = true
 # Each stream has one sink: results go through `write_stdout` (CLI) or the
 # MCP transport's writer, diagnostics through `diag::emit`. `print_stdout`
 # and `print_stderr` cover the macros.
+
+# The environment is read in one place, `tilth::config::env_var`, and never
+# written: `main` builds one `Config` from it and passes it down.
 disallowed-methods = [
+  { path = "std::env::var", reason = "read the environment through `tilth::config::env_var`; settings come from `Config`" },
+  { path = "std::env::var_os", reason = "read the environment through `tilth::config::env_var`; settings come from `Config`" },
+  { path = "std::env::vars", reason = "read the environment through `tilth::config::env_var`; settings come from `Config`" },
+  { path = "std::env::vars_os", reason = "read the environment through `tilth::config::env_var`; settings come from `Config`" },
+  { path = "std::env::set_var", reason = "the environment is process-global; pass settings in a `Config`" },
+  { path = "std::env::remove_var", reason = "the environment is process-global; pass settings in a `Config`" },
   { path = "std::io::stdout", reason = "write results through `write_stdout` (CLI) or the MCP transport's writer" },
   { path = "std::io::stderr", reason = "write diagnostics through `diag::emit`" },
   { path = "std::fs::read", reason = "read through `tilth_core::source`, whose open never waits on a pipe" },

@@ -10,6 +10,7 @@ use crate::format;
 use crate::util::WriteOutcome;
 use tilth_core::error::TilthError;
 use tilth_core::index::bloom::BloomFilterCache;
+use tilth_core::search::walk::WalkConfig;
 
 /// One write guard per file, keyed by [`normalize_path_key`].
 ///
@@ -480,6 +481,7 @@ pub struct BatchApplied {
 pub fn apply_batch(
     tasks: Vec<FileEditTask>,
     bloom: &Arc<BloomFilterCache>,
+    walk: WalkConfig,
     show_diff: bool,
 ) -> Result<BatchApplied, String> {
     if let Some(msg) = detect_duplicate_paths(&tasks) {
@@ -489,7 +491,7 @@ pub fn apply_batch(
     let bloom: &BloomFilterCache = bloom;
     let outcomes: Vec<(String, Option<PathBuf>)> = tasks
         .into_par_iter()
-        .map(|task| apply_one(task, bloom, show_diff))
+        .map(|task| apply_one(task, bloom, walk, show_diff))
         .collect();
 
     let (sections, applied): (Vec<String>, Vec<Option<PathBuf>>) = outcomes.into_iter().unzip();
@@ -509,6 +511,7 @@ pub fn apply_batch(
 fn apply_one(
     task: FileEditTask,
     bloom: &BloomFilterCache,
+    walk: WalkConfig,
     show_diff: bool,
 ) -> (String, Option<PathBuf>) {
     let (path, edits) = match task {
@@ -517,7 +520,7 @@ fn apply_one(
         }
         FileEditTask::Ready { path, edits } => (path, edits),
     };
-    match render_applied(&path, &edits, bloom, show_diff) {
+    match render_applied(&path, &edits, bloom, walk, show_diff) {
         // Echo the resolved absolute path in the success header so a write that
         // landed in a different worktree than the agent intended is visible.
         Ok(body) => {
@@ -538,6 +541,7 @@ fn render_applied(
     path: &Path,
     edits: &[Edit],
     bloom: &BloomFilterCache,
+    walk: WalkConfig,
     show_diff: bool,
 ) -> Result<String, String> {
     match apply_edits(path, edits).map_err(|e| e.to_string())? {
@@ -570,7 +574,7 @@ fn render_applied(
             match scope {
                 Ok(scope) => {
                     if let Some(blast) =
-                        crate::search::blast::blast_radius(path, edits, &scope, bloom)
+                        crate::search::blast::blast_radius(path, edits, &scope, bloom, walk)
                     {
                         output.push_str(&blast);
                     }
@@ -1002,7 +1006,7 @@ mod tests {
             ),
         ];
 
-        let out = apply_batch(tasks, &fresh_bloom(), false)
+        let out = apply_batch(tasks, &fresh_bloom(), WalkConfig::default(), false)
             .expect("batch should succeed")
             .output;
         // The success header echoes the resolved absolute (canonicalized) path.
@@ -1047,7 +1051,8 @@ mod tests {
             ),
         ];
 
-        let batch = apply_batch(tasks, &fresh_bloom(), false).expect("good half succeeded");
+        let batch = apply_batch(tasks, &fresh_bloom(), WalkConfig::default(), false)
+            .expect("good half succeeded");
         assert_eq!(
             batch.applied,
             std::slice::from_ref(&good),
@@ -1079,7 +1084,7 @@ mod tests {
             }],
         )];
 
-        let err = apply_batch(tasks, &fresh_bloom(), false)
+        let err = apply_batch(tasks, &fresh_bloom(), WalkConfig::default(), false)
             .expect_err("batch with no successes returns Err");
         assert!(err.contains("hash mismatch"));
     }
@@ -1108,7 +1113,7 @@ mod tests {
             },
         ];
 
-        let out = apply_batch(tasks, &fresh_bloom(), false)
+        let out = apply_batch(tasks, &fresh_bloom(), WalkConfig::default(), false)
             .expect("good half kept the batch alive")
             .output;
         assert!(out.contains("## files[1]"));
@@ -1273,7 +1278,7 @@ mod tests {
             ready_task(a.clone(), vec![make_edit()]),
         ];
 
-        let err = apply_batch(tasks, &fresh_bloom(), false)
+        let err = apply_batch(tasks, &fresh_bloom(), WalkConfig::default(), false)
             .expect_err("duplicate paths must reject the batch");
         assert!(err.contains("duplicate file path"), "unexpected: {err}");
         // File must be untouched — no worker ran.
@@ -1322,12 +1327,12 @@ mod tests {
                 let a = s.spawn(|| {
                     let task = ready_task(path.clone(), one_edit(1, h1, "AAA"));
                     barrier.wait();
-                    apply_batch(vec![task], &bloom, false)
+                    apply_batch(vec![task], &bloom, WalkConfig::default(), false)
                 });
                 let b = s.spawn(|| {
                     let task = ready_task(path.clone(), one_edit(5, h5, "EEE"));
                     barrier.wait();
-                    apply_batch(vec![task], &bloom, false)
+                    apply_batch(vec![task], &bloom, WalkConfig::default(), false)
                 });
                 (a.join().unwrap(), b.join().unwrap())
             });
@@ -1379,7 +1384,7 @@ mod tests {
             }],
         )];
 
-        let out = apply_batch(tasks, &fresh_bloom(), false)
+        let out = apply_batch(tasks, &fresh_bloom(), WalkConfig::default(), false)
             .expect("edit applies")
             .output;
         assert!(
@@ -1408,7 +1413,7 @@ mod tests {
             }],
         )];
 
-        let out = apply_batch(tasks, &fresh_bloom(), false)
+        let out = apply_batch(tasks, &fresh_bloom(), WalkConfig::default(), false)
             .expect("edit applies")
             .output;
         assert!(
