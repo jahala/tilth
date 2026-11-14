@@ -1643,6 +1643,30 @@ diff --git a/src/main.rs b/src/main.rs
         );
     }
 
+    #[test]
+    fn an_absolute_file_pair_keeps_the_new_path_absolute_in_the_heading() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.rs");
+        let dst = dir.path().join("dst.rs");
+        fs::write(&src, "fn f() -> u32 { 1 }\n").unwrap();
+        fs::write(&dst, "fn f() -> u32 { 2 }\n").unwrap();
+        let out = diff(
+            &DiffSource::Files(src, dst.clone()),
+            dir.path(),
+            None,
+            None,
+            None,
+            0,
+            None,
+        )
+        .unwrap();
+        assert!(
+            out.contains(&format!("\n## {} (1 symbol)\n", dst.display())),
+            "{out}"
+        );
+        assert!(out.contains("[~]      f"), "{out}");
+    }
+
     /// `git diff --no-index` exits 1 for a file it cannot access, as it does
     /// for files that differ, so a missing side read as "No changes." (#358).
     /// It fails the way a read of it fails, resolved against the checkout.
@@ -1732,6 +1756,12 @@ diff --git a/src/main.rs b/src/main.rs
         for root in [Path::new(""), dir.path()] {
             let out = pair(root.join("d1"), root.join("d2"));
             assert!(out.contains("4 files, 2 modified, 1 added"), "{out}");
+            if root.is_absolute() {
+                for file in ["d1/gone.rs", "d2/fresh.rs", "d2/x.rs", "d2/sub/s.rs"] {
+                    let heading = format!("## {} (1 symbol)", root.join(file).display());
+                    assert!(out.contains(&heading), "{heading:?}: {out}");
+                }
+            }
             for line in [
                 "x.rs (1 symbol)\n  [~]      a ",
                 "s.rs (1 symbol)\n  [~]      s ",
