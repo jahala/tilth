@@ -25,8 +25,18 @@ use crate::git::{Git, GitError};
 /// `repo` anchors git commands and working-tree reads.
 pub(crate) fn compute_overlay(file_diff: &FileDiff, sides: &Sides, repo: &Path) -> FileOverlay {
     let (added, removed) = count_changed_lines(&file_diff.hunks);
+    let heading_side = if file_diff.status == FileStatus::Deleted {
+        &sides.old
+    } else {
+        &sides.new
+    };
     let mut overlay = FileOverlay {
-        path: file_diff.path.clone(),
+        path: match heading_side {
+            Side::File(root) if root.is_absolute() => {
+                file_under(root, &file_diff.path).unwrap_or_else(|| file_diff.path.clone())
+            }
+            _ => file_diff.path.clone(),
+        },
         old_path: file_diff.old_path.clone(),
         symbol_changes: Vec::new(),
         other_lines: Vec::new(),
